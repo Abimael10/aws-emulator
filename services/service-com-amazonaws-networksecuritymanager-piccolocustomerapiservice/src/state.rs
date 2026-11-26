@@ -13,15 +13,18 @@
 //! Deployment record in [`deployments`], the Template record in [`templates`] and the
 //! Scope record in [`scopes`], re-exported here so `crate::state::<name>` keeps naming
 //! every one of them. The references those records hold between one another — the graph a
-//! delete consults before removing anything — live in [`references`].
+//! delete consults before removing anything — live in [`references`], and a policy's
+//! published version and the snapshots taken of it in [`policy_snapshots`].
 
 mod deployments;
+mod policy_snapshots;
 mod references;
 mod rules;
 mod scopes;
 mod templates;
 
 pub use deployments::*;
+pub use policy_snapshots::*;
 pub use references::*;
 pub use rules::*;
 pub use scopes::*;
@@ -165,6 +168,12 @@ pub struct Policy {
     pub update_token: String,
     pub is_snapshot: bool,
     pub has_published_version: bool,
+    /// The policy's PUBLISHED version: the body as it stood when a create or update last
+    /// published one, which a draft update leaves alone, and which
+    /// [`PolicySnapshot`] copies. `None` until the policy publishes a version, so it is
+    /// `Some` exactly when [`Policy::has_published_version`] is true — a create or update
+    /// writes the two together.
+    pub published: Option<PolicyVersion>,
     pub tags: BTreeMap<String, String>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
@@ -616,6 +625,12 @@ pub struct ComAmazonawsNetworksecuritymanagerPiccolocustomerapiserviceState {
     next_idempotency_seq: u64,
     /// Monotonic counter feeding [`Self::mint_policy_id`].
     pub next_policy_seq: u64,
+    /// Every snapshot taken of a policy's published version, keyed by that policy's
+    /// `policyId` and the version the snapshot froze — so one published version has one
+    /// snapshot, and the snapshots of one policy are iterated in version order. At most
+    /// [`MAX_POLICY_SNAPSHOTS`] entries per policy; a policy's snapshots are removed with
+    /// the policy.
+    pub policy_snapshots: BTreeMap<(String, u32), PolicySnapshot>,
     /// Every persisted rule, keyed by its `ruleId` and so iterated in a stable order —
     /// which is what makes `ListRules`' `nextToken` resume exactly where the previous
     /// page stopped. At most [`MAX_RULES`] entries.

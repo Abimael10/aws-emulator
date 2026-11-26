@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPolicy
-//! Reads one persisted policy back out of [`crate::state`] by its `policyId` or its ARN.
-//! A pure read: it never writes.
+//! Reads one persisted policy back out of [`crate::state`] by its `policyId` or its ARN,
+//! or one SNAPSHOT of it by that id or ARN carrying the version suffix a version-qualified
+//! identifier of this service is written with. A pure read: it never writes.
 //!
 //! ## Shape of an operation
 //!
@@ -183,7 +184,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let store = state.lock();
-        let Some(policy) = store.policy_by_identifier(&input.policy_identifier) else {
+        // The live policy for an identifier that names it, and the frozen copy for one
+        // that names a snapshot of a published version: which members each answers with is
+        // decided in `crate::state`, so this read and `CreatePolicySnapshot` cannot
+        // disagree about them.
+        let Some(facts) = store.policy_facts(&input.policy_identifier) else {
             return Err(GetPolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: format!(
@@ -198,20 +203,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(GetPolicyOutput {
-            policy_id: policy.policy_id.clone(),
-            policy_arn: policy.policy_arn.clone(),
-            policy_name: policy.policy_name.clone(),
-            policy_description: policy.policy_description.clone(),
-            status: policy.status.clone(),
-            priority: policy.priority,
-            associated_template_and_rule_list: policy.associated_template_and_rule_list.clone(),
-            version: policy.version_string(),
-            update_token: Some(policy.update_token.clone()),
-            is_snapshot: Some(policy.is_snapshot),
-            has_published_version: Some(policy.has_published_version),
-            firewall_type: policy.firewall_type.clone(),
-            policy_configuration: policy.policy_configuration.clone(),
-            updated_at: Some(policy.updated_at_timestamp()),
+            policy_id: facts.policy_id,
+            policy_arn: facts.policy_arn,
+            policy_name: facts.policy_name,
+            policy_description: facts.policy_description,
+            status: facts.status,
+            priority: facts.priority,
+            associated_template_and_rule_list: facts.associated_template_and_rule_list,
+            version: facts.version,
+            update_token: Some(facts.update_token),
+            is_snapshot: Some(facts.is_snapshot),
+            has_published_version: Some(facts.has_published_version),
+            firewall_type: facts.firewall_type,
+            policy_configuration: facts.policy_configuration,
+            updated_at: Some(facts.updated_at),
         })
     }
 }

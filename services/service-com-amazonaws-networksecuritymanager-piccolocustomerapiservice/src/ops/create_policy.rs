@@ -305,7 +305,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let policy_id = store.mint_policy_id();
-        let policy = crate::state::Policy {
+        let mut policy = crate::state::Policy {
             policy_arn: ::engine::emulator_arn(
                 crate::state::ARN_NAMESPACE,
                 &region,
@@ -329,10 +329,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // published version (`CreatePolicySnapshot` makes those).
             is_snapshot: false,
             has_published_version: input.is_published,
+            // Filled in below, once the record this version IS exists.
+            published: None,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             created_at: now,
             updated_at: now,
         };
+        // A create that publishes records version 1 as the policy's published version,
+        // which is the body `CreatePolicySnapshot` copies; a draft create publishes none.
+        if input.is_published {
+            policy.published = Some(policy.version_body());
+        }
 
         // Rendered from the record that is about to be stored, so the response cannot
         // disagree with what a later read returns.

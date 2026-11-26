@@ -181,6 +181,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // name stays reserved against a policy nobody can read.
                 store.policy_name_index.remove(&removed.policy_name);
             }
+            // A snapshot is a version of the policy, so it goes with the policy: keeping
+            // one would leave a version-qualified identifier resolving against a policy no
+            // read can reach.
+            store
+                .policy_snapshots
+                .retain(|(snapshot_policy, _), _| *snapshot_policy != policy_id);
             // Likewise the idempotency records: a token that produced this policy can no
             // longer replay it, so keeping the row would only hold memory for an id no
             // call can read again.

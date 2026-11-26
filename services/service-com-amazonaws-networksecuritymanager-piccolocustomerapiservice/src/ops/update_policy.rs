@@ -347,6 +347,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         policy.version = policy.version.saturating_add(1);
         policy.update_token = crate::state::mint_update_token();
         policy.updated_at = now;
+        // An update that publishes records the body it just wrote as the policy's
+        // published version; a draft update moves the live record on and leaves the
+        // published version — the body `CreatePolicySnapshot` copies — as it stood.
+        if input.is_published {
+            policy.published = Some(policy.version_body());
+        }
 
         let output = output_of(policy);
         let applied_version = policy.version;

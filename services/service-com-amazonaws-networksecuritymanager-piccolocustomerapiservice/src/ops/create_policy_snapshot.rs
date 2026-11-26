@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePolicySnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePolicySnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Freezes the policy's PUBLISHED version as an immutable snapshot and PERSISTS it in
+//! [`crate::state`]: the response is rendered from the stored snapshot, so a read of the
+//! version-qualified identifier it answers with (`<policyArn>:<version>`) observes exactly
+//! what this call returned, however far the live policy moves on afterwards.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePolicySnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What a snapshot freezes, and what it reads from the live policy, is decided once in
+//! [`crate::state::PolicySnapshot::facts`] rather than here.
 //!
 //! ## Shape of an operation
 //!
@@ -189,20 +187,154 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePolicySnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePolicySnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePolicySnapshot"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreatePolicySnapshotErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the policy store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let idempotency_key = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key(Self::NAME, token));
+
+        let mut store = state.lock();
+
+        let Some(policy_id) = store.resolve_policy_id(&input.policy_identifier) else {
+            return Err(
+                CreatePolicySnapshotErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+                        resource_id: Some(input.policy_identifier.clone()),
+                        resource_type: Some(crate::state::RESOURCE_TYPE_POLICY.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `clientToken` is `@idempotencyToken`: "If you retry a request with the same
+        // client token and the same parameters, the service returns the result of the
+        // original successful request." The record names the policy and the version the
+        // original call froze, so the replay is answered from that stored snapshot and
+        // freezes nothing a second time.
+        if let Some(facts) = idempotency_key
+            .as_deref()
+            .and_then(|key| store.idempotent_call(key))
+            .filter(|call| call.resource_id == policy_id)
+            .map(|call| call.version)
+            .and_then(|version| {
+                let policy = store.policies.get(&policy_id)?;
+                Some(store.policy_snapshot(&policy_id, version)?.facts(policy))
+            })
+        {
+            return Ok(output_of(facts));
+        }
+
+        let Some(policy) = store.policies.get(&policy_id) else {
+            return Err(CreatePolicySnapshotErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the policy resolved from the identifier is no longer stored"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // This operation snapshots "the current published version of the specified
+        // policy", so a policy that has never published one has nothing to copy: the
+        // modelled `ConflictException` — "it is in a state that does not allow the
+        // requested operation".
+        let Some(published) = policy.published.clone() else {
+            return Err(
+                CreatePolicySnapshotErrorModeled::ConflictException(ConflictException {
+                    message: crate::state::NO_PUBLISHED_VERSION_MESSAGE.to_string(),
+                    resource_id: Some(policy.policy_id.clone()),
+                    resource_type: Some(crate::state::RESOURCE_TYPE_POLICY.to_string()),
+                })
+                .into(),
+            );
+        };
+        let version = published.version;
+        let snapshot_arn = format!("{}:{version}", policy.policy_arn);
+
+        // A snapshot is an IMMUTABLE copy of one published version, so the snapshot of a
+        // version is taken once: a later call naming a published version this store
+        // already froze answers with the stored copy rather than freezing a second one.
+        if let Some(facts) = store
+            .policy_snapshot(&policy_id, version)
+            .map(|snapshot| snapshot.facts(policy))
+        {
+            if let Some(key) = idempotency_key {
+                store.remember_idempotent_call(key, policy_id, version);
+            }
+            return Ok(output_of(facts));
+        }
+
+        // The store is bounded per policy: past its capacity a snapshot is REFUSED with
+        // the modelled quota error rather than growing the process for as long as callers
+        // keep asking.
+        if store.policy_snapshot_count(&policy_id) >= crate::state::MAX_POLICY_SNAPSHOTS {
+            return Err(
+                CreatePolicySnapshotErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this policy already holds the maximum of {} snapshots",
+                            crate::state::MAX_POLICY_SNAPSHOTS
+                        ),
+                        resource_id: Some(policy_id.clone()),
+                        resource_type: Some(crate::state::RESOURCE_TYPE_POLICY.to_string()),
+                        ..ServiceQuotaExceededException::default()
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let snapshot = crate::state::PolicySnapshot {
+            policy_id: policy_id.clone(),
+            policy_arn: snapshot_arn,
+            published,
+            update_token: crate::state::mint_update_token(),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created_at: now,
+        };
+
+        // Rendered from the record that is about to be stored, so the response cannot
+        // disagree with what a later read of the same version returns.
+        let facts = snapshot.facts(policy);
+        store
+            .policy_snapshots
+            .insert((policy_id.clone(), version), snapshot);
+        if let Some(key) = idempotency_key {
+            store.remember_idempotent_call(key, policy_id, version);
+        }
+        Ok(output_of(facts))
+    }
+}
+
+/// The `CreatePolicySnapshotOutput` view of a persisted snapshot.
+fn output_of(facts: crate::state::PolicyFacts) -> CreatePolicySnapshotOutput {
+    CreatePolicySnapshotOutput {
+        policy_id: facts.policy_id,
+        policy_arn: facts.policy_arn,
+        policy_name: facts.policy_name,
+        policy_description: facts.policy_description,
+        status: facts.status,
+        priority: facts.priority,
+        associated_template_and_rule_list: facts.associated_template_and_rule_list,
+        version: facts.version,
+        update_token: Some(facts.update_token),
+        is_snapshot: Some(facts.is_snapshot),
+        has_published_version: Some(facts.has_published_version),
+        firewall_type: facts.firewall_type,
+        policy_configuration: facts.policy_configuration,
+        updated_at: Some(facts.updated_at),
     }
 }
