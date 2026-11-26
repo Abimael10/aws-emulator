@@ -4,8 +4,9 @@
 //! Reports the stored run state of several campaigns in one call: every requested id the
 //! store holds is answered in `successfulRequests` with the state the last
 //! start/pause/stop left it in, and every id it does not hold is answered in
-//! `failedRequests` with the `ResourceNotFound` failure code — a per-id outcome, so one
-//! absent id does not refuse the whole batch.
+//! `failedRequests` with the `ResourceNotFound` failure code and, beside it, the reason
+//! for that failure in words naming that id — a per-id outcome, so one absent id does not
+//! refuse the whole batch.
 //!
 //! How MANY ids one call may name is the service's own cap
 //! (`crate::state::CAMPAIGN_IDS_PER_BATCH`), applied here rather than at the boundary:
@@ -63,7 +64,10 @@
 //!
 //! * `failedRequests` (FailedCampaignStateResponseList) — List of failed requests of
 //!   campaign state. One entry per requested id that resolved to nothing, so the list is as
-//!   long as the batch the caller sent.
+//!   long as the batch the caller sent. Beside the two members the model declares
+//!   (`campaignId`, `failureCode`) an entry carries the reason in words; that member's wire
+//!   form is written out in `super::types::failed_campaign_state_wire`, since the model
+//!   does not declare it.
 //! * `successfulRequests` (SuccessfulCampaignStateResponseList) — List of successful
 //!   response of campaign state
 //!
@@ -198,9 +202,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     campaign_id: Some(stored.id.clone()),
                     state: Some(stored.state.as_wire().to_string()),
                 }),
+                // An id this store holds no campaign under is a per-id failure of the
+                // batch rather than a failure of the call, carrying the failure code the
+                // model's own catalog names for it and, beside it, the explanation of that
+                // failure in words: the one sentence this service words for a campaign id
+                // that names no campaign ([`crate::state::campaign_absent_message`]),
+                // naming the id the request asked about, so a client reads the same text
+                // here as the single-id run-state operations answer with.
                 None => failed_requests.push(FailedCampaignStateResponse {
                     campaign_id: Some(campaign_id.clone()),
                     failure_code: Some(RESOURCE_NOT_FOUND_FAILURE_CODE.to_string()),
+                    failure_reason: Some(crate::state::campaign_absent_message(campaign_id)),
                 }),
             }
         }

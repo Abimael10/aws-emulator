@@ -8,6 +8,11 @@
 //! lives in `<operation>_types`. Every submodule is re-exported here, so
 //! `use super::types::*` resolves a type wherever it lives.
 //!
+//! One shape's wire form is written out rather than derived, in a module of its own
+//! (`failed_campaign_state_wire`): the derive admits exactly the on-disk model's member
+//! list, and that shape's wire carries a member the model does not declare — see that
+//! module's own note.
+//!
 //! The `_types` suffix keeps these submodule names disjoint from the operation
 //! module names: `ops/mod.rs` declares `pub mod types;` beside one
 //! `pub mod <operation>;` per operation and glob-re-exports both, so a submodule
@@ -19,6 +24,7 @@ pub mod delete_campaign_types;
 pub mod delete_connect_instance_config_types;
 pub mod delete_instance_onboarding_job_types;
 pub mod describe_campaign_types;
+pub mod failed_campaign_state_wire;
 pub mod get_campaign_state_batch_types;
 pub mod get_campaign_state_types;
 pub mod get_connect_instance_config_types;
@@ -48,6 +54,8 @@ pub use delete_connect_instance_config_types::*;
 pub use delete_instance_onboarding_job_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use describe_campaign_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use failed_campaign_state_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_campaign_state_batch_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
