@@ -28,8 +28,12 @@
 //! ([`crate::state::trace_pages`]), never cut on a grid the request never named,
 //! so a window no longer than one step is answered in ONE page carrying every
 //! trace it holds — a trace just accepted is in the answer to the minutes-wide
-//! window that covers it. `ApproximateTime` is the start of the step this page
-//! served, which is the requested `StartTime` for the page that reaches it, and
+//! window that covers it. `ApproximateTime` labels the answer on the ABSOLUTE
+//! hour grid: it is the start of the hour bucket the step this page served
+//! closes in, clipped forward to the start of that step
+//! ([`crate::state::WindowPage::approximate_time`]), so a step reaching back
+//! across an hour boundary reports that boundary whatever bounds the request
+//! named, and
 //! a `NextToken` is due while the query has anything left to serve — the rest of
 //! a step holding more summaries than one page carries
 //! ([`TRACE_SUMMARIES_PAGE_SIZE`]), or the step before it while the window
@@ -566,17 +570,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetTraceSummariesOutput {
             trace_summaries: Some(selected),
-            // "The start time of this page of results": where this page's own
-            // STEP of the requested window starts — one step before it ends, or
-            // the requested `StartTime` for the page that reaches the start of
-            // the window, so the instant reported is always inside the window
-            // asked about and the single page a short window is answered in
-            // reports that window's own start. Never the clock: when this
-            // response was built is not a time any result was recorded at, and
-            // for a window in the past it is not even inside the window asked
-            // about.
+            // "The start time of this page of results": the start of the
+            // absolute HOUR BUCKET the step this page served closes in, clipped
+            // forward to the start of that step
+            // ([`crate::state::WindowPage::approximate_time`]). So a step that
+            // reaches back across an hour boundary is labelled by that boundary
+            // whatever bounds the request named, a step inside one hour by its
+            // own start, every page cut out of one step reports the same label,
+            // and a walk back through a multi-step window reports one label per
+            // step, an hour earlier each time. A window served in no page at all
+            // is labelled the same way from its own bounds. Never the clock:
+            // when this response was built is not a time any result was recorded
+            // at.
             approximate_time: Some(crate::state::timestamp_of(
-                page.map_or(start, |page| page.start),
+                page.map_or_else(
+                    || crate::state::span_approximate_time(start, end),
+                    |page| page.approximate_time(),
+                ),
             )),
             traces_processed_count: Some(traces_processed),
             next_token,

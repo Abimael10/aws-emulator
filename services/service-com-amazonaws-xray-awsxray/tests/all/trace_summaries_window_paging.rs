@@ -11,10 +11,11 @@
 //! * a window no longer than one step ([`TRACE_PAGE_SECONDS`]) is answered in
 //!   ONE page carrying every trace it holds, wherever its bounds fall relative
 //!   to the top of an hour, and that page carries no `NextToken`;
-//! * `ApproximateTime` ("the start time of this page of results") is the start of
-//!   the step the page served — one step before that page ends, and the requested
-//!   `StartTime` for the page that reaches it — so it always lies inside the
-//!   window asked about;
+//! * `ApproximateTime` ("the start time of this page of results") is read off
+//!   the absolute hour grid rather than off the requested bounds — the hour the
+//!   step served closes in, clipped forward to that step's start, which is the
+//!   rule [`super::trace_summaries_reported_instant`] asserts — so it always
+//!   lies inside the window asked about;
 //! * a `NextToken` is due while the query has anything left to serve: the rest of
 //!   a step holding more summaries than one page carries, or the step before this
 //!   one while the window reaches into it;
@@ -38,7 +39,8 @@
 //! * and because every one of those is read from the REQUESTED window and from
 //!   the summaries it holds, translating a whole query — its window and the
 //!   traces that window covers — across an absolute hour boundary answers it
-//!   identically, member for member of the envelope.
+//!   identically, member for member of the envelope, bar the one member read off
+//!   the absolute grid.
 //!
 //! The rows differ along what the rule generalises over: the WIDTH of the window
 //! (nothing, a second, part of an hour, an hour, several hours, the widest window
@@ -52,6 +54,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_xray_awsxray::ops::get_trace_summaries::TRACE_SUMMARIES_PAGE_SIZE;
 use service_common::page_tokens::{page_token, PageTokenKey, AUTHENTICATOR_BYTES};
 
+use super::trace_summaries_reported_instant::reported_instant;
 use super::xray_wire::{
     array, close, reported, reported_trace_ids, root_document, summaries_body, trace_id, Answer,
     Xray, ALIGNED, HOUR,
@@ -111,19 +114,21 @@ async fn seed(xray: &Xray, offsets: &[f64]) -> Vec<String> {
 }
 
 // =============================================================================
-// 1. The first page reports the start of the window's last step, and a token
+// 1. The first page serves the step the window ends in, and a token is due
 //    only while an earlier step of the window remains
 // =============================================================================
 
 /// One window, and what the rule says the first page of a query over it reports:
-/// the start of the step the window ends in, and whether a token is due.
+/// the instant that labels the step the window ends in, and whether a token is
+/// due.
 struct WindowCase {
     label: &'static str,
     start: f64,
     end: f64,
-    /// `ApproximateTime` the rule requires: the start of the page's own step,
-    /// which is the requested `StartTime` for a window no longer than one step.
-    page_start: f64,
+    /// `ApproximateTime` the rule requires: the hour the first page's own step
+    /// closes in, clipped forward to that step's start — which is the requested
+    /// `StartTime` for a window that holds no hour boundary at all.
+    reported: f64,
     /// Whether the window reaches into a step before the one it ends in.
     earlier_step: bool,
 }
@@ -134,84 +139,84 @@ fn window_cases() -> Vec<WindowCase> {
             label: "a window of a single instant",
             start: ALIGNED,
             end: ALIGNED,
-            page_start: ALIGNED,
+            reported: ALIGNED,
             earlier_step: false,
         },
         WindowCase {
             label: "a window one second wide, ending on the hour",
             start: ALIGNED - 1.0,
             end: ALIGNED,
-            page_start: ALIGNED - 1.0,
+            reported: ALIGNED - 1.0,
             earlier_step: false,
         },
         WindowCase {
             label: "part of an hour, starting on the hour",
             start: ALIGNED,
             end: ALIGNED + 42.0 * 60.0,
-            page_start: ALIGNED,
+            reported: ALIGNED,
             earlier_step: false,
         },
         WindowCase {
             label: "part of an hour, starting inside it",
             start: ALIGNED + 600.0,
             end: ALIGNED + 1_200.0,
-            page_start: ALIGNED + 600.0,
+            reported: ALIGNED + 600.0,
             earlier_step: false,
         },
         WindowCase {
             label: "minutes wide, straddling the top of an hour",
             start: ALIGNED + HOUR - 600.0,
             end: ALIGNED + HOUR + 600.0,
-            page_start: ALIGNED + HOUR - 600.0,
+            reported: ALIGNED + HOUR,
             earlier_step: false,
         },
         WindowCase {
             label: "exactly one step, on the grid",
             start: ALIGNED,
             end: ALIGNED + HOUR,
-            page_start: ALIGNED,
+            reported: ALIGNED,
             earlier_step: false,
         },
         WindowCase {
             label: "exactly one step, off the grid",
             start: ALIGNED + 600.0,
             end: ALIGNED + HOUR + 600.0,
-            page_start: ALIGNED + 600.0,
+            reported: ALIGNED + HOUR,
             earlier_step: false,
         },
         WindowCase {
             label: "one second longer than a step",
             start: ALIGNED,
             end: ALIGNED + HOUR + 1.0,
-            page_start: ALIGNED + 1.0,
+            reported: ALIGNED + HOUR,
             earlier_step: true,
         },
         WindowCase {
             label: "several steps, on the grid",
             start: ALIGNED,
             end: ALIGNED + 6.0 * HOUR,
-            page_start: ALIGNED + 5.0 * HOUR,
+            reported: ALIGNED + 5.0 * HOUR,
             earlier_step: true,
         },
         WindowCase {
             label: "several steps, off the grid",
             start: ALIGNED + 600.0,
             end: ALIGNED + 3.0 * HOUR + 600.0,
-            page_start: ALIGNED + 2.0 * HOUR + 600.0,
+            reported: ALIGNED + 3.0 * HOUR,
             earlier_step: true,
         },
         WindowCase {
             label: "the widest window this read serves",
             start: ALIGNED,
             end: ALIGNED + 24.0 * HOUR,
-            page_start: ALIGNED + 23.0 * HOUR,
+            reported: ALIGNED + 23.0 * HOUR,
             earlier_step: true,
         },
     ]
 }
 
 #[tokio::test]
-async fn the_first_page_reports_the_start_of_the_windows_last_step() {
+async fn the_first_page_serves_the_windows_last_step() {
     for case in window_cases() {
         // A store holding nothing in any of these windows: what the envelope
         // reports is a property of the WINDOW, so an empty page states it as
@@ -225,9 +230,10 @@ async fn the_first_page_reports_the_start_of_the_windows_last_step() {
         );
         let at = approximate_time(&answered);
         assert!(
-            at.is_some_and(|at| (at - case.page_start).abs() < 1e-6),
-            "case {label:?}: expected ApproximateTime {} (the page's own step start), got {at:?}",
-            case.page_start
+            at.is_some_and(|at| close(at, case.reported)),
+            "case {label:?}: expected ApproximateTime {} (the hour the first page's step closes \
+             in), got {at:?}",
+            case.reported
         );
         // Every bound in this table is a whole second, so the instant derived
         // from it is one too.
@@ -273,25 +279,26 @@ async fn the_pages_walk_the_window_one_step_at_a_time_newest_first() {
     .await;
     let (start, end) = (ALIGNED + 1_800.0, ALIGNED + 1_800.0 + 3.0 * HOUR);
 
-    // The pages, newest step first: each step's own start, and the trace that
+    // The pages, newest step first: each step's own start and the label the
+    // step's answer carries (the hour that step closes in), and the trace that
     // step holds.
-    let expected: Vec<(f64, Vec<String>)> = vec![
-        (end - HOUR, vec![stored[2].clone()]),
-        (end - 2.0 * HOUR, vec![stored[1].clone()]),
-        (end - 3.0 * HOUR, vec![stored[0].clone()]),
+    let expected: Vec<(f64, f64, Vec<String>)> = vec![
+        (end - HOUR, ALIGNED + 3.0 * HOUR, vec![stored[2].clone()]),
+        (end - 2.0 * HOUR, ALIGNED + 2.0 * HOUR, vec![stored[1].clone()]),
+        (end - 3.0 * HOUR, ALIGNED + HOUR, vec![stored[0].clone()]),
     ];
 
     let mut token: Option<String> = None;
     let mut seen: Vec<String> = Vec::new();
-    for (page, (step_start, holds)) in expected.iter().enumerate() {
+    for (page, (step_start, reports, holds)) in expected.iter().enumerate() {
         let answered = xray.summaries(start, end, token.as_deref()).await;
         assert_eq!(
             answered.status, 200,
             "page {page}: the step must be served, got {answered:?}"
         );
         assert!(
-            approximate_time(&answered).is_some_and(|at| (at - step_start).abs() < 1e-6),
-            "page {page}: expected ApproximateTime {step_start} (that step's start), got \
+            approximate_time(&answered).is_some_and(|at| close(at, *reports)),
+            "page {page}: expected ApproximateTime {reports} (the hour that step closes in), got \
              {answered:?}"
         );
         assert_eq!(
@@ -325,7 +332,7 @@ async fn the_pages_walk_the_window_one_step_at_a_time_newest_first() {
 
 // =============================================================================
 // 3. A step holding more than one page is served over several pages, each
-//    reporting that same step's start
+//    carrying that same step's label
 // =============================================================================
 
 #[tokio::test]
@@ -359,12 +366,12 @@ async fn a_step_holding_more_than_one_page_is_served_over_several_pages() {
             "page {pages}: a page carries at most {TRACE_SUMMARIES_PAGE_SIZE} summaries, got \
              {ids:?}"
         );
-        // Every page of one step reports that step's own start: the instant
+        // Every page of one step carries that step's own label: the instant
         // reported says WHICH step was served, not how far into it the page
         // reached.
         assert!(
-            approximate_time(&answered).is_some_and(|at| (at - ALIGNED).abs() < 1e-6),
-            "page {pages}: expected ApproximateTime {ALIGNED} (the step's start), got \
+            approximate_time(&answered).is_some_and(|at| close(at, ALIGNED)),
+            "page {pages}: expected ApproximateTime {ALIGNED} (the step's label), got \
              {answered:?}"
         );
         seen.extend(ids);
@@ -697,9 +704,11 @@ async fn a_just_accepted_trace_is_on_the_first_page_of_a_minutes_wide_window() {
         "the complete answer to a window shorter than one step carries no token, got \
          {answered:?}"
     );
+    let expected = reported_instant(start, end);
     assert!(
-        approximate_time(&answered).is_some_and(|at| (at - start).abs() < 1e-6),
-        "the only page of that window begins at the requested StartTime {start}, got {answered:?}"
+        approximate_time(&answered).is_some_and(|at| close(at, expected)),
+        "the only page of that window is labelled {expected} — the hour it closes in, clipped to \
+         the requested StartTime {start} — got {answered:?}"
     );
 }
 
@@ -790,9 +799,9 @@ async fn the_steps_are_cut_on_the_instant_the_request_windows_on() {
 }
 
 // =============================================================================
-// 8. The envelope is a function of the requested window and of the results it
-//    holds, so translating a whole query across an hour boundary answers it
-//    identically
+// 8. WHICH summaries a query answers, and how it pages them, are a function of
+//    the requested window and of the results it holds, so translating a whole
+//    query across an hour boundary pages it identically
 // =============================================================================
 
 /// How far one query — its window and every trace that window covers — is
@@ -802,11 +811,12 @@ async fn the_steps_are_cut_on_the_instant_the_request_windows_on() {
 /// The rows differ along where the translated window then sits relative to that
 /// boundary: anchored on it, a second past it, astride it by a single second,
 /// starting exactly on it, wholly inside one hour, ending a second short of the
-/// next boundary, and inside the hour before it. The answer is read from the
-/// window asked about rather than from the clock, so every row must answer the
-/// same — which is also what makes the answer reproducible: the same logical
-/// query asked minutes later, on the other side of a boundary, reports the same
-/// envelope.
+/// next boundary, and inside the hour before it. Which summaries the query
+/// answers, and which page each falls on, are read from the window asked about
+/// rather than from where it sits on the grid, so every row must answer the same
+/// summaries in the same pages — the instant each page is LABELLED with is the
+/// one member read off the absolute grid
+/// ([`super::trace_summaries_reported_instant`]).
 const TRANSLATIONS: [(&str, f64); 7] = [
     ("anchored on an hour boundary", 0.0),
     ("a second past the boundary", 1.0),
@@ -827,7 +837,7 @@ async fn a_translated_short_window_answers_identically_whatever_the_grid() {
         let xray = Xray::new();
         // One trace at the case's anchor, asked about over the ten minutes
         // around it: shorter than one step, so the window is ONE page carrying
-        // that trace, reporting the requested `StartTime` and no token —
+        // that trace, and no token —
         // wherever the anchor sits relative to the top of an hour.
         let stored = seed(&xray, &[offset]).await;
         let start = ALIGNED + offset - SHORT_HALF;
@@ -849,10 +859,11 @@ async fn a_translated_short_window_answers_identically_whatever_the_grid() {
              token, got {answered:?}"
         );
         let at = approximate_time(&answered);
+        let expected = reported_instant(start, end);
         assert!(
-            at.is_some_and(|at| close(at, start)),
-            "case {label:?}: expected ApproximateTime {start} (the requested StartTime), got \
-             {at:?}"
+            at.is_some_and(|at| close(at, expected)),
+            "case {label:?}: expected ApproximateTime {expected} (the hour the window closes in, \
+             clipped to its own start), got {at:?}"
         );
     }
 }
@@ -864,7 +875,8 @@ async fn a_translated_multi_step_window_pages_identically_whatever_the_grid() {
         // One trace in each step of a three-step window, the whole query
         // translated by the case's offset: which page a trace falls on follows
         // from the window's own end, so each page carries the trace of its own
-        // step and reports that step's start however many hour boundaries the
+        // step and is labelled by the hour that step closes in however many hour
+        // boundaries the
         // window happens to cross.
         let stored = seed(
             &xray,
@@ -887,11 +899,14 @@ async fn a_translated_multi_step_window_pages_identically_whatever_the_grid() {
         for (index, page) in pages.iter().enumerate() {
             #[allow(clippy::cast_precision_loss)]
             let step_start = end - HOUR * (index as f64 + 1.0);
+            #[allow(clippy::cast_precision_loss)]
+            let step_end = end - HOUR * index as f64;
+            let expected = reported_instant(step_start, step_end);
             let at = approximate_time(page);
             assert!(
-                at.is_some_and(|at| close(at, step_start)),
-                "case {label:?}: page {index} must report its own step start {step_start}, got \
-                 {at:?}"
+                at.is_some_and(|at| close(at, expected)),
+                "case {label:?}: page {index} must be labelled {expected}, the hour its step \
+                 [{step_start}, {step_end}) closes in, got {at:?}"
             );
             assert_eq!(
                 reported(page),
@@ -921,7 +936,7 @@ async fn a_short_window_pages_on_its_results_rather_than_on_an_hour_boundary() {
     // inside a window shorter than one step: a token is due here because
     // RESULTS remain, so the window astride an hour boundary and the one wholly
     // inside an hour must page the same way, and every page of the one step
-    // reports that step's start — the requested `StartTime`.
+    // carries that step's one label.
     let rows: [(&str, f64); 2] = [
         ("astride an hour boundary", 0.0),
         ("wholly inside one hour", 1_200.0),
@@ -950,10 +965,11 @@ async fn a_short_window_pages_on_its_results_rather_than_on_an_hour_boundary() {
         );
         for (index, page) in pages.iter().enumerate() {
             let at = approximate_time(page);
+            let expected = reported_instant(start, end);
             assert!(
-                at.is_some_and(|at| close(at, start)),
-                "case {label:?}: page {index} must report the requested StartTime {start}, got \
-                 {at:?}"
+                at.is_some_and(|at| close(at, expected)),
+                "case {label:?}: page {index} must carry the one label {expected} of the step it \
+                 was cut from, got {at:?}"
             );
             assert_eq!(
                 next_token(page).is_some(),
@@ -1126,10 +1142,11 @@ async fn a_filtered_short_window_answers_its_matches_identically() {
                 "case {case:?}: the window holds {held} traces however the query narrows, got \
                  {answered:?}"
             );
+            let expected = reported_instant(start, end);
             assert!(
-                approximate_time(&answered).is_some_and(|at| close(at, start)),
-                "case {case:?}: expected ApproximateTime {start} (the requested StartTime), got \
-                 {answered:?}"
+                approximate_time(&answered).is_some_and(|at| close(at, expected)),
+                "case {case:?}: expected ApproximateTime {expected} (the hour the window closes \
+                 in, clipped to its own start), got {answered:?}"
             );
 
             // The answer is a function of the window asked about and of what the

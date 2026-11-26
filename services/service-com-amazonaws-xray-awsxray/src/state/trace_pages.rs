@@ -22,9 +22,21 @@
 //! rather than of where that window falls between two boundaries.
 //!
 //! Every page's own step lies inside the requested window by construction (it is
-//! clipped to `StartTime`), so the instant a page reports is a time the reader
-//! can place in the range it asked about, and the page a single-step window is
-//! answered in reports the requested `StartTime`.
+//! clipped to `StartTime`), so no page ever selects a trace the window excludes.
+//!
+//! WHICH STEP a page serves is one thing; the instant the answer is LABELLED
+//! with is another. "The start time of this page of results"
+//! (`smithy_query(query="shape",shape="GetTraceSummariesResult")`) is reported
+//! on the absolute, hour-aligned grid ([`TRACE_REPORT_BUCKET_SECONDS`]): the
+//! start of the hour bucket the step being served CLOSES in, clipped forward to
+//! the start of that step ([`span_approximate_time`],
+//! [`WindowPage::approximate_time`]). So a step reaching back across an hour
+//! boundary is labelled by that boundary — an hour-aligned instant whatever
+//! bounds the request named — a step lying wholly inside one hour is labelled by
+//! its own start, every page cut out of ONE step reports the same label, and
+//! walking a multi-step window reports one label per step, an hour earlier each
+//! time, as the walk moves back through the window. The label therefore always
+//! lies inside the stretch of time the page reports on.
 //!
 //! WITHIN one step the summaries are served NEWEST FIRST — "the first page
 //! contains the most recent results, closest to the end of the time frame" — so
@@ -83,6 +95,69 @@ const TOKEN_SEPARATOR: char = ':';
 /// walk below; it never decides an answer.
 const MAX_WINDOW_PAGES: usize = super::MAX_TRACE_SUMMARIES_WINDOW_HOURS as usize;
 
+/// How long the ABSOLUTE, hour-aligned bucket an answer is LABELLED by is, in
+/// seconds: the hour.
+///
+/// The model puts no constraint on the granularity of the instant a query
+/// reports (`GetTraceSummariesResult$ApproximateTime` targets `Timestamp` with
+/// no range or format), so the bucket is stated here as the service's own, and
+/// every label is read off it ([`span_approximate_time`]).
+pub const TRACE_REPORT_BUCKET_SECONDS: i64 = 60 * 60;
+
+/// The start of the absolute, hour-aligned bucket `instant` falls in:
+/// `floor(instant / TRACE_REPORT_BUCKET_SECONDS)` buckets from the epoch.
+///
+/// A bucket of the ABSOLUTE grid, so the same stretch of time is named by the
+/// same instant in every answer that reports it, and a reader bucketing or
+/// de-duplicating answers by that instant gets one bucket per hour of traffic
+/// rather than one value per call. It is never the clock: when a response was
+/// built is not a time any result was recorded at.
+///
+/// An instant that is no instant at all — one that compares with nothing, or one
+/// reaching past every instant there is — falls in no bucket, so it is answered
+/// as itself and bounded where it is converted ([`super::timestamp_of`]).
+#[must_use]
+pub fn hour_bucket_start(instant: f64) -> f64 {
+    if !instant.is_finite() {
+        return instant;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let bucket = TRACE_REPORT_BUCKET_SECONDS as f64;
+    (instant / bucket).floor() * bucket
+}
+
+/// The start of the absolute hour bucket the LAST INSTANT of a `[_, end)` span
+/// falls in.
+///
+/// The bucket `end` itself falls in, except where `end` sits exactly on a
+/// boundary: an exclusive end on a boundary is the first instant of the NEXT
+/// bucket, which the span does not reach, so the span closes in the bucket
+/// before it.
+fn closing_hour_bucket(end: f64) -> f64 {
+    let bucket = hour_bucket_start(end);
+    #[allow(clippy::cast_precision_loss)]
+    let seconds = TRACE_REPORT_BUCKET_SECONDS as f64;
+    if bucket >= end {
+        return bucket - seconds;
+    }
+    bucket
+}
+
+/// What an answer over the span `[start, end)` is LABELLED with — "the start
+/// time of this page of results": the start of the absolute hour bucket that
+/// span closes in, clipped forward to the span's own start.
+///
+/// So a span reaching back across an hour boundary is labelled by that boundary,
+/// an hour-aligned instant whatever bounds the request named, while one lying
+/// wholly inside a single hour is labelled by its own start, the first instant
+/// it reports on. Either way the label lies inside the span, so a reader can
+/// place it in the stretch of time the answer describes, and two answers over
+/// spans closing in the same hour are labelled alike.
+#[must_use]
+pub fn span_approximate_time(start: f64, end: f64) -> f64 {
+    closing_hour_bucket(end).max(start)
+}
+
 /// One page of a `[start, end)` window: the step of that window it serves.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WindowPage {
@@ -91,8 +166,10 @@ pub struct WindowPage {
     /// This is what a token names a page by.
     pub index: usize,
     /// Where the page's own step starts: one step before it ends, or the start
-    /// of the requested window for the page that reaches it. This is "the start
-    /// time of this page of results".
+    /// of the requested window for the page that reaches it. This SELECTS the
+    /// traces the page carries; it is not what the answer is labelled with,
+    /// which is read off the absolute hour grid
+    /// ([`WindowPage::approximate_time`]).
     pub start: f64,
     /// Where the page's own step ends, exclusive: the end of the requested
     /// window for the first page, and the start of the page before it after
@@ -102,6 +179,22 @@ pub struct WindowPage {
     /// requested window reaches into one, and `None` for the step that reaches
     /// the start of the window, after which the query has nothing left to serve.
     pub earlier: Option<usize>,
+}
+
+impl WindowPage {
+    /// The instant an answer serving this page REPORTS — "the start time of this
+    /// page of results": the label of this page's own STEP
+    /// ([`span_approximate_time`]).
+    ///
+    /// Read off the step rather than off the summaries it was cut into pages of,
+    /// so every page cut out of one step — a step holding more summaries than
+    /// one page carries — reports that step's one label, and a walk back through
+    /// a multi-step window reports one label per step, an hour earlier each
+    /// time.
+    #[must_use]
+    pub fn approximate_time(&self) -> f64 {
+        span_approximate_time(self.start, self.end)
+    }
 }
 
 /// The instant `steps` steps back from `end`.
@@ -150,8 +243,7 @@ pub fn window_page_count(start: f64, end: f64) -> usize {
 /// other window looks like here.
 ///
 /// The step is clipped to the requested window at its start, so a page never
-/// reports an instant outside the range the caller asked about and never selects
-/// a trace the window excludes.
+/// selects a trace the window excludes.
 #[must_use]
 pub fn window_page(start: f64, end: f64, index: usize) -> Option<WindowPage> {
     let pages = window_page_count(start, end);
