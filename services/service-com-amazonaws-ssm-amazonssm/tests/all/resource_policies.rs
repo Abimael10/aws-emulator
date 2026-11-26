@@ -22,10 +22,16 @@
 //! * **only an advanced-tier parameter can carry a resource policy, so a put against a
 //!   parameter in any other tier is refused `ValidationException`;**
 //! * **a rewrite proceeds only against the policy version the caller last read: it takes
-//!   both the `PolicyId` and the stored `PolicyHash`, an obsolete hash is refused
-//!   `ResourcePolicyConflictException`, an unknown id `ResourcePolicyNotFoundException`
+//!   both the `PolicyId` and the stored `PolicyHash`, which TOGETHER address the policy, so
+//!   a pair naming no stored policy — an unknown id, or a hash the policy no longer carries
+//!   — is refused `ResourcePolicyNotFoundException`
 //!   and one of the pair without the other `ResourcePolicyInvalidParameterException` —
 //!   and a refused call changes nothing;**
+//! * **a resource holds at most ONE policy, so a call that names no `PolicyId` is a create
+//!   and reaches only a resource holding none: one against a resource that already holds
+//!   its policy is refused — the modelled limit for an OpsItemGroup, the plane's
+//!   already-exists `ValidationException` naming the ARN for every other resource — leaves
+//!   that policy exactly as it was, and succeeds again once the policy is deleted;**
 //! * **a delete addresses a policy by its id AND its hash together, so a pair naming no
 //!   stored policy — an unknown id, or a hash the policy no longer carries — removes
 //!   nothing and is refused `ResourcePolicyNotFoundException`;**
@@ -51,7 +57,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::parameter_store::{call, error_code, router, ACCOUNT, REGION};
+use crate::parameter_store::{call, error_code, error_message, router, ACCOUNT, REGION};
 
 /// The largest policy document `PutResourcePolicy` accepts: "a policy can't be greater
 /// than 1024 bytes in size" (`ResourcePolicyLimitExceededException`).
@@ -597,14 +603,14 @@ const UPDATE_ROWS: &[UpdateRow] = &[
         case: "the stored id with the hash the policy carried before it was updated",
         addressed: Addressed::ObsoleteHash,
         status: 400,
-        code: Some("ResourcePolicyConflictException"),
+        code: Some("ResourcePolicyNotFoundException"),
         parameter_name: None,
     },
     UpdateRow {
         case: "the stored id with a hash nothing issued",
         addressed: Addressed::UnknownHash,
         status: 400,
-        code: Some("ResourcePolicyConflictException"),
+        code: Some("ResourcePolicyNotFoundException"),
         parameter_name: None,
     },
     UpdateRow {
@@ -1504,9 +1510,134 @@ async fn the_documented_resource_policy_limits_are_enforced() {
     );
 }
 
-/// A read walks a resource's policies in attachment order and pages at the number the
-/// request asks for, resuming at the policy the previous page stopped at; a token this
-/// operation did not issue is refused.
+/// A resource holds at most ONE resource policy: a call that names no `PolicyId` is a
+/// CREATE, so one against a resource that already holds its policy is refused, leaves that
+/// policy exactly as it was, and succeeds again once the policy has been deleted.
+///
+/// The rows are each kind of resource a policy can be attached to, which is what the rule
+/// generalises over; the OpsItemGroup's refusal is the limit the model publishes for it
+/// (`the_documented_resource_policy_limits_are_enforced`), so this table carries the two
+/// resources the plane words its own sentence for.
+#[tokio::test]
+async fn a_resource_holds_at_most_one_policy() {
+    // (case, the noun the sentence names the resource with, how the resource is created)
+    let rows: &[(&str, &str, PolicyHolderRow)] = &[
+        ("a parameter", "parameter", PolicyHolderRow::Parameter("single-policy-parameter")),
+        ("a document", "document", PolicyHolderRow::Document("SinglePolicyDocument")),
+    ];
+    for (case, noun, holder) in rows {
+        let router = router();
+        let resource_arn = match holder {
+            PolicyHolderRow::Parameter(name) => {
+                create_parameter(&router, case, name).await;
+                parameter_arn(name)
+            }
+            PolicyHolderRow::Document(name) => {
+                create_document(&router, case, name).await;
+                document_arn(name)
+            }
+        };
+
+        let (policy_id, policy_hash) = attach(&router, case, &resource_arn, COMPACT_POLICY).await;
+
+        // A second create, carrying a DIFFERENT document and no PolicyId at all.
+        let second = policy_with_sid("Second");
+        let (status, response) = put(
+            &router,
+            &json!({ "ResourceArn": resource_arn, "Policy": second }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a second policy must be refused, got {status} {response}"
+        );
+        let code = error_code(&response);
+        assert_eq!(
+            code, "ValidationException",
+            "case {case:?}: expected ValidationException, got {code} {response}"
+        );
+        assert_eq!(
+            error_message(&response),
+            format!("Resource policy for {noun} {resource_arn} already exists"),
+            "case {case:?}: expected the already-exists sentence naming the ARN, got {response}"
+        );
+
+        // The attached policy is unchanged: same id, same hash, same document.
+        let reported = policies_of(&router, case, &resource_arn).await;
+        assert_eq!(
+            reported.len(),
+            1,
+            "case {case:?}: expected the resource to hold its one policy, got {reported:?}"
+        );
+        assert_eq!(
+            (
+                reported[0]["PolicyId"].as_str(),
+                reported[0]["PolicyHash"].as_str()
+            ),
+            (Some(policy_id.as_str()), Some(policy_hash.as_str())),
+            "case {case:?}: expected the first policy untouched, got {:?}",
+            reported[0]
+        );
+        assert_eq!(
+            policy_text(&reported[0]),
+            COMPACT_POLICY,
+            "case {case:?}: expected the first document untouched, got {:?}",
+            reported[0]
+        );
+
+        // The identical no-PolicyId call succeeds once the first policy is deleted.
+        let (status, deleted) = call(
+            &router,
+            "DeleteResourcePolicy",
+            &json!({
+                "ResourceArn": resource_arn,
+                "PolicyId": policy_id,
+                "PolicyHash": policy_hash,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the delete must succeed, got {status} {deleted}"
+        );
+        let (new_id, _) = attach(&router, case, &resource_arn, &second).await;
+        assert_ne!(
+            new_id, policy_id,
+            "case {case:?}: expected the re-created policy to carry its own id, got {new_id}"
+        );
+        let reported = policies_of(&router, case, &resource_arn).await;
+        assert_eq!(
+            reported.len(),
+            1,
+            "case {case:?}: expected the resource to hold one policy again, got {reported:?}"
+        );
+        assert_eq!(
+            policy_text(&reported[0]),
+            second,
+            "case {case:?}: expected the second document to be the stored one, got {:?}",
+            reported[0]
+        );
+    }
+}
+
+/// Which resource one row of [`a_resource_holds_at_most_one_policy`] attaches to, by the
+/// name it is created under.
+enum PolicyHolderRow {
+    /// A parameter of that name, in the tier a shared parameter must be in.
+    Parameter(&'static str),
+    /// A document of that name.
+    Document(&'static str),
+}
+
+/// A read reports a resource's policy at whatever page size the request asks for, and a
+/// token this operation did not issue is refused.
+///
+/// A resource holds at most ONE policy, so the walk a client drives over a resource is a
+/// one-policy walk whatever page size it asks for: each row below has to report that policy
+/// exactly once and then stop, with no token left over. The MULTI-page walk and the resumed
+/// `NextToken` are pinned where several records can exist —
+/// `all/ops_metadata_listing.rs` for a listing of this service and the page-token suites of
+/// this crate — since no resource can hold the second policy a second page would need.
 #[tokio::test]
 async fn a_read_pages_a_resources_policies_in_attachment_order() {
     let router = router();
@@ -1514,13 +1645,11 @@ async fn a_read_pages_a_resources_policies_in_attachment_order() {
     let resource_arn = parameter_arn("multi-policy");
 
     let mut attached: Vec<String> = Vec::new();
-    for sid in ["First", "Second", "Third"] {
-        let (policy_id, _) = attach(&router, sid, &resource_arn, &policy_with_sid(sid)).await;
-        attached.push(policy_id);
-    }
+    let (policy_id, _) = attach(&router, "First", &resource_arn, &policy_with_sid("First")).await;
+    attached.push(policy_id);
 
-    // Rows: a page smaller than, equal to and larger than what the resource holds, plus
-    // the call that asks for no page size at all.
+    // Rows: the smallest page a request may ask for, one larger than the resource holds, the
+    // published maximum, and the call that asks for no page size at all.
     for (case, page_size) in [
         ("one at a time", Some(1usize)),
         ("two at a time", Some(2)),

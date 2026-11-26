@@ -42,8 +42,7 @@ use std::time::SystemTime;
 
 use ::aws_smithy_schema_server::constraints::ViolationKind;
 use ::service_common::validation::{
-    quoted_echo, rendered_list, rendered_map_in_key_order, rendered_record, unanchored,
-    UNSET_MEMBER,
+    quoted_echo, rendered_list, rendered_map_in_key_order, rendered_record, UNSET_MEMBER,
 };
 use ::service_common::validation_message::{
     element_set_requirement, envelope_over, map_key_refusal_quoting, requirement,
@@ -81,18 +80,19 @@ pub fn metadata_key_is_well_formed(key: &str) -> bool {
         && !key.trim().is_empty()
 }
 
-/// The expression a clause of this service quotes for [`METADATA_KEY_PATTERN`]: the model's
-/// text without the whole-value pair it wraps the published expression in, which is how this
-/// service states a `@pattern` (`crate::service::refusal`, rule 4) and the tree's one reading
-/// of that pair ([`unanchored`]).
+/// The expression a clause of this service quotes for [`METADATA_KEY_PATTERN`]: the one this
+/// service PUBLISHES for the key shape, read through the service's own one reading of a
+/// `@pattern` (`crate::service::refusal::stated_constraints::quoted_pattern`) — for this
+/// shape the model's text with the anchor it OPENS with kept and the one it closes with
+/// dropped.
 ///
 /// A clause a HANDLER states has to read like the one a member the framework's own walk
 /// reported gets — that walk reports an element of `KeysToDelete` outside the key shape's
-/// `@length`, and this service renders its expression that way — so both halves of the same
-/// shape's refusal quote the same text.
+/// `@length`, and it renders this shape's expression through that same reading — so both
+/// halves of the same shape's refusal quote one text.
 #[must_use]
 pub fn quoted_metadata_key_pattern() -> String {
-    unanchored(METADATA_KEY_PATTERN)
+    crate::service::refusal::stated_constraints::quoted_pattern(METADATA_KEY_PATTERN)
 }
 
 /// The requirements the modelled `MetadataKey` states, in the order a clause lists a
@@ -109,8 +109,15 @@ fn metadata_key_requirements() -> Vec<String> {
 /// it declares (`smithy_query(query="shape",shape="MetadataValue")`).
 const METADATA_VALUE_SHAPE: &str = "MetadataValue";
 
-/// See [`METADATA_VALUE_SHAPE`].
-const METADATA_VALUE_MEMBER: &str = "Value";
+/// How that member is PRINTED inside such a rendering: the validating front end in front of
+/// the service prints a modelled structure over its members' lowerCamel spellings — the same
+/// spelling a member PATH is stated in (`aws_smithy_schema_server::constraints::path`) — so
+/// the member the model declares as `Value` is printed `value=`.
+///
+/// RECORDED BEHAVIOUR (corpus `simparity-behavioral-aws-v1`, unit
+/// `ssm.update-ops-metadata-invalid-argument-rejected`): the map quoted by the clause about a
+/// whitespace-only key renders its value as `MetadataValue(value=…)`.
+const METADATA_VALUE_PRINTED_MEMBER: &str = "value";
 
 /// `entries` as a clause quotes a map-valued member: each entry `<key>=<value>` in ascending
 /// key order inside braces ([`rendered_map_in_key_order`]), with a value printed as the
@@ -127,7 +134,7 @@ fn rendered_metadata_map(
                 rendered_record(
                     METADATA_VALUE_SHAPE,
                     &[(
-                        METADATA_VALUE_MEMBER,
+                        METADATA_VALUE_PRINTED_MEMBER,
                         value.value.as_deref().unwrap_or(UNSET_MEMBER),
                     )],
                 ),

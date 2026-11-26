@@ -55,8 +55,10 @@ pub const OPS_ITEM_GROUP_RESOURCE_TYPE: &str = "opsitemgroup";
 pub const MAX_POLICY_SIZE: usize = 1024;
 
 /// How many policies one OpsItemGroup holds: "only one policy can be attached to
-/// `OpsItemGroup`" (`ResourcePolicyLimitExceededException`).
-pub const MAX_OPS_ITEM_GROUP_POLICIES: usize = 1;
+/// `OpsItemGroup`" (`ResourcePolicyLimitExceededException`), which is
+/// [`MAX_POLICIES_PER_RESOURCE`] read for the one resource whose limit the model publishes —
+/// the figure the limit exception reports.
+pub const MAX_OPS_ITEM_GROUP_POLICIES: usize = MAX_POLICIES_PER_RESOURCE;
 
 /// Ceiling on the resource policies this emulator will hold at once. `PutResourcePolicy`
 /// writes a record any caller can reach, keyed by an ARN the caller chose and carrying a
@@ -100,9 +102,14 @@ pub const INVALID_PARAMETER: &str = "One or more parameters specified for the ca
 /// parsed, and names nothing from the request.
 pub const MALFORMED_POLICY_DOCUMENT: &str = "Policy is malformed and cannot be parsed";
 
-/// What `ResourcePolicyConflictException` says: "the hash provided in the call doesn't
-/// match the stored hash".
-pub const POLICY_HASH_MISMATCH: &str = "The hash provided in the call doesn't match the stored hash.";
+/// How many policies ONE resource holds.
+///
+/// A resource policy is THE policy of the resource it is attached to: "only one policy can
+/// be attached to `OpsItemGroup`" (`ResourcePolicyLimitExceededException`) states it for that
+/// resource, and a second attachment to a parameter is refused the same way
+/// ([`policy_already_exists_message`]) — so a create reaches a resource that holds none, and
+/// a resource that holds one is rewritten through its `PolicyId` and `PolicyHash` instead.
+pub const MAX_POLICIES_PER_RESOURCE: usize = 1;
 
 /// What `ResourcePolicyNotFoundException` says of a `PolicyId`/`PolicyHash` pair that
 /// addresses no policy on the resource: the pair IS the address, so the sentence names all
@@ -112,6 +119,22 @@ pub fn policy_not_found_message(resource_arn: &str, policy_id: &str, policy_hash
     format!(
         "Resource policy for resource {resource_arn} with policy ID {policy_id} and policy \
          hash {policy_hash} does not exist"
+    )
+}
+
+/// What a `PutResourcePolicy` that would attach a SECOND policy to a resource already
+/// holding one is refused with: fixed text around the `ResourceArn` the request carried,
+/// which is the one value of the request it names.
+///
+/// A create — a call naming no `PolicyId` — is what this refuses: the resource already has
+/// its one policy ([`MAX_POLICIES_PER_RESOURCE`]), so there is nothing for a create to
+/// attach, and rewriting it is the update that names that policy's id and hash. Worded for
+/// the KIND of resource the ARN names, as [`resource_not_found_message`] is.
+#[must_use]
+pub fn policy_already_exists_message(kind: PolicyResourceKind, resource_arn: &str) -> String {
+    format!(
+        "Resource policy for {} {resource_arn} already exists",
+        kind.resource_noun()
     )
 }
 
@@ -175,6 +198,17 @@ pub enum PolicyResourceKind {
 }
 
 impl PolicyResourceKind {
+    /// How a refusal about this resource NAMES it — the noun the sentence states before the
+    /// ARN ([`policy_already_exists_message`]).
+    #[must_use]
+    pub fn resource_noun(self) -> &'static str {
+        match self {
+            Self::OpsItemGroup => "OpsItemGroup",
+            Self::Parameter => "parameter",
+            Self::Document => "document",
+        }
+    }
+
     /// The resource type an ARN of this kind carries — the token the ARN's resource field
     /// begins with, and part of the key a resource's policies are held under.
     #[must_use]
@@ -445,23 +479,32 @@ impl ResourcePolicyStore {
         record
     }
 
-    /// Replace the document of the policy `policy_id` names on `resource`, answering
-    /// the record as it now stands; `None` when that resource holds no such policy.
+    /// Replace the document of the policy BOTH `policy_id` and `policy_hash` name on
+    /// `resource`, answering the record as it now stands; `None` when that resource holds
+    /// no policy of that pair.
+    ///
+    /// The pair is one address: "no policies with the specified policy ID AND HASH could be
+    /// found" (`ResourcePolicyNotFoundException`), so a caller holding an obsolete hash
+    /// names no policy here rather than naming the current one with the wrong hash — the
+    /// same address [`Self::detach_addressed`] removes by, and the lookup and the write are
+    /// ONE step, so the policy an update refuses and the policy it rewrites cannot drift
+    /// apart.
     ///
     /// The policy keeps its id — it is the same attachment, rewritten — and its hash is
     /// recomputed from the new document, so the hash the caller held is obsolete
     /// afterwards.
-    pub fn replace(
+    pub fn replace_addressed(
         &mut self,
         resource: &PolicyResourceKey,
         policy_id: &str,
+        policy_hash_held: &str,
         policy: String,
     ) -> Option<ResourcePolicyRecord> {
         let held = self
             .attached
             .get_mut(resource)?
             .iter_mut()
-            .find(|held| held.policy_id == policy_id)?;
+            .find(|held| held.policy_id == policy_id && held.policy_hash == policy_hash_held)?;
         held.policy_hash = policy_hash(&policy);
         held.policy = policy;
         Some(held.clone())

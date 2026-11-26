@@ -12,11 +12,22 @@
 //!
 //! The hash is the document's own digest ([`crate::state::resource_policies::policy_hash`])
 //! and "helps to prevent a situation where multiple users attempt to overwrite a policy":
-//! an update proceeds only against the policy version the caller last read, so a hash that
-//! is not the stored one is refused `ResourcePolicyConflictException` and a `PolicyId` the
-//! resource holds no policy under is refused `ResourcePolicyNotFoundException`. What this
-//! writes lands in the one store `GetResourcePolicies` reports and `DeleteResourcePolicy`
-//! removes from ([`crate::state::resource_policies::ResourcePolicyStore`]).
+//! an update proceeds only against the policy version the caller last read, so the
+//! `PolicyId` and the `PolicyHash` together are the ADDRESS of the policy being rewritten —
+//! "no policies with the specified policy ID and hash could be found"
+//! (`ResourcePolicyNotFoundException`) — and a pair naming no policy of the resource, an
+//! unknown id or a hash the policy no longer carries alike, is refused with that class and
+//! rewrites nothing. What this writes lands in the one store `GetResourcePolicies` reports
+//! and `DeleteResourcePolicy` removes from
+//! ([`crate::state::resource_policies::ResourcePolicyStore`]).
+//!
+//! A resource holds at most ONE resource policy
+//! ([`crate::state::resource_policies::MAX_POLICIES_PER_RESOURCE`]), so a call that names no
+//! `PolicyId` is a CREATE and reaches only a resource holding none: one against a resource
+//! that already holds its policy is refused and leaves that policy exactly as it was, since
+//! rewriting it is the update above. The refusal is the limit the model publishes for an
+//! OpsItemGroup and the resource-policy plane's own sentence for every other resource
+//! ([`crate::state::resource_policies::policy_already_exists_message`]).
 //!
 //! The two documented limits are the ones `ResourcePolicyLimitExceededException` reports:
 //! a policy document is at most [`crate::state::resource_policies::MAX_POLICY_SIZE`] bytes,
@@ -127,6 +138,10 @@
 //! * `ResourcePolicyConflictException` (HTTP 400) — The hash provided in the call doesn't
 //!   match the stored hash. This exception is thrown when trying to update an obsolete policy
 //!   version or when multiple requests to update a policy are sent.
+//!   (Recorded behaviour answers the modelled NOT-FOUND class for an obsolete pair instead:
+//!   the `PolicyId` and `PolicyHash` together ADDRESS the policy, so a pair naming none is
+//!   "no policies with the specified policy ID and hash could be found" — see the rule above,
+//!   which is what this handler implements.)
 //! * `ResourcePolicyInvalidParameterException` (HTTP 400) — One or more parameters specified
 //!   for the call aren't valid. Verify the parameters and their values and try again.
 //! * `ResourcePolicyLimitExceededException` (HTTP 400) — The PutResourcePolicy API action
@@ -209,14 +224,6 @@ fn malformed_document() -> PutResourcePolicyError {
     crate::scaffolded::Scaffolded::malformed_resource_policy_document(
         policies::MALFORMED_POLICY_DOCUMENT,
     )
-}
-
-/// The modelled refusal for a `PolicyHash` that is not the stored policy's.
-fn hash_mismatch() -> PutResourcePolicyError {
-    PutResourcePolicyErrorModeled::ResourcePolicyConflictException(ResourcePolicyConflictException {
-        message: Some(policies::POLICY_HASH_MISMATCH.to_string()),
-    })
-    .into()
 }
 
 /// The modelled refusal for a `PolicyId` the resource holds no policy under, naming the
@@ -373,24 +380,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "To update a policy, you must specify PolicyId and PolicyHash": the update
             // proceeds only against the policy version the caller last read.
             (Some(policy_id), Some(policy_hash)) => {
-                let attached = store
-                    .resource_policies
-                    .policy(&held_under, policy_id)
-                    .map(|held| held.policy_hash.clone());
-                let Some(attached) = attached else {
-                    return Err(policy_not_found(
-                        &input.resource_arn,
-                        policy_id,
-                        policy_hash,
-                    ));
-                };
-                if attached != policy_hash {
-                    return Err(hash_mismatch());
-                }
-                match store
-                    .resource_policies
-                    .replace(&held_under, policy_id, stored)
-                {
+                // The pair is ONE address — "no policies with the specified policy ID and
+                // hash could be found" — so a caller holding an obsolete hash names no
+                // policy here rather than naming the current one with the wrong hash, and
+                // the lookup and the write are one step
+                // ([`policies::ResourcePolicyStore::replace_addressed`]).
+                match store.resource_policies.replace_addressed(
+                    &held_under,
+                    policy_id,
+                    policy_hash,
+                    stored,
+                ) {
                     Some(written) => written,
                     None => {
                         return Err(policy_not_found(
@@ -403,13 +403,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // Neither named: a new policy, under an id this call mints.
             (None, None) => {
+                // A resource holds at most ONE policy, so a create reaches only a resource
+                // holding none: the policy a resource already has is rewritten through the
+                // pair that addresses it, and this call names none. The OpsItemGroup is the
+                // resource the model publishes that limit for, so its refusal is that
+                // modelled limit; every other resource is refused by the plane's own
+                // sentence, which names the resource the ARN addressed.
                 let held = store.resource_policies.policies(&held_under).len();
-                if resource.kind == policies::PolicyResourceKind::OpsItemGroup
-                    && held >= policies::MAX_OPS_ITEM_GROUP_POLICIES
-                {
-                    return Err(limit_exceeded(
-                        policies::MAX_OPS_ITEM_GROUP_POLICIES,
-                        policies::ONE_POLICY_PER_OPS_ITEM_GROUP.to_string(),
+                if held >= policies::MAX_POLICIES_PER_RESOURCE {
+                    if resource.kind == policies::PolicyResourceKind::OpsItemGroup {
+                        return Err(limit_exceeded(
+                            policies::MAX_OPS_ITEM_GROUP_POLICIES,
+                            policies::ONE_POLICY_PER_OPS_ITEM_GROUP.to_string(),
+                        ));
+                    }
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        policies::policy_already_exists_message(
+                            resource.kind,
+                            &input.resource_arn,
+                        ),
                     ));
                 }
                 // Every create adds a record for a resource the caller named, so what one

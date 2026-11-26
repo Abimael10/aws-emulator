@@ -85,7 +85,7 @@
 //! reported as a shape-level constraint failure — so the whole refusal is that sentence,
 //! never half in one voice and half in the other.
 
-mod stated_constraints;
+pub(crate) mod stated_constraints;
 mod unapplied_patterns;
 
 pub(super) use unapplied_patterns::refusing_violations;

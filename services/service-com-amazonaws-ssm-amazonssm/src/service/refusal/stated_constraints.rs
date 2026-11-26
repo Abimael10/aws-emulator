@@ -152,6 +152,22 @@ const SESSION_TARGET_PATTERN: &str = "^[a-zA-Z0-9_:-]{1,400}$";
 /// and only the closing one is the model's own wrapping.
 const OPS_AGGREGATOR_TYPE_PATTERN: &str = "^(range|count|sum)$";
 
+/// `com.amazonaws.ssm#MetadataKey`'s expression as the model declares it
+/// (`smithy_query(query="shape",shape="MetadataMap")`: the key targets `MetadataKey`,
+/// `length 1..256`, `pattern ^(?!\s*$).+$`), which this service publishes with the `^` it
+/// OPENS with and without the `$` it closes with.
+///
+/// RECORDED BEHAVIOUR (corpus `simparity-behavioral-aws-v1`, unit
+/// `ssm.update-ops-metadata-invalid-argument-rejected`): a whitespace-only metadata key is
+/// refused with the clause `Member must satisfy regular expression pattern: ^(?!\s*$).+` —
+/// the opening anchor is part of the expression the service publishes, and the negative
+/// lookahead it opens needs it, while only the closing one is the model's own wrapping.
+///
+/// Declared ONCE for the whole service, at the key shape's own home
+/// (`crate::state::ops_metadata`), which holds a key to it and quotes the same text through
+/// [`quoted_pattern`] for the clauses a HANDLER words about a map's KEY.
+const METADATA_KEY_PATTERN: &str = crate::state::ops_metadata::METADATA_KEY_PATTERN;
+
 /// The expressions this service publishes exactly as the model declares them, the outer
 /// anchors included — every other expression is published without the whole-value pair the
 /// model wrote around it ([`quoted_pattern`]).
@@ -176,7 +192,8 @@ const PUBLISHED_AS_DECLARED: &[&str] = &[
 /// Which of the three forms a shape is published with cannot be read off the text, because
 /// all of them are spelled `^…$` in the model: it is reference data about the SHAPE, so one
 /// row holds for every member targeting it, in any operation.
-const PUBLISHED_UNANCHORED_AT_THE_CLOSE: &[&str] = &[OPS_AGGREGATOR_TYPE_PATTERN];
+const PUBLISHED_UNANCHORED_AT_THE_CLOSE: &[&str] =
+    &[OPS_AGGREGATOR_TYPE_PATTERN, METADATA_KEY_PATTERN];
 
 /// One constraint of a shape's stated set.
 ///
@@ -585,7 +602,10 @@ fn satisfies(regex: &str, value: &str) -> bool {
 /// Every DROP is a shared one (`service_common::validation`'s `unanchored` and
 /// `unanchored_at_the_close`), called rather than restated, so this service cannot read an
 /// anchor differently from any other.
-pub(super) fn quoted_pattern(regex: &str) -> String {
+///
+/// `pub(crate)` because a clause a HANDLER words about a value no walk ahead of it reported
+/// — a map's KEY above all — quotes its expression through this one reading too.
+pub(crate) fn quoted_pattern(regex: &str) -> String {
     if PUBLISHED_AS_DECLARED.contains(&regex) {
         return regex.to_string();
     }

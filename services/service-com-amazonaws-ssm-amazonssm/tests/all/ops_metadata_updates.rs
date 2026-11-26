@@ -107,14 +107,15 @@ fn metadata(entries: Entries) -> Value {
 
 /// The requirements a `MetadataKey` has to satisfy, as a refusal lists a constraint set:
 /// written out here from the model's own declaration for that shape, longest bound first,
-/// with the expression quoted the way this service quotes one — the pair the model wraps a
-/// whole-value match in dropped, which is how the framework's own refusal of an element of
-/// `KeysToDelete` outside that shape's length quotes it too.
+/// with the expression quoted the way this service publishes one for that shape — the `$`
+/// the model closes the whole-value match with dropped and the `^` it opens with kept, which
+/// is how the framework's own refusal of an element of `KeysToDelete` outside that shape's
+/// length quotes it too.
 fn metadata_key_requirements() -> String {
     format!(
         "[Member must have length less than or equal to {METADATA_KEY_MAX_CHARACTERS}, Member \
          must have length greater than or equal to 1, Member must satisfy regular expression \
-         pattern: (?!\\s*$).+]"
+         pattern: ^(?!\\s*$).+]"
     )
 }
 
@@ -126,7 +127,7 @@ fn map_key_refusal(member_path: &str, entries: Entries) -> String {
     rendered.sort_unstable_by_key(|(key, _)| *key);
     let quoted: Vec<String> = rendered
         .iter()
-        .map(|(key, value)| format!("{key}=MetadataValue(Value={value})"))
+        .map(|(key, value)| format!("{key}=MetadataValue(value={value})"))
         .collect();
     format!(
         "1 validation error detected: Value '{{{}}}' at '{member_path}' failed to satisfy \

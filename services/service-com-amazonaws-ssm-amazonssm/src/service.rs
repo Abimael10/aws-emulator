@@ -99,7 +99,11 @@
 //! plane renders itself.
 
 mod recorded_response_members;
-mod refusal;
+// `pub(crate)` for its `refusal::stated_constraints::quoted_pattern` alone: a clause a
+// HANDLER words about a value no walk ahead of it reported quotes a `@pattern` through the
+// same reading as one the walk reported, so the two halves of one shape's refusal cannot
+// state two expressions.
+pub(crate) mod refusal;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_schema_server::constraints::Violation;
