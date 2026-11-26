@@ -81,6 +81,14 @@ impl Emulator {
         }
     }
 
+    /// The SAME engine the service holds, for a suite that asserts an invariant of a store
+    /// no response exposes — the family's shared directories among them, which this
+    /// service's own API reports nothing about once the resource they were keyed on is
+    /// gone. `pub(crate)` so those suites read the one engine this harness built.
+    pub(crate) fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+        &self.engine
+    }
+
     /// How many app instances, users and idempotency entries the store holds.
     fn store_sizes(&self) -> (usize, usize, usize) {
         let state = self

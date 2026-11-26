@@ -37,7 +37,11 @@ use crate::cloudfront_key_value_store_handshake::segment as encode;
 
 /// Chime SDK Identity and Chime SDK Messaging, mounted on ONE engine, exactly as
 /// `core/router/src/lib.rs` mounts them.
-fn build_identity_and_messaging_router() -> MultiServiceRouter {
+///
+/// `pub(crate)` so the sibling suite about the same hand-off — what becomes of the role when
+/// the app instance that granted it is deleted — drives the two services through this one
+/// builder rather than carrying another copy.
+pub(crate) fn build_identity_and_messaging_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -55,13 +59,13 @@ fn build_identity_and_messaging_router() -> MultiServiceRouter {
 }
 
 /// One answer, reduced to the status and the JSON body.
-struct Reply {
-    status: u16,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 impl Reply {
-    fn error_code(&self) -> &str {
+    pub(crate) fn error_code(&self) -> &str {
         self.body
             .get("__type")
             .and_then(Value::as_str)
@@ -70,7 +74,7 @@ impl Reply {
 }
 
 /// Dispatch one request to `host`, optionally as the `x-amz-chime-bearer` identity.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     host: &str,
     bearer: Option<&str>,
@@ -104,9 +108,9 @@ async fn call(
 }
 
 /// The Chime SDK Identity endpoint host.
-const IDENTITY_HOST: &str = "identity-chime.us-east-1.amazonaws.com";
+pub(crate) const IDENTITY_HOST: &str = "identity-chime.us-east-1.amazonaws.com";
 /// The Chime SDK Messaging endpoint host.
-const MESSAGING_HOST: &str = "messaging-chime.us-east-1.amazonaws.com";
+pub(crate) const MESSAGING_HOST: &str = "messaging-chime.us-east-1.amazonaws.com";
 
 #[tokio::test]
 async fn only_an_identity_promoted_by_chime_sdk_identity_administers_a_messaging_app_instance() {

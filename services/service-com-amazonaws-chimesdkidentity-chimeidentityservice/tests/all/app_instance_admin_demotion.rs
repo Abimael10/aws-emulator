@@ -14,8 +14,18 @@
 //! this service does not keep, an ARN that is no identity of the app instance), the number
 //! of times the demotion is requested, and an app instance that does not exist; the tail of
 //! the test covers the deleted app instance, which only a delete can reach.
+//!
+//! The two tests after it pin the OTHER way a promotion ends: the app instance that scoped
+//! it is deleted. The rule they pin is that a promotion lasts exactly as long as the app
+//! instance granting it — `DeleteAppInstance` drops every promotion of that instance from
+//! the shared directory, and no read of one is served from a record a delete left behind,
+//! whether the delete ran before the read or concurrently with it.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_common::chime_app_instance_admins::AppInstanceAdminDirectory;
 
 use crate::app_instance_lifecycle::{uri_encode, Emulator};
 
@@ -114,6 +124,330 @@ async fn describe_user(emulator: &Emulator, user_arn: &str) -> (u16, Value) {
             None,
         )
         .await
+}
+
+async fn delete_app_instance(emulator: &Emulator, app_instance_arn: &str) -> (u16, Value) {
+    emulator
+        .call(
+            "DELETE",
+            &format!("/app-instances/{}", uri_encode(app_instance_arn)),
+            None,
+        )
+        .await
+}
+
+async fn list_admins(emulator: &Emulator, app_instance_arn: &str) -> (u16, Value) {
+    emulator
+        .call(
+            "GET",
+            &format!("/app-instances/{}/admins", uri_encode(app_instance_arn)),
+            None,
+        )
+        .await
+}
+
+/// The administering identities the SHARED app-instance admin directory holds a promotion
+/// of over `app_instance_arn`, read from the engine this emulator was built on.
+///
+/// The directory is the record the role is read from — by this service and by the sibling
+/// that honours the role — and no response of this service reports what it holds for an app
+/// instance it no longer has, so a record left behind by a delete is only visible here.
+fn recorded_admins(emulator: &Emulator, app_instance_arn: &str) -> Vec<String> {
+    let directory = emulator.engine().state::<AppInstanceAdminDirectory>();
+    let directory = directory.lock();
+    directory
+        .admins_of(app_instance_arn)
+        .into_iter()
+        .map(|record| record.admin_arn.clone())
+        .collect()
+}
+
+/// One row of the delete-cascade table: how many promotions an app instance holds when it
+/// is deleted, and of which identity kinds.
+#[derive(Debug)]
+struct CascadeCase {
+    label: &'static str,
+    /// The identity children promoted over the app instance before it is deleted, as
+    /// `(segment, id)` pairs — `user` for an `AppInstanceUser` this service stores, `bot`
+    /// for an `AppInstanceBot` whose record it does not keep.
+    promoted: &'static [(&'static str, &'static str)],
+}
+
+/// RULE: a promotion is a grant OVER one app instance, so it lasts exactly as long as that
+/// instance does — deleting the app instance drops every promotion recorded over it from
+/// the shared directory, and leaves every other app instance's promotions standing.
+///
+/// The table spans what the rule generalises over: the number of promotions the deleted
+/// instance holds (none, one, several) and the identity kind each names, with a second app
+/// instance beside it whose own administrator must survive every row.
+#[tokio::test]
+async fn deleting_an_app_instance_drops_every_promotion_it_scoped() {
+    let cases = [
+        CascadeCase {
+            label: "an app instance with no promotion at all",
+            promoted: &[],
+        },
+        CascadeCase {
+            label: "an app instance with one promoted AppInstanceUser",
+            promoted: &[("user", "alice")],
+        },
+        CascadeCase {
+            label: "an app instance with several promotions of both identity kinds",
+            promoted: &[("user", "alice"), ("user", "bob"), ("bot", "helper")],
+        },
+    ];
+
+    let emulator = Emulator::new();
+    // The bystander: another app instance, with an administrator of its own that every row
+    // must leave administering.
+    let bystander = emulator.app_instance("cascade-bystander", "cascade-token-b").await;
+    let bystander_admin = emulator
+        .user(&bystander, "carol", "cascade-token-b-carol")
+        .await;
+    let (promoted_bystander, bystander_body) =
+        promote(&emulator, &bystander, &bystander_admin).await;
+    assert_eq!(
+        promoted_bystander, 201,
+        "promoting the bystander's administrator must answer 201, got {promoted_bystander} \
+         {bystander_body:?}"
+    );
+
+    for (row, case) in cases.iter().enumerate() {
+        let instance = emulator
+            .app_instance(&format!("cascade-{row}"), &format!("cascade-token-{row}"))
+            .await;
+        let mut admins: Vec<String> = Vec::new();
+        for (segment, id) in case.promoted {
+            let admin_arn = match *segment {
+                // A user has to exist to be promoted; a bot's record this service does not
+                // keep, so its ARN is built from the instance's.
+                "user" => {
+                    emulator
+                        .user(&instance, id, &format!("cascade-token-{row}-{id}"))
+                        .await
+                }
+                other => format!("{instance}/{other}/{id}"),
+            };
+            let (status, body) = promote(&emulator, &instance, &admin_arn).await;
+            assert_eq!(
+                status, 201,
+                "case {:?}: promoting {admin_arn} must answer 201, got {status} {body:?}",
+                case.label
+            );
+            admins.push(admin_arn);
+        }
+        let mut recorded = recorded_admins(&emulator, &instance);
+        recorded.sort();
+        let mut expected = admins.clone();
+        expected.sort();
+        assert_eq!(
+            recorded, expected,
+            "case {:?}: expected exactly the promoted identities recorded, got {recorded:?}",
+            case.label
+        );
+
+        let (deleted, delete_body) = delete_app_instance(&emulator, &instance).await;
+        assert_eq!(
+            deleted, 204,
+            "case {:?}: DeleteAppInstance must answer 204, got {deleted} {delete_body:?}",
+            case.label
+        );
+
+        // The grant goes with the instance that granted it: nothing is left in the shared
+        // directory for any reader of the role to be served from.
+        let left_behind = recorded_admins(&emulator, &instance);
+        assert!(
+            left_behind.is_empty(),
+            "case {:?}: expected no promotion left over the deleted app instance, got \
+             {left_behind:?}",
+            case.label
+        );
+
+        // And both reads of a promotion answer the refusal every instance-keyed read of a
+        // deleted app instance answers.
+        for admin_arn in &admins {
+            let (described, described_body) = describe_admin(&emulator, &instance, admin_arn).await;
+            assert_eq!(
+                (
+                    described,
+                    described_body["Code"].as_str(),
+                    described_body["Message"].as_str()
+                ),
+                (403, Some("Forbidden"), Some(FORBIDDEN_MESSAGE)),
+                "case {:?}: reading {admin_arn} under the deleted app instance must be \
+                 refused, got {described} {described_body:?}",
+                case.label
+            );
+        }
+        let (listed, listed_body) = list_admins(&emulator, &instance).await;
+        assert_eq!(
+            (listed, listed_body["Code"].as_str()),
+            (403, Some("Forbidden")),
+            "case {:?}: listing the administrators of the deleted app instance must be \
+             refused, got {listed} {listed_body:?}",
+            case.label
+        );
+
+        // The bystander is untouched by every row: its promotion is recorded, readable and
+        // listed after each delete.
+        assert_eq!(
+            recorded_admins(&emulator, &bystander),
+            vec![bystander_admin.clone()],
+            "case {:?}: expected the bystander's promotion kept, got {:?}",
+            case.label,
+            recorded_admins(&emulator, &bystander)
+        );
+        let (bystander_read, bystander_read_body) =
+            describe_admin(&emulator, &bystander, &bystander_admin).await;
+        assert_eq!(
+            bystander_read, 200,
+            "case {:?}: the bystander's administrator must still be readable, got \
+             {bystander_read} {bystander_read_body:?}",
+            case.label
+        );
+        let listed = listed_admins(&emulator, &bystander).await;
+        assert_eq!(
+            listed,
+            vec![bystander_admin.clone()],
+            "case {:?}: the bystander's administrator must still be listed, got {listed:?}",
+            case.label
+        );
+    }
+}
+
+/// How many concurrent rounds each pairing below is driven over.
+///
+/// A single round can be served in either order by chance, so the invariant is checked over
+/// a run of them; each round is a handful of in-process calls, so the run costs
+/// milliseconds.
+const CONCURRENT_ROUNDS: usize = 16;
+
+/// Which operation on a promotion is run CONCURRENTLY with the delete of the app instance
+/// that scopes it.
+#[derive(Debug, Clone, Copy)]
+enum Concurrently {
+    /// `DescribeAppInstanceAdmin` of a promotion already recorded.
+    ReadingThePromotion,
+    /// `CreateAppInstanceAdmin` promoting a second identity.
+    RecordingAnotherPromotion,
+}
+
+/// RULE: every answer an app-instance-admin operation gives comes from ONE snapshot of this
+/// service's store and the shared directory, so a `DeleteAppInstance` that runs concurrently
+/// with it is ordered either before it or after it: a read either reports the promotion or is
+/// refused as a request over a deleted app instance, never a promotion of an app instance
+/// whose delete has already been acknowledged, and a promotion recorded alongside the delete
+/// never outlives the instance it was granted over.
+///
+/// The rows span what the rule generalises over: which operation the delete races (a READ of
+/// a promotion, a WRITE of another), over a run of rounds so either order is reached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_app_instance_delete_racing_an_admin_operation_leaves_one_consistent_answer() {
+    for pairing in [
+        Concurrently::ReadingThePromotion,
+        Concurrently::RecordingAnotherPromotion,
+    ] {
+        let emulator = Arc::new(Emulator::new());
+        for round in 0..CONCURRENT_ROUNDS {
+            let case = format!("{pairing:?} round {round}");
+            let token = format!("race-{pairing:?}-{round}");
+            let instance = emulator.app_instance(&format!("race-{round}"), &token).await;
+            let alice = emulator.user(&instance, "alice", &format!("{token}-alice")).await;
+            let bob = emulator.user(&instance, "bob", &format!("{token}-bob")).await;
+            let (promoted, promoted_body) = promote(&emulator, &instance, &alice).await;
+            assert_eq!(
+                promoted, 201,
+                "case {case:?}: the setup promotion must answer 201, got {promoted} \
+                 {promoted_body:?}"
+            );
+
+            // Set once the delete has ANSWERED, and read by the other call right after its
+            // own answer: a caller that has been told the app instance is gone is what
+            // makes a later success a stale one.
+            let delete_acknowledged = Arc::new(AtomicBool::new(false));
+
+            let deleter = {
+                let emulator = Arc::clone(&emulator);
+                let instance = instance.clone();
+                let acknowledged = Arc::clone(&delete_acknowledged);
+                tokio::spawn(async move {
+                    let answer = delete_app_instance(&emulator, &instance).await;
+                    acknowledged.store(true, Ordering::SeqCst);
+                    answer
+                })
+            };
+            let other = {
+                let emulator = Arc::clone(&emulator);
+                let instance = instance.clone();
+                let alice = alice.clone();
+                let bob = bob.clone();
+                let acknowledged = Arc::clone(&delete_acknowledged);
+                tokio::spawn(async move {
+                    let answer = match pairing {
+                        Concurrently::ReadingThePromotion => {
+                            describe_admin(&emulator, &instance, &alice).await
+                        }
+                        Concurrently::RecordingAnotherPromotion => {
+                            promote(&emulator, &instance, &bob).await
+                        }
+                    };
+                    (answer, acknowledged.load(Ordering::SeqCst))
+                })
+            };
+
+            let (delete_status, delete_body) = deleter.await.expect("the delete task finished");
+            let ((status, body), after_the_delete_was_acknowledged) =
+                other.await.expect("the concurrent task finished");
+            assert_eq!(
+                delete_status, 204,
+                "case {case:?}: DeleteAppInstance must answer 204, got {delete_status} \
+                 {delete_body:?}"
+            );
+
+            // Either order is allowed; what is not is a success reported for an app instance
+            // the caller racing it was already told is gone.
+            let served = match pairing {
+                Concurrently::ReadingThePromotion => 200,
+                Concurrently::RecordingAnotherPromotion => 201,
+            };
+            assert!(
+                status == served || (status == 403 && body["Code"].as_str() == Some("Forbidden")),
+                "case {case:?}: expected either {served} or the 403 Forbidden refusal, got \
+                 {status} {body:?}"
+            );
+            if status == served {
+                assert!(
+                    !after_the_delete_was_acknowledged,
+                    "case {case:?}: expected no success after the delete of its app instance \
+                     was acknowledged, got {status} {body:?}"
+                );
+            }
+
+            // And whichever order the two ran in, the delete has the last word: no promotion
+            // of the deleted app instance survives in the shared directory, and every read
+            // of one is refused.
+            let left_behind = recorded_admins(&emulator, &instance);
+            assert!(
+                left_behind.is_empty(),
+                "case {case:?}: expected no promotion left over the deleted app instance, got \
+                 {left_behind:?}"
+            );
+            for admin_arn in [&alice, &bob] {
+                let (described, described_body) =
+                    describe_admin(&emulator, &instance, admin_arn).await;
+                assert_eq!(
+                    (
+                        described,
+                        described_body["Code"].as_str(),
+                        described_body["Message"].as_str()
+                    ),
+                    (403, Some("Forbidden"), Some(FORBIDDEN_MESSAGE)),
+                    "case {case:?}: reading {admin_arn} after the delete must be refused, got \
+                     {described} {described_body:?}"
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]

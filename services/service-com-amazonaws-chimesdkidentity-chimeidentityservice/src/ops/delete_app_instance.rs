@@ -185,6 +185,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the Chime identity name directory is unavailable".to_string()),
             })
         })?;
+        // And the promotions this instance scoped, so the family's shared app-instance
+        // ADMIN directory is resolved before the delete as well.
+        let admin_directory = crate::state::app_instance_admins(&*self.engine).ok_or_else(|| {
+            DeleteAppInstanceErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the AppInstanceAdmin directory is unavailable".to_string()),
+            })
+        })?;
         let mut state = state.lock();
 
         // Deleting an AppInstance deletes everything it owns, so the users and bots it
@@ -256,6 +264,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _dropped_names = name_directory
             .lock()
             .forget_identities_of(&input.app_instance_arn);
+
+        // And the promotions the instance SCOPED: an `AppInstanceAdmin` is an administrator
+        // OF this app instance, so the role lasts exactly as long as the instance granting
+        // it. Left behind, the record would outlive its instance in a directory this
+        // service shares with the sibling that READS the role — which would keep honouring
+        // an administrator of an app instance nobody holds — and would still be there for a
+        // reader here to be served from. Written under the store guard taken above, in the
+        // lock order this crate's directories document.
+        let _dropped_promotions = admin_directory
+            .lock()
+            .forget_admins_of(&input.app_instance_arn);
 
         Ok(DeleteAppInstanceOutput)
     }

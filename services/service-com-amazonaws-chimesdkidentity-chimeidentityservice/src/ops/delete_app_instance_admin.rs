@@ -200,14 +200,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // was DELETED is refused as a request this caller may no longer make, and one that
         // never named an app instance as absent — the two answers the rest of this service
         // gives for an ARN it cannot resolve.
-        {
-            let store = state.lock();
-            if !store.app_instances.contains_key(&input.app_instance_arn) {
-                return Err(unresolved(
-                    store.unresolved_arn(&input.app_instance_arn),
-                    format!("AppInstance {} does not exist", input.app_instance_arn),
-                ));
-            }
+        //
+        // LOCK ORDER: this service's store first, the shared admin directory second — the
+        // order every writer in this crate takes them in — and the store guard is held
+        // across the demotion below, so the decision and the write belong to ONE snapshot.
+        let store = state.lock();
+        if !store.app_instances.contains_key(&input.app_instance_arn) {
+            return Err(unresolved(
+                store.unresolved_arn(&input.app_instance_arn),
+                format!("AppInstance {} does not exist", input.app_instance_arn),
+            ));
         }
 
         // Demoting is the removal of one record from a SET, so it is idempotent: whether

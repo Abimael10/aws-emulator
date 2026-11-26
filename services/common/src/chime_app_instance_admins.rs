@@ -121,4 +121,121 @@ impl AppInstanceAdminDirectory {
         self.order.retain(|held| *held != key);
         self.admins.remove(&key).is_some()
     }
+
+    /// Drop every promotion recorded over `app_instance_arn`, and answer how many were
+    /// dropped — what the service that owns the app instance calls when the instance
+    /// itself is deleted.
+    ///
+    /// An administrator is an administrator OF one app instance, so a promotion exists only
+    /// for as long as the app instance that scopes it does: once the instance is gone, the
+    /// role it granted is gone with it, here as well as in the store that owns the instance.
+    /// Without that cascade the reader of the role would keep honouring a grant over an app
+    /// instance nobody holds any more.
+    pub fn forget_admins_of(&mut self, app_instance_arn: &str) -> usize {
+        let dropped: Vec<(String, String)> = self
+            .admins
+            .keys()
+            .filter(|(instance, _)| instance == app_instance_arn)
+            .cloned()
+            .collect();
+        for (instance, admin) in &dropped {
+            self.demote(instance, admin);
+        }
+        dropped.len()
+    }
+
+    /// How many promotions the directory currently holds, over every app instance.
+    pub fn registered_admins(&self) -> usize {
+        self.admins.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The directory over what a promotion's LIFETIME generalises over: a promotion
+    //! recorded and read back, one demoted on its own, and the cascade a deleted app
+    //! instance owes — which reaches every promotion that instance scoped and no other's.
+
+    use super::*;
+
+    const INSTANCE: &str = "arn:aws:chime:us-east-1:000000000000:app-instance/ai1";
+    const OTHER_INSTANCE: &str = "arn:aws:chime:us-east-1:000000000000:app-instance/ai2";
+
+    fn identity(instance: &str, segment: &str, id: &str) -> String {
+        format!("{instance}/{segment}/{id}")
+    }
+
+    #[test]
+    fn deleting_an_app_instance_drops_every_promotion_it_scoped_and_no_other() {
+        // Rows: the two identity kinds an app instance has, in the numbers one instance can
+        // hold them in, plus a second app instance whose promotions the cascade must leave
+        // standing.
+        let cases = [
+            ("one user of the instance", INSTANCE, vec![("user", "u1")]),
+            (
+                "several identities of both kinds",
+                INSTANCE,
+                vec![("user", "u2"), ("user", "u3"), ("bot", "b1")],
+            ),
+            (
+                "another app instance's own administrator",
+                OTHER_INSTANCE,
+                vec![("user", "u4")],
+            ),
+        ];
+        let mut directory = AppInstanceAdminDirectory::default();
+        for (case, instance, identities) in &cases {
+            for (segment, id) in identities {
+                let arn = identity(instance, segment, id);
+                directory.promote(instance, &arn, 1_700_000_000_000);
+                assert!(
+                    directory.administers(instance, &arn),
+                    "case {case:?}: expected {arn} to administer {instance} once promoted"
+                );
+            }
+        }
+
+        let dropped = directory.forget_admins_of(INSTANCE);
+        assert_eq!(
+            dropped, 4,
+            "case {:?}: expected every promotion of that app instance dropped, got {dropped}",
+            "the cascade of a deleted app instance"
+        );
+        assert!(
+            directory.admins_of(INSTANCE).is_empty(),
+            "case {:?}: expected no promotion left over the deleted app instance, got {:?}",
+            "the cascade of a deleted app instance",
+            directory.admins_of(INSTANCE)
+        );
+        let survivor = identity(OTHER_INSTANCE, "user", "u4");
+        assert!(
+            directory.administers(OTHER_INSTANCE, &survivor),
+            "case {:?}: expected another app instance's promotion kept, held {}",
+            "the cascade of a deleted app instance",
+            directory.registered_admins()
+        );
+        assert_eq!(
+            directory.registered_admins(),
+            1,
+            "case {:?}: expected exactly the surviving promotion held, got {}",
+            "the cascade of a deleted app instance",
+            directory.registered_admins()
+        );
+
+        // The cascade is a removal from a SET: an app instance whose promotions are already
+        // gone drops none, and one that never had any drops none either.
+        for (case, instance) in [
+            ("the same app instance twice", INSTANCE),
+            (
+                "an app instance the directory never held a promotion over",
+                "arn:aws:chime:us-east-1:000000000000:app-instance/never",
+            ),
+        ] {
+            let again = directory.forget_admins_of(instance);
+            assert_eq!(
+                again, 0,
+                "case {case:?}: expected nothing left to drop, got {again}"
+            );
+        }
+    }
 }

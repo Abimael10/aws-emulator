@@ -176,6 +176,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // LOCK ORDER: this service's store first, the shared admin directory second — the
+        // order every writer in this crate takes them in — and the store guard is held
+        // across the promotion below, so the identity this create checked and the record it
+        // writes belong to ONE snapshot: a delete of the app instance cannot land between
+        // the check and the write and leave a promotion over an instance nobody holds.
+        let store = state.lock();
+
         // Only the two identity kinds may be promoted, and an administrator is an identity
         // OF the app instance it administers — so the promoted ARN has to name one of that
         // instance's identity children: `<AppInstanceArn>/user/<id>` for an
@@ -184,49 +191,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instance beneath a segment of its own (a sibling service's resource), which names
         // no identity and so can administer nothing. The predicate is the crate's one
         // answer to "does this ARN name an identity of this service".
-        let name = {
-            let store = state.lock();
-            if !store.app_instances.contains_key(&input.app_instance_arn) {
+        if !store.app_instances.contains_key(&input.app_instance_arn) {
+            return Err(unresolved(
+                store.unresolved_arn(&input.app_instance_arn),
+                format!("AppInstance {} does not exist", input.app_instance_arn),
+            ));
+        }
+        if !crate::state::names_identity_of(&input.app_instance_arn, &input.app_instance_admin_arn)
+        {
+            return Err(CreateAppInstanceAdminErrorModeled::BadRequestException(
+                BadRequestException {
+                    code: Some("BadRequest".to_string()),
+                    message: Some(format!(
+                        "AppInstanceAdminArn {} is not an AppInstanceUser or AppInstanceBot of AppInstance {}",
+                        input.app_instance_admin_arn, input.app_instance_arn
+                    )),
+                },
+            )
+            .into());
+        }
+        let name = match store.user(&input.app_instance_admin_arn) {
+            Some(user) => Some(user.name.clone()),
+            // An `AppInstanceUser` has to exist to be promoted; an `AppInstanceBot` this
+            // service holds reports the name on its own record, and one it does not hold is
+            // recorded without a name rather than refused.
+            None if input
+                .app_instance_admin_arn
+                .starts_with(&format!("{}/user/", input.app_instance_arn)) =>
+            {
                 return Err(unresolved(
-                    store.unresolved_arn(&input.app_instance_arn),
-                    format!("AppInstance {} does not exist", input.app_instance_arn),
+                    store.unresolved_arn(&input.app_instance_admin_arn),
+                    format!(
+                        "AppInstanceUser {} does not exist",
+                        input.app_instance_admin_arn
+                    ),
                 ));
             }
-            if !crate::state::names_identity_of(
-                &input.app_instance_arn,
-                &input.app_instance_admin_arn,
-            ) {
-                return Err(CreateAppInstanceAdminErrorModeled::BadRequestException(
-                    BadRequestException {
-                        code: Some("BadRequest".to_string()),
-                        message: Some(format!(
-                            "AppInstanceAdminArn {} is not an AppInstanceUser or AppInstanceBot of AppInstance {}",
-                            input.app_instance_admin_arn, input.app_instance_arn
-                        )),
-                    },
-                )
-                .into());
-            }
-            match store.user(&input.app_instance_admin_arn) {
-                Some(user) => Some(user.name.clone()),
-                // An `AppInstanceUser` has to exist to be promoted; an `AppInstanceBot`
-                // this service holds reports the name on its own record, and one it does
-                // not hold is recorded without a name rather than refused.
-                None if input.app_instance_admin_arn.starts_with(&format!(
-                    "{}/user/",
-                    input.app_instance_arn
-                )) =>
-                {
-                    return Err(unresolved(
-                        store.unresolved_arn(&input.app_instance_admin_arn),
-                        format!(
-                            "AppInstanceUser {} does not exist",
-                            input.app_instance_admin_arn
-                        ),
-                    ));
-                }
-                None => store.identity_name(&input.app_instance_admin_arn),
-            }
+            None => store.identity_name(&input.app_instance_admin_arn),
         };
 
         // Recording the promotion is idempotent: an identity already promoted keeps the

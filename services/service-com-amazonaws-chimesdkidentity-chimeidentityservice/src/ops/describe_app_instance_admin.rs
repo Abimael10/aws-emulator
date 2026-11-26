@@ -166,11 +166,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
+        // LOCK ORDER: this service's store first, the shared admin directory second — the
+        // order every writer in this crate takes them in — and the store guard is held
+        // across BOTH reads below, so the decision this read refuses or answers on and the
+        // record it reports come from ONE snapshot. Taking the store a second time would
+        // let a delete of the app instance land in between and turn this refusal into an
+        // answer served from the record that delete is removing.
+        let store = state.lock();
+
         // The `AppInstance` an administrator is an identity OF is what serves a read of
         // that promotion, so once that instance has been deleted the read is refused as a
         // request this caller may no longer make rather than answered from a record the
         // delete left behind. A reporting operation: nothing here writes.
-        if state.lock().unresolved_arn(&input.app_instance_arn)
+        if store.unresolved_arn(&input.app_instance_arn)
             == crate::state::UnresolvedArn::DeletedAppInstance
         {
             return Err(
@@ -203,9 +211,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })?;
         // The administering identity's NAME is held by the identity's own record, not by
-        // the directory, so it is read from the store here and left absent for an identity
+        // the directory, so it is read from the store here — under the same guard, so the
+        // name belongs to the same snapshot as the record — and left absent for an identity
         // this service does not hold.
-        let name = state.lock().identity_name(&record.admin_arn);
+        let name = store.identity_name(&record.admin_arn);
 
         Ok(DescribeAppInstanceAdminOutput {
             app_instance_admin: Some(AppInstanceAdmin {
