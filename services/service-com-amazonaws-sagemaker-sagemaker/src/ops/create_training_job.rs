@@ -40,7 +40,12 @@
 //! this call answers: the run records the `SecondaryStatus` phases it went through and the
 //! clock materialises them in order ([`crate::state::TrainingJob::settle_status`]), so a
 //! caller polling the job observes `Downloading`, `Training` and `Uploading` before the
-//! terminal status, and `SecondaryStatusTransitions` reports every stage the job was in. The
+//! terminal status, and `SecondaryStatusTransitions` reports every stage the job was in. Each
+//! of those stages is in effect for a whole [`crate::state::TRAINING_JOB_PHASE_SPAN`], sized so
+//! the stages that run the container outlast the interval a client polling this job sleeps
+//! between two reads — a client in another process learns that the container is running, and
+//! that the artifact has been written, only by polling, so a stage narrower than its interval
+//! would be reported to nobody. The
 //! artifact the run built appears under the output location once the stage that UPLOADS it is
 //! over, and the checkpoints it produced from the stage that TRAINS, which this call arms for
 //! the instants the clock owes them ([`crate::state::publish_when_due`]), so a client that

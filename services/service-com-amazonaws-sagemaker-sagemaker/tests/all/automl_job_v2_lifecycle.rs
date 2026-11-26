@@ -15,14 +15,21 @@
 //! case-insensitive uniqueness of `AutoMLJobName`, each documented cross-member
 //! refusal, and the status transition the clock owes a job nothing trained.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 use crate::inference_deployment_lifecycle::{error_code, str_field, Emulator, ACCOUNT};
 
-/// Long enough to pass `state::AUTO_ML_JOB_TERMINAL_AFTER` (5 x 700 ms).
-const PAST_TERMINAL_DUE: Duration = Duration::from_millis(6_000);
+/// How long a poll below gives the clock to settle a job, and how often it looks again.
+///
+/// The deadline is far longer than the span this state gives an AutoML job's work
+/// (`state::AUTO_ML_JOB_TERMINAL_AFTER`), so it bounds a lifecycle that never settles rather
+/// than the condition a case waits for: the wait below is on the CONDITION, re-read in a loop,
+/// so a loaded host takes more turns of it instead of reaching a different answer.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(120);
+/// See [`SETTLE_DEADLINE`].
+const SETTLE_POLL: Duration = Duration::from_millis(100);
 
 /// A `RoleArn` satisfying the modelled pattern
 /// `^arn:aws[a-z\-]*:iam::\d{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+$`.
@@ -33,6 +40,22 @@ async fn describe(emulator: &Emulator, name: &str) -> Value {
     emulator
         .ok("DescribeAutoMLJobV2", &json!({ "AutoMLJobName": name }))
         .await
+}
+
+/// Describe `name` again until the job has left `InProgress`, answering the read that saw it.
+async fn poll_until_settled(emulator: &Emulator, name: &str, case: &str) -> Value {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let read = describe(emulator, name).await;
+        if str_field(&read, "AutoMLJobStatus") != "InProgress" {
+            return read;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case}: the job must leave InProgress before the deadline, last read {read:?}"
+        );
+        tokio::time::sleep(SETTLE_POLL).await;
+    }
 }
 
 /// One input channel: the `S3Prefix` source every problem type accepts.
@@ -471,9 +494,7 @@ async fn a_job_leaves_in_progress_once_the_clock_owes_it_and_reports_why_it_fail
             "case {case} immediately-after-create: AutoMLJobStatus, got {running:?}"
         );
 
-        tokio::time::sleep(PAST_TERMINAL_DUE).await;
-
-        let settled = describe(&emulator, name).await;
+        let settled = poll_until_settled(&emulator, name, case).await;
         assert_eq!(
             str_field(&settled, "AutoMLJobStatus"),
             "Failed",

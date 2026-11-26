@@ -41,7 +41,15 @@ pub const AUTO_ML_JOB_QUOTA: usize = 1_000;
 /// still observes `InProgress`/`Starting`, and one that keeps polling observes each stage of
 /// the work in turn before the terminal status. Nothing sleeps: the due instant is stored and
 /// materialised by the next call that reads the record.
-pub const AUTO_ML_JOB_PHASE_SPAN: Duration = Duration::from_millis(700);
+///
+/// What it has to be long enough for is OBSERVATION by a client in ANOTHER PROCESS, which
+/// learns how far the work has got only by POLLING `DescribeAutoMLJobV2` — seconds apart,
+/// commonly ten of them. So each stage gets a whole span of its own rather than a share of one,
+/// and the span is sized so the stages of the WORK (`AnalyzingData` through
+/// `CandidateDefinitionsGenerated`, four of them for a run that gets through its candidates)
+/// are together in effect for longer than such an interval; a walk narrower than that is a
+/// sequence the API reports and no client ever observes.
+pub const AUTO_ML_JOB_PHASE_SPAN: Duration = Duration::from_secs(3);
 
 /// How long after `CreateAutoMLJobV2` the clock owes the job's terminal transition.
 ///

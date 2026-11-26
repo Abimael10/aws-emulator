@@ -4,14 +4,17 @@
 //! clock-owed schedule of a job's work fits inside, and the train → model → transform flow a
 //! batch-inference client drives through it.
 //!
-//! RULE — a status transition this emulator owes the CLOCK is due inside the compressed span
-//! this project gives such a transition (seconds, not the minutes the real service takes), and
-//! that holds for the WHOLE walk of a job's work, stage by stage: a client does not wait out one
-//! lifecycle in isolation, it chains them — trains a model, hands the artifact to `CreateModel`,
-//! transforms data with the model and reads the output — so a schedule laid out on the service's
-//! own wall-clock scale leaves such a client with no terminal status to observe inside its own
-//! budget at all. The span is still never zero, so each stage stays observable in order and a
-//! caller that reads straight after its create still finds the job non-terminal.
+//! RULE — a status transition this emulator owes the CLOCK is due inside the compressed band
+//! this project gives such a transition (tens of seconds, not the minutes the real service
+//! takes), and that holds for the WHOLE walk of a job's work, stage by stage: a client does not
+//! wait out one lifecycle in isolation, it chains them — trains a model, hands the artifact to
+//! `CreateModel`, transforms data with the model and reads the output — so a schedule laid out
+//! on the service's own wall-clock scale leaves such a client with no terminal status to observe
+//! inside its own budget at all. The band is a ceiling and not a target: each stage of the work
+//! is a status the API reports to a client that POLLS, so it is in effect for a whole span of
+//! its own — wide enough to outlast that client's own interval between two reads
+//! (`crate::training_job_phase_window` holds that floor) — and a caller that reads straight
+//! after its create still finds the job non-terminal.
 //!
 //! The rows of [`a_job_lays_its_whole_clock_owed_walk_out_inside_a_client_window`] span what the
 //! rule generalises over: how many channels the job declares (and so how many stages its work
@@ -55,15 +58,18 @@ const SERVICE_PRINCIPAL: &str = service_com_amazonaws_sagemaker_sagemaker::state
 ///
 /// The band this project gives a transition the clock owes, stated here as the ceiling the rule
 /// above fixes rather than read from the constant under test — a span read from that constant
-/// would hold whatever the constant said.
-const STEP_CEILING: Duration = Duration::from_secs(3);
+/// would hold whatever the constant said. It covers a step a polling client has to be able to
+/// OBSERVE the stage before it over — seconds, not a fraction of one — and, for the step that
+/// leaves the stage running the container, the work that container stated besides.
+const STEP_CEILING: Duration = Duration::from_secs(15);
 
 /// The longest the WHOLE clock-owed walk of a job's work may take, from the first stage of that
 /// work to the terminal status it ends in.
 ///
-/// A client chains these lifecycles, so one job's walk has to leave room for the next: it is the
-/// same band as [`STEP_CEILING`], with room for the stages inside it.
-const WALK_CEILING: Duration = Duration::from_secs(5);
+/// A client chains these lifecycles, so one job's walk has to leave room for the next: a budget
+/// of a minute or two — what the suites of this crate give a chain — has to hold a training job,
+/// a model and a transform job one after another, which is what fixes this at half a minute.
+const WALK_CEILING: Duration = Duration::from_secs(30);
 
 /// The `SecondaryStatus` members a job's work passes through, in the order
 /// `DescribeTrainingJob$SecondaryStatus`'s own doc lists them
