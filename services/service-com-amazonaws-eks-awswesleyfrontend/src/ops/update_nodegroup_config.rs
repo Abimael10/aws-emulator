@@ -595,7 +595,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(repair) = pending.node_repair_config.as_ref() {
             params.push(UpdateParam {
                 r#type: Some(UPDATE_PARAM_NODE_REPAIR_CONFIG.to_string()),
-                value: Some(repair.enabled.unwrap_or(false).to_string()),
+                value: Some(node_repair_param(repair)),
             });
         }
         if let Some(warm_pool) = pending.warm_pool_config.as_ref() {
@@ -728,4 +728,86 @@ fn taints_param(taints: &[Taint]) -> String {
         })
         .collect();
     ::serde_json::Value::Array(entries).to_string()
+}
+
+/// The `params` value a `nodeRepairConfig` change reports: the JSON text of the node
+/// auto repair configuration the request submitted.
+///
+/// The same rule [`taints_param`] states, on the one param of this operation whose
+/// submitted value is a STRUCTURE rather than a collection or a scalar: the text is
+/// the JSON object of the members the request named, so a client reading
+/// `update.params` back learns the whole requested configuration — the enable switch
+/// AND the repair thresholds and action overrides, each of which a rendering of the
+/// switch alone would drop.
+///
+/// A member the request left out asks for no change and is not written at all.
+///
+/// The param is reported under the key that names the REQUEST MEMBER this change
+/// carries, `NodeRepairConfig`, which is why its value is that member's whole
+/// submitted structure. The `UpdateParamType` enum also declares `NodeRepairEnabled`,
+/// a key for the enable switch on its own; nothing this service holds distinguishes
+/// which of the two a given change is reported under, so one key is reported for the
+/// one member the request names rather than a second key derived from its contents.
+fn node_repair_param(repair: &NodeRepairConfig) -> String {
+    let mut entry = ::serde_json::Map::new();
+    if let Some(enabled) = repair.enabled {
+        entry.insert("enabled".to_string(), ::serde_json::json!(enabled));
+    }
+    for (name, count) in [
+        (
+            "maxUnhealthyNodeThresholdCount",
+            repair.max_unhealthy_node_threshold_count,
+        ),
+        (
+            "maxUnhealthyNodeThresholdPercentage",
+            repair.max_unhealthy_node_threshold_percentage,
+        ),
+        (
+            "maxParallelNodesRepairedCount",
+            repair.max_parallel_nodes_repaired_count,
+        ),
+        (
+            "maxParallelNodesRepairedPercentage",
+            repair.max_parallel_nodes_repaired_percentage,
+        ),
+    ] {
+        if let Some(count) = count {
+            entry.insert(name.to_string(), ::serde_json::json!(count));
+        }
+    }
+    if let Some(overrides) = repair.node_repair_config_overrides.as_ref() {
+        let entries: Vec<::serde_json::Value> = overrides
+            .iter()
+            .map(|over| {
+                let mut item = ::serde_json::Map::new();
+                if let Some(condition) = over.node_monitoring_condition.as_deref() {
+                    item.insert(
+                        "nodeMonitoringCondition".to_string(),
+                        ::serde_json::json!(condition),
+                    );
+                }
+                if let Some(reason) = over.node_unhealthy_reason.as_deref() {
+                    item.insert(
+                        "nodeUnhealthyReason".to_string(),
+                        ::serde_json::json!(reason),
+                    );
+                }
+                if let Some(minutes) = over.min_repair_wait_time_mins {
+                    item.insert(
+                        "minRepairWaitTimeMins".to_string(),
+                        ::serde_json::json!(minutes),
+                    );
+                }
+                if let Some(action) = over.repair_action.as_deref() {
+                    item.insert("repairAction".to_string(), ::serde_json::json!(action));
+                }
+                ::serde_json::Value::Object(item)
+            })
+            .collect();
+        entry.insert(
+            "nodeRepairConfigOverrides".to_string(),
+            ::serde_json::Value::Array(entries),
+        );
+    }
+    ::serde_json::Value::Object(entry).to_string()
 }

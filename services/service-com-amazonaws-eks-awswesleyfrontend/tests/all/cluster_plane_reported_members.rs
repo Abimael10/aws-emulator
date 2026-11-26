@@ -1027,7 +1027,7 @@ async fn describe_update(router: &MultiServiceRouter, cluster: &str, update_id: 
 
 /// `DescribeUpdate` for one update of a NODE GROUP of `cluster`, which selects the
 /// updates of that node group rather than the cluster's own (`nodegroupName`).
-async fn describe_nodegroup_update(
+pub(crate) async fn describe_nodegroup_update(
     router: &MultiServiceRouter,
     cluster: &str,
     nodegroup: &str,
