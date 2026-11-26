@@ -1725,15 +1725,16 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
     /// a request this refuses persists NOTHING. The order of the checks is the
     /// order the refusals are reported in: the request's member combination
     /// first (it can be judged without touching the store), then the resources it
-    /// names — the bundle, then the directory — then the directory slot it would
+    /// names — the directory, then the bundle — then the directory slot it would
     /// occupy, then the store's own bound.
     ///
-    /// The bundle is resolved in PREFERENCE to the directory, which is what AWS
-    /// answers for an element where neither resolves: an element whose `BundleId`
-    /// names no stored bundle is reported as [`ERROR_CODE_BUNDLE_NOT_FOUND`]
-    /// whatever its `DirectoryId` resolves to, and
-    /// [`ERROR_CODE_DIRECTORY_NOT_FOUND`] is reported only for an element whose
-    /// bundle resolved and whose directory did not.
+    /// The element's CONTAINER is resolved before the resources it would be built
+    /// from: the WorkSpace is created IN a directory and FROM a bundle, so an
+    /// element whose `DirectoryId` names no registered directory is reported as
+    /// [`ERROR_CODE_DIRECTORY_NOT_FOUND`] whatever its `BundleId` resolves to,
+    /// and [`ERROR_CODE_BUNDLE_NOT_FOUND`] is reported only for an element whose
+    /// directory resolved and whose bundle did not. That is what AWS answers for
+    /// an element where neither resolves.
     ///
     /// The returned record is a snapshot of what was persisted, so the caller can
     /// serialize it into `PendingRequests` without holding the map borrow.
@@ -1750,30 +1751,30 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
             ));
         }
 
-        // A WorkSpace is created FROM a bundle: `WorkspaceRequest$BundleId` is
-        // "the identifier of the bundle for the WorkSpace. You can use
-        // DescribeWorkspaceBundles to list the available bundles", which is this
-        // store's bundles — the Amazon-provided catalog plus the ones this
-        // account created. The bundle is resolved FIRST, so an element naming no
-        // stored bundle is reported against the BUNDLE whatever its directory
-        // resolves to.
-        if !self.bundle_ids.contains_key(&request.bundle_id) {
-            return Err((
-                ERROR_CODE_BUNDLE_NOT_FOUND,
-                MESSAGE_BUNDLE_NOT_FOUND.to_string(),
-            ));
-        }
-
-        // ... and it lives in a directory registered with WorkSpaces: the model
+        // A WorkSpace lives IN a directory registered with WorkSpaces: the model
         // points `WorkspaceRequest$DirectoryId` at "the Directory Service
         // directory for the WorkSpace. You can use DescribeWorkspaceDirectories
         // to list the available directories", so an id naming nothing registered
-        // names no directory this account can create in. Only an element whose
-        // bundle resolved is judged against the directory.
+        // names no directory this account can create in. The CONTAINER is
+        // resolved FIRST, so an element naming no registered directory is
+        // reported against the DIRECTORY whatever its bundle resolves to.
         if !self.directories.contains_key(&request.directory_id) {
             return Err((
                 ERROR_CODE_DIRECTORY_NOT_FOUND,
                 MESSAGE_DIRECTORY_NOT_FOUND.to_string(),
+            ));
+        }
+
+        // ... and it is created FROM a bundle: `WorkspaceRequest$BundleId` is
+        // "the identifier of the bundle for the WorkSpace. You can use
+        // DescribeWorkspaceBundles to list the available bundles", which is this
+        // store's bundles — the Amazon-provided catalog plus the ones this
+        // account created. Only an element whose directory resolved is judged
+        // against the bundle.
+        if !self.bundle_ids.contains_key(&request.bundle_id) {
+            return Err((
+                ERROR_CODE_BUNDLE_NOT_FOUND,
+                MESSAGE_BUNDLE_NOT_FOUND.to_string(),
             ));
         }
 

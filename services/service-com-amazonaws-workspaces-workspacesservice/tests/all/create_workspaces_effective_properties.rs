@@ -21,10 +21,11 @@
 //! 2. A per-element refusal names the resource that actually failed to resolve:
 //!    `ResourceNotFound.Bundle` for a `BundleId` the store does not hold and
 //!    `ResourceNotFound.Directory` for a `DirectoryId` no `RegisterWorkspaceDirectory`
-//!    registered, each beside the fixed sentence AWS answers for that class. The bundle is
-//!    resolved in PREFERENCE to the directory, so an element whose `BundleId` names no
-//!    stored bundle is reported against the BUNDLE whatever its `DirectoryId` resolves to,
-//!    and the directory class is reported only for an element whose bundle resolved.
+//!    registered, each beside the fixed sentence AWS answers for that class. The directory
+//!    the WorkSpace would live in is resolved BEFORE the bundle it would be built from, so
+//!    an element whose `DirectoryId` names no registered directory is reported against the
+//!    DIRECTORY whatever its `BundleId` resolves to, and the bundle class is reported only
+//!    for an element whose directory resolved.
 //!
 //! The property values the rows carry come from the model: the `RunningMode` values from
 //! `RUNNING_MODE_VALUES` (the `RunningMode` enum), the compute names from
@@ -402,18 +403,19 @@ async fn a_refusal_names_the_resource_that_failed_to_resolve() {
             Some("ResourceNotFound.Directory"),
         ),
         (
-            // Two failures to report and one `ErrorCode`: the bundle is resolved in
-            // preference to the directory, so the element is reported against the bundle.
+            // Two failures to report and one `ErrorCode`: the directory the WorkSpace
+            // would live in is resolved before the bundle it would be built from, so
+            // the element is reported against the directory.
             "neither resolves",
             UNREGISTERED_DIRECTORY,
             &shortest_unheld,
-            Some("ResourceNotFound.Bundle"),
+            Some("ResourceNotFound.Directory"),
         ),
         (
             "neither resolves, longest unheld bundle id",
             UNREGISTERED_DIRECTORY,
             &longest_unheld,
-            Some("ResourceNotFound.Bundle"),
+            Some("ResourceNotFound.Directory"),
         ),
     ];
 

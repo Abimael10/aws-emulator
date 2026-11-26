@@ -13,6 +13,12 @@
 //! what could not be resolved (`ResourceNotFound.Directory` /
 //! `ResourceNotFound.Bundle`), never a top-level error and never a minted WorkSpace.
 //!
+//! A WorkSpace is created IN a directory and FROM a bundle, so the element's CONTAINER is
+//! resolved first: an element whose `DirectoryId` names no registered directory is
+//! reported against the DIRECTORY whatever its `BundleId` resolves to, and the bundle
+//! class is reported only for an element whose directory resolved. That ordering is
+//! asserted over the full cross product of the two lookups below.
+//!
 //! The directory half of that state is written by `RegisterWorkspaceDirectory`, which is
 //! implemented in the same change and asserted here too: registering is what makes a
 //! `DirectoryId` resolvable, and the registration is read back through the create it
@@ -241,14 +247,15 @@ async fn every_batch_element_is_judged_on_its_own_against_persisted_state() {
         ),
         (
             // Neither resolves: the entry has two failures to report and one
-            // `ErrorCode`, and the bundle is resolved in preference to the directory, so
-            // it is reported against the bundle.
+            // `ErrorCode`, and the directory the WorkSpace would live in is resolved
+            // before the bundle it would be built from, so it is reported against the
+            // directory.
             json!({
                 "DirectoryId": "wsd-unregistered1",
                 "UserName": "dan",
                 "BundleId": "wsb-00000000",
             }),
-            Expected::Refused("ResourceNotFound.Bundle"),
+            Expected::Refused("ResourceNotFound.Directory"),
         ),
         (
             // The same directory user as the first row (the model's `UserName` doc says
@@ -615,5 +622,160 @@ async fn registering_a_directory_is_what_makes_it_resolvable() {
             .unwrap_or_default()
             .ends_with("InvalidParameterValuesException"),
         "expected InvalidParameterValuesException, got {body:?}"
+    );
+}
+
+/// The per-item `(ErrorCode, ErrorMessage)` pair for an element whose directory does not
+/// resolve, written as LITERALS: this is the recorded wire contract for that class, and
+/// the sentence is fixed text that interpolates nothing from the request or from state.
+const REFUSAL_DIRECTORY: (&str, &str) = (
+    "ResourceNotFound.Directory",
+    "The specified directory could not be found in the specified region.",
+);
+/// The same pair for an element whose directory resolved and whose bundle did not.
+const REFUSAL_BUNDLE: (&str, &str) = (
+    "ResourceNotFound.Bundle",
+    "The specified bundle could not be found in the specified region.",
+);
+
+#[tokio::test]
+async fn a_refusal_names_the_directory_before_the_bundle() {
+    // The rule: a WorkSpace is created IN a directory and FROM a bundle, so the element's
+    // CONTAINER is resolved first — an element whose `DirectoryId` names no registered
+    // directory is reported against the directory whatever its `BundleId` resolves to, and
+    // the bundle class is reported only for an element whose directory resolved. The table
+    // is the full cross product of the two lookups, so the rule is asserted over every
+    // combination rather than over the one recorded element.
+    let (router, engine) = emulator_with_engine();
+    let catalog = amazon_bundle_ids(&router).await;
+    assert!(
+        catalog.len() >= 2,
+        "the Amazon-provided catalog must offer at least two bundles, got {catalog:?}"
+    );
+    for directory_id in ["d-aaaaaaaa11", "wsd-abcdef0123"] {
+        register_directory(&router, directory_id).await;
+    }
+
+    // (case, DirectoryId, does it resolve?). Both id forms the model's `DirectoryId`
+    // pattern `^(d-[0-9a-f]{8,63}$)|(wsd-[0-9a-z]{8,63}$)$` allows, registered and not,
+    // plus the longest id its `@length 10..65` admits.
+    let directories: [(&str, String, bool); 5] = [
+        ("registered d- form", "d-aaaaaaaa11".to_string(), true),
+        ("registered wsd- form", "wsd-abcdef0123".to_string(), true),
+        ("unregistered d- form", "d-ffffffff99".to_string(), false),
+        ("unregistered wsd- form", "wsd-unregistered1".to_string(), false),
+        (
+            "unregistered, longest id",
+            format!("wsd-{}", "z".repeat(61)),
+            false,
+        ),
+    ];
+    // (case, BundleId, does it resolve?). The stocked ids come from the catalog the client
+    // lists with `DescribeWorkspaceBundles`; the unstocked ones sit on both bounds of the
+    // model's `BundleId` pattern `^wsb-[0-9a-z]{8,63}$`.
+    let bundles: [(&str, String, bool); 4] = [
+        ("first catalog bundle", catalog[0].clone(), true),
+        (
+            "last catalog bundle",
+            catalog[catalog.len() - 1].clone(),
+            true,
+        ),
+        ("unstocked, shortest id", "wsb-00000000".to_string(), false),
+        (
+            "unstocked, longest id",
+            format!("wsb-{}", "z".repeat(63)),
+            false,
+        ),
+    ];
+
+    // One element per combination, each with a user name of its own so no row is refused
+    // for a reason other than the two lookups under test. The model caps the batch at 25
+    // elements and this product is 20, so the whole table travels as ONE batch — which
+    // also varies the position every row sits at.
+    let mut elements: Vec<Value> = Vec::new();
+    let mut expectations: Vec<(String, Option<(&str, &str)>)> = Vec::new();
+    for (directory_case, directory_id, directory_resolves) in &directories {
+        for (bundle_case, bundle_id, bundle_resolves) in &bundles {
+            let user_name = format!("user{}", elements.len());
+            elements.push(json!({
+                "DirectoryId": directory_id,
+                "UserName": user_name,
+                "BundleId": bundle_id,
+            }));
+            let expected = match (directory_resolves, bundle_resolves) {
+                (false, _) => Some(REFUSAL_DIRECTORY),
+                (true, false) => Some(REFUSAL_BUNDLE),
+                (true, true) => None,
+            };
+            expectations.push((format!("{directory_case} / {bundle_case}"), expected));
+        }
+    }
+
+    let (failed, pending) = create_batch(&router, &elements).await;
+
+    let expected_failures: Vec<(&String, &Value, (&str, &str))> = expectations
+        .iter()
+        .zip(elements.iter())
+        .filter_map(|((case, expected), element)| {
+            expected.map(|refusal| (case, element, refusal))
+        })
+        .collect();
+    let expected_created: Vec<&Value> = expectations
+        .iter()
+        .zip(elements.iter())
+        .filter(|((_, expected), _)| expected.is_none())
+        .map(|(_, element)| element)
+        .collect();
+    assert_eq!(
+        failed.len(),
+        expected_failures.len(),
+        "every unsatisfiable element gets its own FailedRequests entry, got {failed:?}"
+    );
+    assert_eq!(
+        pending.len(),
+        expected_created.len(),
+        "only elements whose directory and bundle both resolve may be created, got {pending:?}"
+    );
+
+    for (reported, (case, submitted, (code, message))) in failed.iter().zip(&expected_failures) {
+        // The entry echoes its own element, so the code below is attributed to the right
+        // element of the batch rather than to whichever one failed first.
+        for member in ["DirectoryId", "UserName", "BundleId"] {
+            assert_eq!(
+                &reported["WorkspaceRequest"][member], &submitted[member],
+                "case {case}: the entry must echo the element's {member}, got {reported:?}"
+            );
+        }
+        assert_eq!(
+            reported["ErrorCode"].as_str(),
+            Some(*code),
+            "case {case}: expected ErrorCode {code}, got {reported:?}"
+        );
+        assert_eq!(
+            reported["ErrorMessage"].as_str(),
+            Some(*message),
+            "case {case}: expected the fixed message for {code}, got {reported:?}"
+        );
+        // The sentence is fixed text for the class: it carries no value taken from the
+        // element, so a client reads which element failed from the echo above.
+        for member in ["DirectoryId", "UserName", "BundleId"] {
+            let value = submitted[member].as_str().unwrap_or_default();
+            assert!(
+                !message.contains(value),
+                "case {case}: the message must interpolate no {member}, got {message:?}"
+            );
+        }
+    }
+
+    // Nothing is persisted for a refused element, whatever resource it was refused over.
+    settle(&engine);
+    let described = described_user_names(&router).await;
+    let created_users: Vec<String> = expected_created
+        .iter()
+        .map(|element| element["UserName"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        described, created_users,
+        "DescribeWorkspaces must report exactly the satisfiable elements, got {described:?}"
     );
 }

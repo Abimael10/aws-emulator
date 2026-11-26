@@ -6,12 +6,13 @@
 //! RULE: `CreateWorkspaces` judges every `WorkspaceRequest` of its batch on its own and
 //! reports an element it cannot satisfy as its own `FailedRequests` entry inside a 200
 //! (the operation models only `InvalidParameterValuesException` and
-//! `ResourceLimitExceededException`, so an unresolvable reference is never a non-200). An
-//! element resolves its `BundleId` BEFORE its `DirectoryId`: one naming no stored bundle is
-//! reported against the BUNDLE whatever its `DirectoryId` resolves to, and the DIRECTORY is
-//! named only for an element whose bundle resolved and whose directory is registered with
-//! nothing. Each code carries the fixed sentence of its class, which interpolates no value
-//! from the request or from state.
+//! `ResourceLimitExceededException`, so an unresolvable reference is never a non-200). The
+//! entry names the resource that failed to resolve, and a WorkSpace is created IN a
+//! directory and FROM a bundle, so the element's CONTAINER is resolved first: one whose
+//! `DirectoryId` is registered with nothing is reported against the DIRECTORY whatever its
+//! `BundleId` resolves to, and the BUNDLE is named only for an element whose directory
+//! resolved and whose bundle names nothing stored. Each code carries the fixed sentence of
+//! its class, which interpolates no value from the request or from state.
 //!
 //! The rows differ along what the rule generalises over: whether each reference resolves
 //! (all four combinations), the form and length of an unresolvable `BundleId` inside the
@@ -209,7 +210,7 @@ async fn is_described(router: &MultiServiceRouter, workspace_id: &str) -> bool {
 }
 
 #[tokio::test]
-async fn an_element_whose_bundle_does_not_resolve_is_reported_against_the_bundle() {
+async fn a_refusal_names_the_resource_that_failed_to_resolve() {
     let router = emulator();
     let bundles = stored_bundle_ids(&router).await;
     register_directory(&router, REGISTERED_DIRECTORY).await;
@@ -248,17 +249,17 @@ async fn an_element_whose_bundle_does_not_resolve_is_reported_against_the_bundle
             Some(BUNDLE_NOT_FOUND),
         ),
         (
-            // Neither resolves: the bundle is resolved first, so the bundle is named.
+            // Neither resolves: the container is resolved first, so the directory is named.
             "neither resolves, d- directory form",
             Directory::Unregistered(UNREGISTERED_D_FORM),
             Bundle::Unheld("wsb-00000000"),
-            Some(BUNDLE_NOT_FOUND),
+            Some(DIRECTORY_NOT_FOUND),
         ),
         (
             "neither resolves, wsd- directory form",
             Directory::Unregistered(UNREGISTERED_WSD_FORM),
             Bundle::Unheld("wsb-0a1b2c3d4e5f6"),
-            Some(BUNDLE_NOT_FOUND),
+            Some(DIRECTORY_NOT_FOUND),
         ),
         (
             // Only the directory fails to resolve: the directory is named.
@@ -375,7 +376,7 @@ async fn each_element_of_a_batch_is_judged_and_reported_on_its_own() {
         register_directory(&router, REGISTERED_DIRECTORY).await;
 
         // index 0 is satisfiable; 1 names no stored bundle; 2 names an unregistered
-        // directory; 3 resolves neither.
+        // directory; 3 resolves neither, and is reported against its directory.
         let kinds: [(Value, Option<&str>); 4] = [
             (
                 json!({
@@ -407,7 +408,7 @@ async fn each_element_of_a_batch_is_judged_and_reported_on_its_own() {
                     "UserName": "neither",
                     "BundleId": "wsb-0a1b2c3d4e5f6",
                 }),
-                Some(BUNDLE_NOT_FOUND),
+                Some(DIRECTORY_NOT_FOUND),
             ),
         ];
 
