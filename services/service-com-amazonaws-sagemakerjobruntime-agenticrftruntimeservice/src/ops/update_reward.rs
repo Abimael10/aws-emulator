@@ -203,14 +203,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // IAM decides authorization before the trajectory is resolved and before this
-        // operation's own request checks run, under its own IAM action
-        // ([`crate::service::authorization`]).
-        crate::service::authorization::authorize(&*self.engine, ctx, Self::NAME, &input.job_arn)
-            .map_err(UpdateRewardErrorModeled::AccessDeniedException)?;
-
+        // IAM has already decided authorization under this operation's own IAM action by
+        // the time this runs: the decision is taken in the layer every operation of this
+        // service is served behind ([`crate::service::authorization`]), before the
+        // trajectory is resolved and before this operation's own request checks run.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 UpdateRewardErrorModeled::InternalServiceError(InternalServiceError {

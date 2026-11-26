@@ -22,10 +22,10 @@
 //!   modeled URI path space.
 //! - `override_operation` — which operation serves a request. EDITED HERE: the key and
 //!   the handler stay the generated table's, but the operation is served through
-//!   [`InModelledEnvelope`], which refuses a request outside a modelled constraint with
-//!   this service's own `ValidationException` — whose prose member the model calls
-//!   `Message` — instead of the framework's pre-dispatch envelope, which names only a
-//!   lowercase `message`.
+//!   [`InModelledEnvelope`], which takes the IAM decision ([`authorization`]) and then
+//!   refuses a request outside a modelled constraint with this service's own
+//!   `ValidationException` — whose prose member the model calls `Message` — instead of the
+//!   framework's pre-dispatch envelope, which names only a lowercase `message`.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. EDITED HERE: a value outside a declared constraint is
 //!   `ValidationException`, worded from the violations the framework collected, and a
@@ -40,7 +40,8 @@
 //!   rendering. Return `Some(resp)` to reword it if desired.
 //!
 //! Beside those seams, this file owns one submodule: [`authorization`], the IAM decision
-//! every operation of this service takes before it resolves what a request names. It sits
+//! taken in front of every operation of this service — before what a request names is
+//! resolved and before its own values are checked. It sits
 //! here because it is about the REQUEST and the credentials it was signed with — the same
 //! subject as `can_handle` and the refusal seams — rather than about the trajectories
 //! `crate::state` holds.
@@ -50,8 +51,9 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-/// WHO may reach this service's operations: the IAM authorization step every one of its
-/// handlers runs before it resolves the job or the trajectory a request names.
+/// WHO may reach this service's operations: the IAM authorization step taken in front of
+/// every one of them, before the job or the trajectory a request names is resolved and
+/// before the request's own values are checked ([`InModelledEnvelope`]).
 ///
 /// It is a submodule of this file rather than of `state`, because the decision is about
 /// the REQUEST and the caller's credentials — not about the trajectories this service
@@ -360,8 +362,9 @@ fn claiming_names(signing_name: &str) -> impl Iterator<Item = &str> {
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
     /// The same modelled operations the generated table holds, each wrapped in
-    /// [`InModelledEnvelope`] so a request refused before the handler runs is answered
-    /// in this service's own `ValidationException`. Keyed by the routing key the
+    /// [`InModelledEnvelope`] so the IAM decision is taken in front of every one of them
+    /// and a request refused before the handler runs is answered in this service's own
+    /// `ValidationException`. Keyed by the routing key the
     /// protocol resolves — the key the generated table uses — and built from the SAME
     /// shared engine, so a wrapped operation reads and writes the one store.
     in_modelled_envelope: OperationRoutingTable,
@@ -377,6 +380,7 @@ macro_rules! wrap_operations {
                 stringify!($operation),
                 ::std::boxed::Box::new(InModelledEnvelope::new(
                     crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                    ::std::sync::Arc::clone(&$engine),
                 )) as ::std::boxed::Box<dyn ErasedOperation>,
             );
         )+
@@ -404,8 +408,16 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     }
 }
 
-/// One modelled operation, served with the refusals it owes stated in this service's own
-/// `ValidationException`.
+/// One modelled operation, served behind the decision AWS takes in front of a handler —
+/// IAM's authorization of the action — with the refusals it owes after that stated in this
+/// service's own `ValidationException`.
+///
+/// The ORDER is the point of the two living together. AWS decides authorization at the IAM
+/// layer, ahead of the service looking at what a request carries, so a caller whose
+/// policies grant it nothing is answered the modelled 403 whether or not its request also
+/// breaks a modelled constraint ([`authorization`]). Were the gate inside the handlers
+/// instead, the refusal below — which answers before any handler runs — would tell such a
+/// caller about its own request instead.
 ///
 /// The framework's pre-dispatch renderer gets the status (400) and the error code
 /// (`ValidationException`) right, but writes the prose into a framework-chosen lowercase
@@ -422,20 +434,26 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// re-implemented: a request this service does not refuse is handed to the generated
 /// `ErasedOperation::run`, which owns deserialize -> validate -> handle -> serialize,
 /// telemetry and every modelled error.
-struct InModelledEnvelope<O> {
+struct InModelledEnvelope<O, Eng> {
     operation: O,
+    /// The ONE shared engine the wrapped operation was built from, which is what the
+    /// authorization decision reads the caller's identity and its policies through
+    /// ([`authorization`]). Sharing it is what keeps the gate and the handler on one store.
+    engine: Arc<Eng>,
 }
 
-impl<O> InModelledEnvelope<O> {
-    /// Wrap one operation, already constructed from the shared engine.
-    fn new(operation: O) -> Self {
-        Self { operation }
+impl<O, Eng> InModelledEnvelope<O, Eng> {
+    /// Wrap one operation, already constructed from the shared engine, and hold that same
+    /// engine for the authorization decision taken in front of it.
+    fn new(operation: O, engine: Arc<Eng>) -> Self {
+        Self { operation, engine }
     }
 }
 
-impl<O> ErasedOperation for InModelledEnvelope<O>
+impl<O, Eng> ErasedOperation for InModelledEnvelope<O, Eng>
 where
     O: Operation + ErasedOperation,
+    Eng: Send + Sync + 'static,
 {
     fn run<'r>(
         &'r self,
@@ -447,6 +465,16 @@ where
             // Read the protocol out before the await: `&dyn ErasedServiceDefinition` is
             // not `Sync`, and this future is. The protocol itself is.
             let protocol: &dyn ServerHttpProtocol = svc.definition().protocol();
+            // IAM decides FIRST, ahead of anything this service reads off the request: a
+            // caller whose policies do not grant this operation's action on the `JobArn`
+            // the request carries is told it is not authorized, rather than told what its
+            // request got wrong or whether the job it named exists. That is why the gate
+            // stands HERE and not inside the handlers: this wrapper is also where a value
+            // outside a modelled constraint is refused, and a refusal of the request's own
+            // values must not answer in front of the IAM decision.
+            if let Some(denial) = access_denied::<O, Eng>(&self.engine, ctx, protocol, req) {
+                return denial;
+            }
             let violations = refused_by::<O>(protocol, req);
             if let Some(refusal) = validation_exception(protocol, &violations) {
                 return refusal;
@@ -488,6 +516,25 @@ fn refused_by<O: Operation>(protocol: &dyn ServerHttpProtocol, req: &RtRequest) 
         req,
         LARGEST_QUOTED_VALUE_BYTES,
     )
+}
+
+/// This service's answer to a request IAM does not permit: the modelled 403
+/// `AccessDeniedException` ([`authorization::refusal_response`]), and `None` for a request
+/// the gate permits — including every caller it does not bound.
+///
+/// The action is `O`'s own name and the resource the `JobArn` the REQUEST carries
+/// ([`authorization::judged_resource`]), read off the header the model binds that member to
+/// rather than off a deserialized input: the decision is owed before the request's own
+/// values are checked, so it cannot wait for them to pass.
+fn access_denied<O: Operation, Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &OperationContext<'_>,
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<RtResponse> {
+    let denial =
+        authorization::authorize(engine, ctx, O::NAME, authorization::judged_resource(req)).err()?;
+    Some(authorization::refusal_response(protocol, &denial))
 }
 
 /// This service's answer to `violations`: HTTP 400 `ValidationException` with the prose
@@ -549,7 +596,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<&dyn ErasedOperation> {
         // NOT a re-route: the key is the one the generated table's own protocol
         // resolves, and the operation it names is the one served — wrapped in
-        // `InModelledEnvelope` so a request refused before the handler runs is refused
+        // `InModelledEnvelope` so the IAM decision is taken in front of it and a request
+        // refused before the handler runs is refused
         // in this service's `ValidationException`, whose prose member the model calls
         // `Message`, rather than in the framework's pre-dispatch envelope, which names
         // only a lowercase `message`. A key the model does not name resolves to `None`

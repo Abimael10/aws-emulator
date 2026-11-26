@@ -26,6 +26,11 @@
 //! the action, of the action in another case, of the whole namespace and of everything), the
 //! account the `JobArn` names against the condition the grant carries, and the principal (an
 //! assumed-role session and the account's own published credential).
+//!
+//! THE ORDER is part of the rule and has its own table at the end of this suite: the decision
+//! is taken BEFORE anything of the request's own values is checked, so a caller no statement
+//! grants is answered 403 whether or not its request also breaks a modelled constraint,
+//! while a caller IAM permits meets this service's own 400 for the same request.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -576,5 +581,280 @@ async fn the_accounts_own_credential_is_served() {
             reply.error_type,
             reply.text()
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The ORDER the decision is taken in: IAM first, the request's own values after
+// ---------------------------------------------------------------------------
+
+/// A value that is not an ARN at all, for the row whose `JobArn` is outside the modelled
+/// `@pattern` (`smithy_query(query="shape",shape="JobArn")`).
+const MALFORMED_JOB_ARN: &str = "not-a-job-arn";
+
+/// `JobArn`'s and `TrajectoryId`'s modelled `@length` maximum — both are min 1 max 256
+/// (`smithy_query(query="shape",shape="JobArn,TrajectoryId")`) — so a row one byte past it
+/// is a value the walk refuses.
+const LENGTH_MAX: usize = 256;
+
+/// A value outside the `CompletionStatus` enum, whose only members are `ready` and `failed`
+/// (`smithy_query(query="shape",shape="CompletionStatus")`).
+const STATUS_OUTSIDE_THE_ENUM: &str = "finished";
+
+/// Which modelled constraint a row's request breaks.
+///
+/// One row per class this model can break before a handler runs, read off the members the
+/// four operations bind (`smithy_query(query="operation",operation="Sample,\
+/// SampleWithResponseStream,CompleteRollout,UpdateReward")`): a `@length` maximum, a
+/// `@length` minimum, an absent `@required` member, a `@pattern`, and an enum's value set.
+#[derive(Debug, Clone, Copy)]
+enum Broken {
+    /// `TrajectoryId` one byte past its `@length` maximum.
+    TrajectoryIdPastTheMaximum,
+    /// `TrajectoryId` under its `@length` minimum of 1 — the empty value.
+    TrajectoryIdBelowTheMinimum,
+    /// No `TrajectoryId` at all, which is `@required` on every operation. Rowed only where
+    /// the operation binds it in the BODY: a request missing a `@required` HEADER binding
+    /// names no operation under rest routing, so it never reaches a service at all.
+    TrajectoryIdAbsent,
+    /// A `JobArn` that is not an ARN at all, so outside its `@pattern`.
+    JobArnOutsideThePattern,
+    /// A well-formed `JobArn` one byte past its `@length` maximum.
+    JobArnPastTheMaximum,
+    /// A `JobArn` carried as the empty value: under its `@length` minimum of 1, and the one
+    /// member that names the resource the gate judges, so the request addresses none.
+    JobArnCarriedEmpty,
+    /// A `Status` outside the `CompletionStatus` value set (`CompleteRollout` alone binds
+    /// it).
+    StatusOutsideTheEnum,
+    /// No `Rewards` at all, which is `@required` on `UpdateReward` alone.
+    RewardsAbsent,
+}
+
+/// A well-formed `JobArn` carrying exactly `bytes` bytes, padded in the segment the modelled
+/// `@pattern` leaves unbounded — the job category, `[a-zA-Z0-9_\-]+` — so the ARN satisfies
+/// the pattern at any size and only its `@length` can refuse it.
+fn job_arn_of(bytes: usize) -> String {
+    let minted = minted_job_arn(JOB_CATEGORY, JOB_NAME);
+    let padding = bytes.saturating_sub(minted.len());
+    job_arn(
+        "aws",
+        REGION,
+        ACCOUNT,
+        &format!("{JOB_CATEGORY}{}", "c".repeat(padding)),
+        JOB_NAME,
+    )
+}
+
+/// The `JobArn` a row's request carries — which is the resource the gate judges it against —
+/// and `None` for the row that carries none.
+fn carried_job_arn(broken: Broken) -> Option<String> {
+    match broken {
+        Broken::JobArnOutsideThePattern => Some(MALFORMED_JOB_ARN.to_string()),
+        Broken::JobArnPastTheMaximum => Some(job_arn_of(LENGTH_MAX + 1)),
+        Broken::JobArnCarriedEmpty => Some(String::new()),
+        _ => Some(minted_job_arn(JOB_CATEGORY, JOB_NAME)),
+    }
+}
+
+/// The `TrajectoryId` a row's request carries, and `None` for the row that carries none.
+fn carried_trajectory_id(broken: Broken) -> Option<String> {
+    match broken {
+        Broken::TrajectoryIdPastTheMaximum => Some("t".repeat(LENGTH_MAX + 1)),
+        Broken::TrajectoryIdBelowTheMinimum => Some(String::new()),
+        Broken::TrajectoryIdAbsent => None,
+        _ => Some(TRAJECTORY.to_string()),
+    }
+}
+
+/// One call of the operation bound at `path`, signed with `access_key_id`, breaking exactly
+/// the modelled constraint `broken` names: the sampling operations carry `JobArn` and
+/// `TrajectoryId` in headers, the rollout operations carry `JobArn` in a header and the rest
+/// in the JSON body, so a row's broken member is left out or spoiled wherever that operation
+/// binds it.
+async fn call_breaking(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    path: &str,
+    broken: Broken,
+) -> Reply {
+    let job = carried_job_arn(broken);
+    let trajectory = carried_trajectory_id(broken);
+    let mut headers: Vec<(&str, &str)> = vec![("content-type", "application/json")];
+    if let Some(job) = job.as_deref() {
+        headers.push((JOB_ARN_HEADER, job));
+    }
+    let body = match path {
+        SAMPLE_PATH | SAMPLE_STREAM_PATH => {
+            if let Some(trajectory) = trajectory.as_deref() {
+                headers.push((TRAJECTORY_ID_HEADER, trajectory));
+            }
+            json!({ "messages": [{ "role": "user", "content": "go" }] })
+        }
+        COMPLETE_ROLLOUT_PATH => {
+            let mut body = json!({
+                "Status": match broken {
+                    Broken::StatusOutsideTheEnum => STATUS_OUTSIDE_THE_ENUM,
+                    _ => "ready",
+                },
+            });
+            if let Some(trajectory) = trajectory {
+                body["TrajectoryId"] = json!(trajectory);
+            }
+            body
+        }
+        UPDATE_REWARD_PATH => {
+            let mut body = json!({});
+            if let Some(trajectory) = trajectory {
+                body["TrajectoryId"] = json!(trajectory);
+            }
+            if !matches!(broken, Broken::RewardsAbsent) {
+                body["Rewards"] = json!([1.0]);
+            }
+            body
+        }
+        other => unreachable!("this model binds no operation at {other}"),
+    };
+    send_as(
+        router,
+        access_key_id,
+        path,
+        &headers,
+        serde_json::to_vec(&body).expect("a serializable body"),
+    )
+    .await
+}
+
+/// Assert that `reply` is the modelled 403 of `action`, worded as IAM words an identity-based
+/// default deny: naming the `JobArn` the request carried, and naming no resource at all for a
+/// request that carried none.
+fn assert_refused_by_iam(case: &str, reply: &Reply, action: &str, resource: Option<&str>) {
+    assert_eq!(
+        reply.status, 403,
+        "case {case:?}: expected HTTP 403, got {} {:?} / {}",
+        reply.status,
+        reply.error_type,
+        reply.text()
+    );
+    assert_eq!(
+        reply.error_code(),
+        "AccessDeniedException",
+        "case {case:?}: expected an AccessDeniedException, got {:?} / {}",
+        reply.error_type,
+        reply.text()
+    );
+    let reason = Refusal::DefaultDeny.reason(action);
+    let expected = match resource {
+        Some(resource) => format!(
+            "User: {} is not authorized to perform: {action} on resource: {resource} {reason}",
+            session_arn()
+        ),
+        None => format!(
+            "User: {} is not authorized to perform: {action} {reason}",
+            session_arn()
+        ),
+    };
+    assert_eq!(
+        reply.message(),
+        expected,
+        "case {case:?}: expected IAM's wording, got {:?}",
+        reply.message()
+    );
+}
+
+/// Assert that `reply` is this service's own modelled 400 for what the request carried, in
+/// the `Message` member the model declares — the answer a caller IAM permits gets for the
+/// same request.
+fn assert_refused_for_its_own_values(case: &str, reply: &Reply) {
+    assert_eq!(
+        (reply.status, reply.error_code().as_str()),
+        (400, "ValidationException"),
+        "case {case:?}: expected 400 ValidationException, got {} {:?} / {}",
+        reply.status,
+        reply.error_type,
+        reply.text()
+    );
+    assert!(
+        !reply.message().is_empty(),
+        "case {case:?}: expected the refusal's prose in the modelled Message member, got {}",
+        reply.text()
+    );
+}
+
+/// THE RULE: the IAM decision is taken BEFORE anything of the request's own values is
+/// checked, so a caller whose identity-based policies grant it nothing is answered the
+/// modelled 403 `AccessDeniedException` — naming the principal, the action and the `JobArn`
+/// the request carried — whether or not that request also breaks a modelled constraint; a
+/// caller IAM permits is answered this service's own 400 `ValidationException` for the same
+/// request.
+///
+/// The rows span the constraint classes this model can break before a handler runs (a
+/// `@length` maximum, a `@length` minimum, an absent `@required` member, a `@pattern` and an
+/// enum's value set), the member that breaks it (`JobArn`, `TrajectoryId`, `Status`,
+/// `Rewards` — in a header and in the body), and every operation that binds it; the caller
+/// varies over the three the gate tells apart: a session no statement grants, a session
+/// granted the action, and the account's own published credential, which the gate does not
+/// bound.
+#[tokio::test]
+async fn the_iam_decision_precedes_the_requests_own_values() {
+    // (the class, the operations that bind the member it breaks)
+    //
+    // `TrajectoryIdAbsent` is rowed on the rollout pair alone: the sampling pair binds
+    // `TrajectoryId` to a header, and rest routing admits an operation only when every
+    // `@required` header binding it declares is on the request, so a request without it
+    // names no operation and never reaches this service's gate at all.
+    let rows: &[(Broken, &[(&str, &str)])] = &[
+        (Broken::TrajectoryIdPastTheMaximum, &OPERATIONS),
+        (Broken::TrajectoryIdBelowTheMinimum, &OPERATIONS),
+        (
+            Broken::TrajectoryIdAbsent,
+            &[
+                ("CompleteRollout", COMPLETE_ROLLOUT_PATH),
+                ("UpdateReward", UPDATE_REWARD_PATH),
+            ],
+        ),
+        (Broken::JobArnOutsideThePattern, &OPERATIONS),
+        (Broken::JobArnPastTheMaximum, &OPERATIONS),
+        (Broken::JobArnCarriedEmpty, &OPERATIONS),
+        (
+            Broken::StatusOutsideTheEnum,
+            &[("CompleteRollout", COMPLETE_ROLLOUT_PATH)],
+        ),
+        (
+            Broken::RewardsAbsent,
+            &[("UpdateReward", UPDATE_REWARD_PATH)],
+        ),
+    ];
+
+    for (broken, operations) in rows {
+        for (operation, path) in *operations {
+            let case = format!("{operation} with {broken:?}");
+            let action = format!("{ACTION_PREFIX}:{operation}");
+            // The resource the gate judges is the `JobArn` the request carried; a request
+            // carrying it empty addresses no resource, which the refusal names none for.
+            let carried = carried_job_arn(*broken);
+            let named = carried.as_deref().filter(|arn| !arn.is_empty());
+
+            // A caller the role's policies grant nothing: IAM's default deny, answered
+            // before the request's own values are looked at.
+            let (engine, router) = router_with_identity();
+            given_session(&engine);
+            given_role_policy(&engine, None);
+            let reply = call_breaking(&router, SESSION_KEY_ID, path, *broken).await;
+            assert_refused_by_iam(&case, &reply, &action, named);
+
+            // The account's own published credential is a caller this gate does not bound,
+            // so the same request meets this service's own refusal of what it carried.
+            let served = call_breaking(&router, DEFAULT_ACCESS_KEY_ID, path, *broken).await;
+            assert_refused_for_its_own_values(&format!("{case}, as the account"), &served);
+
+            // And so does a session the role's policies DO grant the action to, which is
+            // what tells an enforced decision apart from a blanket denial.
+            let (granted_engine, granted_router) = router_with_identity();
+            given_session(&granted_engine);
+            given_role_policy(&granted_engine, Some(&allow(json!(action))));
+            let granted = call_breaking(&granted_router, SESSION_KEY_ID, path, *broken).await;
+            assert_refused_for_its_own_values(&format!("{case}, granted the action"), &granted);
+        }
     }
 }

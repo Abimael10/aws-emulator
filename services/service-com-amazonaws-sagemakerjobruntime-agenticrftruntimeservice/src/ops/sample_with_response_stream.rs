@@ -163,12 +163,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The same gate `Sample` runs, under THIS operation's own IAM action: a grant of
-        // the non-streaming action is not a grant of the streaming one
-        // ([`crate::service::authorization`]).
-        crate::service::authorization::authorize(&*self.engine, ctx, Self::NAME, &input.job_arn)
-            .map_err(SampleWithResponseStreamErrorModeled::AccessDeniedException)?;
-
+        // The same gate `Sample` is served behind, under THIS operation's own IAM action:
+        // a grant of the non-streaming action is not a grant of the streaming one. The
+        // decision is taken ahead of this handler, in the layer every operation of this
+        // service is served behind ([`crate::service::authorization`]).
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(SampleWithResponseStreamErrorModeled::InternalServiceError(
                 InternalServiceError {

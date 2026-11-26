@@ -161,13 +161,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // IAM decides authorization ahead of this data plane resolving what the request
-        // names, so a caller whose policies do not allow `sagemaker:Sample` on the job it
-        // addressed is told it is not authorized rather than told whether that job exists
-        // ([`crate::service::authorization`]).
-        crate::service::authorization::authorize(&*self.engine, ctx, Self::NAME, &input.job_arn)
-            .map_err(SampleErrorModeled::AccessDeniedException)?;
-
+        // IAM has already decided authorization by the time this runs: the decision is
+        // taken for `sagemaker:Sample` on the `JobArn` the request carries in the layer
+        // every operation of this service is served behind
+        // ([`crate::service::authorization`]), ahead of this data plane resolving what the
+        // request names and ahead of its own values being checked — so a caller whose
+        // policies do not allow the action is told it is not authorized rather than told
+        // whether that job exists or what its request got wrong.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(SampleErrorModeled::InternalServiceError(InternalServiceError {
                 message: "the AgenticRFT runtime emulator has no state store".to_string(),

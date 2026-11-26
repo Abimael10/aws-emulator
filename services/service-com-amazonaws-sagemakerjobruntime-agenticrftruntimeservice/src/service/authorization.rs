@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Whether IAM lets a request to this data plane perform the action it asks for — the
-//! authorization step every operation runs BEFORE it resolves the job or the trajectory
-//! the request names.
+//! authorization step taken BEFORE anything of the request itself is looked at: before the
+//! job or the trajectory it names is resolved, and before its own values are checked.
 //!
 //! AWS decides authorization at the IAM layer, ahead of the service looking at what the
 //! request addresses, so a caller whose identity-based policies do not grant the action is
@@ -14,6 +14,14 @@
 //! the answer every one of the four operations gives such a caller — and it is the answer
 //! BEFORE the job lookup, which is also what keeps a refusal from disclosing whether the
 //! job exists.
+//!
+//! Because the decision rests on the request's credentials, the action it names and the
+//! `JobArn` it carries rather than on anything a handler goes on to do, it is taken ONCE, in
+//! the layer every operation of this service is served behind
+//! (`crate::service::EmulatedService::override_operation`), and nowhere else. That layer is
+//! also where this service refuses a value outside a modelled constraint, so taking the
+//! decision there is what keeps the ordering AWS has: an unauthorized caller is refused 403
+//! whether or not its request would also have been refused 400 for what it carried.
 //!
 //! Three pieces, each held in exactly one place:
 //!
@@ -85,9 +93,12 @@
 
 use std::time::SystemTime;
 
+use ::aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
+use ::aws_smithy_types::body::SdkBody;
 use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_store;
 use ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_store;
 use ::service_common::iam_authorization::{self as iam, Decision};
+use ::smithy_server_runtime::ServerHttpProtocol;
 
 use crate::ops::types::AccessDeniedException;
 
@@ -95,6 +106,76 @@ use crate::ops::types::AccessDeniedException;
 /// service's `arnNamespace` (`smithy_query(query="service_info")`), which is also the
 /// vendor field of every `JobArn` it serves.
 pub const ACTION_PREFIX: &str = "sagemaker";
+
+/// The wire name of the refusal this gate answers with, and the status the model gives it:
+/// `AccessDeniedException`, `@error("client")` at `@httpError(403)`
+/// (`smithy_query(query="shape",shape="AccessDeniedException")`), a service-common error
+/// every operation of this model declares.
+const ACCESS_DENIED_EXCEPTION: &str = "AccessDeniedException";
+const ACCESS_DENIED_STATUS: u16 = 403;
+
+/// The media type this restJson1 service renders an error in.
+const JSON_CONTENT_TYPE: &str = "application/json";
+
+/// The header every operation of this model binds `JobArn` to
+/// (`smithy_query(query="operation",operation="Sample,SampleWithResponseStream,\
+/// CompleteRollout,UpdateReward")`: `httpHeader` `X-Amzn-SageMaker-Job-Arn` on all four),
+/// matched case-insensitively as HTTP field names are.
+const JOB_ARN_HEADER: &str = "x-amzn-sagemaker-job-arn";
+
+/// The resource THIS request is judged against: the `JobArn` it carries, read straight off
+/// the header the model binds that member to ([`JOB_ARN_HEADER`]) — the same bytes the codec
+/// binds the member from, so the gate judges the ARN the request names whether or not that
+/// value satisfies the member's own declared constraints.
+///
+/// A request carrying no such header names no resource, and the empty value is what it is
+/// judged against: a statement that covers it has to say so, which is the fail-closed
+/// reading.
+#[must_use]
+pub fn judged_resource(req: &RtRequest) -> &str {
+    req.headers().get(JOB_ARN_HEADER).unwrap_or_default()
+}
+
+/// The wire answer to a request this gate refused: the modelled `AccessDeniedException` at
+/// its modelled 403, serialized through the SAME protocol a handler-returned error of that
+/// shape goes through, so a refusal taken in front of an operation and one taken inside it
+/// are indistinguishable on the wire.
+///
+/// The hand-built fallback carries the same three things a client branches on — the status,
+/// the shape in `x-amzn-errortype` and the prose in the `Message` member this model declares
+/// — for the one case the serializer can fail: a value it cannot render. A refusal is never
+/// dropped for want of a rendering, because dropping it would serve a request IAM denied.
+#[must_use]
+pub fn refusal_response(
+    protocol: &dyn ServerHttpProtocol,
+    denial: &AccessDeniedException,
+) -> RtResponse {
+    protocol
+        .serialize_error(
+            denial,
+            &crate::ops::types::SCHEMA_ACCESS_DENIED_EXCEPTION,
+            ACCESS_DENIED_EXCEPTION,
+            ACCESS_DENIED_STATUS,
+        )
+        .unwrap_or_else(|_| {
+            let body = ::serde_json::json!({
+                "__type": ACCESS_DENIED_EXCEPTION,
+                "Message": denial.message.clone(),
+            });
+            let mut response = RtResponse::new(
+                StatusCode::try_from(ACCESS_DENIED_STATUS)
+                    .expect("the status is a constant of this module"),
+                SdkBody::from(body.to_string()),
+            );
+            response
+                .headers_mut()
+                .insert("content-type", JSON_CONTENT_TYPE);
+            response
+                .headers_mut()
+                .insert("x-amzn-errortype", ACCESS_DENIED_EXCEPTION);
+            response
+        })
+}
 
 /// What a refusal names as the principal of a request whose session credential has already
 /// expired: that credential speaks for nobody, and the key it presented is not quoted back.
@@ -116,9 +197,10 @@ const RESOURCE_ACCOUNT_KEY: &str = "aws:ResourceAccount";
 /// NAMES.
 ///
 /// `Ok(())` for a request IAM permits (and for every caller this gate does not bound, see
-/// the module docs); the modelled refusal otherwise, which each operation returns as its
-/// own `AccessDeniedException`. Call it FIRST in a handler, before the store is read or
-/// written and before the request's own values are checked.
+/// the module docs); the modelled refusal otherwise, answered as `AccessDeniedException`
+/// ([`refusal_response`]). It is taken in the layer every operation of this service is
+/// served behind (`crate::service::EmulatedService::override_operation`), which is BEFORE
+/// the store is read or written and before the request's own values are checked.
 ///
 /// Resolving the caller goes through STS's own `resolve_caller`, which first materialises
 /// the session expiries the clock has already made due; that write is owed at the same
@@ -190,7 +272,9 @@ pub fn authorize<Eng: Send + Sync + 'static>(
 /// which of IAM's rules refused it. A request for a resource of ANOTHER account is refused
 /// with the sentence that names the principal alone — it states neither the action nor the
 /// ARN, because a caller must learn nothing about a resource outside its own account, not
-/// even which of them it asked about.
+/// even which of them it asked about. A request that addresses no resource at all — one
+/// carrying no `JobArn` ([`judged_resource`]) — is refused with the denial sentence that
+/// names no resource, because there is none to name.
 ///
 /// Every value in either sentence comes from the request and from the stored policies: the
 /// principal from the credential the request presented, the action from the operation it
@@ -216,6 +300,14 @@ fn not_authorized(
             &[caller.arn.as_str()],
         );
         inaccessible_resource_message(held.first())
+    } else if resource.is_empty() {
+        // A request carrying no `JobArn` at all addresses no resource of this service, so
+        // the sentence states no resource clause: there is nothing to name.
+        let held = held_to_what_the_member_leaves(
+            &unaddressed_resource_message("", action, reason),
+            &[caller.arn.as_str()],
+        );
+        unaddressed_resource_message(held.first(), action, reason)
     } else {
         let held = held_to_what_the_member_leaves(
             &unauthorized_message("", action, "", reason),
@@ -233,6 +325,13 @@ fn unauthorized_message(principal: &str, action: &str, resource: &str, reason: &
         "User: {principal} is not authorized to perform: {action} on resource: {resource} \
          {reason}"
     )
+}
+
+/// The same sentence for a request that addresses no resource at all — one carrying no
+/// `JobArn` ([`judged_resource`]) — which states who was refused, which action and which of
+/// IAM's rules refused it, and names no resource because the request named none.
+fn unaddressed_resource_message(principal: &str, action: &str, reason: &str) -> String {
+    format!("User: {principal} is not authorized to perform: {action} {reason}")
 }
 
 /// The sentence a request for a resource of ANOTHER account is refused with, which names the
