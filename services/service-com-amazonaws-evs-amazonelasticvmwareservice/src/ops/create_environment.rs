@@ -68,7 +68,11 @@
 //!    caller's own account — minted there by `CreateKeyPair` or `ImportKeyPair`, never by
 //!    Amazon EVS — and it is resolved whatever an entry's placement members say, a key
 //!    pair being no placement reference
-//!    ([`crate::state::ec2_resources::host_key_pair_failures`]).
+//!    ([`crate::state::ec2_resources::host_key_pair_failures`]). Every reference an entry
+//!    carries, placement and key pair alike, is resolved only where Amazon EVS INSTALLS
+//!    VCF, exactly as rule 10 over the same member is: that is the mode in which the hosts
+//!    are added at all, and a mode that adds none places nothing and reaches nothing, so
+//!    an entry's ids and names name no resource that has to resolve.
 //! 10. A `hostName` an entry of `hosts` names is free: "DNS hostnames for hosts must be
 //!    unique across Amazon EVS environments and within VCF"
 //!    (`HostInfoForCreate$hostName` doc), and the hosts this create adds TAKE their
@@ -141,7 +145,10 @@
 //! added for `hosts` ([`add_requested_hosts`]) and no license key is carried for
 //! `licenseInfo` ([`crate::state::StoredEnvironment::license_keys`]), so neither this
 //! environment's health checks nor another environment's see anything the mode does
-//! nothing with.
+//! nothing with. The preconditions above owe them the same: a check that derives a fact
+//! out of an unsupported member — a name it claims, a resource it references — is asked
+//! only in the mode that uses it (rules 9, 10, 12 and 14), so only the shape's own
+//! structural constraints (rule 1) still judge it.
 //!
 //! Every one of those checks runs before anything is minted, and they are all
 //! evaluated: a request that breaks several is refused ONCE, with one
@@ -469,10 +476,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `placementGroupId` or `dedicatedHostId` names a resource of the caller's own
         // account, which Amazon EVS does not create. An entry that names BOTH is already
         // refused for that by `host_failures`, so neither of its references is resolved.
+        // Asked only where the hosts ARE added, exactly as the hostname rule over this
+        // same member is: a mode that adds no host places none, so an id of an inert
+        // entry names nothing that has to resolve.
         let host_member_prefixes: Vec<String> = (0..input.hosts.as_deref().unwrap_or_default().len())
             .map(|index| format!("hosts[{index}]"))
             .collect();
-        {
+        if installs_vcf {
             let references: Vec<crate::state::ec2_resources::HostPlacementReferences<'_>> = input
                 .hosts
                 .as_deref()
@@ -500,8 +510,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // EC2 mints and Amazon EVS does not, so the name is resolved in the account's own
         // key pair store — read by name the way EC2 itself reads one. Resolved for every
         // entry, whatever its placement members say: a key pair is no placement reference,
-        // and the launch of a host writes this name onto its instance either way.
-        {
+        // and the launch of a host writes this name onto its instance either way. Asked,
+        // like the placement references above, only where the hosts ARE added: a mode that
+        // adds no host reaches none, so an inert entry's key pair name names nothing.
+        if installs_vcf {
             let members: Vec<String> = host_member_prefixes
                 .iter()
                 .map(|member_prefix| format!("{member_prefix}.keyName"))
