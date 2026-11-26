@@ -12,7 +12,8 @@
 //! external-id requirement (stated by the channel's resource policy, which the
 //! CloudTrail control plane's `PutResourcePolicy` / `DeleteResourcePolicy` carry into
 //! this service's registry) are checked, the batch is rejected as a whole when it
-//! repeats an event id, and every event that passes per-event validation is APPENDED to
+//! repeats an event id or when an event's `eventData` declares no audit event schema at
+//! all, and every event that passes per-event validation is APPENDED to
 //! the channel's ingest log under a freshly minted `eventID` which is then echoed in
 //! `successful`. Events that fail validation are reported per event in `failed`, which
 //! is a partial failure, not an operation error; their ATTEMPT is recorded against the
@@ -236,53 +237,286 @@ fn event_data_checksum(event_data: &str) -> String {
     ::aws_smithy_types::base64::encode(sha2::Sha256::digest(event_data.as_bytes()))
 }
 
-/// Why this event cannot be ingested, as a `ResultErrorEntry$errorCode` from the
-/// catalog the model documents, plus the message explaining it — or `None` when the
-/// event is acceptable.
+/// The JSON type the audit event schema gives one of its members.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemberType {
+    /// A JSON string.
+    Text,
+    /// A JSON object, whose own members the schema states.
+    Object,
+    /// Any JSON value: the schema's free-form members carry whatever the event source
+    /// put in them, so nothing about their shape can be refused.
+    Document,
+}
+
+impl MemberType {
+    /// Whether `value` is of this type.
+    fn admits(self, value: &serde_json::Value) -> bool {
+        match self {
+            Self::Text => value.is_string(),
+            Self::Object => value.is_object(),
+            Self::Document => true,
+        }
+    }
+
+    /// How a refusal names this type, for the message that states what the member is not.
+    fn description(self) -> &'static str {
+        match self {
+            Self::Text => "a JSON string",
+            Self::Object => "a JSON object",
+            Self::Document => "a JSON value",
+        }
+    }
+}
+
+/// One member of an audit event's content: where it sits in the payload, the JSON type it
+/// carries, and whether an audit event has to carry it at all.
+#[derive(Debug)]
+struct SchemaMember {
+    /// The member's path in the payload: a top-level member's own name, or `.`-separated
+    /// names for a member of a nested object.
+    path: &'static str,
+    /// The JSON type the schema gives it.
+    member_type: MemberType,
+    /// Whether an audit event has to carry it.
+    required: bool,
+}
+
+/// The content an audit event is made of: the members of the open audit event schema
+/// CloudTrail Lake ingests events in (the AWS CloudTrail User Guide's open audit event
+/// schema for Lake integrations — the same content the model points at for
+/// `AuditEvent$eventData`, "such as `userIdentity`, `userAgent`, and `eventSource`"),
+/// with the JSON type each carries and whether the schema requires it.
+///
+/// A member of a nested object is listed AFTER its parent, so a payload whose parent is
+/// absent or is not an object is reported against the parent rather than against each of
+/// its members in turn.
+const AUDIT_EVENT_SCHEMA: &[SchemaMember] = &[
+    SchemaMember {
+        path: SCHEMA_VERSION_MEMBER,
+        member_type: MemberType::Text,
+        required: true,
+    },
+    SchemaMember {
+        path: "userIdentity",
+        member_type: MemberType::Object,
+        required: true,
+    },
+    SchemaMember {
+        path: "userIdentity.type",
+        member_type: MemberType::Text,
+        required: true,
+    },
+    SchemaMember {
+        path: "userIdentity.principalId",
+        member_type: MemberType::Text,
+        required: true,
+    },
+    SchemaMember {
+        path: "userIdentity.details",
+        member_type: MemberType::Object,
+        required: false,
+    },
+    SchemaMember {
+        path: "eventSource",
+        member_type: MemberType::Text,
+        required: true,
+    },
+    SchemaMember {
+        path: "eventTime",
+        member_type: MemberType::Text,
+        required: true,
+    },
+    SchemaMember {
+        path: "UID",
+        member_type: MemberType::Text,
+        required: true,
+    },
+    SchemaMember {
+        path: "eventName",
+        member_type: MemberType::Text,
+        required: false,
+    },
+    SchemaMember {
+        path: "userAgent",
+        member_type: MemberType::Text,
+        required: false,
+    },
+    SchemaMember {
+        path: "sourceIPAddress",
+        member_type: MemberType::Text,
+        required: false,
+    },
+    SchemaMember {
+        path: "recipientAccountId",
+        member_type: MemberType::Text,
+        required: false,
+    },
+    SchemaMember {
+        path: "requestID",
+        member_type: MemberType::Text,
+        required: false,
+    },
+    SchemaMember {
+        path: "errorCode",
+        member_type: MemberType::Text,
+        required: false,
+    },
+    SchemaMember {
+        path: "errorMessage",
+        member_type: MemberType::Text,
+        required: false,
+    },
+    SchemaMember {
+        path: "requestParameters",
+        member_type: MemberType::Document,
+        required: false,
+    },
+    SchemaMember {
+        path: "responseElements",
+        member_type: MemberType::Document,
+        required: false,
+    },
+    SchemaMember {
+        path: "additionalEventData",
+        member_type: MemberType::Document,
+        required: false,
+    },
+];
+
+/// The member of an audit event that names the SCHEMA its content is written in: an event
+/// carrying no such member declares no schema, which is the one content fault this
+/// operation reports as an operation error rather than per event (see
+/// [`Verdict::UnsupportedSchema`]).
+const SCHEMA_VERSION_MEMBER: &str = "version";
+
+/// The message of `ChannelUnsupportedSchema`, as the model documents the shape: "The
+/// schema type of the event is not supported." The sentence leaves no slot for a caller
+/// value, so it is stated verbatim.
+const CHANNEL_UNSUPPORTED_SCHEMA_MESSAGE: &str = "The schema type of the event is not supported.";
+
+/// The value at `path` in an audit event's payload, or `None` when the payload does not
+/// carry it: a step whose parent is not an object, a member that is absent, and a member
+/// explicitly set to `null` all carry nothing.
+///
+/// The path is one of this module's own ([`AUDIT_EVENT_SCHEMA`]), so the walk's depth is
+/// this crate's, never the caller's.
+fn member_at<'a>(payload: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let mut current = payload;
+    for step in path.split('.') {
+        current = current.as_object()?.get(step)?;
+    }
+    (!current.is_null()).then_some(current)
+}
+
+/// The message `FieldNotFound` states for an audit event that does not carry one of the
+/// members the schema requires: the fixed sentence, naming the member the request left
+/// out.
+fn field_not_found_message(path: &str) -> String {
+    format!("eventData does not carry {path}, which an audit event is required to carry.")
+}
+
+/// The message `InvalidData` states for a member the payload carries as a type the schema
+/// does not give it: the member's path from the request, and the type the schema states
+/// for it.
+fn member_type_message(path: &str, member_type: MemberType) -> String {
+    format!(
+        "eventData carries {path}, which is not {}.",
+        member_type.description()
+    )
+}
+
+/// What this request's validation decided about one event, from the event alone.
+#[derive(Debug)]
+enum Verdict {
+    /// Ingest it.
+    Accepted,
+    /// Report it in `failed` under this `ResultErrorEntry$errorCode` — one of the catalog
+    /// the model documents — with this message.
+    Failed(&'static str, String),
+    /// Its `eventData` declares no audit event schema at all, so there is no content for
+    /// CloudTrail to read it as. The documented `errorCode` catalog holds no code for a
+    /// schema fault, and the operation models `ChannelUnsupportedSchema` for one, so this
+    /// is the whole call's answer rather than one entry's.
+    UnsupportedSchema,
+}
+
+/// Whether this event can be ingested, and why not when it cannot: a
+/// `ResultErrorEntry$errorCode` from the catalog the model documents plus the message
+/// explaining it, or the whole call's schema refusal.
 ///
 /// Size is clamped FIRST, so neither the O(n) digest below nor the JSON parse ever runs
 /// over a caller-sized payload this function is about to reject anyway; then integrity
 /// (was the payload received intact?), then content. An event that breaks several is
 /// reported under the earliest.
 ///
-/// DEFERRED, and so deliberately not decided here: whether the JSON object carries the
-/// members of CloudTrail's open audit event schema (and therefore `FieldNotFound` for a
-/// missing one, or the operation's `ChannelUnsupportedSchema` for a schema version this
-/// channel does not take). The bootstrap issue puts `ChannelUnsupportedSchema` schema
-/// validation out of this slice, and its own happy path ingests a two-member payload, so
-/// this slice validates `eventData` only as far as it can without inventing a schema —
-/// the schema check is its own gap issue. Nothing is fabricated in the meantime: an
-/// event that parses is reported as ingested only because it really was stored.
-fn rejection(event: &AuditEvent) -> Option<(&'static str, String)> {
+/// CONTENT is decided against the open audit event schema CloudTrail Lake ingests events
+/// in ([`AUDIT_EVENT_SCHEMA`]): a payload that is no JSON object at all carries no
+/// content (`InvalidData`); one that names no schema is the call's
+/// `ChannelUnsupportedSchema`; one that leaves out a member the schema requires is
+/// `FieldNotFound`; and one that carries a member as a type the schema does not give it
+/// is `InvalidData`. Members are decided in schema order, so an event missing several is
+/// reported under the first.
+fn verdict(event: &AuditEvent) -> Verdict {
     if event.event_data.len() > MAX_EVENT_DATA_BYTES {
-        return Some((
+        return Verdict::Failed(
             "FieldTooLong",
             format!(
                 "eventData is {} bytes, which exceeds the {MAX_EVENT_DATA_BYTES} byte limit.",
                 event.event_data.len()
             ),
-        ));
+        );
     }
     if let Some(supplied) = event.event_data_checksum.as_deref() {
         if supplied != event_data_checksum(&event.event_data) {
-            return Some((
+            return Verdict::Failed(
                 "InvalidChecksum",
                 "eventDataChecksum does not match the base64-SHA256 checksum of eventData."
                     .to_string(),
-            ));
+            );
         }
     }
-    if !matches!(
-        serde_json::from_str::<serde_json::Value>(&event.event_data),
-        Ok(serde_json::Value::Object(_))
-    ) {
-        return Some((
-            "InvalidData",
-            "eventData is not a JSON object carrying the content of an audit event."
-                .to_string(),
-        ));
+    let payload = match serde_json::from_str::<serde_json::Value>(&event.event_data) {
+        Ok(payload @ serde_json::Value::Object(_)) => payload,
+        _ => {
+            return Verdict::Failed(
+                "InvalidData",
+                "eventData is not a JSON object carrying the content of an audit event."
+                    .to_string(),
+            )
+        }
+    };
+
+    // The schema the content is written in, before the content itself: a payload whose
+    // `version` is absent or is not a schema version at all declares no schema, and
+    // nothing can be said about which members such a payload is required to carry.
+    if !member_at(&payload, SCHEMA_VERSION_MEMBER)
+        .is_some_and(|version| version.as_str().is_some_and(|value| !value.is_empty()))
+    {
+        return Verdict::UnsupportedSchema;
     }
-    None
+
+    for member in AUDIT_EVENT_SCHEMA {
+        match member_at(&payload, member.path) {
+            None => {
+                if member.required {
+                    return Verdict::Failed(
+                        "FieldNotFound",
+                        field_not_found_message(member.path),
+                    );
+                }
+            }
+            Some(value) => {
+                if !member.member_type.admits(value) {
+                    return Verdict::Failed(
+                        "InvalidData",
+                        member_type_message(member.path, member.member_type),
+                    );
+                }
+            }
+        }
+    }
+    Verdict::Accepted
 }
 
 /// Emit this request's access record: when it happened (the subscriber's timestamp),
@@ -426,8 +660,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Per-event validation is PURE (it reads only the request), so it runs before
         // the state lock is taken: the digest and the JSON parse of a caller-sized
         // payload never hold the lock against every other request to this service.
-        let rejections: Vec<Option<(&'static str, String)>> =
-            input.audit_events.iter().map(rejection).collect();
+        let verdicts: Vec<Verdict> = input.audit_events.iter().map(verdict).collect();
 
         let mut guard = state.lock();
         let Some(channel) = guard.channel_mut(&channel_ref) else {
@@ -509,6 +742,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // An event whose payload declares no audit event schema fails the WHOLE request
+        // too: the `errorCode` catalog the model documents for a per-event entry holds no
+        // code for a schema fault, and the operation models `ChannelUnsupportedSchema`
+        // for one. Checked before anything is written, so such a request persists
+        // nothing.
+        if verdicts
+            .iter()
+            .any(|verdict| matches!(verdict, Verdict::UnsupportedSchema))
+        {
+            record_access(
+                ctx,
+                &input.channel_arn,
+                "ChannelUnsupportedSchema",
+                "an event's eventData declares no audit event schema; nothing was persisted",
+            );
+            return Err(PutAuditEventsErrorModeled::ChannelUnsupportedSchema(
+                ChannelUnsupportedSchema {
+                    message: Some(CHANNEL_UNSUPPORTED_SCHEMA_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
         // Per-event outcome, recorded against the channel whichever way it goes: an
         // accepted event is appended to the channel's ingest log under a freshly minted
         // `eventID`; a refused one is reported in `failed` and its ATTEMPT is recorded,
@@ -521,9 +777,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut successful: Vec<AuditEventResultEntry> =
             Vec::with_capacity(input.audit_events.len());
         let mut failed: Vec<ResultErrorEntry> = Vec::new();
-        for (event, rejected) in input.audit_events.iter().zip(rejections) {
-            match rejected {
-                Some((error_code, error_message)) => {
+        for (event, verdict) in input.audit_events.iter().zip(verdicts) {
+            match verdict {
+                Verdict::Failed(error_code, error_message) => {
                     channel.record_refusal(event.id.clone(), error_code, decided_at);
                     failed.push(ResultErrorEntry {
                         id: event.id.clone(),
@@ -531,7 +787,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         error_message,
                     });
                 }
-                None => {
+                Verdict::Accepted => {
                     let event_id = crate::state::new_event_id();
                     // Appends under the channel's retention bounds, so repeated calls
                     // cannot grow this store without limit.
@@ -547,6 +803,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         event_id,
                     });
                 }
+                // Answered above, for the whole request, before anything was written.
+                Verdict::UnsupportedSchema => {}
             }
         }
         drop(guard);

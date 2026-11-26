@@ -49,8 +49,9 @@ const DUPLICATED_AUDIT_EVENT_ID: &str =
 const ACCESS_DENIED: (u16, &str) = (403, "AccessDeniedException");
 
 /// A JSON audit event that passes per-event validation, so nothing but the channel
-/// reference decides these calls.
-const GOOD_EVENT: &str = r#"{"eventSource":"custom.app","eventName":"Login"}"#;
+/// reference decides these calls: the one payload carrying the content CloudTrail's open
+/// audit event schema requires, from the suite that owns this crate's test client.
+const GOOD_EVENT: &str = crate::put_audit_events::AUDIT_EVENT;
 
 /// The prose member of a refusal: the modelled error shapes of this service spell it
 /// `message`, and the authorization layer's `AccessDeniedException` — which is not one of

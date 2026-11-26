@@ -65,8 +65,10 @@ const POLICY_NAME: &str = "inline";
 const SESSION_SECONDS: i32 = 3_600;
 
 /// A JSON audit event that passes per-event validation, so nothing but authorization and
-/// the channel reference decides these calls.
-pub(crate) const GOOD_EVENT: &str = r#"{"eventSource":"custom.app","eventName":"Login"}"#;
+/// the channel reference decides these calls: the one payload carrying the content
+/// CloudTrail's open audit event schema requires, from the suite that owns this crate's
+/// test client.
+pub(crate) const GOOD_EVENT: &str = crate::put_audit_events::AUDIT_EVENT;
 
 /// The error code and status the authorization layer answers an unauthorized call with.
 const ACCESS_DENIED: (u16, &str) = (403, "AccessDeniedException");

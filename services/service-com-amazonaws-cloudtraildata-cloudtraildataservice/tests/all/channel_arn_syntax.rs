@@ -27,8 +27,9 @@ use service_com_amazonaws_cloudtraildata_cloudtraildataservice::state::Channel;
 const INVALID_CHANNEL_ARN: &str = "The specified channel ARN is not a valid channel ARN.";
 
 /// A JSON audit event that passes per-event validation, so nothing but the channel
-/// reference decides these calls.
-const GOOD_EVENT: &str = r#"{"eventSource":"custom.app","eventName":"Login"}"#;
+/// reference decides these calls: the one payload carrying the content CloudTrail's open
+/// audit event schema requires, from the suite that owns this crate's test client.
+const GOOD_EVENT: &str = crate::put_audit_events::AUDIT_EVENT;
 
 /// The channel id this suite registers, in the canonical form CloudTrail mints a channel
 /// id in.

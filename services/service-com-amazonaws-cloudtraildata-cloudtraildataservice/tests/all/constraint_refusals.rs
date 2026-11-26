@@ -29,8 +29,9 @@ use crate::put_audit_events::{channel_arn, ev, Ev, Harness, Reply, DEFAULT_ACCES
 use service_com_amazonaws_cloudtraildata_cloudtraildataservice::state::Channel;
 
 /// A JSON audit event that passes per-event validation, so nothing but the member under
-/// test decides these calls.
-pub const GOOD_EVENT: &str = r#"{"eventSource":"custom.app","eventName":"Login"}"#;
+/// test decides these calls: the one payload carrying the content CloudTrail's open audit
+/// event schema requires, from the suite that owns this crate's test client.
+pub const GOOD_EVENT: &str = crate::put_audit_events::AUDIT_EVENT;
 
 /// The largest batch `auditEvents` admits, from the member's own `@length`
 /// (`smithy_query(query="shape", shape="AuditEvents")`: min 1, max 100).

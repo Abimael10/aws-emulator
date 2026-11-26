@@ -64,19 +64,45 @@ fn is_modelled_event_id(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// A valid audit-event JSON object whose encoded length is exactly `len` bytes, for
-/// exercising the payload-size bound.
+/// The content CloudTrail's open audit event schema requires an audit event to carry, as
+/// one complete `eventData` payload: `version` — the schema the content is written in —
+/// `userIdentity` with its own `type` and `principalId`, `eventSource`, `eventTime` and
+/// `UID`, plus the optional `eventName`.
+///
+/// This is what an ingestible event looks like, written once: the sibling suites' own
+/// payload constants are this one, and a case that varies content builds on it through
+/// [`audit_event_with`].
+pub const AUDIT_EVENT: &str = r#"{"version":"1.0.0","userIdentity":{"type":"CustomUser","principalId":"principal-1"},"eventSource":"custom.app","eventName":"Login","eventTime":"2026-01-01T00:00:00Z","UID":"8d1f8c6e-0b1a-4f3c-9a2d-5e6f70819203"}"#;
+
+/// [`AUDIT_EVENT`] with the members of `extra` written over it, so a case varies only the
+/// content it is about. A member of `extra` whose value is `null` is REMOVED from the
+/// payload, which is how a case drops one of the schema's members.
+pub fn audit_event_with(extra: serde_json::Value) -> String {
+    let mut payload: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(AUDIT_EVENT).expect("the base payload is a JSON object");
+    if let serde_json::Value::Object(members) = extra {
+        for (name, value) in members {
+            if value.is_null() {
+                payload.remove(&name);
+            } else {
+                payload.insert(name, value);
+            }
+        }
+    }
+    serde_json::Value::Object(payload).to_string()
+}
+
+/// A complete audit event whose encoded length is exactly `len` bytes, for exercising the
+/// payload-size bound: the content above, padded out in a member of its own.
 fn json_object_of_len(len: usize) -> String {
-    let prefix = r#"{"eventSource":"custom.app","eventName":"Login","pad":""#;
-    let suffix = r#""}"#;
+    let unpadded = audit_event_with(serde_json::json!({ "pad": "" })).len();
     assert!(
-        len >= prefix.len() + suffix.len(),
-        "json_object_of_len({len}): too short to build a JSON object"
+        len >= unpadded,
+        "json_object_of_len({len}): too short to build an audit event ({unpadded} bytes \
+         unpadded)"
     );
-    format!(
-        "{prefix}{}{suffix}",
-        "p".repeat(len - prefix.len() - suffix.len())
-    )
+    // Every padding byte is one more ASCII byte inside the `pad` member's JSON string.
+    audit_event_with(serde_json::json!({ "pad": "p".repeat(len - unpadded) }))
 }
 
 /// One entry of an `auditEvents` batch.
@@ -311,17 +337,17 @@ async fn ingest_accumulates_in_the_channel_across_calls() {
     harness.register(Channel::from_arn(&arn, "Custom").expect("a channel ARN"));
 
     let batches: Vec<Vec<Ev>> = vec![
-        // one event, flat payload
-        vec![ev(
-            "evt-1",
-            r#"{"eventSource":"custom.app","eventName":"Login"}"#,
-        )],
+        // one event, the schema's required content and nothing else
+        vec![ev("evt-1", AUDIT_EVENT)],
         // two events, one of them carrying a correct checksum
         vec![
-            ev("evt-2", r#"{"eventSource":"custom.app","eventName":"Logout"}"#),
+            ev("evt-2", audit_event_with(serde_json::json!({ "eventName": "Logout" }))),
             ev(
                 "evt-3",
-                r#"{"eventSource":"custom.app","eventName":"Purchase","amount":42}"#,
+                audit_event_with(serde_json::json!({
+                    "eventName": "Purchase",
+                    "requestParameters": { "amount": 42 },
+                })),
             )
             .signed(),
         ],
@@ -329,9 +355,19 @@ async fn ingest_accumulates_in_the_channel_across_calls() {
         vec![
             ev(
                 "evt_4",
-                r#"{"eventSource":"custom.app","userIdentity":{"type":"Custom","principalId":"p-1"}}"#,
+                audit_event_with(serde_json::json!({
+                    "userIdentity": {
+                        "type": "Custom",
+                        "principalId": "p-1",
+                        "details": { "tenant": "t-7" },
+                    },
+                })),
             ),
-            ev("evt-5", r#"{"eventSource":"custom.app","note":"héllo wörld"}"#).signed(),
+            ev(
+                "evt-5",
+                audit_event_with(serde_json::json!({ "userAgent": "héllo wörld" })),
+            )
+            .signed(),
             ev("evt-6", json_object_of_len(64 * 1024)),
         ],
     ];
@@ -403,7 +439,7 @@ async fn per_event_defects_are_reported_per_event() {
     let arn = channel_arn("1b2c3d4e-5f60-7182-93a4-b5c6d7e8f901");
     harness.register(Channel::from_arn(&arn, "Custom").expect("a channel ARN"));
 
-    let good = r#"{"eventSource":"custom.app","eventName":"Login"}"#;
+    let good = AUDIT_EVENT;
     // (case name, event, expected error code — None means the event is ingested)
     let rows: Vec<(&str, Ev, Option<&str>)> = vec![
         ("no checksum supplied", ev("ok-1", good), None),
@@ -619,7 +655,7 @@ async fn channel_resolution_answers_the_modelled_error_for_each_arn_form() {
 
     for (case, channel, status, code) in &rows {
         let reply = harness
-            .put(channel, None, &[ev("evt-1", r#"{"eventSource":"custom.app"}"#)])
+            .put(channel, None, &[ev("evt-1", AUDIT_EVENT)])
             .await;
         assert_eq!(
             reply.status, *status,
@@ -649,7 +685,7 @@ async fn repeated_event_ids_fail_the_whole_request() {
     let harness = Harness::new();
     let arn = channel_arn("3d4e5f60-7182-93a4-b5c6-d7e8f9012345");
     harness.register(Channel::from_arn(&arn, "Custom").expect("a channel ARN"));
-    let data = r#"{"eventSource":"custom.app","eventName":"Login"}"#;
+    let data = AUDIT_EVENT;
 
     // (case name, the batch's ids, expected status, expected error code)
     let rows: Vec<(&str, Vec<&'static str>, u16, &str)> = vec![
@@ -779,7 +815,7 @@ async fn ownership_and_external_id_decide_permission() {
             .put(
                 channel,
                 *external_id,
-                &[ev("evt-1", r#"{"eventSource":"custom.app"}"#)],
+                &[ev("evt-1", AUDIT_EVENT)],
             )
             .await;
         assert_eq!(
@@ -914,7 +950,7 @@ fn a_channel_resolves_by_its_arn_or_by_its_arn_suffix() {
 #[tokio::test]
 async fn the_ingest_log_is_bounded_by_its_retention_limits() {
     let harness = Harness::new();
-    let small = r#"{"eventSource":"custom.app","eventName":"Login"}"#;
+    let small = AUDIT_EVENT;
 
     // Count bound: 12 batches of 100 (the modelled maximum per request) = 1200 events.
     let by_count = channel_arn("58697a8b-9c0d-4e1f-8021-324354657687");
@@ -983,4 +1019,307 @@ async fn the_ingest_log_is_bounded_by_its_retention_limits() {
         Some("big-19"),
         "case \"byte bound\": the newest event must be retained"
     );
+}
+
+/// `(errorCode, errorMessage)` of the entry `failed` reports for `id`.
+fn failure_of(reply: &Reply, id: &str) -> Option<(String, String)> {
+    reply.member("failed")?.iter().find_map(|entry| {
+        let field = |member: &str| {
+            entry
+                .get(member)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        (field("id") == id).then(|| (field("errorCode"), field("errorMessage")))
+    })
+}
+
+/// What the response must say about one row of the content table: `None` for an event to
+/// be ingested, or the `errorCode` its `failed` entry must carry and the member that
+/// entry's message must name.
+type ContentOutcome = Option<(&'static str, &'static str)>;
+
+/// An event is decided on the CONTENT of its `eventData`, against the open audit event
+/// schema CloudTrail ingests events in: a payload that leaves out a member the schema
+/// requires is reported per event under `FieldNotFound` naming that member, one that
+/// carries a member as a type the schema does not give it under `InvalidData` naming it,
+/// and only a payload carrying the content an audit event is made of is ingested.
+///
+/// The rows span which member is missing (top-level and nested, absent and `null`), which
+/// member is mistyped (required and optional, nested too), and the optional members a
+/// payload may carry on top of the required ones.
+#[tokio::test]
+async fn audit_event_content_decides_each_event() {
+    let harness = Harness::new();
+    let arn = channel_arn("7a8b9c0d-1e2f-4031-8243-546576879809");
+    harness.register(Channel::from_arn(&arn, "Custom").expect("a channel ARN"));
+
+    // (case name, eventData, expected outcome: None to be ingested, or the errorCode
+    // the entry must carry and the member its message must name)
+    let rows: Vec<(&str, String, ContentOutcome)> = vec![
+        ("the content the schema requires", AUDIT_EVENT.to_string(), None),
+        (
+            "every member the schema states",
+            audit_event_with(serde_json::json!({
+                "userIdentity": {
+                    "type": "CustomUser",
+                    "principalId": "principal-2",
+                    "details": { "team": "payments" },
+                },
+                "userAgent": "custom-app/1.4",
+                "sourceIPAddress": "203.0.113.7",
+                "recipientAccountId": engine::emulator_account_id(),
+                "requestID": "9b1d8f20-0e3a-4a7c-8f11-2d3e4f506172",
+                "errorCode": "AccessDenied",
+                "errorMessage": "the principal may not sign in",
+                "requestParameters": { "tenant": "t-7" },
+                "responseElements": { "accepted": [1, 2, 3] },
+                "additionalEventData": { "channel": "web" },
+            })),
+            None,
+        ),
+        (
+            "a free-form member carrying a scalar",
+            audit_event_with(serde_json::json!({ "additionalEventData": "signed in from the app" })),
+            None,
+        ),
+        (
+            "no eventSource",
+            audit_event_with(serde_json::json!({ "eventSource": null })),
+            Some(("FieldNotFound", "eventSource")),
+        ),
+        (
+            "no eventTime",
+            audit_event_with(serde_json::json!({ "eventTime": null })),
+            Some(("FieldNotFound", "eventTime")),
+        ),
+        (
+            "no UID",
+            audit_event_with(serde_json::json!({ "UID": null })),
+            Some(("FieldNotFound", "UID")),
+        ),
+        (
+            "no userIdentity",
+            audit_event_with(serde_json::json!({ "userIdentity": null })),
+            Some(("FieldNotFound", "userIdentity")),
+        ),
+        (
+            "a userIdentity without its principalId",
+            audit_event_with(serde_json::json!({ "userIdentity": { "type": "CustomUser" } })),
+            Some(("FieldNotFound", "userIdentity.principalId")),
+        ),
+        (
+            "a userIdentity without its type",
+            audit_event_with(serde_json::json!({ "userIdentity": { "principalId": "p-1" } })),
+            Some(("FieldNotFound", "userIdentity.type")),
+        ),
+        (
+            // A member the payload states as JSON `null` carries no value, so it is
+            // missing rather than mistyped.
+            "a UID stated as null",
+            r#"{"version":"1.0.0","userIdentity":{"type":"CustomUser","principalId":"p-1"},"eventSource":"custom.app","eventTime":"2026-01-01T00:00:00Z","UID":null}"#
+                .to_string(),
+            Some(("FieldNotFound", "UID")),
+        ),
+        (
+            "eventSource as a number",
+            audit_event_with(serde_json::json!({ "eventSource": 7 })),
+            Some(("InvalidData", "eventSource")),
+        ),
+        (
+            "eventTime as a list",
+            audit_event_with(serde_json::json!({ "eventTime": ["2026-01-01T00:00:00Z"] })),
+            Some(("InvalidData", "eventTime")),
+        ),
+        (
+            "userIdentity as a string",
+            audit_event_with(serde_json::json!({ "userIdentity": "custom-user" })),
+            Some(("InvalidData", "userIdentity")),
+        ),
+        (
+            "a nested member as an object",
+            audit_event_with(serde_json::json!({
+                "userIdentity": { "type": { "kind": "custom" }, "principalId": "p-1" },
+            })),
+            Some(("InvalidData", "userIdentity.type")),
+        ),
+        (
+            "an optional member as a number",
+            audit_event_with(serde_json::json!({ "eventName": 42 })),
+            Some(("InvalidData", "eventName")),
+        ),
+        (
+            "an optional nested member as a string",
+            audit_event_with(serde_json::json!({
+                "userIdentity": {
+                    "type": "CustomUser",
+                    "principalId": "p-1",
+                    "details": "none",
+                },
+            })),
+            Some(("InvalidData", "userIdentity.details")),
+        ),
+    ];
+
+    let batch: Vec<Ev> = rows
+        .iter()
+        .enumerate()
+        .map(|(index, (_, data, _))| ev(format!("content-{index}"), data.clone()))
+        .collect();
+    let reply = harness.put(&arn, None, &batch).await;
+    assert_eq!(
+        reply.status, 200,
+        "an event's content is a partial failure, not an operation error: expected HTTP \
+         200, got {} with body {}",
+        reply.status, reply.body
+    );
+
+    let successful = reply.successful();
+    let mut expected_log: Vec<String> = Vec::new();
+    for (entry, (case, _, expected)) in batch.iter().zip(rows.iter()) {
+        let id = entry.id();
+        match expected {
+            None => {
+                assert!(
+                    successful.iter().any(|(got, _)| got == id),
+                    "case {case:?}: expected {id} in successful[], got successful \
+                     {successful:?} and failure {:?}",
+                    failure_of(&reply, id)
+                );
+                expected_log.push(id.to_string());
+            }
+            Some((code, member)) => {
+                let failure = failure_of(&reply, id);
+                let (got_code, got_message) = failure.clone().unwrap_or_default();
+                assert_eq!(
+                    got_code, *code,
+                    "case {case:?}: expected {id} in failed[] with errorCode {code}, got \
+                     {failure:?}"
+                );
+                assert!(
+                    got_message.contains(member),
+                    "case {case:?}: the message must name the member it is about \
+                     ({member}), got {got_message:?}"
+                );
+            }
+        }
+    }
+
+    let stored: Vec<String> = harness
+        .ingest_log(&arn)
+        .into_iter()
+        .map(|(source_id, _)| source_id)
+        .collect();
+    assert_eq!(
+        stored, expected_log,
+        "only an event carrying an audit event's content may be stored, got {stored:?}"
+    );
+}
+
+/// `eventData` that declares no audit event schema at all is not one entry's defect but
+/// the whole call's: the `errorCode` catalog the model documents for a per-event entry
+/// holds no schema code, and the operation models `ChannelUnsupportedSchema` for one — so
+/// the call is refused with that error, under the sentence the model documents for it,
+/// and persists nothing.
+///
+/// The rows span how a payload can declare no schema (no `version` member at all, one
+/// that is not a schema version, an object carrying nothing of an audit event) and where
+/// such an event sits in the batch.
+#[tokio::test]
+async fn a_payload_declaring_no_schema_fails_the_whole_request() {
+    let harness = Harness::new();
+    let arn = channel_arn("8b9c0d1e-2f30-4152-8364-657687980910");
+    harness.register(Channel::from_arn(&arn, "Custom").expect("a channel ARN"));
+
+    // (case name, the batch's payloads, expected status, expected error code)
+    let rows: Vec<(&str, Vec<String>, u16, &str)> = vec![
+        (
+            "an empty JSON object",
+            vec!["{}".to_string()],
+            400,
+            "ChannelUnsupportedSchema",
+        ),
+        (
+            "a JSON object carrying nothing of an audit event",
+            vec![r#"{"not":"an audit event"}"#.to_string()],
+            400,
+            "ChannelUnsupportedSchema",
+        ),
+        (
+            "the schema's content with no version",
+            vec![audit_event_with(serde_json::json!({ "version": null }))],
+            400,
+            "ChannelUnsupportedSchema",
+        ),
+        (
+            "a version that is not a string",
+            vec![audit_event_with(serde_json::json!({ "version": 1 }))],
+            400,
+            "ChannelUnsupportedSchema",
+        ),
+        (
+            "an empty version",
+            vec![audit_event_with(serde_json::json!({ "version": "" }))],
+            400,
+            "ChannelUnsupportedSchema",
+        ),
+        (
+            "one schemaless event among complete ones",
+            vec![
+                AUDIT_EVENT.to_string(),
+                "{}".to_string(),
+                AUDIT_EVENT.to_string(),
+            ],
+            400,
+            "ChannelUnsupportedSchema",
+        ),
+        (
+            "every event declaring the schema",
+            vec![
+                AUDIT_EVENT.to_string(),
+                audit_event_with(serde_json::json!({ "eventName": "Logout" })),
+            ],
+            200,
+            "",
+        ),
+    ];
+
+    let mut expected_stored = 0usize;
+    for (index, (case, payloads, status, code)) in rows.iter().enumerate() {
+        let batch: Vec<Ev> = payloads
+            .iter()
+            .enumerate()
+            .map(|(position, data)| ev(format!("schema-{index}-{position}"), data.clone()))
+            .collect();
+        let reply = harness.put(&arn, None, &batch).await;
+        assert_eq!(
+            reply.status, *status,
+            "case {case:?}: expected HTTP {status}, got {} with body {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code(),
+            *code,
+            "case {case:?}: expected error code {code:?}, got body {}",
+            reply.body
+        );
+        if *status == 400 {
+            assert_eq!(
+                crate::constraint_refusals::message_of(&reply),
+                "The schema type of the event is not supported.",
+                "case {case:?}: the refusal must state the sentence the model documents \
+                 for the error shape, got body {}",
+                reply.body
+            );
+        } else {
+            expected_stored += batch.len();
+        }
+        let stored = harness.ingest_log(&arn);
+        assert_eq!(
+            stored.len(),
+            expected_stored,
+            "case {case:?}: a refused request must persist nothing, got {stored:?}"
+        );
+    }
 }

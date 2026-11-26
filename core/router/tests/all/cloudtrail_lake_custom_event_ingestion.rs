@@ -235,18 +235,36 @@ pub(crate) async fn create_channel(
     channel_arn
 }
 
+/// The content CloudTrail's open audit event schema requires an audit event to carry, as
+/// one complete `eventData` payload: `version` — the schema the content is written in —
+/// `userIdentity` with its own `type` and `principalId`, `eventSource`, `eventTime` and
+/// `UID`, plus the optional `eventName`. This is what an ingestible event looks like,
+/// written once for the suites that drive this data plane.
+pub(crate) const AUDIT_EVENT: &str = r#"{"version":"1.0.0","userIdentity":{"type":"CustomUser","principalId":"principal-1"},"eventSource":"custom.app","eventName":"Login","eventTime":"2026-01-01T00:00:00Z","UID":"8d1f8c6e-0b1a-4f3c-9a2d-5e6f70819203"}"#;
+
+/// [`AUDIT_EVENT`] with the members of `extra` written over it, so a case varies only the
+/// content it is about.
+pub(crate) fn audit_event_with(extra: serde_json::Value) -> String {
+    let mut payload: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(AUDIT_EVENT).expect("the base payload is a JSON object");
+    if let serde_json::Value::Object(members) = extra {
+        for (name, value) in members {
+            payload.insert(name, value);
+        }
+    }
+    serde_json::Value::Object(payload).to_string()
+}
+
 /// A JSON audit event payload of the documented shape, `len` bytes long.
-fn payload_of_len(len: usize) -> String {
-    let prefix = r#"{"eventSource":"custom.app","eventName":"Login","pad":""#;
-    let suffix = r#""}"#;
+pub(crate) fn payload_of_len(len: usize) -> String {
+    let unpadded = audit_event_with(serde_json::json!({ "pad": "" })).len();
     assert!(
-        len >= prefix.len() + suffix.len(),
-        "payload_of_len({len}): too short to build a JSON object"
+        len >= unpadded,
+        "payload_of_len({len}): too short to build an audit event ({unpadded} bytes \
+         unpadded)"
     );
-    format!(
-        "{prefix}{}{suffix}",
-        "p".repeat(len - prefix.len() - suffix.len())
-    )
+    // Every padding byte is one more ASCII byte inside the `pad` member's JSON string.
+    audit_event_with(serde_json::json!({ "pad": "p".repeat(len - unpadded) }))
 }
 
 /// Run `body` against a freshly assembled router, on a thread sized for that assembly.
@@ -305,7 +323,7 @@ fn a_channel_the_control_plane_created_ingests_audit_events_at_once() {
                     documented_store: true,
                     batch: vec![(
                         "sim2real-1".to_string(),
-                        r#"{"eventSource":"custom.app","eventName":"ReproAction"}"#.to_string(),
+                        audit_event_with(serde_json::json!({ "eventName": "ReproAction" })),
                     )],
                 },
                 Row {
@@ -316,12 +334,17 @@ fn a_channel_the_control_plane_created_ingests_audit_events_at_once() {
                     batch: vec![
                         (
                             "evt_2".to_string(),
-                            r#"{"eventSource":"custom.app","eventName":"Logout"}"#.to_string(),
+                            audit_event_with(serde_json::json!({ "eventName": "Logout" })),
                         ),
                         (
                             "evt-3".to_string(),
-                            r#"{"eventSource":"custom.app","userIdentity":{"type":"CustomUserIdentity","principalId":"p-1"}}"#
-                                .to_string(),
+                            audit_event_with(serde_json::json!({
+                                "userIdentity": {
+                                    "type": "CustomUserIdentity",
+                                    "principalId": "p-1",
+                                    "details": { "tenant": "t-7" },
+                                },
+                            })),
                         ),
                     ],
                 },
@@ -333,13 +356,15 @@ fn a_channel_the_control_plane_created_ingests_audit_events_at_once() {
                     batch: vec![
                         (
                             "evt-4".to_string(),
-                            r#"{"eventSource":"custom.app","note":"héllo wörld"}"#.to_string(),
+                            audit_event_with(serde_json::json!({ "userAgent": "héllo wörld" })),
                         ),
                         ("evt-5".to_string(), payload_of_len(32 * 1024)),
                         (
                             "0123456789".to_string(),
-                            r#"{"eventSource":"custom.app","eventName":"Purchase","amount":42}"#
-                                .to_string(),
+                            audit_event_with(serde_json::json!({
+                                "eventName": "Purchase",
+                                "requestParameters": { "amount": 42 },
+                            })),
                         ),
                     ],
                 },
@@ -466,7 +491,10 @@ fn only_a_channel_the_control_plane_does_not_hold_is_refused_as_absent() {
             const REGION: &str = "us-west-2";
             let batch = vec![(
                 "repro-1".to_string(),
-                r#"{"eventSource":"repro.example.com","eventName":"ReproAction"}"#.to_string(),
+                audit_event_with(serde_json::json!({
+                    "eventSource": "repro.example.com",
+                    "eventName": "ReproAction",
+                })),
             )];
 
             // Two channels, so the retired one is refused while its neighbour keeps

@@ -72,11 +72,15 @@ fn string_equals(key: &str, values: &[&str]) -> Value {
     json!({ "StringEquals": { key: values } })
 }
 
-/// The batch one ingest attempt submits: one well-formed custom event, under `id`.
+/// The batch one ingest attempt submits: one well-formed custom event, under `id` — the
+/// payload carrying the content CloudTrail's open audit event schema requires, from the
+/// suite that owns this data plane's client.
 fn batch(id: &str) -> Vec<(String, String)> {
     vec![(
         id.to_string(),
-        r#"{"eventSource":"custom.app","eventName":"ReproAction"}"#.to_string(),
+        crate::cloudtrail_lake_custom_event_ingestion::audit_event_with(
+            json!({ "eventName": "ReproAction" }),
+        ),
     )]
 }
 

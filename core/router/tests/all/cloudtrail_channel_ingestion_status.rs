@@ -28,8 +28,8 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_cloudtraildata_cloudtraildataservice::state::MAX_EVENT_DATA_BYTES;
 
 use crate::cloudtrail_lake_custom_event_ingestion::{
-    authorization, control_plane, create_channel, create_event_data_store, entries, error_code,
-    on_a_router, DATA_PLANE_SIGNING_NAME,
+    audit_event_with, authorization, control_plane, create_channel, create_event_data_store,
+    entries, error_code, on_a_router, payload_of_len, DATA_PLANE_SIGNING_NAME,
 };
 
 /// How many characters a `UUID` is written with (`com.amazonaws.cloudtrail#UUID`:
@@ -57,7 +57,7 @@ struct Submitted {
 fn accepted(id: &str) -> Submitted {
     Submitted {
         id: id.to_string(),
-        data: r#"{"eventSource":"custom.app","eventName":"ReproAction"}"#.to_string(),
+        data: audit_event_with(json!({ "eventName": "ReproAction" })),
         checksum: None,
         expected_error_code: "",
     }
@@ -68,7 +68,7 @@ fn accepted(id: &str) -> Submitted {
 fn refused_checksum(id: &str) -> Submitted {
     Submitted {
         id: id.to_string(),
-        data: r#"{"eventSource":"custom.app","eventName":"Checksum"}"#.to_string(),
+        data: audit_event_with(json!({ "eventName": "Checksum" })),
         // Well-formed base64 of 32 bytes, so it is a checksum in form and simply not
         // this payload's.
         checksum: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
@@ -95,20 +95,6 @@ fn refused_too_long(id: &str) -> Submitted {
         checksum: None,
         expected_error_code: "FieldTooLong",
     }
-}
-
-/// A JSON audit event payload of the documented shape, `len` bytes long.
-fn payload_of_len(len: usize) -> String {
-    let prefix = r#"{"eventSource":"custom.app","eventName":"Login","pad":""#;
-    let suffix = r#""}"#;
-    assert!(
-        len >= prefix.len() + suffix.len(),
-        "payload_of_len({len}): too short to build a JSON object"
-    );
-    format!(
-        "{prefix}{}{suffix}",
-        "p".repeat(len - prefix.len() - suffix.len())
-    )
 }
 
 /// `PutAuditEvents` with a batch that may carry per-event checksums — the sibling suite's
