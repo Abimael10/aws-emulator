@@ -508,23 +508,36 @@ async fn a_guest_identity_a_developer_login_resolves_away_from_is_absorbed() {
     }
 }
 
-/// RULE: where BOTH sides of the link are identities the pool already HOLDS — a presented
-/// login proving one, the developer user identifier registered under another — the call asks
-/// for a join of two stored identities, which only `MergeDeveloperIdentities` performs, so it
-/// is refused as the conflict between those identities and writes nothing.
+/// RULE: where BOTH sides of the link are identities an identity PROVIDER's login proves — a
+/// presented login proving one, the developer user identifier registered under another the
+/// pool reaches through a provider's login too — the call asks for a join of two federated
+/// accounts, which only `MergeDeveloperIdentities` performs, so it is refused as the conflict
+/// between those identities and writes nothing.
 #[tokio::test]
 async fn a_login_proving_another_stored_identity_is_the_merge_conflict() {
     let emulator = Emulator::new(false);
     let pool_id = developer_pool(&emulator, "cross-identity-conflict").await;
 
-    // The identity the developer user identifier is registered under, and the identities two
-    // kinds of identity provider's login prove: an opaque public-provider credential and an
-    // Amazon Cognito user pool's id token.
+    // The identity the developer user identifier is registered under — an account a
+    // provider's login proves as well as the backend's own user, which one call makes of a
+    // public-provider login the pool had bound to no identity and a developer user identifier
+    // ("supplying multiple logins will create an implicit linked account") — and the
+    // identities two kinds of identity provider's login prove: an opaque public-provider
+    // credential and an Amazon Cognito user pool's id token.
     let registered_user = "the-backends-own-user";
+    let registered_users_token = user_pool_token("the-backends-own-user-at-the-user-pool");
     let registered = emulator
         .ok(
             MINT,
-            &token_request(&pool_id, &[(DEVELOPER_PROVIDER, registered_user)], None, None),
+            &token_request(
+                &pool_id,
+                &[
+                    (USER_POOL_PROVIDER, registered_users_token.as_str()),
+                    (DEVELOPER_PROVIDER, registered_user),
+                ],
+                None,
+                None,
+            ),
         )
         .await["IdentityId"]
         .as_str()

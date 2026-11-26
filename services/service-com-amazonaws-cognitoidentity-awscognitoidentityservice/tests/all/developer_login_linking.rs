@@ -4,18 +4,20 @@
 //! and the only thing that stops the link.
 //!
 //! RULE: the logins one call presents name ONE account, so the call links every one of them
-//! to the identity it is about — the one the request names when the call PROVES it (a
-//! presented login is already one of that identity's, or no login has ever been linked to it),
-//! else the one the presented developer user identifier is already registered under — and it
-//! is refused only where a presented login is bound to a DIFFERENT identity than that one, or
-//! where it would join a developer user to an identity another provider's login proves while
-//! presenting no login of it. An `IdentityId` that names an identity nothing of the request
-//! binds the call to is ignored rather than refused: the developer user identifier keeps
-//! naming the identity it is registered under, and the identity the request named is left
-//! untouched ("Supplying multiple logins will create an implicit linked account … When you
+//! to the identity it registers the developer user in — the one the request names while no
+//! identity PROVIDER's login proves it (an identity of the same backend's other developer
+//! users, or one no login has ever been linked to), else the one the presented developer user
+//! identifier is already registered under, else a NEW identity of the pool, which a
+//! public-provider login the pool has bound to no identity yet is linked into beside the
+//! developer one ("Supplying multiple logins will create an implicit linked account … When you
 //! want to associate a new login with an existing authenticated/unauthenticated identity, you
 //! can do so by providing the existing IdentityId",
-//! `smithy_query(query="operation",operation="GetOpenIdTokenForDeveloperIdentity")`).
+//! `smithy_query(query="operation",operation="GetOpenIdTokenForDeveloperIdentity")`). It is
+//! refused where a presented login is bound to a DIFFERENT identity than that one, and where
+//! it would join a developer user to an account an identity provider's login already proves.
+//! An `IdentityId` that names an identity nothing of the request binds the call to is ignored
+//! rather than refused: the developer user identifier keeps naming the identity it is
+//! registered under, and the identity the request named is left untouched.
 //!
 //! The rows differ along what the rule generalises over: whether the request names an
 //! `IdentityId` at all and what state that identity is in (a developer identity, an identity a
@@ -216,14 +218,9 @@ async fn a_developer_login_links_into_the_identity_the_call_names_or_proves() {
             )
             .await,
     );
-    let user_pool_login = user_pool_token("a-user-pool-user");
-    let user_pool_identity = emulator
-        .identity(&pool_id, Some(json!({USER_POOL_PROVIDER: &user_pool_login})))
-        .await;
-    let facebook_login = "a-facebook-access-token";
-    let facebook_identity = emulator
-        .identity(&pool_id, Some(json!({PUBLIC_PROVIDER: facebook_login})))
-        .await;
+    // A user-pool login the pool has bound to NO identity, for the implicit link the served
+    // call below makes, and a guest identity for the rows that name one.
+    let unbound_user_pool_login = user_pool_token("a-user-pool-user");
     let guest = emulator.identity(&pool_id, None).await;
     // A SECOND guest, for the row that links a new developer login onto an unauthenticated
     // identity: an earlier row resolves AWAY from the first guest, which absorbs it into the
@@ -263,24 +260,12 @@ async fn a_developer_login_links_into_the_identity_the_call_names_or_proves() {
             vec![DEVELOPER_PROVIDER],
         ),
         (
-            "a new developer login onto the user-pool identity whose id token it presents",
-            Some(user_pool_identity.as_str()),
-            vec![
-                (USER_POOL_PROVIDER, user_pool_login.as_str()),
-                (DEVELOPER_PROVIDER, "the-user-pool-users-backend-id"),
-            ],
-            user_pool_identity.as_str(),
-            vec![USER_POOL_PROVIDER, DEVELOPER_PROVIDER],
-        ),
-        (
-            "a new developer login onto the public-provider identity whose token it presents",
-            Some(facebook_identity.as_str()),
-            vec![
-                (PUBLIC_PROVIDER, facebook_login),
-                (DEVELOPER_PROVIDER, "the-facebook-users-backend-id"),
-            ],
-            facebook_identity.as_str(),
-            vec![PUBLIC_PROVIDER, DEVELOPER_PROVIDER],
+            "a second developer user of the same backend onto the identity the first \
+             registered",
+            Some(canonical.as_str()),
+            vec![(DEVELOPER_PROVIDER, "the-backends-second-user")],
+            canonical.as_str(),
+            vec![DEVELOPER_PROVIDER],
         ),
         (
             "a new developer login onto a guest identity no login has been linked to",
@@ -360,31 +345,86 @@ async fn a_developer_login_links_into_the_identity_the_call_names_or_proves() {
             }
         }
     }
+
+    // The one way the two kinds of login come to share an identity: a public-provider login
+    // the pool has bound to NO identity is linked with the developer one into the single
+    // account this call registers that developer user in — "supplying multiple logins will
+    // create an implicit linked account" — so the identity it answers is a NEW one carrying
+    // both providers.
+    let case = "an implicit linked account: an unbound user-pool login beside a new identifier";
+    let implicit_identifier = "the-implicitly-linked-backend-id";
+    let (status, body) = emulator
+        .call(
+            "GetOpenIdTokenForDeveloperIdentity",
+            &token_request(
+                &pool_id,
+                &[
+                    (USER_POOL_PROVIDER, unbound_user_pool_login.as_str()),
+                    (DEVELOPER_PROVIDER, implicit_identifier),
+                ],
+                None,
+                None,
+            ),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: a login the pool has bound to no identity is linked, got {status} with \
+         {body}"
+    );
+    let linked_account = minted_identity(case, &body);
+    let mut owed_providers = vec![
+        USER_POOL_PROVIDER.to_string(),
+        DEVELOPER_PROVIDER.to_string(),
+    ];
+    owed_providers.sort();
+    assert_eq!(
+        described_providers(&emulator, case, &linked_account).await,
+        owed_providers,
+        "case {case:?}: expected the implicit linked account linked to {owed_providers:?}"
+    );
+    assert_eq!(
+        resolved_identity(&emulator, case, &pool_id, implicit_identifier).await,
+        linked_account,
+        "case {case:?}: the identifier resolves to the account the implicit link created"
+    );
 }
 
-/// RULE: the link is refused only where a presented login is bound to a DIFFERENT identity
-/// than the one the call is about, or where it would join a developer user to an identity
-/// another provider's login proves while presenting no login of that identity — and which
-/// refusal it is follows what the call has proven and how many of the link's sides the pool
-/// holds: a call that presents a login OF the identity it names while presenting a developer
-/// user identifier the pool has registered elsewhere asks to join two stored identities, so
-/// it is the merge conflict; a request that NAMES an identity, shows no login of it and
-/// presents a developer user identifier the pool has already registered elsewhere is the
-/// authorization failure carrying the logins-mismatch sentence; and a request naming no
-/// identity (or one the pool has registered nothing against) is the link CONFLICT it is. A
-/// refused call writes nothing.
+/// RULE: the link is refused where a presented login is bound to a DIFFERENT identity than
+/// the one the call is about, and where it would join a developer user to an account an
+/// identity provider's login already proves — whatever the call presents of that account —
+/// and which refusal it is follows how many of the link's sides the pool holds: a call that
+/// presents a login OF the identity it names while presenting a developer user identifier the
+/// pool has registered elsewhere asks to join two stored identities, so it is the merge
+/// conflict; a request that NAMES an identity, shows no login of it and presents a developer
+/// user identifier the pool has already registered elsewhere is the authorization failure
+/// carrying the logins-mismatch sentence; and a request naming no identity (or one the pool
+/// has registered nothing against) is the link CONFLICT it is. A refused call writes nothing.
 #[tokio::test]
 async fn a_login_bound_to_another_identity_is_what_refuses_the_link() {
     let emulator = Emulator::new();
     let pool_id = pool_with_developer_and_identity_providers(&emulator, "developer-conflict").await;
 
     let owner_user = "the-owners-backend-user";
+    let owner_users_token = user_pool_token("the-owners-user-pool-user");
+    // The identity the owning developer user identifier is registered under: the account one
+    // call makes of a public-provider login the pool had bound to no identity and a developer
+    // user identifier, so an identity PROVIDER's login proves it as well as the backend's own
+    // user — the side a join of two federated accounts has on it.
     let owner = minted_identity(
         "the registration of the owning developer user",
         &emulator
             .ok(
                 "GetOpenIdTokenForDeveloperIdentity",
-                &token_request(&pool_id, &[(DEVELOPER_PROVIDER, owner_user)], None, None),
+                &token_request(
+                    &pool_id,
+                    &[
+                        (USER_POOL_PROVIDER, owner_users_token.as_str()),
+                        (DEVELOPER_PROVIDER, owner_user),
+                    ],
+                    None,
+                    None,
+                ),
             )
             .await,
     );
@@ -437,6 +477,17 @@ async fn a_login_bound_to_another_identity_is_what_refuses_the_link() {
             CANNOT_LINK_LOGINS,
         ),
         (
+            "a brand-new identifier for the joined account of a provider's user and one of the \
+             backend's, presenting that account's own login",
+            Some(owner.as_str()),
+            vec![
+                (USER_POOL_PROVIDER, owner_users_token.as_str()),
+                (DEVELOPER_PROVIDER, "a-third-brand-new-backend-user"),
+            ],
+            "ResourceConflictException",
+            CANNOT_LINK_LOGINS,
+        ),
+        (
             "a new identifier for an identity a provider's login proves, presenting none of \
              its logins",
             Some(provider_proven.as_str()),
@@ -483,7 +534,10 @@ async fn a_login_bound_to_another_identity_is_what_refuses_the_link() {
         (
             "the identity the owning identifier is registered under",
             owner.as_str(),
-            vec![DEVELOPER_PROVIDER.to_string()],
+            vec![
+                USER_POOL_PROVIDER.to_string(),
+                DEVELOPER_PROVIDER.to_string(),
+            ],
         ),
     ] {
         let mut expected = linked;

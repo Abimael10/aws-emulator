@@ -21,7 +21,9 @@
 //! `ResourceConflictException`, "Thrown when a user tries to use a login which is already
 //! linked to another account" (`smithy_query(query="doc",shape="ResourceConflictException")`),
 //! named in the body's `__type` and in the `x-amzn-errortype` header, carrying "Cannot link
-//! these logins.". No sentence has a request- or state-derived part, so none names an
+//! these logins." — which is also what a call asking to join a developer user into an account
+//! an identity PROVIDER's login already proves carries, whatever login of that account it
+//! presents. No sentence has a request- or state-derived part, so none names an
 //! identity, a provider or a login, and a refused call writes nothing.
 //!
 //! The rows differ along what the rule generalises over: whether the request names an
@@ -247,6 +249,30 @@ async fn a_link_that_cannot_be_made_is_refused_as_the_conflict_it_is() {
     let other_registered =
         registered_identity(&emulator, &pool_id, "another-backend-user").await;
 
+    // An account the pool holds BOTH kinds of login for: the joined account one call makes of
+    // a public-provider login the pool had bound to no identity and a developer user
+    // identifier ("supplying multiple logins will create an implicit linked account"), so an
+    // identity provider's login proves it as well as the backend's own user.
+    let joined_user = "the-joined-accounts-backend-user";
+    let joined_users_token = user_pool_token("a-joined-account-user-pool-user");
+    let joined_account = emulator
+        .ok(
+            OPERATION,
+            &token_request(
+                &pool_id,
+                &[
+                    (USER_POOL_PROVIDER, joined_users_token.as_str()),
+                    (DEVELOPER_PROVIDER, joined_user),
+                ],
+                None,
+                None,
+            ),
+        )
+        .await["IdentityId"]
+        .as_str()
+        .expect("a served exchange answers an IdentityId")
+        .to_string();
+
     // The identities a provider's login proves, a guest identity, and one an unlink left
     // reachable through no login at all: the states the identity a request names can be in.
     let user_pool_login = user_pool_token("a-user-pool-user");
@@ -302,14 +328,16 @@ async fn a_link_that_cannot_be_made_is_refused_as_the_conflict_it_is() {
             NOT_AUTHORIZED,
             UNMATCHED_LOGINS,
         ),
-        // Both sides identified AND the identity named proven by a login the call presents:
-        // two identities the pool holds, which only a merge could join.
+        // Both sides identified, the identity named proven by a login the call presents, and
+        // the identifier registered under an account an identity provider's login proves too:
+        // two federated accounts, which only a merge could join.
         (
-            "that identity, with its own id token presented beside the registered identifier",
+            "that identity, with its own id token beside an identifier registered under \
+             another federated account",
             Some(idp_proven.as_str()),
             vec![
                 (USER_POOL_PROVIDER, user_pool_login.as_str()),
-                (DEVELOPER_PROVIDER, registered_user),
+                (DEVELOPER_PROVIDER, joined_user),
             ],
             CONFLICT,
             CANNOT_MERGE_IDENTITIES,
@@ -326,11 +354,11 @@ async fn a_link_that_cannot_be_made_is_refused_as_the_conflict_it_is() {
         ),
         (
             "an identity a public provider's access token proves, with its own token beside \
-             the registered identifier",
+             an identifier registered under another federated account",
             Some(facebook_proven.as_str()),
             vec![
                 (PUBLIC_PROVIDER, facebook_login),
-                (DEVELOPER_PROVIDER, registered_user),
+                (DEVELOPER_PROVIDER, joined_user),
             ],
             CONFLICT,
             CANNOT_MERGE_IDENTITIES,
@@ -394,12 +422,29 @@ async fn a_link_that_cannot_be_made_is_refused_as_the_conflict_it_is() {
             CONFLICT,
             CANNOT_LINK_LOGINS,
         ),
+        // The joined account of a provider's user and one of the backend's, with its own
+        // login presented: one call registers ONE of the backend's users, and that identity
+        // already stands for a provider's user and one of them, so another of the backend's
+        // users comes onto it only by a join of two identities — what cannot be done here is
+        // the link.
+        (
+            "the joined account of a provider's user and one of the backend's, with its own \
+             id token beside a new identifier",
+            Some(joined_account.as_str()),
+            vec![
+                (USER_POOL_PROVIDER, joined_users_token.as_str()),
+                (DEVELOPER_PROVIDER, "a-fourth-brand-new-backend-user"),
+            ],
+            CONFLICT,
+            CANNOT_LINK_LOGINS,
+        ),
     ];
 
     // What the pool held before the refusals, so they can be shown to have written nothing.
     let watched = [
         ("the identity the identifier is registered under", registered.as_str()),
         ("the other developer identity", other_registered.as_str()),
+        ("the joined account", joined_account.as_str()),
         ("the identity a user-pool id token proves", idp_proven.as_str()),
         ("the identity a public token proves", facebook_proven.as_str()),
         ("the guest identity", guest.as_str()),
@@ -464,32 +509,45 @@ async fn a_link_that_cannot_be_made_is_refused_as_the_conflict_it_is() {
         "the registered identifier still resolves to the identity it was registered under"
     );
 
-    // And the boundary of the rule: the same logins that cannot be linked into two accounts
-    // ARE linked where they name one, so the conflict is decided by what the pool holds and
-    // not by the shape of the request.
+    // And the boundary of the rule: a public-provider login the pool has bound to NO identity
+    // is linked with the developer one into the single account the call registers that
+    // developer user in — "supplying multiple logins will create an implicit linked account" —
+    // so the conflict is decided by what the pool HOLDS and not by the shape of the request.
+    let unbound_login = user_pool_token("a-user-pool-user-the-pool-has-not-seen");
     let served = emulator
         .ok(
             OPERATION,
             &token_request(
                 &pool_id,
                 &[
-                    (USER_POOL_PROVIDER, user_pool_login.as_str()),
-                    (DEVELOPER_PROVIDER, "the-user-pool-users-backend-id"),
+                    (USER_POOL_PROVIDER, unbound_login.as_str()),
+                    (DEVELOPER_PROVIDER, "the-implicitly-linked-backend-id"),
                 ],
-                Some(idp_proven.as_str()),
+                None,
                 None,
             ),
         )
         .await;
+    let linked_account = served["IdentityId"]
+        .as_str()
+        .expect("a served exchange answers an IdentityId")
+        .to_string();
+    let mut linked = described_logins(&emulator, &linked_account).await;
+    linked.sort();
+    let mut owed_providers = vec![
+        USER_POOL_PROVIDER.to_string(),
+        DEVELOPER_PROVIDER.to_string(),
+    ];
+    owed_providers.sort();
     assert_eq!(
-        served["IdentityId"],
-        json!(idp_proven),
-        "a call presenting a login of the identity it names links into it, got {served}"
+        linked, owed_providers,
+        "the implicit linked account carries both logins the served call linked onto it, got \
+         {linked:?}"
     );
     assert_eq!(
-        resolved_identity(&emulator, &pool_id, "the-user-pool-users-backend-id").await,
-        idp_proven,
-        "the new identifier resolves to the identity it was registered against"
+        resolved_identity(&emulator, &pool_id, "the-implicitly-linked-backend-id").await,
+        linked_account,
+        "the new identifier resolves to the account the implicit link created"
     );
 }
 
@@ -536,6 +594,26 @@ async fn the_proof_a_call_presents_decides_the_sentence_its_refusal_carries() {
     .await;
     let guest = federated_identity(&emulator, &pool_id, None).await;
     let guest_token = minted_token(&emulator, &guest).await;
+    // A developer user identifier registered under an account an identity provider's login
+    // proves too — the joined account one call makes of an unbound public-provider login and
+    // a developer user identifier — which is the link's other side where the join the call
+    // asks for is of two federated accounts.
+    let joined_user = "the-proof-joined-accounts-backend-user";
+    let joined_users_token = user_pool_token("the-proof-joined-account-user-pool-user");
+    emulator
+        .ok(
+            OPERATION,
+            &token_request(
+                &pool_id,
+                &[
+                    (USER_POOL_PROVIDER, joined_users_token.as_str()),
+                    (DEVELOPER_PROVIDER, joined_user),
+                ],
+                None,
+                None,
+            ),
+        )
+        .await;
 
     // (case, the IdentityId sent, the logins presented, the shape owed, the sentence owed)
     type ProofRow<'a> = (
@@ -557,11 +635,12 @@ async fn the_proof_a_call_presents_decides_the_sentence_its_refusal_carries() {
             CANNOT_MERGE_IDENTITIES,
         ),
         (
-            "the proof is a public provider's access token, with the registered identifier",
+            "the proof is a public provider's access token, with an identifier registered \
+             under another federated account",
             facebook_proven.as_str(),
             vec![
                 (PUBLIC_PROVIDER, facebook_login),
-                (DEVELOPER_PROVIDER, registered_user),
+                (DEVELOPER_PROVIDER, joined_user),
             ],
             CONFLICT,
             CANNOT_MERGE_IDENTITIES,

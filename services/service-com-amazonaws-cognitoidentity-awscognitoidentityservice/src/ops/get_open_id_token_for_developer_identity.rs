@@ -41,6 +41,23 @@
 //! one account from there on, so the absorbed id is left in the state a join leaves the side
 //! it absorbed in and no later call reaches it as the guest it was.
 //!
+//! One call registers ONE of the backend's users, so the identity it registers a developer
+//! user identifier in is one that can still become that user's: a new identity of the pool,
+//! an unauthenticated one, an identity only the backend's own users reach, or one only an
+//! identity provider's login proves. An identity that ALREADY stands for a provider's user
+//! AND one of the backend's users is the joined account an implicit link made of the two, and
+//! another of the backend's users comes onto it only by a JOIN of the two identities their
+//! registrations stand for — the merge that leaves one record carrying the developer provider
+//! once per user it stands for — so a fresh identifier presented for it is refused as the
+//! link it cannot make. That JOIN is what a call presenting a developer user identifier the
+//! pool has ALREADY registered elsewhere asks for, and this operation performs it where the
+//! identity that registration stands for is an account the BACKEND's own logins alone reach
+//! and the call has PROVEN the identity it names: the named identity survives, answering its
+//! own id, and the joined-away one is left as a join leaves the side it absorbed. Where that
+//! other registration is an account an identity PROVIDER's login also proves, the join is of
+//! two federated accounts, which only `MergeDeveloperIdentities` performs: the conflict
+//! between those identities.
+//!
 //! A MERGE makes the two identities it joins ONE account: the merged-away side's logins all
 //! resolve to the identity that survives it, so a login of that survivor is a login of the
 //! merged-away identity's own account
@@ -566,32 +583,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
         // * a presented login the pool has already PROVEN for another identity is no login
         //   of this account;
         // * the identity the request NAMES is one an identity PROVIDER's login already
-        //   proves, the call presents NO login of it, and the developer user identifier
-        //   presented is not one already registered against it — so linking it would join a
-        //   developer user to an account that is already that provider's user, on a call that
-        //   has shown no login of that account. A call that DOES present a login of it has
-        //   proven the account it links into, which is the documented way to "associate a new
-        //   login with an existing authenticated/unauthenticated identity"; an
-        //   UNAUTHENTICATED (guest) identity no login proves is the case the member exists
-        //   for, another developer user identifier of a developer identity is one more login
-        //   of the same backend's user, and a developer login the pool has already registered
-        //   against the named identity is that identity's own, so none of those is refused
-        //   here.
+        //   proves, and the developer user identifier presented is not one already registered
+        //   against it — so the call would JOIN a developer user to an account that is already
+        //   that provider's user, which this operation does not do: it registers a developer
+        //   user identifier in an identity no provider's login proves. A login of the named
+        //   identity presented beside the developer one shows the caller may act on that
+        //   identity, which is not the same as the two users being one account, so it does not
+        //   make the join one this call can have. An UNAUTHENTICATED (guest) identity no login
+        //   proves is the case the member exists for, another developer user identifier of a
+        //   developer identity is one more login of the same backend's user, and a developer
+        //   login the pool has already registered against the named identity is that
+        //   identity's own re-login, so none of those is refused here.
         let proven = store.identities_proven_by(&input.identity_pool_id, &input.logins, now);
-        let proves_another_account = proven
-            .iter()
-            .any(|named| Some(named) != resolved.as_ref());
         // Whether one of the presented logins is a login OF the identity the request names —
         // the same question every login-authorized call of this service is authorized by
         // (`logins_name_identity`), answered from the identities just resolved.
         let proves_the_named_identity = named_identity
             .as_ref()
             .is_some_and(|named| proven.contains(named));
+        // The identity the presented developer user identifier is already registered under,
+        // JOINED into the identity this call has proven. An identity the pool reaches through
+        // the BACKEND's own logins alone stands for that backend's users and for no provider's
+        // user, so a call that names the identity it registers the user in and PROVES it — one
+        // of the logins it presents is a login of that identity — makes the two one account:
+        // the merge this operation performs implicitly, leaving the surviving record carrying
+        // the developer provider once per user it now stands for and the joined-away one
+        // reached by no login at all
+        // ([`crate::state::ComAmazonawsCognitoidentityAwscognitoidentityserviceState::merge_identity_into`]).
+        // An account an identity PROVIDER's login ALSO proves is that provider's user, and
+        // joining two such accounts is what `MergeDeveloperIdentities` is for, so that one is
+        // refused below instead.
+        let joined_developer_identity = match (named_identity.as_deref(), registered_to.as_deref())
+        {
+            (Some(named), Some(registered))
+                if registered != named
+                    && resolved.as_deref() == Some(named)
+                    && proves_the_named_identity =>
+            {
+                let logins = store.pool_logins_of_identity(&input.identity_pool_id, registered);
+                (!logins.is_empty()
+                    && logins
+                        .iter()
+                        .all(|(provider, _)| *provider == developer_provider))
+                .then(|| registered.to_string())
+            }
+            _ => None,
+        };
+        let proves_another_account = proven.iter().any(|named| {
+            Some(named) != resolved.as_ref()
+                && Some(named.as_str()) != joined_developer_identity.as_deref()
+        });
         let would_join_a_proven_identity = named_identity.as_deref().is_some_and(|named| {
             named_identity_is_idp_proven
                 && !proves_the_named_identity
                 && registered_to.as_deref() != Some(named)
         });
+        // Whether the call would register a developer user identifier the pool has registered
+        // against NOTHING in an identity that ALREADY stands for a provider's user AND one of
+        // the backend's users at once — the account an implicit link makes of the two
+        // ("supplying multiple logins will create an implicit linked account"). One call
+        // registers ONE of the backend's users, and such an identity is already the joined
+        // account of a provider's user and one of them, so another of the backend's users
+        // comes onto it only by a JOIN of the two identities their registrations stand for —
+        // the merge that leaves one record carrying the developer provider once per user it
+        // stands for. The link itself is therefore not one this call can make. An identity
+        // only the backend's own users reach, one only an identity provider's login proves,
+        // an unauthenticated one and a new identity of the pool each still take the
+        // registration, so none of them is refused here.
+        let adds_to_a_joined_account = registered_to.is_none()
+            && resolved.as_deref().is_some_and(|identity_id| {
+                let logins =
+                    store.pool_logins_of_identity(&input.identity_pool_id, identity_id);
+                logins
+                    .iter()
+                    .any(|(provider, _)| *provider == developer_provider)
+                    && logins
+                        .iter()
+                        .any(|(provider, _)| *provider != developer_provider)
+            });
 
         // An identity reached through NO login of its own — a DISABLED one, which an unlink
         // or a merge left linked to nothing ("removing the last linked login will make this
@@ -616,7 +685,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
                 .into(),
             );
         }
-        if proves_another_account || would_join_a_proven_identity {
+        if proves_another_account || would_join_a_proven_identity || adds_to_a_joined_account {
             // Which refusal this is follows WHOSE ownership the request got wrong, and how
             // many of the link's two sides are identities the pool already HOLDS.
             //
@@ -648,7 +717,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
             // user tries to use a login which is already linked to another account") — a
             // condition of what the pool HOLDS rather than of what the caller may do, so no
             // login the caller could add would clear it
-            // ([`crate::state::CANNOT_LINK_LOGINS_MESSAGE`], also fixed text).
+            // ([`crate::state::CANNOT_LINK_LOGINS_MESSAGE`], also fixed text). A fresh
+            // developer user identifier the call would register in the joined account of a
+            // provider's user and one of the backend's users is the same fact about the pool:
+            // that identity already stands for both, and only a JOIN of two identities puts
+            // another of the backend's users on it.
             if registered_to.is_some() && proves_the_named_identity {
                 return Err(
                     GetOpenIdTokenForDeveloperIdentityErrorModeled::ResourceConflictException(
@@ -761,6 +834,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
                 identity_id
             }
         };
+
+        // The identity the presented developer user identifier was registered in, where this
+        // call JOINS it into the identity it proved: the two are one account from here on,
+        // reached through the identity this call answers, so the joined-away one is left in
+        // the state that join leaves the side it absorbed in — a DISABLED identity whose
+        // record stays stored, its developer users resolving to the surviving identity, which
+        // carries the developer provider once per user it now stands for. Joined BEFORE the
+        // presented logins are linked, so the user this call presents is counted on the
+        // survivor once: the join brings that registration over, and linking the login again
+        // adds a provider the identity now carries no second time.
+        if let Some(joined) = &joined_developer_identity {
+            store.merge_identity_into(&input.identity_pool_id, joined, &identity_id, now);
+        }
 
         // Every presented login now resolves to this identity, however it was reached —
         // "supplying multiple logins will create an implicit linked account".
