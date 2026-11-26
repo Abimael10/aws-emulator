@@ -21,7 +21,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{now_ms, without_sdk_envelope, Logs};
+use crate::harness::{now_ms, Logs};
 
 /// The operation under test.
 const START: &str = "StartQuery";
@@ -72,11 +72,12 @@ async fn refused(
         code, MALFORMED,
         "case {case:?}: expected {MALFORMED}, got {code} with {body}"
     );
-    let said = body["message"]
+    // The compile failure's own text is the WHOLE message: nothing of the SDK's exception
+    // rendering is serialized after it.
+    let sentence = body["message"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: a refusal carries a message, got {body}"))
         .to_string();
-    let sentence = without_sdk_envelope(case, &said, 400, MALFORMED);
     let location = &body["queryCompileError"]["location"];
     (
         sentence,

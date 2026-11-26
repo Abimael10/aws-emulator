@@ -273,6 +273,8 @@ fn seed(logs: &Logs, name: &str, age_ms: i64, pin_provisioning: bool) -> i64 {
         &seed_config(),
         created,
         seq,
+        // Seeded straight into the store, so no request's own endpoint stands behind it.
+        None,
     );
     if pin_provisioning {
         record.status_due_ms = Some(now_ms() + 60 * 60 * 1_000);

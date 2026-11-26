@@ -12,7 +12,10 @@
 //!
 //! A template covers delivering ONE log type of ONE kind of resource to ONE kind of
 //! destination, so the catalogue holds one template per (log type, resource type, delivery
-//! destination type) triple a sender supports. Two different things decide what it carries:
+//! destination type) triple a sender supports — and only for the destination types the SENDER
+//! delivers that log type to, which it publishes per log type
+//! ([`ConfigurationTemplateLogType::delivery_destination_types`]). Two different things decide
+//! what it carries:
 //!
 //! * The SENDER decides the record: `allowedFields` is the schema of the records that log
 //!   type carries, in the order a caller restates them in `recordFields`, with the fields a
@@ -52,8 +55,9 @@
 //! each row's log types in turn — in the order the SENDER publishes them, which is published
 //! data like the rows themselves rather than an ordering of these strings — and for each log
 //! type one template per delivery destination
-//! type in the order the model's `DeliveryDestinationType` enum DECLARES its values
-//! ([`DELIVERY_DESTINATION_TYPE_ORDER`]), the object destination first. The order is published
+//! type that log type is delivered to, in the order the model's `DeliveryDestinationType` enum
+//! DECLARES its values ([`DELIVERY_DESTINATION_TYPE_ORDER`]), the object destination first
+//! where the sender writes objects at all. The order is published
 //! data rather than anything derived from a template's contents, and it is a total order over
 //! a catalogue nothing mutates, which is what makes `DescribeConfigurationTemplates`'s
 //! pagination cursor resume at a position that does not move.
@@ -802,6 +806,18 @@ pub struct ConfigurationTemplateLogType {
     /// offer is published per log type: a sender that publishes it offers every rendering its
     /// object destination can store, and one that does not offers the rest of them.
     pub columnar_objects: bool,
+    /// The delivery destination types the catalogue publishes a template of THIS log type for,
+    /// in the order the model's `DeliveryDestinationType` enum declares them
+    /// ([`DELIVERY_DESTINATION_TYPE_ORDER`]).
+    ///
+    /// A template carries "the valid and default values" for delivering one log type to one
+    /// kind of destination, so one exists only where the SENDING SERVICE delivers that log type
+    /// to that kind of destination at all: a sender that delivers a log type to log groups
+    /// alone publishes that one template ([`LOG_GROUP_DELIVERY_ONLY`]), and a caller
+    /// enumerating where it may deliver is offered no destination the sender cannot write to.
+    /// Which destinations those are is decided by the sending service, so it is published per
+    /// log type rather than derived here.
+    pub delivery_destination_types: &'static [&'static str],
     /// Whether this log type's record is the SENDING SERVICE'S OWN DOCUMENT, delivered as the
     /// one field that carries it rather than as a row of named fields.
     ///
@@ -842,18 +858,18 @@ impl ConfigurationTemplateSource {
     /// The delivery destination types the catalogue publishes a template of `log_type` for, in
     /// the order the model's `DeliveryDestinationType` enum declares them
     /// ([`DELIVERY_DESTINATION_TYPE_ORDER`]): the kinds of destination that RECEIVE the records
-    /// a delivery carries.
+    /// a delivery of THAT log type carries
+    /// ([`ConfigurationTemplateLogType::delivery_destination_types`]).
     ///
     /// The X-Ray trace destination ([`TRACE_DELIVERY_DESTINATION_TYPE`], the kind
     /// `PutDeliveryDestination` documents as needing no destination configuration) receives
     /// spans rather than a record of fields, and the catalogue publishes no template for it:
     /// `allowedFields`, `allowedOutputFormats` and the rest of a template are the valid and
     /// default values of a RECORD delivery, so there is nothing published to configure a trace
-    /// delivery with. Every log type — traces included — is published for each of the
-    /// destination types that receive records.
-    pub fn delivery_destination_types(log_type: &str) -> Vec<String> {
-        let _ = log_type;
-        DELIVERY_DESTINATION_TYPE_ORDER
+    /// delivery with.
+    pub fn delivery_destination_types(log_type: &ConfigurationTemplateLogType) -> Vec<String> {
+        log_type
+            .delivery_destination_types
             .iter()
             .map(|destination_type| (*destination_type).to_string())
             .collect()
@@ -866,7 +882,7 @@ impl ConfigurationTemplateSource {
         self.log_types
             .iter()
             .flat_map(|log_type| {
-                Self::delivery_destination_types(log_type.log_type)
+                Self::delivery_destination_types(log_type)
                     .into_iter()
                     .map(|destination_type| self.template(log_type, &destination_type))
                     .collect::<Vec<_>>()
@@ -1013,6 +1029,7 @@ const fn log_type(
         fields_not_delivered_by_default: FIELDS_NOT_DELIVERED_BY_DEFAULT,
         columnar_objects: true,
         document_record: false,
+        delivery_destination_types: &DELIVERY_DESTINATION_TYPE_ORDER,
     }
 }
 
@@ -1029,6 +1046,25 @@ const fn log_type_of_document_records(
         fields_not_delivered_by_default: FIELDS_NOT_DELIVERED_BY_DEFAULT,
         columnar_objects: true,
         document_record: true,
+        delivery_destination_types: &DELIVERY_DESTINATION_TYPE_ORDER,
+    }
+}
+
+/// `base` published for the delivery destination types `delivery_destination_types` alone —
+/// for a sender that delivers that log type to fewer kinds of destination than the catalogue's
+/// default set ([`ConfigurationTemplateLogType::delivery_destination_types`]).
+const fn log_type_delivered_to(
+    base: ConfigurationTemplateLogType,
+    delivery_destination_types: &'static [&'static str],
+) -> ConfigurationTemplateLogType {
+    ConfigurationTemplateLogType {
+        log_type: base.log_type,
+        fields: base.fields,
+        s3_tables_integration: base.s3_tables_integration,
+        fields_not_delivered_by_default: base.fields_not_delivered_by_default,
+        columnar_objects: base.columnar_objects,
+        document_record: base.document_record,
+        delivery_destination_types,
     }
 }
 
@@ -1046,6 +1082,7 @@ const fn log_type_with_s3_tables(
         fields_not_delivered_by_default: FIELDS_NOT_DELIVERED_BY_DEFAULT,
         columnar_objects: true,
         document_record: false,
+        delivery_destination_types: &DELIVERY_DESTINATION_TYPE_ORDER,
     }
 }
 
@@ -1095,6 +1132,12 @@ const DELIVERY_DESTINATION_TYPE_ORDER: [&str; 3] = [
     CWL_DELIVERY_DESTINATION_TYPE,
     STREAM_DELIVERY_DESTINATION_TYPE,
 ];
+
+/// The destination types a log type its sender delivers to CloudWatch Logs ALONE publishes a
+/// template for: the log group that stores each delivered record, and neither of the two
+/// destinations that sender does not write to
+/// ([`ConfigurationTemplateLogType::delivery_destination_types`]).
+const LOG_GROUP_DELIVERY_ONLY: [&str; 1] = [CWL_DELIVERY_DESTINATION_TYPE];
 
 /// The resources that can send vended logs, the log types each of them sends and the record
 /// schema of each — the catalogue `DescribeConfigurationTemplates` reports templates from.
@@ -1300,6 +1343,7 @@ pub const CONFIGURATION_TEMPLATE_SOURCES: &[ConfigurationTemplateSource] = &[
             fields_not_delivered_by_default: CODEWHISPERER_FIELDS_NOT_DELIVERED_BY_DEFAULT,
             columnar_objects: false,
             document_record: false,
+            delivery_destination_types: &DELIVERY_DESTINATION_TYPE_ORDER,
         }],
     },
     ConfigurationTemplateSource {
@@ -1446,6 +1490,11 @@ pub const CONFIGURATION_TEMPLATE_SOURCES: &[ConfigurationTemplateSource] = &[
     // either one finds the templates that apply to it. The newer hub resource is published
     // FIRST, so a caller that takes the first SECURITY_FINDING_LOGS template of the service
     // binds its delivery to the hub resource the service vends findings from today.
+    //
+    // Security Hub delivers its findings to a LOG GROUP and to neither of the other two kinds
+    // of destination ([`LOG_GROUP_DELIVERY_ONLY`]), so each hub resource publishes that one
+    // template: there is no object layout and no S3 suffix-path contract to publish for a
+    // destination this sender never writes objects to.
     ConfigurationTemplateSource {
         service: "securityhub",
         resource_type: "hubv2",
@@ -1453,9 +1502,9 @@ pub const CONFIGURATION_TEMPLATE_SOURCES: &[ConfigurationTemplateSource] = &[
         // Security Hub publishes no object prefix of its own: a delivery of its findings
         // writes under the prefix its destination configures.
         s3_suffix_path: NO_SUFFIX_PATH,
-        log_types: &[log_type_of_document_records(
-            "SECURITY_FINDING_LOGS",
-            SECURITY_FINDING_FIELDS,
+        log_types: &[log_type_delivered_to(
+            log_type_of_document_records("SECURITY_FINDING_LOGS", SECURITY_FINDING_FIELDS),
+            &LOG_GROUP_DELIVERY_ONLY,
         )],
     },
     ConfigurationTemplateSource {
@@ -1463,9 +1512,9 @@ pub const CONFIGURATION_TEMPLATE_SOURCES: &[ConfigurationTemplateSource] = &[
         resource_type: "hub",
         suffix_path_fields: RESOURCE_ID_SUFFIX_PATH_FIELDS,
         s3_suffix_path: NO_SUFFIX_PATH,
-        log_types: &[log_type_of_document_records(
-            "SECURITY_FINDING_LOGS",
-            SECURITY_FINDING_FIELDS,
+        log_types: &[log_type_delivered_to(
+            log_type_of_document_records("SECURITY_FINDING_LOGS", SECURITY_FINDING_FIELDS),
+            &LOG_GROUP_DELIVERY_ONLY,
         )],
     },
     ConfigurationTemplateSource {

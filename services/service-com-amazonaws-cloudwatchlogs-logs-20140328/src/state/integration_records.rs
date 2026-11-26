@@ -315,6 +315,15 @@ pub struct IntegrationRecord {
     /// ([`IntegrationRecord::materialize_due_transitions`]). `None` once it is in a status
     /// the clock owes nothing after.
     pub status_due_ms: Option<i64>,
+    /// The `host[:port]` this emulator answers on, as the create that minted this integration
+    /// resolved it ([`emulator_authority`]), and `None` for an emulator that is served on no
+    /// address of its own.
+    ///
+    /// The two endpoints a read reports are addresses a CLIENT DIALS, so they have to lead
+    /// back to this process ([`opensearch_resource_endpoint`]). The address is resolved ONCE,
+    /// by the create, and stored: an endpoint a client keeps does not move between two reads
+    /// of one integration.
+    pub announced_authority: Option<String>,
 }
 
 impl IntegrationRecord {
@@ -329,6 +338,7 @@ impl IntegrationRecord {
         config: &crate::ops::types::OpenSearchResourceConfig,
         created_at_ms: i64,
         creation_seq: u64,
+        announced_authority: Option<String>,
     ) -> Self {
         Self {
             name: name.to_string(),
@@ -343,6 +353,7 @@ impl IntegrationRecord {
             created_at_ms,
             creation_seq,
             status_due_ms: Some(created_at_ms.saturating_add(INTEGRATION_PROVISIONING_DELAY_MS)),
+            announced_authority,
         }
     }
 
@@ -444,9 +455,9 @@ impl IntegrationRecord {
     /// ([`opensearch_resource_endpoint`]).
     pub fn collection_endpoint(&self) -> String {
         opensearch_resource_endpoint(
-            &self.collection_name(),
-            &self.region,
-            OPENSEARCH_SERVERLESS_SERVICE,
+            COLLECTION_RESOURCE,
+            &self.published_resource_host(COLLECTION_RESOURCE),
+            self.announced_authority.as_deref(),
         )
     }
 
@@ -460,6 +471,31 @@ impl IntegrationRecord {
     /// integration's own for one the setup created ([`Self::application_region`]).
     pub fn application_endpoint(&self) -> String {
         opensearch_resource_endpoint(
+            APPLICATION_RESOURCE,
+            &self.published_resource_host(APPLICATION_RESOURCE),
+            self.announced_authority.as_deref(),
+        )
+    }
+
+    /// The host AWS itself publishes the resource of kind `kind` of this integration at: the
+    /// resource's own name in its service's regional endpoint zone
+    /// ([`aws_resource_endpoint_host`]).
+    ///
+    /// It is what the announced endpoint carries and what the plane serving that endpoint reads
+    /// a request's resource back from ([`integration_resource_path`]), so one derivation names
+    /// the resource on both sides. A kind this family publishes no endpoint for names the
+    /// APPLICATION's host, because the application is the resource an integration is addressed
+    /// through — but no caller reaches that branch: the only kinds addressed are the two a read
+    /// reports ([`addressed_integration_resource`]).
+    pub fn published_resource_host(&self, kind: &str) -> String {
+        if kind == COLLECTION_RESOURCE {
+            return aws_resource_endpoint_host(
+                &self.collection_name(),
+                &self.region,
+                OPENSEARCH_SERVERLESS_SERVICE,
+            );
+        }
+        aws_resource_endpoint_host(
             &self.application_id(),
             self.application_region(),
             OPENSEARCH_SERVICE,
@@ -492,7 +528,7 @@ impl IntegrationRecord {
     /// a resource whose status says everything there is to say about it has none to add — so
     /// the member is reported EMPTY rather than omitted, which is what the service answers
     /// for every resource of an integration it set up.
-    pub(super) fn resource_status(&self) -> crate::ops::types::OpenSearchResourceStatus {
+    pub fn resource_status(&self) -> crate::ops::types::OpenSearchResourceStatus {
         let status = match self.status.as_str() {
             INTEGRATION_STATUS_ACTIVE => OPENSEARCH_RESOURCE_STATUS_ACTIVE,
             INTEGRATION_STATUS_PROVISIONING => OPENSEARCH_RESOURCE_STATUS_NOT_FOUND,
@@ -559,29 +595,155 @@ impl IntegrationRecord {
     }
 }
 
-/// Where a client reaches the OpenSearch Service resource named `resource` that an
-/// integration's setup created in `region`, for the AWS service whose endpoint zone owns it
-/// (`service` is an ARN service segment: [`OPENSEARCH_SERVICE`] for the application that hosts
-/// the dashboards, [`OPENSEARCH_SERVERLESS_SERVICE`] for the collection they query).
+/// Where a client reaches the OpenSearch Service resource of kind `kind` that an integration's
+/// setup created, published at `published_host` ([`aws_resource_endpoint_host`]).
+///
+/// An endpoint is not a label a caller reads back: it is an address the caller then DIALS —
+/// "the documented next step after the integration is created" — so it has to lead back to
+/// THIS process. The address is therefore the `host[:port]` this emulator answers on
+/// (`announced_authority`, resolved by the create through [`emulator_authority`]) followed by
+/// the path this service SERVES that resource at ([`integration_resource_path`]), which is
+/// where a client on the machine this emulator runs on can carry what it cannot carry in the
+/// host.
 ///
 /// THE FORM is the one both endpoint members' `@pattern` admits — `^https://[\.\-_/#:A-Za-z0-9]+\.com$`
 /// (`smithy_query(query="shape",shape="OpenSearchCollectionEndpoint")`), which is also what
-/// `OpenSearchApplicationEndpoint` carries — so the resource's identity goes in the HOST: the
-/// expression ends the whole value at the endpoint zone AWS publishes its own endpoints in
-/// ([`aws_endpoint_zone`]), leaving no path to carry it and admitting no address of a listener
-/// of this process. The host is therefore the resource's own name as the first label of its
-/// service's regional endpoint host, which is the form AWS publishes these two resources at
-/// and the address a client that resolves AWS's own names reaches them by.
+/// `OpenSearchApplicationEndpoint` carries: the expression ends the whole value in the endpoint
+/// zone AWS publishes its own endpoints in ([`aws_endpoint_zone`]), so the resource's published
+/// host stands at the END of the value — as the path segment naming the resource when there is
+/// an address of this emulator's to put in front of it, and as the host itself for an emulator
+/// with no address the member can carry ([`endpoint_member_admits`]), which has none to
+/// announce.
+fn opensearch_resource_endpoint(
+    kind: &str,
+    published_host: &str,
+    announced_authority: Option<&str>,
+) -> String {
+    match announced_authority.filter(|authority| endpoint_member_admits(authority)) {
+        Some(authority) => format!(
+            "https://{authority}{}",
+            integration_resource_path(kind, published_host)
+        ),
+        None => format!("https://{published_host}"),
+    }
+}
+
+/// The path segment naming THIS service's integration-resource plane, under the reserved
+/// namespace every plane this emulator serves on its own endpoint sits beneath
+/// (`::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE`): this service's own
+/// name and the service whose resources it addresses, so neither OpenSearch Service's own
+/// application plane nor OpenSearch Serverless's own collection plane can claim a path of this
+/// one, however a resource is named.
+pub const INTEGRATION_PLANE_SEGMENT: &str = "logs-opensearch";
+
+/// The two resources of an integration a client ADDRESSES, spelled as the members a read
+/// reports them under (`OpenSearchIntegrationDetails$application` and `$collection`).
+pub const APPLICATION_RESOURCE: &str = "application";
+/// See [`APPLICATION_RESOURCE`].
+pub const COLLECTION_RESOURCE: &str = "collection";
+
+/// The path the resource of kind `kind` published at `published_host` is SERVED at on this
+/// emulator's own endpoint: `/_aws/logs-opensearch/<kind>/<published host>`.
+///
+/// Shared by the endpoint a read announces ([`opensearch_resource_endpoint`]) and by the plane
+/// that answers it ([`crate::service::integration_endpoints`]), so the address this service
+/// publishes is the address it serves. The published host is ONE path segment: it is a host
+/// name, which carries no `/`.
+pub fn integration_resource_path(kind: &str, published_host: &str) -> String {
+    format!(
+        "/{}/{INTEGRATION_PLANE_SEGMENT}/{kind}/{published_host}",
+        ::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE
+    )
+}
+
+/// What an announced path ADDRESSES: the kind of resource, the published host naming it, and
+/// the route beneath that resource's endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressedIntegrationResource {
+    /// [`APPLICATION_RESOURCE`] or [`COLLECTION_RESOURCE`].
+    pub kind: String,
+    /// The host the resource is published at, which is the segment that names it.
+    pub published_host: String,
+    /// The route the request asked for beneath the endpoint; `/` for the endpoint itself.
+    pub route: String,
+}
+
+/// The resource `path` addresses, and `None` for a path that is no endpoint this service
+/// announces.
+///
+/// The inverse of [`integration_resource_path`], read through the shared addressing module, so
+/// a URL this service published resolves back to the resource behind it. Only the two kinds a
+/// read reports an endpoint for are addressed here; a path naming anything else is this
+/// plane's for no resource at all.
+pub fn addressed_integration_resource(path: &str) -> Option<AddressedIntegrationResource> {
+    use ::service_common::data_plane_addressing::{first_segment, EMULATOR_PATH_NAMESPACE};
+    let (namespace, rest) = first_segment(path)?;
+    if namespace != EMULATOR_PATH_NAMESPACE {
+        return None;
+    }
+    let (plane, rest) = first_segment(rest)?;
+    if plane != INTEGRATION_PLANE_SEGMENT {
+        return None;
+    }
+    let (kind, rest) = first_segment(rest)?;
+    if kind != APPLICATION_RESOURCE && kind != COLLECTION_RESOURCE {
+        return None;
+    }
+    let (published_host, route) = first_segment(rest)?;
+    (!published_host.is_empty()).then(|| AddressedIntegrationResource {
+        kind: kind.to_string(),
+        published_host: published_host.to_string(),
+        route: route.to_string(),
+    })
+}
+
+/// Whether `authority` is a value these endpoint members can CARRY: every character of it is one
+/// their `@pattern` admits (`[\.\-_/#:A-Za-z0-9]`).
+///
+/// A bracketed IPv6 authority is not — `[` and `]` are outside that class — so an emulator
+/// reached at one has no address it can announce HERE, and the resource's published host stands
+/// instead ([`opensearch_resource_endpoint`]), exactly as it does for an emulator served on no
+/// address at all. A value outside the member's own constraint is not an address a client could
+/// use either: a validating SDK rejects it before it ever dials.
+fn endpoint_member_admits(authority: &str) -> bool {
+    !authority.is_empty()
+        && authority
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || ".-_/#:".contains(character))
+}
+
+/// The host AWS itself publishes the resource `resource` of `service` at in `region`: the
+/// resource's own name as the first label of its service's regional endpoint host. It names
+/// the resource and the Region the resource lives in, and it is what the announced endpoint
+/// carries ([`opensearch_resource_endpoint`]).
 ///
 /// The name is folded to ONE DNS label through the shared reading of that
 /// ([`::service_common::data_plane_addressing::dns_label`]), because an integration's name may
 /// carry characters a host label does not (`IntegrationName`'s pattern admits `/` and `#`) and
 /// a resource name is what distinguishes one integration's endpoints from another's.
-fn opensearch_resource_endpoint(resource: &str, region: &str, service: &str) -> String {
+fn aws_resource_endpoint_host(resource: &str, region: &str, service: &str) -> String {
     format!(
-        "https://{}.{region}.{service}.{}",
+        "{}.{region}.{service}.{}",
         ::service_common::data_plane_addressing::dns_label(resource),
         aws_endpoint_zone()
+    )
+}
+
+/// The address this emulator answers on for the client that made this request: the emulator's
+/// own endpoint the request reached, else the address this process is served on, and `None` for
+/// a request that addressed one of AWS's own hosts on an emulator served on no address at all
+/// — which has none of its own to announce.
+///
+/// The tree's one reading of that question
+/// (`::service_common::data_plane_addressing::reached_emulator_endpoint` /
+/// `served_endpoint_authority`), so what this service announces is the address every other
+/// service announces.
+pub fn emulator_authority(
+    parts: &::http::request::Parts,
+    served_base: &str,
+) -> Option<String> {
+    ::service_common::data_plane_addressing::reached_emulator_endpoint_of_parts(parts).or_else(
+        || ::service_common::data_plane_addressing::served_endpoint_authority(served_base),
     )
 }
 

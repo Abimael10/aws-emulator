@@ -88,23 +88,13 @@ struct Pairing {
     destination_type: &'static str,
 }
 
-/// Five pairings, each with a different sending service, log type, resource kind and kind of
+/// Four pairings, each with a different sending service, log type, resource kind and kind of
 /// destination. Each resource ARN is of the form its own service documents, and each log type
 /// is one that service sends (the `logType` member's own catalogue,
-/// `smithy_query(query="doc",shape="PutDeliverySourceRequest",member="logType")`).
+/// `smithy_query(query="doc",shape="PutDeliverySourceRequest",member="logType")`), paired with
+/// a kind of destination the catalogue publishes a template of that log type for.
 fn pairings() -> Vec<Pairing> {
     vec![
-        Pairing {
-            label: "Security Hub findings from a hubv2 resource to an S3 bucket",
-            source: "securityhub-findings-v2",
-            resource_arn: format!("arn:aws:securityhub:{REGION}:123456789012:hubv2/*"),
-            log_type: "SECURITY_FINDING_LOGS",
-            service: "securityhub",
-            resource_type: "hubv2",
-            destination: "findings-bucket",
-            destination_resource: "arn:aws:s3:::vended-logs-findings".to_string(),
-            destination_type: "S3",
-        },
         Pairing {
             label: "Security Hub findings from a hub resource to a log group",
             source: "securityhub-findings",
@@ -658,10 +648,10 @@ async fn an_unusable_next_token_is_refused_with_the_delivery_wording() {
     let second = Pairing {
         label: "a second pair, so one page leaves another delivery to come",
         source: "second-source",
-        resource_arn: format!("arn:aws:securityhub:{REGION}:123456789012:hub/*"),
+        resource_arn: format!("arn:aws:securityhub:{REGION}:123456789012:hubv2/*"),
         log_type: "SECURITY_FINDING_LOGS",
         service: "securityhub",
-        resource_type: "hub",
+        resource_type: "hubv2",
         destination: "second-bucket",
         destination_resource: "arn:aws:s3:::vended-logs-second".to_string(),
         destination_type: "S3",

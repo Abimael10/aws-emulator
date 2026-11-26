@@ -24,9 +24,9 @@
 //!   diagnostic names; where the pipeline did open with a command, the diagnostic names the
 //!   WORD that is no command.
 //!
-//! Every message is stated inside the SDK error envelope this service's refusals carry, which
-//! reports the status and the code of the response and this response's own request id — read
-//! off each message here, never stated by a case.
+//! Every message is the COMPILER's own text and nothing else: the clause an AWS SDK writes
+//! when it renders an exception is the client's, not this service's, and is absent from the
+//! serialized body.
 //!
 //! Every case drives the service the way a client does — `POST /` with `X-Amz-Target:
 //! Logs_20140328.<Operation>` through the router that mounts it — so a response a handler does
@@ -37,7 +37,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{now_ms, without_sdk_envelope, Logs};
+use crate::harness::{now_ms, Logs};
 
 /// The operations under test.
 const START: &str = "StartQuery";
@@ -101,7 +101,8 @@ async fn refused_with(logs: &Logs, case: &str, group: &str, window: (i64, i64), 
         .unwrap_or_else(|| panic!("case {case}: a refusal carries a message, got {body}"))
         .to_string();
     (
-        without_sdk_envelope(case, &message, REFUSAL_STATUS, MALFORMED),
+        // The compile failure's text is the WHOLE message a client reads.
+        message,
         body,
     )
 }

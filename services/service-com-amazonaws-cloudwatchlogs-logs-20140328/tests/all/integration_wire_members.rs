@@ -100,6 +100,9 @@ fn seed(logs: &Logs, name: &str, age_ms: i64) {
         },
         now_ms() - age_ms,
         seq,
+        // Seeded straight into the store rather than through a call, so there is no request
+        // whose own endpoint the announced addresses could be minted on.
+        None,
     );
     store.integrations.insert(name.to_string(), record);
 }

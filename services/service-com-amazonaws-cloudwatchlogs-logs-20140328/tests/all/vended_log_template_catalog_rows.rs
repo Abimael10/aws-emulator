@@ -7,13 +7,13 @@
 //!
 //! The rules under test:
 //!
-//! * one log type contributes one template per delivery destination type that RECEIVES A
-//!   RECORD, published in the order the model's `DeliveryDestinationType` enum DECLARES its
-//!   values (`smithy_query(query="shape",shape="DeliveryDestinationType")` answers
+//! * one log type contributes one template per delivery destination type ITS SENDER DELIVERS
+//!   IT TO — a non-empty subset of the destination types that RECEIVE A RECORD — published in
+//!   the order the model's `DeliveryDestinationType` enum DECLARES its values
+//!   (`smithy_query(query="shape",shape="DeliveryDestinationType")` answers
 //!   `[S3, CWL, FH, XRAY]`), so a slice opens with the template for the destination that writes
-//!   objects; the X-Ray trace destination is published NO template, because a template states
-//!   the valid and default values of a record delivery, while every log type — traces included —
-//!   is published for each destination that receives records;
+//!   objects wherever the sender writes objects at all; the X-Ray trace destination is published
+//!   NO template, because a template states the valid and default values of a record delivery;
 //! * `allowedFields` is "the allowed fields that a caller can use in the recordFields
 //!   parameter" and `defaultDeliveryConfigValues.recordFields` is "the default record fields
 //!   that will be delivered when a list of record fields is not provided", so the default list
@@ -68,6 +68,11 @@ const TRACE_LOG_TYPE: &str = "TRACES";
 /// destination, in the order the enum declares them — the destination types the catalogue
 /// publishes a template for.
 const RECORD_DESTINATION_TYPES: [&str; 3] = ["S3", "CWL", "FH"];
+
+/// The destination types a log type delivered to CloudWatch Logs ALONE is published for: the
+/// log group that stores each delivered record, and neither of the two its sender does not
+/// write to.
+const LOG_GROUP_DELIVERY_ONLY: [&str; 1] = ["CWL"];
 
 /// The fields a template ALLOWS that a delivery created without a record field list does not
 /// carry: the record's own ingestion timestamp and the bare id of the sending resource that the
@@ -146,7 +151,7 @@ async fn a_log_types_templates_are_published_in_the_models_destination_type_orde
     let logs = Logs::new();
 
     // (service, log type, resource type, the destination types it is published for)
-    let cases: [(&str, &str, &str, &[&str]); 8] = [
+    let cases: [(&str, &str, &str, &[&str]); 10] = [
         (
             "apigateway",
             "EXECUTION_LOGS",
@@ -192,6 +197,20 @@ async fn a_log_types_templates_are_published_in_the_models_destination_type_orde
             "knowledge-base",
             &RECORD_DESTINATION_TYPES,
         ),
+        // A sender that delivers its log type to a LOG GROUP alone: one template, and no object
+        // or stream template beside it.
+        (
+            "securityhub",
+            "SECURITY_FINDING_LOGS",
+            "hubv2",
+            &LOG_GROUP_DELIVERY_ONLY,
+        ),
+        (
+            "securityhub",
+            "SECURITY_FINDING_LOGS",
+            "hub",
+            &LOG_GROUP_DELIVERY_ONLY,
+        ),
     ];
 
     for (service, log_type, resource_type, expected) in cases {
@@ -230,37 +249,44 @@ async fn a_log_types_templates_are_published_in_the_models_destination_type_orde
             "case {case}: the trace destination is published no template"
         );
     }
-    // Each destination that receives records serves the same log types as the object
-    // destination, in the same order — so the groups of each are compared against the object
-    // destination's, which the table above already pinned row by row.
-    let groups_of = |templates: &[Value]| -> Vec<String> {
-        templates
-            .iter()
-            .map(|template| {
-                format!(
-                    "{}|{}|{}",
-                    member(template, "service"),
-                    member(template, "logType"),
-                    member(template, "resourceType")
-                )
-            })
-            .collect()
+    // Each destination that receives records serves the log types whose sender delivers them
+    // there, and one log type's templates are published in the enum's order — asserted over the
+    // WHOLE catalogue, group by group, so a row that publishes a set of its own is held to the
+    // same ordering rule as the rest.
+    let group_of = |template: &Value| -> String {
+        format!(
+            "{}|{}|{}",
+            member(template, "service"),
+            member(template, "logType"),
+            member(template, "resourceType")
+        )
     };
-    let expected = groups_of(
-        &catalogue
+    let mut groups: Vec<String> = Vec::new();
+    for template in &catalogue {
+        let group = group_of(template);
+        if !groups.contains(&group) {
+            groups.push(group);
+        }
+    }
+    for group in &groups {
+        let published: Vec<String> = catalogue
             .iter()
-            .filter(|template| {
-                member(template, "deliveryDestinationType") == RECORD_DESTINATION_TYPES[0]
-            })
-            .cloned()
-            .collect::<Vec<Value>>(),
-    );
-    for destination_type in &RECORD_DESTINATION_TYPES[1..] {
-        let reported = walk(&logs, &json!({"deliveryDestinationTypes": [destination_type]})).await;
-        let groups = groups_of(&reported);
+            .filter(|template| &group_of(template) == group)
+            .map(|template| member(template, "deliveryDestinationType"))
+            .collect();
+        let in_enum_order: Vec<String> = RECORD_DESTINATION_TYPES
+            .iter()
+            .filter(|destination_type| published.iter().any(|named| named == *destination_type))
+            .map(|destination_type| (*destination_type).to_string())
+            .collect();
+        assert!(
+            !published.is_empty(),
+            "case {group}: a published log type reaches at least one destination type"
+        );
         assert_eq!(
-            groups, expected,
-            "case destination type {destination_type}: every log type the object destination serves is served here too, got {groups:?}"
+            published, in_enum_order,
+            "case {group}: expected the destination types it reaches in the enum's order, got \
+             {published:?}"
         );
     }
 }

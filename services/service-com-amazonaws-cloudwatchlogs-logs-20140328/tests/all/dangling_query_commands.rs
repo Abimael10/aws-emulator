@@ -25,7 +25,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{now_ms, without_sdk_envelope, Logs};
+use crate::harness::{now_ms, Logs};
 
 /// The operations under test.
 const START: &str = "StartQuery";
@@ -38,9 +38,6 @@ const MALFORMED: &str = "MalformedQueryException";
 
 /// What the diagnostic names as the symbol it stopped on when the query string ran out.
 const END_OF_INPUT: &str = "<EOF>";
-
-/// The status a query that does not compile is refused with.
-const REFUSAL_STATUS: u16 = 400;
 
 /// A log group and the window a query of it is started with, in the epoch SECONDS
 /// `StartQuery`'s range is specified in.
@@ -74,11 +71,10 @@ fn message(case: &str, body: &Value) -> String {
         .to_string()
 }
 
-/// The message of a refusal, with the SDK envelope this service states a refusal inside
-/// stripped off: the envelope reports the status and the code the response answers with and
-/// this response's own request id, and the diagnostic is what it wraps.
+/// The message of a refusal, which for a compile failure is the compiler's diagnostic and
+/// nothing else: no SDK exception rendering follows it on the wire.
 fn diagnostic(case: &str, body: &Value) -> String {
-    without_sdk_envelope(case, &message(case, body), REFUSAL_STATUS, MALFORMED)
+    message(case, body)
 }
 
 /// The place a parser states for the end of `query`: the line it ran out on, counted from

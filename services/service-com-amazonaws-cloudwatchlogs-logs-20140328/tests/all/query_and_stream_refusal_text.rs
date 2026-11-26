@@ -39,7 +39,7 @@ use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
 };
 
 use crate::harness::{
-    base_ms, batch, envelope_request_id, group_with_stream, now_ms, without_sdk_envelope, Logs,
+    base_ms, batch, envelope_request_id, group_with_stream, now_ms, Logs,
 };
 
 /// The modelled codes these refusals are answered under.
@@ -575,9 +575,9 @@ async fn a_query_that_does_not_compile_is_refused_with_the_parsers_diagnostic() 
             code, MALFORMED_QUERY,
             "case {case}: expected {MALFORMED_QUERY}, got {code} with {body}"
         );
-        // The envelope reports the status and the code the response itself answers with, and
-        // this response's own request id; the diagnostic is what it wraps.
-        let said = without_sdk_envelope(case, &message(case, &body), 400, MALFORMED_QUERY);
+        // The compile failure's own text is the whole message: nothing of an SDK's exception
+        // rendering is serialized after it.
+        let said = message(case, &body);
         // The symbol the compiler stopped on is its LAST occurrence in each row's query
         // string (for the redefinition row the first one is the definition), so the line
         // and position below are read off the query rather than restated per row.
@@ -863,7 +863,7 @@ async fn an_aggregate_inside_a_sql_filter_is_refused_with_the_rule_and_the_claus
         );
         // The envelope reports the status and the code the response itself answers with; the
         // diagnostic is what it wraps.
-        let said = without_sdk_envelope(case, &message(case, &body), 400, MALFORMED_QUERY);
+        let said = message(case, &body);
         let statement = statement_the_compiler_reads(case, &query_string);
         let (start, end) = clause_range(case, &statement);
         assert_eq!(
@@ -980,7 +980,7 @@ async fn the_recorded_aggregate_filter_refusal_states_the_recorded_span() {
             code, MALFORMED_QUERY,
             "case {case}: expected {MALFORMED_QUERY}, got {code} with {body}"
         );
-        let said = without_sdk_envelope(case, &message(case, &body), 400, MALFORMED_QUERY);
+        let said = message(case, &body);
         assert_eq!(
             said, expected,
             "case {case}: expected the recorded diagnostic, got {said:?}"

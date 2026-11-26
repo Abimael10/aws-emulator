@@ -208,6 +208,12 @@ pub mod stated_request_id;
 /// this service's model binds no operation for.
 pub mod http_ingestion;
 
+/// The two addresses a read of an integration ANNOUNCES — the OpenSearch Service application
+/// that hosts the vended logs dashboards and the collection those dashboards query — which
+/// this service's model binds no operation for either, and which this service serves on its
+/// own endpoint.
+pub mod integration_endpoints;
+
 /// This front door's AUDIT leg: the routing table every request is served from, with each
 /// control-plane call recorded in the account's event history where CloudTrail's
 /// `LookupEvents` reads it.
@@ -812,6 +818,13 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// there is no API this account's usage of it would be counted against
     /// ([`crate::state::api_usage`]).
     http_ingestion: http_ingestion::HttpIngestion<Eng>,
+    /// The ANNOUNCED INTEGRATION ENDPOINTS, which no routing table of the model names either:
+    /// a request to the address a read of an integration reports for one of its OpenSearch
+    /// Service resources.
+    ///
+    /// Unmetered, for the same reason as the ingestion above: such a request names no modelled
+    /// operation, so there is no API this account's usage of it would be counted against.
+    integration_endpoints: integration_endpoints::IntegrationEndpoints<Eng>,
 }
 
 /// One dispatch this service hands the router for an operation the audited table cannot
@@ -876,6 +889,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 )),
             ),
             http_ingestion: http_ingestion::HttpIngestion::new(Arc::clone(&engine)),
+            integration_endpoints: integration_endpoints::IntegrationEndpoints::new(Arc::clone(
+                &engine,
+            )),
         }
     }
 }
@@ -905,6 +921,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // addresses a path of its own, so the front door can resolve no target service for
         // it (`crate::service::http_ingestion`).
         http_ingestion::claims_parts(parts)
+            // And the addresses a read of an integration ANNOUNCES for its OpenSearch Service
+            // resources: this service published them, so a request to one is this service's to
+            // answer rather than the front door's to report no service for
+            // (`crate::service::integration_endpoints`).
+            || integration_endpoints::claims_parts(parts)
     }
 
     fn override_operation(
@@ -922,6 +943,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // at all, and the endpoint owns the whole request-to-response step.
         if http_ingestion::claims_request(req) {
             return Some(&self.http_ingestion as &dyn ErasedOperation);
+        }
+        // And the announced integration endpoints, for the same reason: the address was
+        // published by this service and the plane owns the whole request-to-response step.
+        if integration_endpoints::claims_request(req) {
+            return Some(&self.integration_endpoints as &dyn ErasedOperation);
         }
         let operation = self.definition().protocol().routing_key(req).ok()?;
         // The event-stream operations first: the generated shim of an operation whose output

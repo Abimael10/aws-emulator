@@ -1,26 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end tests for the refusal message a query operation of this service answers: the
-//! request id it STATES, against the one the response that carries it REPORTS, and the parser
-//! diagnostic that precedes it.
+//! request its envelope STATES, against the one the response that carries it REPORTS, and the
+//! parser diagnostic a query that does not compile is refused with.
 //!
-//! The rule under test: a response names ONE request. CloudWatch Logs words a refusal as the
-//! sentence for its class followed by the AWS SDK error envelope — ` (Service: AWSLogs; Status
-//! Code: <the status answered>; Error Code: <the code answered>; Request ID: <id>; Proxy:
-//! null)` — and the id stated in that clause is the id the response reports in the header this
-//! protocol names a request in (`x-amzn-RequestId`), freshly minted per call. So a client that
-//! reads the id out of an SDK's error message and a client that reads the response header see
-//! the same value for one call, whichever refusal class answered. The sentence the clause
-//! follows is the service's own: for a query that does not compile it is the parser diagnostic,
-//! naming the symbol the compiler stopped on and the place that symbol occupies in the
-//! SUBMITTED query string.
+//! The rules under test:
 //!
-//! The rows span what the rule generalises over: which error class the refusal is (so the
+//! * A response names ONE request. CloudWatch Logs words a refusal IT DECIDES as the sentence
+//!   for its class followed by the AWS SDK error envelope — ` (Service: AWSLogs; Status Code:
+//!   <the status answered>; Error Code: <the code answered>; Request ID: <id>; Proxy: null)` —
+//!   and the id stated in that clause is the id the response reports in the header this
+//!   protocol names a request in (`x-amzn-RequestId`), freshly minted per call. So a client
+//!   that reads the id out of an SDK's error message and a client that reads the response
+//!   header see the same value for one call, whichever refusal class answered.
+//! * A refusal this service RELAYS rather than decides — the query compiler's account of a
+//!   query that does not compile — carries the compiler's text and NOTHING else: the clause an
+//!   SDK writes when it renders an exception is assembled client-side out of the status line,
+//!   the error code and the request-id header, so none of it is serialized in that message.
+//!   The sentence is the compiler's diagnostic: the symbol the compiler stopped on and the
+//!   place that symbol occupies in the SUBMITTED query string.
+//!
+//! The rows span what the rules generalise over: which error class the refusal is (so the
 //! status and code stated in the clause differ), which operation answers it, whether the
-//! refusal is decided over the query string, the time range, a named resource or a stored id,
-//! where in the query string the offending token sits and on which line, and whether the
-//! submitted text itself carries the marker a message is worded with — a quoted symbol is left
-//! exactly as the handler wrote it, and only the clause states the response's id.
+//! refusal is decided over the time range, a named resource or a stored id, where in the query
+//! string the offending token sits and on which line, and whether the submitted text itself
+//! carries the marker a message is worded with — a quoted symbol is left exactly as the handler
+//! wrote it, and only a clause the service words states a response's id.
 //!
 //! Every case drives the service the way a client does — `POST /` with
 //! `X-Amz-Target: Logs_20140328.<Operation>` through the router that mounts it — so a response
@@ -95,7 +100,7 @@ fn message(case: &str, body: &Value) -> String {
 }
 
 /// The envelope clause the rule requires: the status and the code the response itself answers
-/// with, and the request id it reports.
+/// with, and the request the clause names.
 fn expected_clause(code: &str, request_id: &str) -> String {
     format!(
         " (Service: AWSLogs; Status Code: {REFUSAL_STATUS}; Error Code: {code}; Request ID: \
@@ -110,10 +115,9 @@ fn window() -> (i64, i64) {
     (now_secs - 60 * 60, now_secs)
 }
 
-/// Every refusal class this service words inside the SDK envelope states the id the response
-/// that carries it reports.
+/// Every refusal class this service DECIDES states the id the response that carries it reports.
 #[tokio::test]
-async fn every_refusal_clause_states_the_id_the_response_reports() {
+async fn every_decided_refusal_clause_states_the_id_the_response_reports() {
     let logs = Logs::new();
     const GROUP: &str = "/envelope/one";
     logs.ok("CreateLogGroup", &json!({"logGroupName": GROUP}))
@@ -122,17 +126,6 @@ async fn every_refusal_clause_states_the_id_the_response_reports() {
 
     // (case, operation, request, the error class it is refused under)
     let cases: Vec<(&str, &str, Value, &str)> = vec![
-        (
-            "a query string that does not compile",
-            "StartQuery",
-            json!({
-                "logGroupName": GROUP,
-                "startTime": start,
-                "endTime": end,
-                "queryString": "fields @timestamp, @message | frobnicate",
-            }),
-            MALFORMED_QUERY,
-        ),
         (
             "a query window that runs backwards",
             "StartQuery",
@@ -157,7 +150,7 @@ async fn every_refusal_clause_states_the_id_the_response_reports() {
         ),
         (
             // The range closes before the group it reads was created, which is a fault of the
-            // range rather than of the query text.
+            // range rather than of the query text, so the service decides it itself.
             "a query window that closes before the log group existed",
             "StartQuery",
             json!({
@@ -214,17 +207,19 @@ async fn every_refusal_clause_states_the_id_the_response_reports() {
 /// The id is per RESPONSE: two identical refused calls state two different ids, and each states
 /// the one its OWN response reports.
 #[tokio::test]
-async fn each_refusal_states_its_own_responses_id() {
+async fn each_decided_refusal_states_its_own_responses_id() {
     let logs = Logs::new();
     const GROUP: &str = "/envelope/per-call";
     logs.ok("CreateLogGroup", &json!({"logGroupName": GROUP}))
         .await;
     let (start, end) = window();
+    // A window that runs backwards: a refusal this service decides itself, so its clause names
+    // the response's own request.
     let request = json!({
         "logGroupName": GROUP,
-        "startTime": start,
-        "endTime": end,
-        "queryString": "fields @message | frobnicate",
+        "startTime": end,
+        "endTime": start,
+        "queryString": "fields @message",
     });
 
     let mut stated: Vec<String> = Vec::new();
@@ -237,7 +232,7 @@ async fn each_refusal_states_its_own_responses_id() {
             "case {case}: expected the refusal status, got {status} with {text}"
         );
         let said = message(&case, &body);
-        let clause = expected_clause(MALFORMED_QUERY, &request_id);
+        let clause = expected_clause(INVALID_PARAMETER, &request_id);
         assert!(
             said.ends_with(&clause),
             "case {case}: expected the clause {clause:?} stating this response's id, got \
@@ -257,7 +252,7 @@ async fn each_refusal_states_its_own_responses_id() {
 
 /// What the substitution does NOT touch: the symbol a parser diagnostic quotes out of the
 /// submitted query string is reported exactly as it was submitted, even when it is the very
-/// text a message is worded with — only the clause states the response's id.
+/// text a message is worded with.
 #[tokio::test]
 async fn a_quoted_symbol_carrying_the_marker_is_reported_as_submitted() {
     let logs = Logs::new();
@@ -287,7 +282,7 @@ async fn a_quoted_symbol_carrying_the_marker_is_reported_as_submitted() {
             "endTime": end,
             "queryString": query_string,
         });
-        let (status, body, text, request_id) = refused(&logs, case, "StartQuery", &request).await;
+        let (status, body, text, _) = refused(&logs, case, "StartQuery", &request).await;
         assert_eq!(
             status, REFUSAL_STATUS,
             "case {case}: expected the refusal status, got {status} with {text}"
@@ -298,19 +293,17 @@ async fn a_quoted_symbol_carrying_the_marker_is_reported_as_submitted() {
             .unwrap_or_else(|| panic!("case {case}: the row's query carries {symbol:?}"));
         assert_eq!(
             said,
-            format!(
-                "unexpected symbol found {symbol} at line 1 and position {position}{}",
-                expected_clause(MALFORMED_QUERY, &request_id)
-            ),
-            "case {case}: expected the submitted symbol quoted and the clause stating the \
-             reported id, got {said:?}"
+            format!("unexpected symbol found {symbol} at line 1 and position {position}"),
+            "case {case}: expected the submitted symbol quoted and nothing after the \
+             diagnostic, got {said:?}"
         );
     }
 }
 
 /// The WHOLE message of a query that does not compile: the parser diagnostic — the symbol the
 /// compiler stopped on and the place that symbol occupies in the SUBMITTED query string — and
-/// then the clause stating the facts of this very response, its request id included.
+/// nothing after it, because the diagnostic is the compiler's own rendering rather than a
+/// sentence this service words inside its own envelope.
 ///
 /// The rows span what the message's variable parts generalise over: where the offending token
 /// sits (so the position moves with it, by exactly as many characters as the token moved), what
@@ -319,7 +312,7 @@ async fn a_quoted_symbol_carrying_the_marker_is_reported_as_submitted() {
 /// off the submitted string in each row rather than restated, so a diagnostic that did not read
 /// the query cannot pass.
 #[tokio::test]
-async fn the_whole_refusal_states_the_place_in_the_submitted_query_and_this_responses_facts() {
+async fn a_relayed_compile_failure_states_the_place_in_the_submitted_query_and_nothing_else() {
     let logs = Logs::new();
     const GROUP: &str = "/envelope/diagnostic";
     logs.ok("CreateLogGroup", &json!({"logGroupName": GROUP}))
@@ -403,13 +396,22 @@ async fn the_whole_refusal_states_the_place_in_the_submitted_query_and_this_resp
             .count();
         assert_eq!(
             message(case, &body),
-            format!(
-                "unexpected symbol found {symbol} at line {line} and position {position}{}",
-                expected_clause(MALFORMED_QUERY, &request_id)
-            ),
-            "case {case}: expected the diagnostic for {query_string:?} and the clause stating \
-             this response's facts, got {text}"
+            format!("unexpected symbol found {symbol} at line {line} and position {position}"),
+            "case {case}: expected the diagnostic for {query_string:?} and nothing after it, \
+             got {text}"
         );
+        // The response still names the request it answers, in the header this protocol names
+        // one in: the message states no id at all, so the two can never name two requests.
+        assert!(
+            !message(case, &body).contains(&request_id),
+            "case {case}: expected the message to name no request, got {text}"
+        );
+        for framing in ["(Service:", "Status Code:", "Error Code:", "Request ID:", "Proxy:"] {
+            assert!(
+                !message(case, &body).contains(framing),
+                "case {case}: expected no {framing:?} framing in the message, got {text}"
+            );
+        }
         // "Details about this error are displayed in a QueryCompileError object": the detail
         // locates the same text, as the character range it occupies in the submitted string.
         let location = &body["queryCompileError"]["location"];

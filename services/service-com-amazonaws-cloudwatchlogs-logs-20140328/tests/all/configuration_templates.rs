@@ -104,9 +104,10 @@ const VENDED_LOGS_DELIVERY_ACTION: &str = "AllowVendedLogDeliveryForResource";
 /// `service|logType|resourceType|deliveryDestinationType`: a CloudFront access log delivered
 /// to S3, a WorkMail access-control log delivered to a log group, an Application Load
 /// Balancer access log delivered to Firehose, an AgentCore trace delivered to a stream, a
-/// Security Hub finding log delivered to S3 from each of the two hub resources that send one,
-/// and an Amazon Q Business event log delivered to a log group.
-const CATALOGUE_TEMPLATES: usize = 180;
+/// Security Hub finding log delivered to a LOG GROUP from each of the two hub resources that
+/// send one — the only kind of destination that sender delivers to — and an Amazon Q Business
+/// event log delivered to a log group.
+const CATALOGUE_TEMPLATES: usize = 176;
 const PINNED_TEMPLATES: [&str; 9] = [
     "cloudfront|ACCESS_LOGS|distribution|S3",
     "workmail|ACCESS_CONTROL_LOGS|organization|CWL",
@@ -114,8 +115,8 @@ const PINNED_TEMPLATES: [&str; 9] = [
     "bedrock-agentcore|TRACES|runtime|FH",
     "apigateway|EXECUTION_LOGS|stages|S3",
     "eks|AUTO_MODE_LOAD_BALANCING_LOGS|cluster|FH",
-    "securityhub|SECURITY_FINDING_LOGS|hub|S3",
-    "securityhub|SECURITY_FINDING_LOGS|hubv2|S3",
+    "securityhub|SECURITY_FINDING_LOGS|hub|CWL",
+    "securityhub|SECURITY_FINDING_LOGS|hubv2|CWL",
     "qbusiness|EVENT_LOGS|application|CWL",
 ];
 
@@ -161,10 +162,11 @@ fn key_of(template: &Value) -> String {
 ///
 /// DERIVED here from the catalogue data (`CONFIGURATION_TEMPLATE_SOURCES`, whose service and
 /// log-type pairings come from the `logType` member of `PutDeliverySourceRequest`) by the rule
-/// under test: one template per log type per delivery destination type that RECEIVES a record,
-/// taken in the order the model's enum declares those destination types. The X-Ray trace
-/// destination is published no template, because a template states the valid and default values
-/// of a record delivery.
+/// under test: one template per log type per delivery destination type the SENDER delivers that
+/// log type to — the set each log type publishes, a subset of the destination types that
+/// receive a record — taken in the order the model's enum declares those destination types. The
+/// X-Ray trace destination is published no template at all, because a template states the valid
+/// and default values of a record delivery.
 fn catalogue() -> Vec<(String, String)> {
     assert!(
         DESTINATION_TYPE_ORDER
@@ -177,14 +179,28 @@ fn catalogue() -> Vec<(String, String)> {
     let mut templates: Vec<(String, String)> = Vec::new();
     for source in CONFIGURATION_TEMPLATE_SOURCES {
         for log_type in source.log_types {
-            let log_type = log_type.log_type;
-            for destination_type in DESTINATION_TYPE_ORDER {
+            let published = log_type.delivery_destination_types;
+            assert!(
+                !published.is_empty()
+                    && published.iter().all(|destination_type| DESTINATION_TYPE_ORDER
+                        .contains(destination_type))
+                    && published
+                        .iter()
+                        .eq(DESTINATION_TYPE_ORDER
+                            .iter()
+                            .filter(|order| published.contains(order))),
+                "{}|{}: a log type publishes a non-empty set of record-receiving destination \
+                 types in the model's order, got {published:?}",
+                source.service,
+                log_type.log_type
+            );
+            for destination_type in published {
                 templates.push((
                     format!(
-                        "{}|{log_type}|{}|{destination_type}",
-                        source.service, source.resource_type
+                        "{}|{}|{}|{destination_type}",
+                        source.service, log_type.log_type, source.resource_type
                     ),
-                    log_type.to_string(),
+                    log_type.log_type.to_string(),
                 ));
             }
         }

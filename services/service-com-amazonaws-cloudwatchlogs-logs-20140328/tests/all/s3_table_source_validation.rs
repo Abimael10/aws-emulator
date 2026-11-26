@@ -503,6 +503,8 @@ fn seed_logs_integration(logs: &Logs, name: &str) {
             &config,
             crate::harness::now_ms(),
             seq,
+            // Seeded straight into the store, so no request's own endpoint stands behind it.
+            None,
         ),
     );
 }

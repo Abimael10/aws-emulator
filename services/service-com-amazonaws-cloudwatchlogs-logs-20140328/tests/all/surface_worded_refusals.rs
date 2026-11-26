@@ -32,7 +32,7 @@ use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
     PAGINATION_TOKEN_INVALID_MESSAGE,
 };
 
-use crate::harness::{base_ms, batch, now_ms, without_sdk_envelope, Logs, REGION};
+use crate::harness::{base_ms, batch, now_ms, Logs, REGION};
 
 /// The modelled codes these refusals are answered under.
 const NOT_FOUND: &str = "ResourceNotFoundException";
@@ -651,10 +651,9 @@ async fn a_query_that_selects_no_log_group_is_a_malformed_query() {
             code, MALFORMED_QUERY,
             "case {case:?}: a query selecting no log group is malformed, got {code} {said:?}"
         );
-        // The diagnostic, with the SDK envelope the service states every refusal of this
-        // operation inside stripped off: the syntax that was being read, then the symbol the
-        // compiler stopped on and where in the submitted string it sits.
-        let message = without_sdk_envelope(case, &said, 400, MALFORMED_QUERY);
+        // The diagnostic is the WHOLE message: the syntax that was being read, then the symbol
+        // the compiler stopped on and where in the submitted string it sits.
+        let message = said;
         let expected = format!(
             "Invalid syntax while using query definition snippets: unexpected symbol found \
              {symbol} at line {line} and position {position}"

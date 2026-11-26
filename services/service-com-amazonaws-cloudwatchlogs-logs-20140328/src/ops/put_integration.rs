@@ -303,6 +303,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             config,
             crate::state::now_ms(),
             creation_seq,
+            // The endpoints a read reports for this integration's OpenSearch Service
+            // resources are addresses a client DIALS, so they are minted on an address THIS
+            // emulator answers on — resolved once here, so two reads of one integration
+            // report the one address.
+            crate::state::emulator_authority(ctx.parts(), ctx.endpoint().as_str()),
         );
         // The status handed back is the stored one, so what this create reports is what a
         // read of the integration reports at the same instant.

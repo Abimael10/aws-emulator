@@ -24,8 +24,8 @@
 //! handler does not actually compute from the store cannot pass.
 //!
 //! The tables span what the rules generalise over rather than one request: senders whose
-//! published layout partitions delivered objects by Region and hour, by the sending resource, by
-//! the day, and not at all; record schemas of 1, 7, 21 and 34 published fields, with and without
+//! published layout partitions delivered objects by Region and hour, by the sending resource and
+//! by the day; record schemas of 7, 21 and 34 published fields, with and without
 //! fields that are allowed without being delivered; and each of them delivered to a destination
 //! that writes objects, to one that stores records and to one that receives a stream — the
 //! expectation for every row READ OFF `DescribeConfigurationTemplates`, because the rule is that
@@ -104,16 +104,6 @@ fn senders() -> Vec<Sender> {
             log_type: "ALB_ACCESS_LOGS",
             service: "elasticloadbalancing",
             resource_type: "loadbalancer",
-        },
-        // Security Hub findings: a single mandatory field, and a sender that publishes no object
-        // prefix of its own at all.
-        Sender {
-            label: "Security Hub findings from a hubv2 resource",
-            source: "securityhub-findings-v2",
-            resource_arn: format!("arn:aws:securityhub:{REGION}:123456789012:hubv2/*"),
-            log_type: "SECURITY_FINDING_LOGS",
-            service: "securityhub",
-            resource_type: "hubv2",
         },
     ]
 }
