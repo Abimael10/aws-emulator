@@ -415,7 +415,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         pool.key_configuration = crate::state::effective_key_configuration(input.key_configuration);
         pool.issuer_configuration =
             crate::state::effective_issuer_configuration(input.issuer_configuration);
-        pool.acr_configuration = input.acr_configuration;
+        pool.acr_configuration =
+            crate::state::effective_acr_configuration(input.acr_configuration);
         pool.sms_authentication_message = input.sms_authentication_message;
         pool.tags = input.user_pool_tags.unwrap_or_default();
 

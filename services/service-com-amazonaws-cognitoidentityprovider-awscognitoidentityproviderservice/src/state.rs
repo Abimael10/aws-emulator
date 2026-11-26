@@ -106,7 +106,11 @@ mod missing_parameter;
 /// The NAME a user pool's hosted domain may take: the two forms a `Domain` value has, and
 /// which of them each request is held to.
 mod domain_name;
+/// The four fixed authentication context class reference levels a user pool
+/// reports, and the name each one carries for a pool that overrides none.
+mod acr_levels;
 pub use access_token_signature::*;
+pub use acr_levels::*;
 pub use device_auth::*;
 pub use domain_name::*;
 pub use feature_plan::*;

@@ -77,7 +77,12 @@ pub struct UserPool {
     /// against the issuer it was configured with: a pool announces ONE issuer for
     /// its whole life, however each later caller addresses this emulator.
     pub issuer_endpoint: Option<String>,
-    pub acr_configuration: Option<HashMap<String, AcrLevelConfigType>>,
+    /// The custom names this pool reports for the four fixed authentication
+    /// context class reference levels, ALWAYS all four: the levels are fixed and
+    /// only their names are configurable, so a pool that overrides none of them
+    /// still holds the service's default name for each
+    /// ([`effective_acr_configuration`]).
+    pub acr_configuration: HashMap<String, AcrLevelConfigType>,
     pub sms_authentication_message: Option<String>,
     /// This pool's TOTP MFA configuration: "Settings for time-based one-time
     /// password (TOTP) multi-factor authentication (MFA) in a user pool"
@@ -2219,7 +2224,7 @@ impl UserPool {
             user_pool_tier: Some(self.user_pool_tier.clone()),
             key_configuration: Some(self.key_configuration.clone()),
             issuer_configuration: Some(self.issuer_configuration.clone()),
-            acr_configuration: self.acr_configuration.clone(),
+            acr_configuration: Some(self.acr_configuration.clone()),
         }
     }
 
@@ -2307,7 +2312,7 @@ pub fn new_user_pool(
         key_configuration: effective_key_configuration(None),
         issuer_configuration: effective_issuer_configuration(None),
         issuer_endpoint,
-        acr_configuration: None,
+        acr_configuration: effective_acr_configuration(None),
         sms_authentication_message: None,
         software_token_mfa_configuration: None,
         email_mfa_configuration: None,
