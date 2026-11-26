@@ -161,13 +161,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // credential before anything is served, under the scheme the surface it is handed
         // declares. A request of this API is authenticated under the scheme it PRESENTS:
         // one presenting SigV4 in its `Authorization` header is verified by the router, as
-        // every modelled operation of this service is, and one presenting a credential of
-        // its OWN — among its parameters, which is where the Signature Version 2 this API
+        // every modelled operation of this service is, and one whose credential could only
+        // be among its parameters — which is where the Signature Version 2 this API
         // publishes carries one, and where no authenticator of the router can see it — is
         // served by the surface that verifies that signature itself
-        // (`sdb_query_api::signature_version_2`).
+        // (`sdb_query_api::signature_version_2`). A request presenting NO credential at all
+        // is that surface's as well: it states this API's own refusal of an unauthenticated
+        // call, where the router would state its refusal in the modelled surface's JSON
+        // envelope — a document a client of this wire cannot parse at all.
         if sdb_query_api::addresses_query_api(req) {
-            if sdb_query_api::signature_version_2::presents_its_own_credential(req) {
+            if sdb_query_api::signature_version_2::owns_authentication_of(req) {
                 return Some(&self.sdb_query_api_signature_version_2);
             }
             return Some(&self.sdb_query_api);

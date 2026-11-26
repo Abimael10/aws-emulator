@@ -23,6 +23,13 @@
 //! ([`crate::service::EmulatedService::override_operation`] decides between the two from
 //! what the request presents).
 //!
+//! A request of this API presenting NO credential at all is this surface's too
+//! ([`owns_authentication_of`]): its credential could only have travelled among its
+//! parameters, where the router's authenticator cannot look, and the refusal it is owed is
+//! this API's own error document for an unauthenticated call. Rendering that refusal in the
+//! modelled surface's JSON envelope would hand a client of this wire a document its parser
+//! rejects, so the error code never reaches the client at all.
+//!
 //! # The signature
 //!
 //! Signature Version 2 signs a canonical string built from the request alone: the HTTP
@@ -82,6 +89,36 @@ const UNRESERVED: &::percent_encoding::AsciiSet = &::percent_encoding::NON_ALPHA
     .remove(b'.')
     .remove(b'_')
     .remove(b'~');
+
+/// The header a request presenting SigV4 carries its credential in, and the one place the
+/// router's own authenticator reads a credential from.
+const AUTHORIZATION_HEADER: &str = "authorization";
+
+/// Whether THIS surface, rather than the router, owns authenticating `req`: it does unless
+/// the request presents its credential in an `Authorization` header, which is the only
+/// place the router's authenticator can read one from.
+///
+/// So this surface answers a request carrying the Signature Version 2 this API publishes
+/// ([`presents_its_own_credential`]) AND a request carrying no credential at all. The
+/// second is this surface's for the same reason the first is: what such a request is owed
+/// is this API's own refusal of an unauthenticated call
+/// ([`envelope::missing_authentication_token`]), stated in this API's own error document,
+/// and only a surface serving this wire can render that. Handing it to the router instead
+/// would state the refusal in the modelled `/v2/*` surface's JSON envelope, which a
+/// client of this wire — parsing every answer as this API's XML — cannot read at all.
+///
+/// The limit of that: a request of this API that DOES present a header credential is the
+/// router's, verified under the scheme it presents as every modelled operation of this
+/// service is — so a refusal of its credential is the router's own, in this service's
+/// modelled envelope, not this API's error document. A conforming client of the 2009-04-15
+/// API presents no such header; re-rendering the router's own credential refusals on this
+/// wire is its own gap.
+///
+/// Nothing is waved through either way: [`refusal_for`] below verifies the credential the
+/// request carries, and a request carrying none is refused here.
+pub fn owns_authentication_of(req: &RtRequest) -> bool {
+    presents_its_own_credential(req) || req.headers().get(AUTHORIZATION_HEADER).is_none()
+}
 
 /// Whether `req` presents a credential of ITS OWN — among its parameters, where the
 /// signature versions of this wire put one — rather than in an `Authorization` header:
@@ -342,6 +379,62 @@ mod tests {
             .body(SdkBody::from(body.to_string()))
             .expect("a well-formed request");
         RtRequest::try_from(request).expect("a request the runtime API accepts")
+    }
+
+    /// One posted form carrying an `Authorization` header, as a client presenting SigV4
+    /// sends it.
+    fn posted_with_authorization(host: &str, body: &str, authorization: &str) -> RtRequest {
+        let request = ::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", host)
+            .header("authorization", authorization)
+            .body(SdkBody::from(body.to_string()))
+            .expect("a well-formed request");
+        RtRequest::try_from(request).expect("a request the runtime API accepts")
+    }
+
+    #[test]
+    fn this_surface_authenticates_every_request_whose_credential_is_not_in_a_header() {
+        let sigv4 = "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/sdb/aws4_request, \
+                     SignedHeaders=host, Signature=abc";
+        let rows: &[(&str, &str, Option<&str>, bool)] = &[
+            (
+                "a conforming client of this API, whose credential is among its parameters",
+                "Action=CreateDomain&SignatureVersion=2&AWSAccessKeyId=AKID&Signature=abc",
+                None,
+                true,
+            ),
+            (
+                "a request presenting no credential anywhere at all",
+                "Action=CreateDomain&Version=2009-04-15&DomainName=a-domain",
+                None,
+                true,
+            ),
+            (
+                "a request presenting SigV4 in its Authorization header",
+                "Action=CreateDomain&Version=2009-04-15&DomainName=a-domain",
+                Some(sigv4),
+                false,
+            ),
+            (
+                "a request presenting both a header and a credential of its own",
+                "Action=CreateDomain&SignatureVersion=2&AWSAccessKeyId=AKID&Signature=abc",
+                Some(sigv4),
+                true,
+            ),
+        ];
+        for (case, body, authorization, expected) in rows {
+            let request = match authorization {
+                None => posted("sdb.amazonaws.com", body),
+                Some(header) => posted_with_authorization("sdb.amazonaws.com", body, header),
+            };
+            let actual = owns_authentication_of(&request);
+            assert_eq!(
+                actual, *expected,
+                "case {case:?}: expected {expected}, got {actual}"
+            );
+        }
     }
 
     #[test]

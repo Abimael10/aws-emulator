@@ -57,7 +57,10 @@ impl Addressed {
         }
     }
 
-    fn host(self) -> String {
+    /// The authority a request addressed this way carries in its `Host` header, which is
+    /// also the authority a Signature Version 2 client signs for (the scheme signs the
+    /// method, the authority, the path and the parameters).
+    pub(crate) fn host(self) -> String {
         match self {
             Self::Nothing | Self::CredentialScope => EMULATOR_HOST.to_string(),
             Self::EndpointHost => format!("sdb.{REGION}.amazonaws.com"),
