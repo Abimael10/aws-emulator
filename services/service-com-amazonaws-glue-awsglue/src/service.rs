@@ -102,6 +102,15 @@ pub mod partition_indexes;
 #[path = "state/integration_properties.rs"]
 pub mod integration_properties;
 
+/// This service's request-DESERIALIZATION layer: how a value whose JSON class the modelled
+/// member it is bound to cannot be read from is refused — the protocol's own
+/// `SerializationException` rather than the constraint validator's `ValidationException`,
+/// which the framework would otherwise answer for both.
+///
+/// It sits in front of EVERY operation (read first in [`Service::override_operation`]), because
+/// what it answers is a property of the protocol rather than of any one operation.
+pub mod unreadable_values;
+
 /// The predefined worker types this service accepts, and the clause a value outside them is
 /// refused with: the one statement of that value set, which several operations judge a
 /// request against.
@@ -183,6 +192,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
+        // DESERIALIZATION precedes every later layer: a value whose JSON class the modelled
+        // member it is bound to cannot be read from never becomes a value at all, so the
+        // request is refused as the PROTOCOL's own marshalling failure before the boundary
+        // walk reaches a constraint and before any handler reads or writes anything
+        // ([`unreadable_values`]). Read for every operation, because the rule belongs to the
+        // protocol and not to one operation; the cost is one read of the request's body,
+        // which the layer pays only to decide this.
+        if unreadable_values::refuses(self.definition(), req) {
+            return Some(&unreadable_values::UNREADABLE_VALUES);
+        }
         // Serve the operations whose own input validation this service words itself
         // through their [`GlueInputValidation`] wrapper, so a request that leaves one of
         // those members ABSENT is refused in the operation's own modelled
@@ -1225,23 +1244,44 @@ fn name_refusal_message(operation: &str, path: &str) -> Option<&'static str> {
 
 /// Record the refusal answered above as the operation row the framework sequence would
 /// have recorded, so a request refused by the wrapper is not a hole in the telemetry
-/// series: the same classification (from the refusal's status and error shape), the same
-/// folded handle (this service's signing name and the operation's own name), and the same
-/// already-sanitized request metadata. Everything is gated on a client collecting, exactly
-/// as the framework gates it.
+/// series: the classification of the error the wrapper renders, the same folded handle
+/// (this service's signing name and the operation's own name), and the same
+/// already-sanitized request metadata.
 fn record_input_refusal<Op: Operation>(ctx: &OperationContext<'_>, latency: std::time::Duration) {
+    record_refusal(
+        ctx,
+        Op::NAME,
+        latency,
+        INVALID_INPUT_EXCEPTION_STATUS,
+        INVALID_INPUT_EXCEPTION,
+    );
+}
+
+/// The operation row a refusal answered OUTSIDE the generated operation sequence is recorded
+/// as, so no such refusal is a hole in the telemetry series: the classification of the error
+/// that was rendered (`status` and `code`), the folded handle every row of this service
+/// carries (its signing name and the operation's own name), and the already-sanitized request
+/// metadata. Everything is gated on a client collecting, exactly as the framework gates it.
+///
+/// One writer, shared by the two seams of this service that answer such a refusal — the
+/// pre-handler wrapper above ([`record_input_refusal`]) and the deserialization layer
+/// ([`unreadable_values`]) — so a row one of them records cannot drift from the other's.
+pub(crate) fn record_refusal(
+    ctx: &OperationContext<'_>,
+    operation: &str,
+    latency: std::time::Duration,
+    status: u16,
+    code: &str,
+) {
     if !emulator_telemetry::recording_active() {
         return;
     }
     let handle =
-        emulator_telemetry::OperationHandle::folded(ctx.identity().signing_name_static(), Op::NAME);
+        emulator_telemetry::OperationHandle::folded(ctx.identity().signing_name_static(), operation);
     emulator_telemetry::record_generated_operation_with_handle(
         &handle,
         latency,
-        Some(emulator_telemetry::OperationFailure::classify(
-            INVALID_INPUT_EXCEPTION_STATUS,
-            INVALID_INPUT_EXCEPTION,
-        )),
+        Some(emulator_telemetry::OperationFailure::classify(status, code)),
         smithy_server_runtime::RequestTelemetry::from_headers(&ctx.parts().headers).into_metadata(),
     );
 }

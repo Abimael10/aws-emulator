@@ -34,6 +34,14 @@ pub const STRING_VALUE: &str = "STRING_VALUE";
 pub const ARRAY_VALUE: &str = "ARRAY_VALUE";
 /// See [`NULL_VALUE`].
 pub const OBJECT_VALUE: &str = "OBJECT_VALUE";
+/// See [`json_literal_class`]: the name a `true` literal is stated under where the refusal
+/// names the LITERAL rather than its JSON type.
+pub const TRUE_VALUE: &str = "TRUE_VALUE";
+/// See [`TRUE_VALUE`], for a `false` literal.
+pub const FALSE_VALUE: &str = "FALSE_VALUE";
+/// See [`TRUE_VALUE`], for a number whose value carries a fraction — a different literal from
+/// a whole number however small the fraction is.
+pub const DECIMAL_VALUE: &str = "DECIMAL_VALUE";
 
 /// The class of JSON value this is, as a coercion failure names it: `<JSON type>_VALUE`.
 ///
@@ -52,6 +60,39 @@ pub fn json_value_class(value: &Value) -> &'static str {
         Value::Array(_) => ARRAY_VALUE,
         Value::Object(_) => OBJECT_VALUE,
     }
+}
+
+/// The same naming with the two classes a coercion failure SPLITS stated by their LITERAL: a
+/// `true` and a `false` are two literals rather than one boolean, and a number whose value
+/// carries a fraction is a different literal from a whole one ([`fractional`]).
+///
+/// RECORDED naming, and the one several services of the same front end share: a refusal of a
+/// boolean is recorded as `TRUE_VALUE`/`FALSE_VALUE` and one of a fraction as `DECIMAL_VALUE`
+/// by every service in this tree whose recordings reach those classes, where a value of any
+/// other class is named by its type exactly as [`json_value_class`] names it. Here beside that
+/// coarser naming so the services that state the literal do not each write the split again.
+#[must_use]
+pub fn json_literal_class(value: &Value) -> &'static str {
+    match value {
+        Value::Bool(true) => TRUE_VALUE,
+        Value::Bool(false) => FALSE_VALUE,
+        Value::Number(number) if fractional(number) => DECIMAL_VALUE,
+        other => json_value_class(other),
+    }
+}
+
+/// Whether the number's VALUE is not a whole one — asked of the value rather than of the text
+/// it was spelled as, so a whole number too large for an integral type is still whole (`1e20`)
+/// and a fraction is one however it was written (`1.5`, `1e-7`).
+///
+/// It is the VALUE that decides, not the presence of an exponent: a recorded refusal of `1e20`
+/// names the whole-number class and one of `1e-7` the fractional one
+/// (`services/service-com-amazonaws-dynamodb-dynamodb-20120810/src/service/request_layer.rs`,
+/// whose own split this generalises), which is why the test below spans both exponent forms.
+fn fractional(number: &serde_json::Number) -> bool {
+    number.as_i64().is_none()
+        && number.as_u64().is_none()
+        && number.as_f64().is_some_and(|held| held.fract() != 0.0)
 }
 
 /// One JSON value as the TEXT a member that carries it as a string holds: a string stays
@@ -95,6 +136,17 @@ pub fn coercion_message(class: &str, target: ShapeType) -> String {
 #[must_use]
 pub fn unreadable_message(class: &str, target: &str) -> String {
     format!("{class} can not be converted to {target}")
+}
+
+/// The same statement in the CONTRACTED spelling and with no article: `<class> cannot be
+/// converted to <Type>`.
+///
+/// RECORDED, per service: some services of this tree record the spelled-out form with the
+/// grammatical article ([`unreadable_message`]) and others this one, so which a service states
+/// is its own and the two forms live side by side here rather than once per service.
+#[must_use]
+pub fn unconverted_message(class: &str, target: &str) -> String {
+    format!("{class} cannot be converted to {target}")
 }
 
 /// The indefinite article that goes in front of a type's name.
@@ -209,6 +261,38 @@ mod tests {
         }
     }
 
+    /// RULE: the two classes a coercion failure splits are named by their literal — each
+    /// boolean literal, and a number whose value carries a fraction — and every other value
+    /// by its JSON type.
+    ///
+    /// The rows span both literals of the split class, the whole-number and fractional sides
+    /// of the numeric one (including a whole number no integral type holds and a fraction
+    /// written as an exponent), and a class that is not split.
+    #[test]
+    fn a_split_class_is_named_by_its_literal() {
+        // (the value, the name a refusal that states the literal gives it)
+        let cases = [
+            (json!(true), "TRUE_VALUE"),
+            (json!(false), "FALSE_VALUE"),
+            (json!(7), "NUMBER_VALUE"),
+            (json!(-7), "NUMBER_VALUE"),
+            (json!(1e20), "NUMBER_VALUE"),
+            (json!(7.5), "DECIMAL_VALUE"),
+            (json!(1e-7), "DECIMAL_VALUE"),
+            (json!("7"), "STRING_VALUE"),
+            (json!(null), "NULL_VALUE"),
+            (json!([7]), "ARRAY_VALUE"),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(
+                json_literal_class(&value),
+                expected,
+                "case {value}: expected {expected}, got {}",
+                json_literal_class(&value)
+            );
+        }
+    }
+
     /// The sentence names the class, then what it could not be read into — with the
     /// grammatical article for a modelled type, and verbatim for a wire form.
     #[test]
@@ -242,6 +326,11 @@ mod tests {
             unreadable_message("STRING_VALUE", "milliseconds since epoch"),
             "STRING_VALUE can not be converted to milliseconds since epoch",
             "a wire form is stated as submitted, with no article added"
+        );
+        assert_eq!(
+            unconverted_message("STRING_VALUE", "Integer"),
+            "STRING_VALUE cannot be converted to Integer",
+            "the contracted form states the type bare, with no article"
         );
     }
 
