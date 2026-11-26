@@ -59,6 +59,22 @@ const DESCRIPTION_MAX_LENGTH: usize = 256;
 /// `smithy_query(query="shape",shape="S3Url")` (len 1..1000).
 const S3_URL_MAX_LENGTH: usize = 1_000;
 
+/// The shortest `S3Url` that addresses an Amazon S3 object: the shortest name S3 holds a
+/// bucket under (three characters) and a one-character key under it. A create's `S3Url` is
+/// where the task's artifact is stored, so it has to address an object; the member's
+/// `@length` floor of one character is below anything that does.
+const SHORTEST_ARTIFACT_URL: &str = "s3://aaa/a";
+
+/// An `S3Url` addressing an object whose length is exactly the member's published maximum:
+/// the bucket, and a key padded out to the bound.
+fn longest_artifact_url() -> String {
+    let prefix = "s3://fleet-updates/";
+    format!(
+        "{prefix}{}",
+        "a".repeat(S3_URL_MAX_LENGTH - prefix.len())
+    )
+}
+
 /// The members of the create request that `GetOtaTask` projects back. `TaskId`, `TaskArn`,
 /// `CreatedAt`, `LastUpdatedAt` and `Status` are the service's own and are asserted
 /// separately.
@@ -350,17 +366,17 @@ async fn a_read_projects_what_the_create_stored() {
             OTA_STATUS_IN_PROGRESS,
         ),
         (
-            "a description and an S3 URL at their published length bounds",
+            "a description and an S3 URL at their published length maximum",
             json!({
-                "S3Url": "s".repeat(S3_URL_MAX_LENGTH),
+                "S3Url": longest_artifact_url(),
                 "OtaType": "ONE_TIME",
                 "Description": "d".repeat(DESCRIPTION_MAX_LENGTH),
             }),
             OTA_STATUS_IN_PROGRESS,
         ),
         (
-            "a one-character description and S3 URL (the length minimum)",
-            json!({"S3Url": "s", "OtaType": "CONTINUOUS", "Description": "d"}),
+            "a one-character description and the shortest artifact URL",
+            json!({"S3Url": SHORTEST_ARTIFACT_URL, "OtaType": "CONTINUOUS", "Description": "d"}),
             OTA_STATUS_IN_PROGRESS,
         ),
         (
@@ -925,7 +941,7 @@ async fn a_read_of_an_unknown_identifier_is_the_modelled_not_found() {
             "case {case:?}: expected the modelled ResourceNotFoundException code, got {:?}",
             reply.error_type
         );
-        let expected = format!("OTA task not found for id: {identifier}");
+        let expected = format!("Ota task with ID {identifier} does not exists.");
         assert_eq!(
             reply.string("Message"),
             Some(expected.as_str()),

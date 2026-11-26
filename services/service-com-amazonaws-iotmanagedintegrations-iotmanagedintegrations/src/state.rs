@@ -2650,6 +2650,21 @@ pub fn not_found_for_id_message(resource_subject: &str, identifier: &str) -> Str
     format!("{resource_subject} not found for id: {identifier}")
 }
 
+/// How a resource whose 404 states the identifier INSIDE a sentence about the resource words
+/// it: the resource as the sentence's subject, the identifier the request carried, and that
+/// no such resource exists.
+///
+/// The text is BUILT FROM THE REQUEST, so it is part of the contract and not just an
+/// example: the recorded 404 of a `GetOtaTask` whose `Identifier` the account holds no OTA
+/// task under reads `Ota task with ID <the Identifier sent> does not exists.` — this
+/// service's own spelling of the subject and its own grammar, both kept verbatim, with the
+/// identifier the only part that varies. A resource whose backend words an absence this way
+/// states it through here rather than through the label-shaped sentence its siblings use
+/// ([`not_found_for_id_message`]).
+pub fn with_id_does_not_exist_message(resource_subject: &str, identifier: &str) -> String {
+    format!("{resource_subject} with ID {identifier} does not exists.")
+}
+
 /// The modelled `ResourceNotFoundException` a READ of an OTA task configuration answers
 /// when this region holds none under the `Identifier` its request carries: the
 /// identifier-quoting reason above, and nothing else.

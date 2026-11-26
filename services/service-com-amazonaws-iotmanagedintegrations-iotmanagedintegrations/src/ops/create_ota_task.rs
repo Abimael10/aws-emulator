@@ -3,7 +3,8 @@
 //! @op CreateOtaTask
 //!
 //! Inserts the over-the-air task into `crate::state`'s `ota_tasks` store under a freshly
-//! generated `OtaTaskId`, after resolving the managed things its `Target` names and the
+//! generated `OtaTaskId`, after admitting the `S3Url` its artifact is stored at and then
+//! resolving the managed things its `Target` names and the
 //! OTA task configuration its `TaskConfigurationId` names, and answers with that id, its
 //! ARN and the description it stored. A replayed `ClientToken` (`@idempotencyToken`)
 //! answers with the record the first call created instead of creating a second one.
@@ -230,6 +231,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into());
             }
+        }
+
+        // The `S3Url` is where the task's artifact is stored, so a value that addresses no
+        // Amazon S3 object describes a rollout with nothing to deploy. It is judged on what
+        // the REQUEST carries, which is why it is settled HERE — before the `Target` and
+        // `TaskConfigurationId` references are resolved against the store, as every
+        // admission check of this service is (`crate::state::names_no_s3_object`).
+        if crate::state::names_no_s3_object(&input.s3_url) {
+            return Err(CreateOtaTaskErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::s3_invalid_request_message(
+                    crate::state::NO_S3_DETAIL,
+                )),
+            })
+            .into());
         }
 
         let region = crate::state::request_region(ctx.parts());
