@@ -11,6 +11,18 @@ Issue-Commit: 075f5affd9be323818b79ff1d792bbcf981ada1a
 
 # CreateServiceLevelObjective duplicate-SLO ConflictException Message does not name the existing SLO ARN
 
+> _CONTESTED by a behavioural recording, and NOT to be re-applied as written. The wording this
+> report asks for (`Slo with arn '<arn>' already exists.`) was implemented once before and
+> regressed the behavioural units `application-signals.slo-duplicate-name-conflict-rejected`
+> and `application-signals.concurrent-create-slo-same-name-exactly-one-wins`, which record AWS
+> refusing a duplicate `Name` with the fixed, identifier-free sentence `A resource with the
+> same identifier already exists` (no ARN, no trailing period). See
+> `issues/things-that-now-work/20261105T081430Z-application-signals-createservicelevelobjective-conflictexception-message-is-generic-instead-of-naming.md`
+> — the same report, closed as superseded for that reason — and the reopened behavioural issue
+> `...-reopen-application-signals-createservicelevelobjective-duplicate-name-conflictexception-still.md`,
+> whose fix restored the recorded sentence. The identifier-free sentence this report calls a
+> defect is the one the emulator answers._
+
 > _Note: this issue was identified against the code base at commit `075f5affd9be323818b79ff1d792bbcf981ada1a`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

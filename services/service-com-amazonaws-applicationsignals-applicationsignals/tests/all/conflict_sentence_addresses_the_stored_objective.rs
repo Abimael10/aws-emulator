@@ -3,14 +3,14 @@
 //! The sentence a 409 `ConflictException` states, against the sentence the 404 of the SAME
 //! objective states.
 //!
-//! RULE: a refusal this service words about ONE PARTICULAR objective addresses that objective
-//! by its ARN — the capitalised resource type, the ARN in single quotes and the predicate
-//! saying what is wrong with it, closed by a period — so a create under a `Name` the store
-//! already holds reads `Slo with arn '<the stored objective's ARN>' already exists.`, which
-//! differs from the refusal of a read of an objective nothing holds only in its predicate.
-//! `ConflictException` carries one `Message` member and the model states no text for it, so
-//! the wording IS the contract a client reads; the ARN is the only variable part, and it is
-//! the STORED record's own, so nothing of the refused request reaches the sentence.
+//! RULE: a create refused because the identifier it sent is already taken states the FIXED
+//! sentence of that conflict class — `A resource with the same identifier already exists`, no
+//! variable part, no trailing period — while a refusal this service words about ONE
+//! PARTICULAR objective the caller addressed (a read of an objective nothing holds) addresses
+//! that objective by its ARN. `ConflictException` carries one `Message` member and the model
+//! states no text for it, so the wording IS the contract a client reads; the conflict states
+//! no identifier, so nothing of the refused request and nothing of the record it collided
+//! with reaches it.
 //!
 //! The rows span what the rule generalises over: the form the objective's `Name` takes (the
 //! character classes the modelled `ServiceLevelObjectiveName` pattern
@@ -24,7 +24,7 @@
 
 use serde_json::{json, Value};
 
-use crate::refusal_prose::slo_already_exists;
+use crate::refusal_prose::SAME_IDENTIFIER_ALREADY_EXISTS;
 use crate::resource_tags::slo_arn;
 use crate::slo_evaluation_kind::request_based_sli_config;
 use crate::slo_lifecycle::{call, create, name_path_segment, router, sli_config};
@@ -86,11 +86,11 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// The 409 a taken `Name` earns states the conflict class's predicate about the objective that
-/// name already addresses, by the ARN the stored record reports — and the 404 a name nothing
-/// holds earns states the same sentence with the other predicate.
+/// The 409 a taken `Name` earns states the conflict class's fixed sentence, naming no
+/// identifier at all — and the 404 a name nothing holds earns names the objective it
+/// addressed by its ARN.
 #[tokio::test]
-async fn a_conflict_addresses_the_objective_its_name_already_names() {
+async fn a_conflict_states_no_identifier_while_a_not_found_states_one() {
     for row in rows() {
         let router = router();
         let mut stored = row.stored.clone();
@@ -128,24 +128,23 @@ async fn a_conflict_addresses_the_objective_its_name_already_names() {
             row.case
         );
         let message = answer["Message"].as_str().unwrap_or_default().to_string();
-        let expected = slo_already_exists(&row.name);
         assert_eq!(
-            message, expected,
-            "case {}: expected {expected:?}, got {message:?}",
+            message, SAME_IDENTIFIER_ALREADY_EXISTS,
+            "case {}: expected {SAME_IDENTIFIER_ALREADY_EXISTS:?}, got {message:?}",
             row.case
         );
-        // The ARN is the ONE variable part, and it is the stored record's own: nothing of the
-        // refused create's own body reaches the sentence.
+        // There is no variable part: neither the ARN of the record the identifier collided
+        // with nor anything of the refused create's own body reaches the sentence.
         assert!(
-            message.contains(&stored_arn) && !message.contains("a second attempt"),
-            "case {}: expected a sentence naming {stored_arn:?} and nothing of the refused \
+            !message.contains(&stored_arn) && !message.contains("a second attempt"),
+            "case {}: expected a sentence naming neither {stored_arn:?} nor the refused \
              body, got {message:?}",
             row.case
         );
 
-        // The other refusal class about one particular objective: a read of a name nothing
-        // holds. The two sentences differ ONLY in their predicate, which is what tells a
-        // client which of the two happened.
+        // The other refusal class, the one worded about one particular objective: a read of a
+        // name nothing holds, which DOES state the ARN it addressed. That difference is what
+        // tells a client which of the two happened.
         let (status, missing) = call(
             &router,
             "GET",
@@ -167,8 +166,8 @@ async fn a_conflict_addresses_the_objective_its_name_already_names() {
             row.case
         );
 
-        // Round trip: the refused create wrote nothing, so the record the sentence addresses
-        // is still the one the admitted create stored.
+        // Round trip: the refused create wrote nothing, so the record the identifier collided
+        // with is still the one the admitted create stored.
         let (status, fetched) = call(
             &router,
             "GET",

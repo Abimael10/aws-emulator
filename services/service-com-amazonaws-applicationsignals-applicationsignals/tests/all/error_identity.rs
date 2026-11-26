@@ -31,8 +31,8 @@ use crate::slo_lifecycle::{
 // owns that rule.
 use crate::refusal_wording::assert_work_item_wording;
 // The sentence a create whose name is already stored is refused with, and the assertion that
-// it names the stored record: owned by the suite that holds this service's refusal prose and
-// applied here to this suite's rows too, so the two cannot drift.
+// it names neither the stored record nor the identifier: owned by the suite that holds this
+// service's refusal prose and applied here to this suite's rows too, so the two cannot drift.
 use crate::refusal_prose::assert_name_already_taken;
 
 /// The `ResourceType` every SLO failure reports: the resource's type NAME, capitalised.
@@ -155,15 +155,15 @@ async fn a_missing_slo_is_identified_by_its_arn_on_every_read_write_and_delete()
     }
 }
 
-/// Rule 2: a create under a name already stored is refused with the sentence of that error
-/// class, which identifies the stored record by its ARN — the same ARN the create that won
-/// returned, by which that record stays addressable.
+/// Rule 2: a create under a name already stored is refused with the fixed sentence of that
+/// error class, which identifies no record at all — the stored record stays addressable by
+/// the ARN the create that won returned, which is where a caller reads it.
 ///
 /// The rows differ along the name's form and along the rest of the repeated request, which
 /// the wording must not depend on: a different description, the other (mutually
 /// exclusive) SLI config, a goal and burn rates the stored record does not carry.
 #[tokio::test]
-async fn a_repeated_create_conflicts_and_identifies_the_stored_slo() {
+async fn a_repeated_create_conflicts_without_identifying_the_stored_slo() {
     // Name forms drawn from the modelled `ServiceLevelObjectiveName` pattern
     // `^[0-9A-Za-z][-._0-9A-Za-z ]{0,126}[0-9A-Za-z]$`, including its shortest spelling and
     // one of its maximum length.
@@ -221,8 +221,8 @@ async fn a_repeated_create_conflicts_and_identifies_the_stored_slo() {
         }
 
         // The ARN the winning create returned addresses the record the store really holds: a
-        // Get by that ARN answers the SLO under this name, so the identifier the refused
-        // caller read is the resource's own.
+        // Get by that ARN answers the SLO under this name, so the identifier the refusal
+        // withheld is the resource's own and the caller can still read it.
         let (status, fetched) =
             call(&router, "GET", &format!("/slo/{}", arn_path_segment(name)), None).await;
         assert_eq!(
@@ -276,8 +276,8 @@ async fn create_signed_in(
 }
 
 /// Rule 2, the other half: the sentence does not depend on the refused request at all — a
-/// duplicate create signed in another region reads the identical sentence, which states the
-/// STORED record's ARN and so carries nothing of the refused request's credential scope.
+/// duplicate create signed in another region reads the identical fixed sentence, so nothing
+/// of the refused request's credential scope reaches it.
 ///
 /// The rows differ along the region the duplicate create is signed in, including the region
 /// the stored record itself carries, and along the name's form.

@@ -979,21 +979,29 @@ pub fn tagged_resource_type(resource_arn: &str) -> &'static str {
     }
 }
 
-/// The predicate [`slo_arn_sentence`] states about an SLO a create cannot mint because the
-/// store already holds one under that identity.
-const SLO_ALREADY_EXISTS: &str = "already exists";
+/// The sentence a create of this service is refused with when the identifier it sent is
+/// already taken by a resource the store holds.
+///
+/// It is FIXED text with NO variable part — not the identifier the request sent, not the
+/// resource type, not the ARN of the record the identifier collided with — and it is closed
+/// by no period. A conflict is a statement that the identifier is taken; the caller already
+/// knows which identifier it sent, and the record it collided with is one it never named.
+/// So this is the whole sentence, identical for every refused create, which is what lets a
+/// client tell "this identifier is taken" from the other conflicts a 409 covers by comparing
+/// the one member `ConflictException` carries.
+pub const SAME_IDENTIFIER_ALREADY_EXISTS: &str = "A resource with the same identifier already exists";
 
 /// The modelled `ConflictException` a create is refused with when the identifier it sent
-/// already names a stored SLO, which `arn` addresses.
+/// already names a stored SLO.
 ///
-/// Worded in the ONE sentence this service states about one particular SLO
-/// ([`slo_arn_sentence`]): the capitalised type name, the ARN of the objective the identifier
-/// already names, and the predicate. The ARN is the STORED record's own, so no region the
-/// refused request happened to be signed in reaches the sentence — what the caller is told
-/// about is the objective it collided with.
-pub fn slo_already_exists(arn: &str) -> ConflictException {
+/// Worded in this service's taken-identifier sentence ([`SAME_IDENTIFIER_ALREADY_EXISTS`]),
+/// which states nothing of either resource: unlike a refusal ABOUT ONE PARTICULAR objective
+/// the caller addressed ([`slo_arn_sentence`], which a read of an id nothing holds answers),
+/// a conflict is about an identifier, so it discloses no ARN of the stored record and reads
+/// the same however the refused create was spelled.
+pub fn slo_already_exists() -> ConflictException {
     ConflictException {
-        message: slo_arn_sentence(arn, SLO_ALREADY_EXISTS),
+        message: SAME_IDENTIFIER_ALREADY_EXISTS.to_string(),
     }
 }
 
