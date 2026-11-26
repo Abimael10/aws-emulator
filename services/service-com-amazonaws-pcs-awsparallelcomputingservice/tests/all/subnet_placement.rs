@@ -10,7 +10,8 @@
 //!    it mints anything: if any of them resolves to no subnet of the account, the create is
 //!    refused with the service's fixed sentence and persists nothing. The same holds for
 //!    `CreateComputeNodeGroup`, whose `subnetIds` is "the list of subnet IDs where the
-//!    compute node group launches instances".
+//!    compute node group launches instances", and for the security groups the same sentence
+//!    names (the submodule below).
 //! 2. A refusal is grounded in what EC2 ANSWERED, never assumed from silence: an emulator
 //!    with no EC2 to ask serves the create.
 //! 3. `scheduler.version` is a plain `String` in the model, so a value that LABELS a
@@ -27,6 +28,9 @@
 //! (`tests/all/subnet_placement/cluster_vpc_placement.rs`): a compute node group's subnets
 //! must be in the same VPC as the cluster it joins, which is a comparison against the
 //! cluster's own stored placement rather than a question about one subnet.
+//!
+//! The SECURITY GROUPS half of rule 1's sentence is its own suite too, in
+//! `tests/all/subnet_placement/security_group_membership.rs`, on the same harness.
 
 use std::sync::Arc;
 
@@ -42,6 +46,10 @@ use crate::cluster_lifecycle::{call, emulator};
 // module, which is this one.
 #[path = "subnet_placement/cluster_vpc_placement.rs"]
 mod cluster_vpc_placement;
+
+// The security groups a create names, declared the same way.
+#[path = "subnet_placement/security_group_membership.rs"]
+mod security_group_membership;
 
 /// The region every case signs for, matching the scope `crate::cluster_lifecycle` signs
 /// with: the Region a request is signed for is the one its subnets are resolved in.

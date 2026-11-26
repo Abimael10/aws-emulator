@@ -48,9 +48,17 @@
 //! * response size — [`page_size`] clamps a caller's `maxResults` to the modelled
 //!   `1..=100` before [`paginate`] truncates.
 
+/// The one hop this service asks Amazon EC2 over, shared by every network fact it resolves
+/// there.
+pub mod ec2_client;
+
 /// The EC2 subnets a request places a resource in, resolved against the service that owns
 /// subnets.
 pub mod ec2_subnets;
+
+/// The EC2 security groups a request would attach a network interface to, resolved against
+/// the service that owns security groups.
+pub mod ec2_security_groups;
 
 /// Why a request about a resource inside a cluster is refused when the cluster it names
 /// cannot be resolved: the cluster is the authorization boundary of everything nested in

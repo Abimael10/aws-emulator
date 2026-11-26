@@ -286,21 +286,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
 
         // "The subnets and security groups for the cluster must already exist before you
-        // use this API action" (this operation's own documentation): the subnets the
-        // control-plane ENI would be created in belong to EC2, so a create resolves them
-        // against EC2 before it mints or stores anything — a cluster whose ENI could never
-        // be placed is refused rather than persisted. The list was bounded above, so the
-        // hop is not sized by the request, and it is made before the state lock is taken,
-        // so nothing is held across it.
+        // use this API action" (this operation's own documentation): BOTH halves of the
+        // networking a request names belong to EC2 — the subnets the control-plane ENI would
+        // be created in and the security groups that ENI would carry — so a create resolves
+        // each of them against EC2 before it mints or stores anything, in the order the
+        // sentence names them. A cluster whose ENI could never be placed, or could never
+        // carry the membership the record would report, is refused rather than persisted.
+        // Both lists were bounded above, so neither hop is sized by the request, and both
+        // are made before the state lock is taken, so nothing is held across them.
         //
-        // The hop goes nowhere: it runs over the emulator's OWN in-process callback
-        // transport, so no socket is opened and no host name is resolved, and the Region it
-        // is addressed in is read as a Region LABEL before it can reach the endpoint
-        // authority (see `crate::state::ec2_subnets`).
+        // The hops go nowhere: they run over the emulator's OWN in-process callback
+        // transport, so no socket is opened and no host name is resolved, and the Region they
+        // are addressed in is read as a Region LABEL before it can reach the endpoint
+        // authority (see `crate::state::ec2_client`).
         if let Some(refusal) = crate::state::ec2_subnets::violation(
             ctx,
             &region,
             input.networking.subnet_ids.as_deref().unwrap_or_default(),
+        )
+        .await
+        {
+            return Err(CreateClusterErrorModeled::ValidationException(refusal).into());
+        }
+        if let Some(refusal) = crate::state::ec2_security_groups::violation(
+            ctx,
+            &region,
+            input
+                .networking
+                .security_group_ids
+                .as_deref()
+                .unwrap_or_default(),
         )
         .await
         {
