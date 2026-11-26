@@ -876,6 +876,7 @@ pub fn reported_network_interface(interface: &NetworkInterface) -> NetworkInterf
 pub(super) fn instance_network_interface_view(
     interface: &NetworkInterface,
     attachment: &NetworkInterfaceAttachment,
+    holds_public_hostname: bool,
 ) -> InstanceNetworkInterface {
     // The public hostname of the address this interface holds, and the public-hostname
     // options naming it, are members of the interface's OWN shape
@@ -884,24 +885,37 @@ pub(super) fn instance_network_interface_view(
     // renders an element this model does not declare — off the SAME stored record this
     // projection reads everything else from, so the two reports of one interface cannot
     // disagree about the name it answers to.
+    //
+    // Nothing is handed over for an instance whose launch has not assigned it a public
+    // hostname yet ([`ComAmazonawsEc2Amazonec2State::instance_holds_public_hostname`], which
+    // the caller asked): the interface then reports neither element, there being no name for
+    // them to carry.
     if let Some(network_interface_id) = interface.network_interface_id.as_deref() {
-        crate::service::recorded_response_members::hold_instance_interface_public_hostname(
-            network_interface_id,
-            interface.public_dns_name.as_deref().unwrap_or_default(),
-            interface_public_ip_dns_name_options(interface),
-        );
+        if holds_public_hostname {
+            crate::service::recorded_response_members::hold_instance_interface_public_hostname(
+                network_interface_id,
+                interface.public_dns_name.as_deref().unwrap_or_default(),
+                interface_public_ip_dns_name_options(interface),
+            );
+        }
     }
     // The public address the interface holds, in the shape the INSTANCE report carries it
     // in: the same stored association, which has no member for the allocation or the
     // association id — those belong to the Elastic IP address record `DescribeAddresses`
     // reports — so one association cannot read one way here and another through
     // `DescribeNetworkInterfaces`.
+    //
+    // Its public hostname follows the one reading of whether the instance has been assigned
+    // one: the ADDRESS is reported from the launch's own answer on, and the name of it only
+    // once the launch that assigns it has finished.
     let interface_association =
         |association: &NetworkInterfaceAssociation| InstanceNetworkInterfaceAssociation {
             carrier_ip: association.carrier_ip.clone(),
             customer_owned_ip: association.customer_owned_ip.clone(),
             ip_owner_id: association.ip_owner_id.clone(),
-            public_dns_name: association.public_dns_name.clone(),
+            public_dns_name: holds_public_hostname
+                .then(|| association.public_dns_name.clone())
+                .flatten(),
             public_ip: association.public_ip.clone(),
         };
     // The same association as the INTERFACE reports: a public address is bound to one

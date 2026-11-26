@@ -2608,6 +2608,10 @@ impl ComAmazonawsEc2Amazonec2State {
     /// belongs to is no longer one of the instance's — the same reading
     /// [`Self::network_interface_attachment`] takes.
     pub fn instance_network_interfaces(&self, instance_id: &str) -> Vec<InstanceNetworkInterface> {
+        // Whether this instance has been assigned its public hostname yet, asked ONCE for the
+        // whole report so every interface of one instance answers the same
+        // ([`Self::instance_holds_public_hostname`] carries the rule).
+        let holds_public_hostname = self.instance_holds_public_hostname(instance_id);
         let mut attached: Vec<(i32, InstanceNetworkInterface)> = self
             .attached_network_interface_records(instance_id)
             .into_iter()
@@ -2615,7 +2619,7 @@ impl ComAmazonawsEc2Amazonec2State {
                 let attachment = interface.attachment.as_ref()?;
                 Some((
                     attachment.device_index.unwrap_or_default(),
-                    instance_network_interface_view(interface, attachment),
+                    instance_network_interface_view(interface, attachment, holds_public_hostname),
                 ))
             })
             .collect();

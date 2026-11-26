@@ -458,10 +458,11 @@ async fn described_interfaces(
     )
 }
 
-/// Look again until the instance reports an association against one of its private addresses,
-/// or a deadline far past the service's own transition span passes — the association is
-/// written by the call before this one, so what is polled for is the interface the attachment
-/// made part of the instance rather than the clock.
+/// Look again until the instance reports an association against one of its private addresses
+/// AND the public hostname that goes with it, or a deadline far past the service's own
+/// transition span passes — the association is written by the call before this one, and the
+/// hostname is assigned by the launch as it completes, so what is polled for is what the
+/// instance reports rather than the clock.
 async fn poll_until_an_address_is_associated(
     router: &MultiServiceRouter,
     case: &str,
@@ -470,10 +471,11 @@ async fn poll_until_an_address_is_associated(
     let deadline = Instant::now() + poll_deadline();
     loop {
         let reported = described_interfaces(router, case, instance_id).await;
-        let associated = reported
-            .1
-            .iter()
-            .any(|interface| interface.addresses.iter().any(|(_, held)| held.is_some()));
+        let associated = !reported.0.is_empty()
+            && reported
+                .1
+                .iter()
+                .any(|interface| interface.addresses.iter().any(|(_, held)| held.is_some()));
         if associated {
             return reported;
         }

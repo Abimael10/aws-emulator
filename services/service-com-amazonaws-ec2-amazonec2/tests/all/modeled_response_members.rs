@@ -638,25 +638,20 @@ async fn a_launch_reports_its_reservation_groups_and_every_instance_member() {
                  assigned, got {instance:?}"
             );
             // A subnet that maps public IPv4 addresses on launch gives its instances one,
-            // and the public DNS name names exactly that address.
+            // and the launch reports that address — but not a hostname for it: the public
+            // hostname is assigned by the launch as it completes, so a launch still running
+            // reports the EMPTY name and the read-back below carries the name of the address.
             assert_eq!(
                 instance.public_ip.as_deref().is_some_and(|ip| !ip.is_empty()),
                 expect_public_address,
                 "case {case:?}: expected a public address: {expect_public_address}, got \
                  {instance:?}"
             );
-            let expected_dns_name = match instance.public_ip.as_deref() {
-                Some(public_ip) if !public_ip.is_empty() => format!(
-                    "ec2-{}.{REGION}.compute.amazonaws.com",
-                    public_ip.replace('.', "-")
-                ),
-                _ => String::new(),
-            };
             assert_eq!(
                 instance.public_dns_name.as_deref(),
-                Some(expected_dns_name.as_str()),
-                "case {case:?}: the public DNS name must name the address the instance \
-                 holds, got {instance:?}"
+                Some(""),
+                "case {case:?}: a launch that has assigned no public hostname yet reports the \
+                 empty one, got {instance:?}"
             );
         }
 
@@ -712,6 +707,22 @@ async fn a_launch_reports_its_reservation_groups_and_every_instance_member() {
                 reservation.instances[0].groups,
                 "case {case:?}: the instance keeps the groups its launch gave it, got \
                  {instance:?}"
+            );
+            // The launch has finished, so the public hostname it assigns now names exactly
+            // the address the instance holds — and the EMPTY name is what an instance holding
+            // no public address reports.
+            let expected_dns_name = match instance.public_ip.as_deref() {
+                Some(public_ip) if !public_ip.is_empty() => format!(
+                    "ec2-{}.{REGION}.compute.amazonaws.com",
+                    public_ip.replace('.', "-")
+                ),
+                _ => String::new(),
+            };
+            assert_eq!(
+                instance.public_dns_name.as_deref(),
+                Some(expected_dns_name.as_str()),
+                "case {case:?}: the public DNS name must name the address the instance \
+                 holds, got {instance:?}"
             );
         }
     }

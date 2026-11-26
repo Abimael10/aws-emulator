@@ -14,9 +14,15 @@
 //! interface the instance reports, and the interface read on its own through
 //! `DescribeNetworkInterfaces`.
 //!
-//! The rows span what that rule generalises over: the REPORT PATH (a launch reply, the
-//! instance read back, the interface read on its own), the VPC attribute (on, off, on again)
-//! and whether the resource holds a public address at all.
+//! The rows span what that rule generalises over: the REPORT PATH (the instance read back, the
+//! interface read on its own), the VPC attribute (on, off, on again) and whether the resource
+//! holds a public address at all.
+//!
+//! The hostname is assigned by the LAUNCH, and a launch that is still running has not assigned
+//! one: the launch reply therefore reports the address it gave the instance with the empty
+//! `dnsName` and no options naming a hostname, and every report from the instant the launch has
+//! carried the instance to `running` carries the name of that address — which is why every row
+//! below is read after the instance reports `running`.
 //!
 //! The HOSTNAME half of that rule — that the name is the VPC's to give, and that it is the
 //! name of the address the resource holds — is already pinned by
@@ -28,6 +34,8 @@
 //! asserted once, because the two halves are one answer: the members are DERIVED from that
 //! hostname, so a suite that moved the hostname without re-reading them would not catch them
 //! drifting apart.
+
+use std::time::{Duration, Instant};
 
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -225,6 +233,58 @@ fn no_hostname() -> PublicHostname {
     }
 }
 
+/// What an INTERFACE under an instance with no public hostname reports: neither element at
+/// all. The interface's `publicDnsName` is an element the reported shape declares no member
+/// for, rendered only where there is a name for it to carry, where the instance's own
+/// `dnsName` is a modelled member reported for every instance — empty included.
+fn absent_hostname() -> PublicHostname {
+    PublicHostname {
+        hostname: None,
+        options: None,
+    }
+}
+
+/// How long a poll of this suite waits for a move the clock owes an instance: far past the
+/// service's own transition span, so a loaded host does not decide the outcome.
+fn poll_deadline() -> Duration {
+    Duration::from_secs(60)
+}
+
+/// How long one poll of this suite waits before looking again.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Look again until `instance_id` reports `running`, or a deadline far past the service's own
+/// transition span passes — the launch owes that move to the clock, so what is waited on is the
+/// STATE rather than a span of time. Answers the body that reported it running.
+async fn poll_until_running(router: &MultiServiceRouter, case: &str, instance_id: &str) -> String {
+    let deadline = Instant::now() + poll_deadline();
+    loop {
+        let body = describe(router, case, instance_id).await;
+        let state = {
+            let parsed = document(case, &body);
+            let instance = parsed
+                .descendants()
+                .find(|node| {
+                    node.is_element()
+                        && child(*node, "instanceId").is_some()
+                        && child(*node, "instanceState").is_some()
+                })
+                .unwrap_or_else(|| panic!("case {case:?}: no reported instance in {body}"));
+            child(instance, "instanceState")
+                .and_then(|state| child_text(state, "name"))
+                .unwrap_or_default()
+        };
+        if state == "running" {
+            return body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: {instance_id} never reached running, last state {state:?} in {body}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// The VPC the one instance of a report runs in.
 fn reported_vpc_id(case: &str, body: &str) -> String {
     let parsed = document(case, body);
@@ -245,16 +305,43 @@ fn reported_vpc_id(case: &str, body: &str) -> String {
 #[tokio::test]
 async fn every_report_of_a_public_instance_carries_the_hostname_of_its_address() {
     let (router, _engine) = super::ec2_query::emulator();
-    let (instance_id, launched) = launch(&router, "the launch reply").await;
-    let described = describe(&router, "the instance read back", &instance_id).await;
+    let case = "the launch reply";
+    let (instance_id, launched) = launch(&router, case).await;
+    // The launch gives the instance the address and reports it, but has not assigned a
+    // hostname for it yet: the instance's own `dnsName` is the empty one and its interface
+    // carries neither element.
+    let at_launch = reported_instance(case, &launched);
+    assert!(
+        at_launch.public_ip.is_some(),
+        "case {case:?}: an instance of the default network is given a public address by its \
+         launch, got {at_launch:?}"
+    );
+    assert_eq!(
+        at_launch.instance,
+        no_hostname(),
+        "case {case:?}: expected the launch reply to report {:?} for an instance it has not \
+         assigned a hostname yet, got {:?}",
+        no_hostname(),
+        at_launch.instance
+    );
+    assert_eq!(
+        at_launch.interface,
+        absent_hostname(),
+        "case {case:?}: expected the interface under it to report {:?}, got {:?}",
+        absent_hostname(),
+        at_launch.interface
+    );
+
+    let described = poll_until_running(&router, "the instance read back", &instance_id).await;
+    let read_again = describe(&router, "the same instance read again", &instance_id).await;
     let network_interface_id =
         primary_network_interface(&router, REGION, "the interface read on its own", &instance_id)
             .await;
 
     // (case, the body that reported the instance)
     let rows = [
-        ("the launch reply", launched),
         ("the instance read back", described),
+        ("the same instance read again", read_again),
     ];
     let mut hostnames = Vec::new();
     for (case, body) in rows {
@@ -312,7 +399,10 @@ async fn the_members_follow_the_vpc_dns_hostnames_attribute() {
     let vpc_id = reported_vpc_id("the launch", &launched);
     let network_interface_id =
         primary_network_interface(&router, REGION, "the launch", &instance_id).await;
-    let public_ip = reported_instance("the launch", &launched)
+    // The hostname is the launch's to assign, so the rows below are read from the instant the
+    // launch has carried the instance to `running`.
+    let running = poll_until_running(&router, "the launched instance", &instance_id).await;
+    let public_ip = reported_instance("the launched instance", &running)
         .public_ip
         .expect("an instance of the default network holds a public address");
 
@@ -384,10 +474,13 @@ async fn the_members_follow_the_vpc_dns_hostnames_attribute() {
 #[tokio::test]
 async fn the_members_follow_the_address_the_interface_holds() {
     let (router, _engine) = super::ec2_query::emulator();
-    let (instance_id, launched) = launch(&router, "the launch").await;
+    let (instance_id, _launched) = launch(&router, "the launch").await;
     let network_interface_id =
         primary_network_interface(&router, REGION, "the launch", &instance_id).await;
-    let public_ip = reported_instance("the launch", &launched)
+    // The hostname is the launch's to assign, so the rows below are read from the instant the
+    // launch has carried the instance to `running`.
+    let running = poll_until_running(&router, "the launched instance", &instance_id).await;
+    let public_ip = reported_instance("the launched instance", &running)
         .public_ip
         .expect("an instance of the default network holds a public address");
 

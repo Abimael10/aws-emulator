@@ -26,6 +26,8 @@
 //! pair the readers of one named interface split an unresolvable id into — which refusal an
 //! operation answers is a fact of that operation.
 
+use std::time::{Duration, Instant};
+
 use ec2::state::ComAmazonawsEc2Amazonec2State as Ec2State;
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -188,6 +190,51 @@ async fn launch(router: &MultiServiceRouter, case: &str) -> String {
         .unwrap_or_else(|| panic!("case {case:?}: no instanceId in the RunInstances {body}"))
 }
 
+/// Look again until `instance_id` reports `running`, or a deadline far past the service's own
+/// transition span passes: the launch owes that move to the clock, so what is waited on is the
+/// STATE rather than a span of time.
+async fn poll_until_running(router: &MultiServiceRouter, case: &str, instance_id: &str) {
+    let deadline = Instant::now() + POLL_DEADLINE;
+    loop {
+        let body = ok(
+            case,
+            router,
+            "DescribeInstances",
+            &[param("InstanceId.1", instance_id)],
+        )
+        .await;
+        let state = {
+            let parsed = document(case, &body);
+            let instance = parsed
+                .descendants()
+                .find(|node| {
+                    node.is_element()
+                        && child(*node, "instanceId").is_some()
+                        && child(*node, "instanceState").is_some()
+                })
+                .unwrap_or_else(|| panic!("case {case:?}: no reported instance in {body}"));
+            child(instance, "instanceState")
+                .and_then(|state| child_text(state, "name"))
+                .unwrap_or_default()
+        };
+        if state == "running" {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: {instance_id} never reached running, last state {state:?} in {body}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// How long [`poll_until_running`] waits for that move: far past the service's own transition
+/// span, so a loaded host does not decide the outcome.
+const POLL_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long one poll waits before looking again.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 /// What `DescribeNetworkInterfaces` reports for the one interface `network_interface_id` names.
 async fn described_interface(
     router: &MultiServiceRouter,
@@ -289,6 +336,9 @@ async fn the_chosen_hostname_type_is_read_back_off_every_report_of_the_interface
     let (router, engine) = emulator();
     let subnet_id = a_default_subnet(&engine);
     let instance_id = launch(&router, "the launched instance").await;
+    // The public hostname of the address a launch assigns is the launch's to assign, so the
+    // fixture is read from the instant the launch has carried the instance to `running`.
+    poll_until_running(&router, "the launched instance", &instance_id).await;
     let primary = super::ec2_query::primary_network_interface(
         &router,
         REGION,

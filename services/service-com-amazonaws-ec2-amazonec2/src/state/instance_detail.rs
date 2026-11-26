@@ -50,9 +50,9 @@ use super::{
     IMAGE_HYPERVISOR_XEN, IMAGE_ROOT_DEVICE_TYPE_EBS, IMAGE_VIRTUALIZATION_TYPE_HVM,
     IMDS_SUPPORT_V2, ImageSpec, InstanceRecord, InstanceStateName, MAX_METADATA_HOP_LIMIT,
     MIN_METADATA_HOP_LIMIT,
-    TRANSITION_DELAY, catalog_member, due_instant, echoed_resource_id, image_creation_time,
+    TRANSITION_DELAY, catalog_member, due_instant, echoed_resource_id,
     instance_type_record, invalid_parameter_combination, invalid_parameter_value,
-    region_of_zone_name, supported_boot_modes,
+    region_of_zone_name, supported_boot_modes, system_time_to_date_time,
     unmanaged_operator,
     zone_id_for_zone_name,
 };
@@ -1196,12 +1196,14 @@ impl ComAmazonawsEc2Amazonec2State {
                 .unwrap_or(defaults.usage_operation),
         );
         // "The time that the usage operation was last updated"
-        // (`Instance$UsageOperationUpdateTime`): the usage operation is the AMI's billing
-        // attribution, so it was last updated when that AMI was registered — read off the
-        // image's own `CreationDate` through the one conversion every report of that stored
-        // string uses, never from this call's clock.
-        view.usage_operation_update_time =
-            image.and_then(|image| image_creation_time(image.creation_date.as_deref()));
+        // (`Instance$UsageOperationUpdateTime`): the usage operation is the billing
+        // attribution the INSTANCE runs under, settled when the instance was launched and
+        // moved by nothing afterwards here, so the instant it was last updated is the
+        // instance's own launch time — read off the record through the one conversion every
+        // report of that instant takes, never from this call's clock. A fact of the instance
+        // rather than of its AMI, so it is reported for every instance, one launched from an
+        // AMI this store does not hold included.
+        view.usage_operation_update_time = Some(system_time_to_date_time(instance.launch_time));
         // "The platform. This value is `windows` for Windows instances; otherwise, it is
         // empty" (`Instance$Platform`): the member's own documented value, which is the
         // lower-case word — the modelled `PlatformValues` spells the enum member `Windows`,
@@ -1372,11 +1374,14 @@ impl ComAmazonawsEc2Amazonec2State {
         // address the instance holds, read through the one place that VPC attribute is
         // applied ([`ComAmazonawsEc2Amazonec2State::public_dns_name_in_vpc`]) — so a VPC
         // that hands out no public hostnames reports the EMPTY name, which is also what an
-        // instance holding no public address reports. The member is reported either way.
+        // instance holding no public address reports, and what one whose launch has not yet
+        // given it a name reports ([`Self::instance_holds_public_hostname`]). The member is
+        // reported either way.
         view.public_dns_name = Some(
             instance
                 .public_ip
                 .as_deref()
+                .filter(|_| self.instance_holds_public_hostname(&instance.instance_id))
                 .map(|public_ip| {
                     self.public_dns_name_in_vpc(
                         self.instance_vpc_id(instance).as_deref(),
@@ -1386,5 +1391,27 @@ impl ComAmazonawsEc2Amazonec2State {
                 })
                 .unwrap_or_default(),
         );
+    }
+
+    /// Whether the instance `instance_id` has been ASSIGNED its public DNS hostname yet.
+    ///
+    /// "The public DNS name assigned to the instance" (`Instance$PublicDnsName`) is assigned
+    /// by the launch that creates the instance, and a launch that is still running has not
+    /// assigned one: an instance in `pending` therefore has no public hostname to report,
+    /// even though the public address it was given is already reported beside it, and from
+    /// the instant the launch has carried it to `running` every report of that hostname names
+    /// the address it holds.
+    ///
+    /// The ONE reading of that question, taken by every public-hostname member of an
+    /// instance's report — its own `dnsName`, the `publicDnsName` of each interface the
+    /// report carries, the association on that interface and on the private address the
+    /// public one is bound to, and the public-hostname options naming it
+    /// ([`ComAmazonawsEc2Amazonec2State::instance_network_interfaces`]) — so they cannot
+    /// disagree about one instance. A READ only: an instance this store no longer holds has
+    /// nothing in flight, so it is not held back.
+    pub fn instance_holds_public_hostname(&self, instance_id: &str) -> bool {
+        self.instances
+            .get(instance_id)
+            .is_none_or(|instance| instance.state != InstanceStateName::Pending)
     }
 }

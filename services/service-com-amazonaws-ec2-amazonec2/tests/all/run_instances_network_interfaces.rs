@@ -26,6 +26,8 @@
 //! for that an interface cannot be given is refused, naming the parameter at fault, rather
 //! than served with an instance whose interfaces are not what was asked for.
 
+use std::time::{Duration, Instant};
+
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -310,6 +312,34 @@ async fn described(case: &str, router: &MultiServiceRouter, instance_id: &str) -
          from {body}"
     );
     reported.pop().expect("checked just above")
+}
+
+/// Look again until `instance_id` reports the public hostname its launch assigns it, or a
+/// deadline far past the service's own transition span passes: the hostname of the address a
+/// launch assigns comes to exist as that launch COMPLETES, so what is waited on is the name
+/// the instance reports rather than a span of time.
+async fn poll_until_named(
+    case: &str,
+    router: &MultiServiceRouter,
+    instance_id: &str,
+) -> ReportedInstance {
+    let deadline = Instant::now() + ec2::state::TRANSITION_DELAY * 40;
+    loop {
+        let reported = described(case, router, instance_id).await;
+        if reported
+            .public_dns_name
+            .as_deref()
+            .is_some_and(|name| !name.is_empty())
+        {
+            return reported;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: {instance_id} never reported a public hostname, last report \
+             {reported:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 /// `DescribeNetworkInterfaces` narrowed to one interface, as that interface.
@@ -1031,11 +1061,14 @@ async fn a_launch_asks_its_primary_interface_for_a_public_address() {
     // Region this suite signs for (Amazon EC2 User Guide, "Amazon EC2 instance hostname
     // types").
     let expected_name = format!("ec2-{}.compute-1.amazonaws.com", public_ip.replace('.', "-"));
+    // The name is assigned as the launch completes, so it is read from the instant the
+    // instance reports one.
+    let named = poll_until_named(case, &network.router, &instance.instance_id).await;
     assert_eq!(
-        instance.public_dns_name.as_deref(),
+        named.public_dns_name.as_deref(),
         Some(expected_name.as_str()),
         "case {case:?}: the public DNS name names the address the instance holds, got \
-         {instance:?}"
+         {named:?}"
     );
     let read_back = described_interface(
         case,
