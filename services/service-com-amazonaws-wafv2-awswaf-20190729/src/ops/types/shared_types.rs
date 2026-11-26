@@ -841,8 +841,15 @@ pub struct CustomResponseBody {
 #[smithy_macros::smithy(shape = "com.amazonaws.wafv2#MonetizationConfig")]
 #[derive(Debug, Clone, Default)]
 pub struct MonetizationConfig {
+    pub connected_account_configs: Option<Vec<ConnectedAccountConfig>>,
     pub crypto_config: Option<CryptoConfig>,
     pub currency_mode: Option<String>,
+}
+
+#[smithy_macros::smithy(shape = "com.amazonaws.wafv2#ConnectedAccountConfig")]
+#[derive(Debug, Clone, Default)]
+pub struct ConnectedAccountConfig {
+    pub connected_account_arn: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.wafv2#CryptoConfig")]

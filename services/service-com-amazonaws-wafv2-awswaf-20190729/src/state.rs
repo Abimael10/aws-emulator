@@ -1312,6 +1312,18 @@ pub struct ComAmazonawsWafv2Awswaf20190729State {
     /// member of the record and a filter over it — so the ledger is keyed by scope
     /// alone. See [`SettlementRecordEntry`].
     pub settlement_records: HashMap<String, Vec<SettlementRecordEntry>>,
+    /// The connected accounts a monetization configuration's payments can settle
+    /// into, by ARN: the set a save naming one resolves against
+    /// ([`connected_account_refusal`]).
+    ///
+    /// A connected account is a PAYMENTS resource — it is created in the Payments
+    /// console and WAF only ever resolves it, which is why the refusal sends a
+    /// caller there for the current ARN. This emulator serves no Payments control
+    /// plane, so nothing inserts here and every reference a configuration carries
+    /// resolves to nothing, which is the answer WAF gives for an account that was
+    /// never created. The resolution is still the whole answer: a set that holds
+    /// an account resolves exactly that one.
+    pub connected_accounts: std::collections::BTreeSet<String>,
     /// The live web ACL association of every protected resource: the resource's
     /// own ARN → the web ACL that is in front of it ([`WebAclAssociation`]).
     ///

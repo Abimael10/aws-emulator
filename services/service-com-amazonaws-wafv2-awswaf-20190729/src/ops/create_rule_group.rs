@@ -280,22 +280,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateRuleGroupErrorModeled::WAFInvalidParameterException(refusal).into());
         }
 
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateRuleGroupErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
         // Every precondition the monetization settings put on the document being
         // written: the namespace the feature is available in, the rules that may take
-        // its action, and the configuration those payments settle against. The same
+        // its action, the configuration those payments settle against, and the
+        // connected (Payments) account that configuration settles into. The same
         // judgements the web ACL save path makes, because the setting lives on both
         // kinds of resource — and all of them are made before anything is written, so
         // a refused create leaves no rule group behind.
-        if let Some(refusal) = crate::state::monetization_save_refusal(
+        let monetization_refusal = crate::state::monetization_save_refusal(
             &input.scope,
             input.rules.as_deref().unwrap_or_default(),
             input.monetization_config.as_ref(),
             crate::state::MONETIZED_RESOURCE_RULE_GROUP,
-        ) {
+            &state.lock().connected_accounts,
+        );
+        if let Some(refusal) = monetization_refusal {
             return Err(refusal
                 .refuse(
                     CreateRuleGroupErrorModeled::WAFInvalidOperationException,
                     CreateRuleGroupErrorModeled::WAFInvalidParameterException,
+                    CreateRuleGroupErrorModeled::WAFNonexistentItemException,
                 )
                 .into());
         }
@@ -340,14 +353,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(CreateRuleGroupErrorModeled::WAFInternalErrorException(
-                WAFInternalErrorException {
-                    message: Some("the wafv2 store is unavailable".to_string()),
-                },
-            )
-            .into());
-        };
         // The region whose namespace this rule group lands in: a REGIONAL group
         // belongs to the region of the endpoint that created it, a CLOUDFRONT-scoped
         // one to the one global namespace (`crate::state::namespace_region`).

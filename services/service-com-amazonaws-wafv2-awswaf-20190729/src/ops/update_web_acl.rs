@@ -405,22 +405,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdateWebACLErrorModeled::WAFInvalidParameterException(refusal).into());
         }
 
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateWebACLErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
         // Every precondition the monetization settings put on the document being
         // written: the namespace the feature is available in, the rules that may take
-        // its action, and the configuration those payments settle against. The same
+        // its action, the configuration those payments settle against, and the
+        // connected (Payments) account that configuration settles into. The same
         // judgements the create path makes, because a save is a save however the rules
         // got there — and all of them are made before anything is written, so a
         // refused update leaves the stored web ACL and its lock token as they were.
-        if let Some(refusal) = crate::state::monetization_save_refusal(
+        let monetization_refusal = crate::state::monetization_save_refusal(
             &input.scope,
             input.rules.as_deref().unwrap_or_default(),
             input.monetization_config.as_ref(),
             crate::state::MONETIZED_RESOURCE_WEB_ACL,
-        ) {
+            &state.lock().connected_accounts,
+        );
+        if let Some(refusal) = monetization_refusal {
             return Err(refusal
                 .refuse(
                     UpdateWebACLErrorModeled::WAFInvalidOperationException,
                     UpdateWebACLErrorModeled::WAFInvalidParameterException,
+                    UpdateWebACLErrorModeled::WAFNonexistentItemException,
                 )
                 .into());
         }
@@ -450,14 +463,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(UpdateWebACLErrorModeled::WAFInternalErrorException(
-                WAFInternalErrorException {
-                    message: Some("the wafv2 store is unavailable".to_string()),
-                },
-            )
-            .into());
-        };
         let mut state = state.lock();
         // The namespace this request addresses: a REGIONAL web ACL is resolved in the
         // region of the endpoint the call reached, the global namespace at the one
