@@ -52,6 +52,11 @@ pub(super) async fn publish_pending<Eng: Send + Sync + 'static>(
     // streams and the events below, because the verdict it records is what the placement
     // ahead of it materialises.
     settle_job_image_fetches(engine);
+    // How long the WORK a job's own program states it takes, for a job that states an
+    // `attemptDurationSeconds` the attempt has to finish inside (see [`attempt_work`]), read
+    // with this store's lock released. It runs before the task reads and the container runs
+    // below, because the end those two materialise is what that allowance decides.
+    settle_attempt_work_accounts(engine).await;
     // The program the container of a job the scheduler has just PLACED runs, performed in
     // process with this store's lock released (see [`container_run`]) — for a job no Amazon
     // ECS task runs, which the step below is what decides. It runs after the fetch above,

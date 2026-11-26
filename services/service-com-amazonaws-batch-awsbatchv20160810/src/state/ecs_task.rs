@@ -751,6 +751,18 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         // The task has stopped: what its container produced is final, so it is recorded on the
         // attempt the placement started before the job's own end is written.
         let ended_at = report.stopped_at.unwrap_or(now);
+        // Unless the attempt never had the time for that work: the duration its program states
+        // outlasts what the job's `timeout` allows one attempt, so the service TERMINATED the
+        // attempt — "Batch terminates your jobs if they aren't finished" — at the DEADLINE that
+        // allowance names, and the container it was running never exited, so no exit status of
+        // it is recorded ([`super::attempt_work`]).
+        if let Some(deadline) = self.attempt_outlasted_its_timeout(job_id) {
+            if let Some(job) = self.jobs.get_mut(job_id) {
+                job.task_dispatch = JobTaskDispatch::Waiting;
+            }
+            self.time_out_attempt(job_id, deadline);
+            return;
+        }
         if let Some(job) = self.jobs.get_mut(job_id) {
             job.task_dispatch = JobTaskDispatch::Waiting;
             if let Some(attempt) = job.attempts.last_mut() {

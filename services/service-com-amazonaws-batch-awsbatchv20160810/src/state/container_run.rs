@@ -361,31 +361,38 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         self.jobs
             .values()
             .filter(|job| Self::awaits_a_container_run(job))
-            .filter_map(|job| {
-                // The container the job is actually RUN with: the one it declares with this
-                // job's parameters substituted into its command and its environment
-                // ([`super::job_parameters`]).
-                let container = self.job_run_container(&job.job_id)?;
-                let mut environment: Vec<(String, String)> = container
-                    .environment
-                    .iter()
-                    .flatten()
-                    .filter_map(|pair| {
-                        Some((pair.name.clone()?, pair.value.clone().unwrap_or_default()))
-                    })
-                    .collect();
-                // And the variables AWS Batch sets itself, after the declared ones so the
-                // service's own prefix decides them ([`super::job_variables`]).
-                environment.extend(self.reserved_job_variables(&job.job_id));
-                Some(JobContainerRun {
-                    job_id: job.job_id.clone(),
-                    program: container_program(container.command.as_deref()),
-                    image: container.image.clone().unwrap_or_default(),
-                    environment,
-                })
-            })
+            .filter_map(|job| self.job_container_run_request(&job.job_id))
             .take(MAX_CONTAINER_RUNS_PER_DRAIN)
             .collect()
+    }
+
+    /// What performing the container program of the job `id` needs: the program its effective
+    /// container declares and the environment that container is given.
+    ///
+    /// The ONE place a job's run is read off its record, so the program this service performs
+    /// ([`settle_job_container_runs`]) and the duration that program states
+    /// ([`super::attempt_work`]) are read from the same container — the one the job is
+    /// actually RUN with, which is its effective container with this job's parameters
+    /// substituted into its command and its environment ([`super::job_parameters`]).
+    /// `None` for a job this store holds no container for.
+    pub(super) fn job_container_run_request(&self, id: &str) -> Option<JobContainerRun> {
+        let job = self.jobs.get(id)?;
+        let container = self.job_run_container(&job.job_id)?;
+        let mut environment: Vec<(String, String)> = container
+            .environment
+            .iter()
+            .flatten()
+            .filter_map(|pair| Some((pair.name.clone()?, pair.value.clone().unwrap_or_default())))
+            .collect();
+        // And the variables AWS Batch sets itself, after the declared ones so the service's
+        // own prefix decides them ([`super::job_variables`]).
+        environment.extend(self.reserved_job_variables(&job.job_id));
+        Some(JobContainerRun {
+            job_id: job.job_id.clone(),
+            program: container_program(container.command.as_deref()),
+            image: container.image.clone().unwrap_or_default(),
+            environment,
+        })
     }
 
     /// Record what each job's container program did.

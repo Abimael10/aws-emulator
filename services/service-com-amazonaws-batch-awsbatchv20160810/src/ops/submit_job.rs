@@ -534,6 +534,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 array_size,
                 array_index: None,
                 array_parent_id: None,
+                // And nothing has read how long the work this job declares states it takes:
+                // that is read for a job carrying a `timeout` while it is live
+                // (`state::attempt_work`).
+                work_stated_millis: None,
             };
             match array_size {
                 // "If you specify array properties for a job, it becomes an array job"
@@ -557,7 +561,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     let children: Vec<batch::Job> = (0..size)
                         .map(|index| {
                             let child_id = batch::array_child_job_id(&job_id, index);
-                            batch::Job {
+                            let mut child = batch::Job {
                                 job_arn: batch::job_arn(&region, &child_id),
                                 job_id: child_id,
                                 depends_on: batch::array_child_dependencies(
@@ -570,7 +574,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 array_index: Some(index),
                                 array_parent_id: Some(job_id.clone()),
                                 ..job.clone()
-                            }
+                            };
+                            // Each child's OWN dependencies decide whether it is held: the
+                            // array forms point them at a different job per index, so one
+                            // child can be waiting while another is already placeable
+                            // (`state::array_child_dependencies`).
+                            state.hold_submitted_job_on_its_dependencies(&mut child);
+                            child
                         })
                         .collect();
                     state.insert_array_job(job, children).map_err(|message| {
@@ -583,6 +593,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // evicting the jobs that have been terminal longest, and a store full of
                 // live jobs refuses the submit with the modelled 400 rather than growing.
                 None => {
+                    let mut job = job;
+                    // A job whose `dependsOn` is not satisfied when the submit is accepted is
+                    // held from that instant, not a span of work later
+                    // (`state::hold_submitted_job_on_its_dependencies`).
+                    state.hold_submitted_job_on_its_dependencies(&mut job);
                     state.insert_job(job).map_err(|message| {
                         SubmitJobError::from(SubmitJobErrorModeled::ClientException(
                             batch::client_exception(message),

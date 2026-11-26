@@ -31,10 +31,6 @@ use crate::batch_job_dependency_gate::{
 const SUCCEEDING: &str = "jd-graph-succeeding";
 const FAILING: &str = "jd-graph-failing";
 
-/// The one `JobStatus` a parent of this graph is still in while its children are held: it has
-/// been placed and its container is running, which is what the hold is observed against.
-const PLACED: [&str; 3] = ["RUNNABLE", "STARTING", "RUNNING"];
-
 /// RULE: both branches of a `dependsOn` graph reach a verdict — the dependent of the parent
 /// that succeeds runs after it, the dependent of the parent that fails is failed without ever
 /// being dispatched — and the graph settles whatever duration the containers' programs state.
@@ -74,7 +70,10 @@ async fn both_branches_of_a_dependency_graph_reach_their_verdict() {
     .await;
 
     // Each child leaves SUBMITTED into PENDING, echoing the parent it waits on and reporting
-    // nothing of a run — while that parent is still working its way through the placement.
+    // nothing of a run — while that parent is still UNFINISHED, which is what the hold is
+    // observed against (the assertion [`crate::batch_job_dependency_gate`] makes over its own
+    // table): a child is held by the submit that named the dependency, so the read that finds
+    // one held can be earlier than its parent's own first move.
     for (child, parent) in [(&good_child, &good_parent), (&bad_child, &bad_parent)] {
         let (held, parent_status) = until_left_submitted(&router, case, child, parent).await;
         assert_eq!(
@@ -84,9 +83,9 @@ async fn both_branches_of_a_dependency_graph_reach_their_verdict() {
              {held}"
         );
         assert!(
-            PLACED.contains(&parent_status.as_str()),
-            "case {case:?}: the parent must still have been working while its child was held, \
-             got {parent_status:?}"
+            !terminal(&parent_status),
+            "case {case:?}: the parent must still have been unfinished while its child was \
+             held, got {parent_status:?}"
         );
         assert_eq!(
             held["dependsOn"][0]["jobId"].as_str(),

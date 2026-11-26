@@ -100,6 +100,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod array_jobs;
 mod attempt_timeout;
+mod attempt_work;
 mod compute_capacity;
 mod consumable_claims;
 mod container_run;
@@ -125,6 +126,7 @@ mod share_selection;
 
 pub use array_jobs::*;
 pub use attempt_timeout::*;
+pub use attempt_work::*;
 pub use consumable_claims::*;
 pub use container_run::*;
 pub use described_collections::*;
@@ -1574,6 +1576,13 @@ pub struct Job {
     /// the admission took and so a repeated materialisation cannot charge twice. Bounded by
     /// the requirement list the job carries.
     pub consumable_claims_held: Vec<ConsumableClaim>,
+    /// How long the WORK this job's container program declares STATES it takes, in
+    /// milliseconds, and `None` while that has not been read ([`attempt_work`]).
+    ///
+    /// Internal bookkeeping, not a modelled member: it is read only for a job that states a
+    /// `timeout.attemptDurationSeconds`, and it is what decides whether that attempt
+    /// finished inside the duration the request allowed it.
+    pub work_stated_millis: Option<i64>,
 }
 
 /// A consumable resource, exactly as `CreateConsumableResource` stored it.
@@ -3444,6 +3453,14 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                     // it started, and the status it exited with is the status the job ends
                     // on ([`container_run`]).
                     JOB_RUNNING => {
+                        // The attempt's own deadline comes first: the work its program states
+                        // outlasts the time the `timeout` allows one attempt, so the service
+                        // terminated the attempt rather than letting that work finish
+                        // ([`attempt_work`]).
+                        if let Some(deadline) = self.attempt_outlasted_its_timeout(id) {
+                            self.time_out_attempt(id, deadline);
+                            return Some(Advanced::Terminal);
+                        }
                         // A job RUNNING with neither a live task nor a recorded run is one
                         // whose task is GONE ([`ecs_task`] gives up on a task this service
                         // can learn nothing more from): its run ended with nothing to report,
@@ -3460,6 +3477,34 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                 }
             }
             _ => None,
+        }
+    }
+
+    /// Hold `job` in `PENDING` when the jobs its `dependsOn` names are not all finished yet.
+    ///
+    /// `JobStatus$PENDING` is where "a job that resides in the queue and isn't yet able to run
+    /// due to a dependency on another job or resource" waits, and `SubmitJob$dependsOn` is
+    /// what puts it there — so the hold is decided by the SUBMIT, out of the dependencies the
+    /// request itself names, rather than owed by the clock the way the work of a placed job
+    /// is: a dependency that is unsatisfied at the instant the submit is accepted is
+    /// unsatisfied from that instant, and the job's own first move is the one that reports it.
+    /// The status the submit STORES is unchanged (a job's initial status is not a job state
+    /// change, which is what [`Self::insert_job`] keeps), so the move into the hold is
+    /// published like every other move this job makes.
+    ///
+    /// A job every one of whose dependencies has already finished is held by nothing: it waits
+    /// for the scheduler like any other submitted job, and what those outcomes then make of it
+    /// is decided where every other dependency question is ([`Self::advance_job`]).
+    pub fn hold_submitted_job_on_its_dependencies(&self, job: &mut Job) {
+        let held = job.depends_on.iter().flatten().any(|dependency| {
+            dependency.job_id.as_deref().is_some_and(|dependency_id| {
+                self.jobs
+                    .get(dependency_id)
+                    .is_none_or(|dependency| !is_terminal_status(&dependency.status))
+            })
+        });
+        if held {
+            job.next_phase_due_at = Some(job.created_at);
         }
     }
 
@@ -3569,6 +3614,7 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             || self.has_pending_image_fetches()
             || self.has_pending_job_tasks()
             || self.has_pending_container_runs()
+            || self.has_pending_work_accounts()
         {
             return Some(now);
         }

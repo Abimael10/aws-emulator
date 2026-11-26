@@ -229,13 +229,20 @@ async fn no_event_reports_the_status_a_submit_stored() {
         let (job_id, _) = submit(&batch, "submitted-job", &watched, &definition, &waits).await;
 
         // The status the submit stored IS observable, through the reader: what follows is
-        // the absence of an event for it, not the absence of the status.
+        // the absence of an event for it, not the absence of the status. The one exception is
+        // a job the request's own `dependsOn` holds: that hold is decided by the submit
+        // rather than owed by the clock (`state::hold_submitted_job_on_its_dependencies`), so
+        // the first read of such a job may already report it.
         let detail = describe_job(&batch, &job_id).await;
-        assert_eq!(
-            detail["status"].as_str(),
-            Some(state::JOB_SUBMITTED),
-            "case {case}: expected the submitted job to be reported {}, got {detail}",
-            state::JOB_SUBMITTED
+        let reported = detail["status"].as_str().unwrap_or_default();
+        let allowed: &[&str] = match action {
+            Action::DependOnALiveJob => &[state::JOB_SUBMITTED, state::JOB_PENDING],
+            _ => &[state::JOB_SUBMITTED],
+        };
+        assert!(
+            allowed.contains(&reported),
+            "case {case}: expected the submitted job to be reported one of {allowed:?}, \
+             got {detail}"
         );
 
         match action {

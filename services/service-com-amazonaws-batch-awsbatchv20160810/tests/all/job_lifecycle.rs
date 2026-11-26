@@ -1265,19 +1265,24 @@ async fn job_status_only_moves_forward_and_never_because_of_a_read() {
         .to_string();
 
     // Each job's first move falls due one span after ITS OWN submit, and the two submits
-    // are different instants: the independent job leaves `SUBMITTED` for `RUNNABLE`, the
-    // dependent one for `PENDING` behind it.
-    for (case, job_id, submit, next) in [
+    // are different instants: the independent job leaves `SUBMITTED` for `RUNNABLE`. The
+    // dependent one is not waiting for work at all — a job whose `dependsOn` is unsatisfied
+    // when the submit is accepted is held from that instant
+    // (`state::hold_submitted_job_on_its_dependencies`) — so `PENDING` is what every read of
+    // it reports.
+    for (case, job_id, submit, from, next) in [
         (
             "independent",
             &first_id,
             &first,
+            state::JOB_SUBMITTED,
             Some(state::JOB_RUNNABLE),
         ),
         (
             "dependent",
             &dependent_id,
             &dependent,
+            state::JOB_PENDING,
             Some(state::JOB_PENDING),
         ),
     ] {
@@ -1285,13 +1290,7 @@ async fn job_status_only_moves_forward_and_never_because_of_a_read() {
         let before = bracketed(describe_job(&batch, job_id)).await;
         let after = bracketed(describe_job(&batch, job_id)).await;
         assert_reads_agree(case, &before, &after, submit.due_window());
-        assert_clock_owed_status(
-            case,
-            &before,
-            submit.due_window(),
-            state::JOB_SUBMITTED,
-            next,
-        );
+        assert_clock_owed_status(case, &before, submit.due_window(), from, next);
     }
 
     // Poll both jobs until the clock owes them nothing, checking the rank never goes
