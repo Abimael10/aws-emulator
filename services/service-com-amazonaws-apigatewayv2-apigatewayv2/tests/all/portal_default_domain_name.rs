@@ -8,11 +8,10 @@
 //! > `EndpointConfigurationResponse$PortalDefaultDomainName` is "the portal default domain
 //! > name. This domain name is generated and managed by API Gateway", typed
 //! > `__stringMin3Max256`
-//! > (`smithy_query(query="shape",shape="EndpointConfigurationResponse")`). API Gateway both
-//! > generates the name and MANAGES it — the portal's site is served on it — so the value
-//! > this emulator publishes is the address it serves that site at: the `host:port` of the
-//! > socket the portal was given, which a client of this emulator reaches, rather than a
-//! > name in a zone nothing here resolves. A request addressed to it is refused while the
+//! > (`smithy_query(query="shape",shape="EndpointConfigurationResponse")`). The value is
+//! > therefore a domain NAME: the portal's own labels in the zone this emulator answers in,
+//! > with no scheme, no `:port` and no path, rather than the address of a socket — and it is
+//! > a name this emulator ANSWERS for, so a request addressed to it is refused while the
 //! > portal has nothing live and is answered the portal's page once a publish has settled.
 //! > It is minted once, by the create, and every operation that reports the portal reports
 //! > that one value.

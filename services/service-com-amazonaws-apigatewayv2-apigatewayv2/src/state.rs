@@ -1127,10 +1127,10 @@ pub struct ComAmazonawsApigatewayv2Apigatewayv2State {
     /// Data-plane state, like [`Self::websocket_transport`], and held beside the domain names
     /// under the same lock so a record and the address it publishes cannot drift apart.
     pub domain_name_transport: domain_name_transport::DomainNameTransport,
-    /// The SOCKET each portal's WEBSITE is reached at: the address its record publishes as
-    /// its `PortalDefaultDomainName` ([`portal_transport::PortalTransport`]). Data-plane
+    /// The SOCKET each portal's WEBSITE is reached at: the address its record carries as the
+    /// base of its URL-typed members ([`portal_transport::PortalTransport`]). Data-plane
     /// state, like [`Self::domain_name_transport`], and held beside the portals under the
-    /// same lock so a portal and the address it publishes cannot drift apart.
+    /// same lock so a portal and the address it is served at cannot drift apart.
     pub portal_transport: portal_transport::PortalTransport,
     /// The in-process transport this service performs an HTTP api's integrations over when
     /// the request being served carries none of its own
@@ -4044,9 +4044,9 @@ pub fn portal_default_domain_name(portal_id: &str, region: &str, zone: &str) -> 
     )
 }
 
-/// The default domain name this emulator ANNOUNCES for a portal that has no socket of its
-/// own: the portal's own labels ([`portal_default_domain_name`]) in the zone this emulator
-/// may announce a name of its own in.
+/// The default domain name this emulator ANNOUNCES for a portal: the portal's own labels
+/// ([`portal_default_domain_name`]) in the zone this emulator may announce a name of its own
+/// in.
 ///
 /// The ZONE is the workspace's one reading of that question
 /// (`service_common::data_plane_addressing::announced_zone_of_authority`): the zone of the
@@ -4058,13 +4058,11 @@ pub fn portal_default_domain_name(portal_id: &str, region: &str, zone: &str) -> 
 ///
 /// The name is also the host the portal's own data plane answers for, host-style
 /// (`crate::service::portal`, which compares an addressed host against the name each portal
-/// RECORDS), so the address a portal publishes and the address its site is served at are one
-/// value.
+/// RECORDS), so the name a portal publishes is a name this emulator serves its site on.
 ///
-/// A portal that DID get a socket of its own publishes the `host:port` that socket landed on
-/// instead ([`published_portal_domain_name`]) — an address a client of this emulator can
-/// actually open a connection to, which a name in a zone no resolver here answers for is
-/// not.
+/// A portal that DID get a socket of its own publishes this SAME name: the member is a domain
+/// name, which carries no port, so the `host:port` that socket landed on is reported by the
+/// portal's URL-typed members instead ([`portal_preview_url`]) and the name stays a name.
 ///
 /// Minted ONCE, by the create, and persisted on the portal's endpoint configuration, so
 /// every later read of that portal reports the same name whatever it is addressed at.
@@ -4079,28 +4077,6 @@ pub fn announced_portal_default_domain_name(
         .unwrap_or_default();
     let zone = ::service_common::data_plane_addressing::announced_zone_of_authority(&reached);
     portal_default_domain_name(portal_id, region, &zone)
-}
-
-/// The default domain name a portal that has a SOCKET of its own publishes: the HOST half of
-/// the address its site is served at.
-///
-/// `EndpointConfigurationResponse$PortalDefaultDomainName` is the name "generated and managed
-/// by API Gateway", and what API Gateway MANAGES about it is that the portal's site is served
-/// there — so the value has to be an address a client of this emulator reaches the site at.
-/// The site is served on the portal's own socket ([`portal_transport`]), whose `host:port` is
-/// the address this emulator answers it on; that authority is what this publishes, and the
-/// portal's data plane claims it host-style (`crate::service::portal`, which compares an
-/// addressed host against the value each portal records, with the port and without it).
-///
-/// `site_base` is that address as the record carries it ([`announced_portal_site_base`]): the
-/// authority, and the path behind it where the site is served at this emulator's front door
-/// rather than on a socket of its own. A domain name carries no path, so only the authority
-/// is published.
-pub fn published_portal_domain_name(site_base: &str) -> String {
-    site_base
-        .split_once('/')
-        .map_or(site_base, |(authority, _path)| authority)
-        .to_string()
 }
 
 /// The single path segment a portal's preview is served under, and the one

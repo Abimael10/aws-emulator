@@ -336,24 +336,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             }
         };
-        // The portal's default domain name is the address this emulator SERVES the portal's
-        // website at, because that is what a client reads the member to fetch the site:
-        // the `host:port` of the socket this portal was given
-        // (`crate::state::published_portal_domain_name`), which is the one address a client
-        // of this emulator can open a connection to the site on and which the portal data
-        // plane claims host-style. A portal no socket could be opened for is served behind
-        // its own path at this emulator's front door, which no host can carry, so it
-        // publishes the generated name its data plane claims instead
-        // (`crate::state::announced_portal_default_domain_name`).
-        let portal_default_domain_name = match &socket {
-            Some(_) => crate::state::published_portal_domain_name(&site_base),
-            ::std::option::Option::None => crate::state::announced_portal_default_domain_name(
-                &portal_id,
-                &region,
-                ctx.parts(),
-                ctx.endpoint().as_str(),
-            ),
-        };
+        // The portal's default domain name is the name this service GENERATES for the portal
+        // — "this domain name is generated and managed by API Gateway" — so it is a DOMAIN
+        // NAME and nothing else: dot-separated host labels, with no scheme, no `:port` and no
+        // path, because a client resolves it, writes it in a `Host` header and points a CNAME
+        // or an alias record at it. It is minted in the zone this emulator answers in
+        // (`crate::state::announced_portal_default_domain_name`), which is the name the portal
+        // data plane claims host-style, whether or not this portal also got a socket of its
+        // own — the two are different values about the same site. The ADDRESS a client dials
+        // is the `host:port` the site is served at, which the portal's URL-typed members carry
+        // (`site_base`, `crate::state::portal_preview_url`).
+        let portal_default_domain_name = crate::state::announced_portal_default_domain_name(
+            &portal_id,
+            &region,
+            ctx.parts(),
+            ctx.endpoint().as_str(),
+        );
 
         let mut store = state.lock();
         weigh(&store, &included_portal_product_arns)?;

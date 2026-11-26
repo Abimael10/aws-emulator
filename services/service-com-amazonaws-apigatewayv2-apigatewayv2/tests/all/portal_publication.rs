@@ -558,11 +558,21 @@ async fn preview_portal_builds_a_preview_without_changing_what_the_portal_publis
             "case {case:?}: expected a preview URL a client on this machine can fetch, got \
              {expected_url:?}"
         );
-        assert_eq!(
+        // The preview URL carries the dialable ADDRESS this emulator serves the site at (the
+        // `host:port` asserted just above), which is NOT the portal's default domain name:
+        // `EndpointConfigurationResponse$PortalDefaultDomainName` is a domain name and so
+        // names no port, while a URL a client fetches carries the port of the socket the site
+        // is served on. The form of that member is `portal_domain_name_is_not_an_authority`'s
+        // subject; what is asserted here is that the two are different values about one site.
+        assert!(
+            !default_domain.contains(':'),
+            "case {case:?}: the portal's domain name names no port, got {default_domain:?}"
+        );
+        assert_ne!(
             expected_url,
             format!("https://{default_domain}/preview"),
-            "case {case:?}: expected the preview on the address the portal publishes its \
-             site at, got {expected_url:?}"
+            "case {case:?}: expected the preview on the address the site is served at rather \
+             than on the domain name the portal publishes, got {expected_url:?}"
         );
         assert_eq!(
             publish_status(case, &building),

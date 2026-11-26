@@ -156,8 +156,10 @@ pub mod websocket;
 // and gives its `ApiGatewayDomainName` the address to publish.
 pub mod domain_name_socket;
 // `pub` for the same reason: `portal_socket::open_for_portal` is called by the operation that
-// mints a portal, which is what opens that portal's socket and gives its
-// `PortalDefaultDomainName` the address to publish.
+// mints a portal, which is what opens that portal's socket and gives the record the `host:port`
+// its URL-typed members (`Preview$PreviewUrl`) send a client to. The domain NAME the portal
+// publishes (`PortalDefaultDomainName`) is generated rather than read off a socket, because a
+// name carries no port.
 pub mod portal_socket;
 // `pub` for the same reason: `invoke_plane_socket::ensure_published` is called by the
 // operations that mint an HTTP api, which is what opens the socket this emulator publishes an
