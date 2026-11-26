@@ -787,6 +787,52 @@ fn names_condition_key(statement: &::serde_json::Value, key: &str) -> bool {
         })
 }
 
+/// Whether a statement of the IDENTITY-based `documents` that is ABOUT `request` — its
+/// `Action` and `Resource` elements both cover it — grants that request only `when` a
+/// `Condition` over `key` holds, and that clause is decidably FALSE for what the request
+/// carries.
+///
+/// In one sentence: "was it a CONDITION over this key that withheld the grant, rather than
+/// there being no grant about the request at all?" — the question a caller WORDING a refusal
+/// asks once the decision has already refused ([`identity_decision`]), because the two have
+/// different remedies: widen the clause, or grant the action. A service whose recorded refusal
+/// of the first case names only the principal
+/// ([`not_authorized_to_perform_this_operation`]) and of the second names the action, the
+/// resource and the rule ([`not_authorized_by_identity_policy`]) tells them apart here.
+///
+/// The IDENTITY-document twin of [`grant_turns_on_condition_key`], which asks the same thing
+/// of a RESOURCE-based document and whose `Allow`-only rule it keeps: a `Deny` is attributable
+/// on its own. Three things are required of one statement, and the resource is not dropped
+/// from them — a grant of the action over ANOTHER resource withheld nothing on a condition,
+/// it simply does not cover this request:
+///
+/// 1. it is an `Allow` whose `Action` and `Resource` elements cover the request
+///    ([`covers`], read as an identity document's, where a statement names no `Principal`);
+/// 2. its `Condition` names `key` ([`names_condition_key`]);
+/// 3. that `Condition` is decidably FALSE for this request ([`conditions_hold`], the same
+///    clause reading the decision itself used — so a pattern, a set qualifier, a negated
+///    operator and an `IfExists` spelling are each decided the one way). A clause this
+///    evaluator could not decide is not what withheld the grant, so it answers `false`.
+#[must_use]
+pub fn identity_grant_withheld_by_condition_key(
+    documents: &[String],
+    request: &Request<'_>,
+    key: &str,
+) -> bool {
+    prepare_documents(documents).iter().any(|prepared| {
+        statements(prepared).into_iter().any(|statement| {
+            statement["Effect"]
+                .as_str()
+                .unwrap_or_default()
+                .eq_ignore_ascii_case("Allow")
+                && covers(statement, request, Flavor::Identity) == Some(true)
+                && names_condition_key(statement, key)
+                && conditions_hold(statement, request, &mut RequiredKeys::unreported())
+                    == Some(false)
+        })
+    })
+}
+
 /// Whether a request carrying `value` for condition key `key` satisfies the grants of
 /// `document` that condition on that key, for `action`.
 ///

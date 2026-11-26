@@ -7,8 +7,9 @@
 //! THAT resource surface with, reproduced character for character — its terminal
 //! punctuation included — so the punctuation is a property of the single condition and is
 //! never normalised across the conditions of one surface. The catalog surface is where that
-//! is visible in one table: its duplicate-name sentence ends on the last letter of its last
-//! word, while its own miss sentence and two of its three input refusals end on a full stop.
+//! is visible in one table: its refusal of a name outside the character class a catalog name
+//! is built from ends on the last letter of its last word, while its duplicate-name sentence,
+//! its own miss sentence and one of its other input refusals end on a full stop.
 //!
 //! This suite's axis is the CONDITION, which is what no other suite of this crate spans:
 //! the duplicate-name sentence beside the catalog miss asked by each of the three operations
@@ -42,12 +43,12 @@ const ENTITY_NOT_FOUND: &str = "EntityNotFoundException";
 const INVALID_INPUT: &str = "InvalidInputException";
 
 /// The whole `Message` a `CreateCatalog` for a name the account already holds answers: fixed
-/// text that names the resource kind, withholds the requested name, and ends on the last
-/// letter of its last word — no terminal full stop.
-const CATALOG_ALREADY_EXISTS: &str = "Catalog already exists";
+/// text that names the resource kind, withholds the requested name, and closes on a full stop
+/// — the punctuation every already-exists sentence of this service closes on.
+const CATALOG_ALREADY_EXISTS: &str = "Catalog already exists.";
 
 /// The whole `Message` the catalog read, update and delete answer for an id holding no
-/// catalog: the same surface, period-terminated.
+/// catalog: the same surface, period-terminated too.
 const CATALOG_NOT_FOUND: &str = "Catalog not found.";
 
 /// The whole `Message` a `CreateCatalog` whose `Name` carries a character the catalog
@@ -86,7 +87,8 @@ struct Condition {
 /// The conditions of the catalog surface, each with the sentence the service words IT with:
 /// the duplicate name, the surface's own miss asked by each of the three operations that
 /// resolve a catalog, and the two input refusals of the create itself — the table whose rows
-/// end on different characters.
+/// end on different characters (the character-class refusal on its last word, the rest on a
+/// full stop).
 fn conditions() -> Vec<Condition> {
     vec![
         Condition {
@@ -152,9 +154,9 @@ async fn given_catalog(router: &MultiServiceRouter, name: &str) {
 }
 
 /// Every refusal of the catalog surface carries the sentence for its OWN condition, whole
-/// and character for character — the duplicate-name sentence ending on its last word beside
-/// the surface's own miss sentence ending on a full stop — whatever the requested name is
-/// spelled like, and none of the refusals reaches the store.
+/// and character for character — the character-class sentence ending on its last word beside
+/// the duplicate-name and miss sentences ending on a full stop — whatever the requested name
+/// is spelled like, and none of the refusals reaches the store.
 #[tokio::test]
 async fn each_catalog_refusal_reproduces_the_sentence_for_its_own_condition() {
     for (row, name) in catalog_names() {

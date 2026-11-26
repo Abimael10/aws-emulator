@@ -91,12 +91,24 @@
 //!
 //! ## How a refusal is worded
 //!
-//! ONE sentence, the one IAM states an authorization failure with: the principal that signed,
-//! the action it asked for, the resource it addressed and which of IAM's rules withheld the
-//! grant ([`::service_common::iam_authorization::not_authorized_by_identity_policy`]). Every
-//! gate of this service answers in it — the identity plane's token mints and the memory
-//! plane's record calls alike — so two operations cannot diverge in the account they give of
-//! one decision, and every value in it comes from the request and from the stored policies.
+//! By WHAT withheld the grant, which is what the caller has to act on — and in both sentences
+//! every value comes from the request and from the stored policies, never from this module.
+//!
+//! * No grant of the account's covers the call — no statement about the action and the
+//!   resource, or an explicit `Deny` over them, or a boundary that caps them: the refusal is
+//!   the sentence IAM states such a failure with, naming the principal that signed, the action
+//!   it asked for, the resource it addressed and which of IAM's rules withheld the grant
+//!   ([`::service_common::iam_authorization::not_authorized_by_identity_policy`]). That is
+//!   what a request for a resource the caller's grant does not name is refused with, and what
+//!   every gate whose operation publishes no condition key of its own answers.
+//! * A grant DOES cover the action and the resource and only its `Condition` over a key the
+//!   request published refused the call ([`condition_withheld_the_grant`]): the refusal names
+//!   the principal and nothing further
+//!   ([`::service_common::iam_authorization::not_authorized_to_perform_this_operation`]).
+//!   Naming the action and the resource there would say the caller holds no grant for them
+//!   when it does: what it may not do is address this key's value under that grant, so the
+//!   remedy is the clause rather than the action — which is why the two denials are told
+//!   apart at all.
 
 use std::time::SystemTime;
 
@@ -179,13 +191,19 @@ impl PublishedConditions {
     }
 }
 
-/// A refused decision: the principal that was refused, and which of IAM's rules refused it.
+/// A refused decision: the principal that was refused, which of IAM's rules refused it, and
+/// whether what refused it was a CONDITION on a grant that otherwise covered the request.
 /// How the refusal is WORDED is the calling surface's own (see the module docs), so nothing
 /// is spelled here.
 #[derive(Debug, Clone)]
 struct Refused {
     principal: String,
     reason: String,
+    /// Set when a document in force on the caller grants this very action but narrows that
+    /// grant with a `Condition` over a key the request publishes, and what the request
+    /// carried for that key does not satisfy the clause — as against a request no grant
+    /// covers at all ([`condition_withheld_the_grant`]).
+    condition_withheld: bool,
 }
 
 /// The IAM action one operation of this service asks about: this service's `arnNamespace`
@@ -212,7 +230,7 @@ pub fn authorize<Eng: Send + Sync + 'static>(
 ) -> Result<(), AccessDeniedException> {
     let action = action_of(operation);
     decide(engine, ctx, &action, resource, &PublishedConditions::none())
-        .map_err(|refused| not_authorized(&refused.principal, &action, resource, &refused.reason))
+        .map_err(|refused| not_authorized(&refused, &action, resource))
 }
 
 /// Authorize a call of the MEMORY plane on the memory container `memory_arn` its `memoryId`
@@ -228,6 +246,11 @@ pub fn authorize<Eng: Send + Sync + 'static>(
 /// resource this plane's actions are scoped to — and which of IAM's rules withheld the
 /// grant. One wording for every gate of this service, so a caller reads the same account of
 /// a denial whichever plane it called.
+///
+/// The one denial worded otherwise is the one a CONDITION took: where a grant covers this
+/// action on this container and only its clause over the published key refused the call, the
+/// refusal names the principal alone ([`not_authorized`]), because the caller does hold a
+/// grant for the action and what it may not do is address this namespace under it.
 pub fn authorize_memory<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
@@ -243,9 +266,7 @@ pub fn authorize_memory<Eng: Send + Sync + 'static>(
         memory_arn,
         &PublishedConditions::of_memory_call(namespace),
     )
-    .map_err(|refused| {
-        not_authorized(&refused.principal, &action, memory_arn, &refused.reason)
-    })
+    .map_err(|refused| not_authorized(&refused, &action, memory_arn))
 }
 
 /// The decision itself: whether the identity-based policies in force on the caller allow
@@ -266,6 +287,7 @@ fn decide<Eng: Send + Sync + 'static>(
     let refused = |reason: String| Refused {
         principal: caller.arn.clone(),
         reason,
+        condition_withheld: false,
     };
     // The principal spellings travel with the request because that is what a statement's
     // `Principal` element would be matched against; an identity-based document states no
@@ -285,7 +307,14 @@ fn decide<Eng: Send + Sync + 'static>(
     let granted =
         iam::is_allowed(identity_said, Decision::NotStated) || caller.identity_is_unbounded();
     if !granted {
-        return Err(refused(iam::no_identity_policy_allows(action)));
+        return Err(Refused {
+            condition_withheld: condition_withheld_the_grant(
+                &caller.documents,
+                &request,
+                conditions,
+            ),
+            ..refused(iam::no_identity_policy_allows(action))
+        });
     }
     // "A permissions boundary sets the maximum permissions that an identity-based policy can
     // grant" (IAM, permissions boundaries): a grant the boundary does not also allow is not
@@ -299,7 +328,17 @@ fn decide<Eng: Send + Sync + 'static>(
             Decision::Denied => iam::PERMISSIONS_BOUNDARY_EXPLICIT_DENY.to_string(),
             Decision::NotStated => iam::no_permissions_boundary_allows(action),
         };
-        return Err(refused(reason));
+        // The same reading of what refused the call: a boundary that caps this action only
+        // for some values of the published key refused this request on that clause, exactly
+        // as a conditioned grant does.
+        return Err(Refused {
+            condition_withheld: condition_withheld_the_grant(
+                ::std::slice::from_ref(boundary),
+                &request,
+                conditions,
+            ),
+            ..refused(reason)
+        });
     }
     Ok(())
 }
@@ -309,17 +348,52 @@ fn decide<Eng: Send + Sync + 'static>(
 /// of that sentence. Every value in it comes from the request and from the stored policies:
 /// the principal from the credential the request presented, the action from the operation it
 /// named, the resource from what it addressed.
-fn not_authorized(
-    principal: &str,
-    action: &str,
-    resource: &str,
-    reason: &str,
-) -> AccessDeniedException {
+///
+/// A denial a CONDITION took is worded differently, and the difference is what the caller
+/// has to act on: the principal does hold a grant for this action on this resource, and what
+/// refused the call is the clause over the key the request published, so naming the action
+/// and the resource would send a client to widen the wrong thing. That refusal names the
+/// principal alone ([`iam::not_authorized_to_perform_this_operation`]), which is the
+/// sentence this service answers it in.
+fn not_authorized(refused: &Refused, action: &str, resource: &str) -> AccessDeniedException {
+    let message = if refused.condition_withheld {
+        iam::not_authorized_to_perform_this_operation(&refused.principal)
+    } else {
+        iam::not_authorized_by_identity_policy(
+            &refused.principal,
+            action,
+            resource,
+            &refused.reason,
+        )
+    };
     AccessDeniedException {
-        message: Some(iam::not_authorized_by_identity_policy(
-            principal, action, resource, reason,
-        )),
+        message: Some(message),
     }
+}
+
+/// Whether what withheld the grant for this request was a `Condition` over a key it
+/// PUBLISHES, on a statement of `documents` that grants the action ON THE RESOURCE the
+/// request addressed — rather than there being no grant about the request at all.
+///
+/// Asked only once a decision has already refused the request, and asked per published key
+/// through the shared evaluation
+/// ([`iam::identity_grant_withheld_by_condition_key`]), which requires of ONE statement that
+/// it be an `Allow` whose action and resource cover this request, that its `Condition` name
+/// the key, and that the clause be decidably false for what the request carries. The resource
+/// is part of that question: a grant of the same action over ANOTHER resource withheld
+/// nothing on a condition — it does not cover this call — so such a refusal keeps IAM's own
+/// sentence.
+///
+/// A set of documents holding no grant about the request, or no clause over any published
+/// key, withheld nothing on a condition.
+fn condition_withheld_the_grant(
+    documents: &[String],
+    request: &iam::Request<'_>,
+    conditions: &PublishedConditions,
+) -> bool {
+    conditions.published.iter().any(|key| {
+        iam::identity_grant_withheld_by_condition_key(documents, request, key)
+    })
 }
 
 /// The principal a request speaks for, and everything the decision is made from.
@@ -497,11 +571,12 @@ mod tests {
         );
     }
 
-    /// RULE: the refusal names the principal, the action, the resource the request addressed
-    /// and which of IAM's rules refused it — every part taken from the request and the
+    /// RULE: a refusal no grant covered names the principal, the action, the resource the
+    /// request addressed and which of IAM's rules refused it; one a CONDITION on a covering
+    /// grant took names the principal alone — every part taken from the request and the
     /// stored policies.
     #[test]
-    fn the_refusal_names_the_principal_the_action_and_the_resource() {
+    fn the_refusal_is_worded_by_what_withheld_the_grant() {
         let principal = format!(
             "arn:aws:sts::{}:assumed-role/agent-role/session-1",
             ::engine::emulator_account_id()
@@ -509,16 +584,133 @@ mod tests {
         let action = format!("{}:GetWorkloadAccessToken", super::super::ARN_SERVICE);
         let resource = super::super::workload_identity_arn("us-east-1", "demo.agent");
         let reason = iam::no_identity_policy_allows(&action);
-        let refusal = not_authorized(&principal, &action, &resource, &reason);
-        assert_eq!(
-            refusal.message,
-            Some(format!(
-                "User: {principal} is not authorized to perform: {action} on resource: \
-                 {resource} {reason}"
-            )),
-            "case \"IAM's default deny\": expected IAM's wording, got {:?}",
-            refusal.message
+        let long = format!(
+            "User: {principal} is not authorized to perform: {action} on resource: {resource} \
+             {reason}"
         );
+        let short = format!("User: {principal} is not authorized to perform this operation");
+        // (case, what withheld the grant, the whole sentence it is refused in)
+        for (case, condition_withheld, expected) in [
+            ("IAM's default deny", false, &long),
+            ("a condition on a covering grant", true, &short),
+        ] {
+            let refused = Refused {
+                principal: principal.clone(),
+                reason: reason.clone(),
+                condition_withheld,
+            };
+            let refusal = not_authorized(&refused, &action, &resource);
+            assert_eq!(
+                refusal.message.as_deref(),
+                Some(expected.as_str()),
+                "case {case:?}: expected {expected:?}, got {:?}",
+                refusal.message
+            );
+        }
+    }
+
+    /// RULE: a refusal is attributed to a CONDITION only where a document in force on the
+    /// caller grants the action ON THE RESOURCE the request addressed and narrows that grant
+    /// with a clause over a key the request PUBLISHES which what the request carried does not
+    /// satisfy; a grant the call misses for any other reason — the resource it names among
+    /// them — withheld nothing on a condition.
+    #[test]
+    fn only_an_unsatisfied_clause_on_a_covering_grant_is_a_condition_refusal() {
+        let action = format!("{}:ListMemoryRecords", super::super::ARN_SERVICE);
+        let allowed = "/t/tenant/actor/alpha/facts/";
+        let sibling = "/t/tenant/actor/beta/facts/";
+        // The container the request addresses, and a second one a grant can be scoped to
+        // instead.
+        let addressed_memory = super::super::memory_arn("us-east-1", "held-memory-0123456789");
+        let other_memory = super::super::memory_arn("us-east-1", "other-memory-9876543210");
+        let conditioned_on = |resource: &str, operator: &str, value: &str| {
+            format!(
+                r#"{{"Statement":[{{"Effect":"Allow","Action":"{action}","Resource":"{resource}",
+                 "Condition":{{"{operator}":{{"{MEMORY_NAMESPACE_CONDITION_KEY}":"{value}"}}}}}}]}}"#
+            )
+        };
+        let conditioned = |operator: &str, value: &str| conditioned_on("*", operator, value);
+        let unconditioned =
+            format!(r#"{{"Statement":[{{"Effect":"Allow","Action":"{action}","Resource":"*"}}]}}"#);
+        // (case, the documents in force, the namespace the request addresses, whether a
+        // condition is what withheld the grant)
+        let rows: Vec<(&str, Vec<String>, AddressedNamespace<'_>, bool)> = vec![
+            (
+                "an equality clause the addressed namespace does not satisfy",
+                vec![conditioned("StringEquals", allowed)],
+                AddressedNamespace::Named(Some(sibling)),
+                true,
+            ),
+            (
+                "a pattern clause the addressed namespace does not satisfy",
+                vec![conditioned("StringLike", "/t/tenant/actor/alpha/*")],
+                AddressedNamespace::Named(Some(sibling)),
+                true,
+            ),
+            (
+                "an equality clause and a request carrying no value for the key",
+                vec![conditioned("StringEquals", allowed)],
+                AddressedNamespace::Named(None),
+                true,
+            ),
+            (
+                "an equality clause the addressed namespace satisfies",
+                vec![conditioned("StringEquals", allowed)],
+                AddressedNamespace::Named(Some(allowed)),
+                false,
+            ),
+            (
+                "a negated clause the addressed namespace satisfies",
+                vec![conditioned("StringNotEquals", allowed)],
+                AddressedNamespace::Named(Some(sibling)),
+                false,
+            ),
+            (
+                "a grant that conditions on nothing",
+                vec![unconditioned.clone()],
+                AddressedNamespace::Named(Some(sibling)),
+                false,
+            ),
+            (
+                "no document at all",
+                Vec::new(),
+                AddressedNamespace::Named(Some(sibling)),
+                false,
+            ),
+            (
+                "a clause on the key for a call that publishes no key of its own",
+                vec![conditioned("StringEquals", allowed)],
+                AddressedNamespace::NoNamespaceMember,
+                false,
+            ),
+            (
+                // The grant names ANOTHER container, so nothing of it is about this request:
+                // the resource withheld the grant, not the clause.
+                "a clause the namespace does not satisfy on a grant scoped to another resource",
+                vec![conditioned_on(&other_memory, "StringEquals", allowed)],
+                AddressedNamespace::Named(Some(sibling)),
+                false,
+            ),
+            (
+                // The same grant, scoped to the container the request DOES address.
+                "a clause the namespace does not satisfy on a grant scoped to this resource",
+                vec![conditioned_on(&addressed_memory, "StringEquals", allowed)],
+                AddressedNamespace::Named(Some(sibling)),
+                true,
+            ),
+        ];
+        for (case, documents, addressed, expected) in rows {
+            let conditions = PublishedConditions::of_memory_call(addressed);
+            let request = iam::Request::new(&action, &addressed_memory, &[])
+                .with_context(&conditions.carried)
+                .with_published_keys(&conditions.published);
+            let withheld = condition_withheld_the_grant(&documents, &request, &conditions);
+            assert_eq!(
+                withheld, expected,
+                "case {case:?}: expected a condition to have withheld the grant = {expected}, \
+                 got {withheld}"
+            );
+        }
     }
 
     /// RULE: the condition key a memory call publishes is named after this service's own ARN

@@ -8,11 +8,9 @@
 //! THAT resource surface with, reproduced character for character — its terminal
 //! punctuation included — and interpolates nothing the sentence does not name, so each
 //! already-exists surface keeps its own wording and none of them is derived from another's.
-//! The catalog surface's duplicate-name sentence names the resource kind, withholds the
-//! requested name and carries no terminal full stop — while the same surface's MISS
-//! sentence does carry one, so the punctuation cannot be normalised across the service;
-//! the suite below drives the database surface beside it so the wording is pinned per
-//! surface rather than blanket-derived.
+//! Every one of them names its resource kind, withholds the requested name and closes on a
+//! full stop; the suite below drives five surfaces beside each other so the wording is pinned
+//! per surface rather than blanket-derived.
 //!
 //! Each suite is a table whose rows differ along what the rule generalises over: the
 //! requested name's value, length, casing and character set, and how the second create
@@ -32,8 +30,8 @@ use crate::wire::{call, emulator, error_code, error_message, ok, ACCOUNT_ID, REG
 const ALREADY_EXISTS: &str = "AlreadyExistsException";
 
 /// The whole `Message` a `CreateCatalog` for a name the account already holds answers:
-/// fixed text, with no terminal full stop.
-const CATALOG_ALREADY_EXISTS: &str = "Catalog already exists";
+/// fixed text, closing on a full stop.
+const CATALOG_ALREADY_EXISTS: &str = "Catalog already exists.";
 
 /// The whole `Message` the catalog read and delete answer for an id holding no catalog.
 const CATALOG_NOT_FOUND: &str = "Catalog not found.";
@@ -87,8 +85,7 @@ async fn description_of(router: &MultiServiceRouter, catalog_id: &str) -> Option
 }
 
 /// A second `CreateCatalog` for a name already taken is refused with the catalog surface's
-/// own fixed sentence — which carries no terminal full stop and names nothing of the
-/// request —
+/// own fixed sentence — which names nothing of the request —
 /// whatever the name is spelled like and however the second create differs from the first,
 /// and the stored catalog keeps the definition the first create wrote.
 #[tokio::test]
@@ -222,9 +219,27 @@ fn connection_body(name: &str) -> Value {
     })
 }
 
-/// The bound of the rule: a duplicate name is worded by the surface it was asked of, so
-/// each of these sentences names its own resource kind — the catalog's, the database's and
-/// the connection's — on the same request and the same error code.
+/// A minimal `CreateCrawler` body: the three required members, naming one S3 crawl target.
+fn crawler_body(name: &str) -> Value {
+    json!({
+        "Name": name,
+        "Role": format!("arn:aws:iam::{ACCOUNT_ID}:role/service-role/AWSGlueServiceRole-test"),
+        "Targets": { "S3Targets": [{ "Path": "s3://crawler-bucket/data/" }] },
+    })
+}
+
+fn registry_body(name: &str) -> Value {
+    json!({ "RegistryName": name })
+}
+
+/// The bound of the rule: a duplicate name is worded by the surface it was asked of, so each
+/// of these sentences names its own resource kind — the catalog's, the database's, the
+/// connection's, the crawler's and the registry's — on the same request and the same error
+/// code, and every one of them closes on the full stop this service's already-exists sentences
+/// close on.
+///
+/// The five surfaces are the axis this suite adds to the name table above: a wording that has
+/// lost or gained its closing character on any one of them fails here.
 #[tokio::test]
 async fn each_already_exists_surface_keeps_its_own_sentence() {
     let surfaces = [
@@ -246,14 +261,40 @@ async fn each_already_exists_surface_keeps_its_own_sentence() {
             body: connection_body,
             message: "Connection already exists.",
         },
+        Surface {
+            case: "crawler",
+            operation: "CreateCrawler",
+            body: crawler_body,
+            message: "Crawler already exists.",
+        },
+        Surface {
+            case: "registry",
+            operation: "CreateRegistry",
+            body: registry_body,
+            message: "Registry already exists.",
+        },
     ];
+
+    // No two surfaces may be served one sentence: each names its own resource kind.
+    for (at, surface) in surfaces.iter().enumerate() {
+        assert!(
+            !surfaces
+                .iter()
+                .skip(at + 1)
+                .any(|other| other.message == surface.message),
+            "case {:?}: expected a sentence of its own, got the one another surface answers: \
+             {:?}",
+            surface.case,
+            surface.message
+        );
+    }
 
     for surface in surfaces {
         for (row, name) in catalog_names() {
             let router = emulator();
             let case = format!("{} / {row}", surface.case);
             ok(&router, surface.operation, &(surface.body)(&name)).await;
-            assert_refusal(
+            let answered = assert_refusal(
                 &router,
                 &case,
                 surface.operation,
@@ -262,6 +303,15 @@ async fn each_already_exists_surface_keeps_its_own_sentence() {
                 surface.message,
             )
             .await;
+            let message = error_message(&answered);
+            // The sentence ends where this service ends it, so a client matching the
+            // documented text, terminal punctuation and all, matches.
+            assert!(
+                message.ends_with('.'),
+                "case {case}: this surface's already-exists sentence closes on a full stop, got \
+                 {message:?}"
+            );
+            assert_withholds(&case, &message, &name);
         }
     }
 }

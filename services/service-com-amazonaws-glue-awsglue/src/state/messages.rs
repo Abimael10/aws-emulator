@@ -1363,12 +1363,18 @@ pub fn federation_source_not_registered(source: &str) -> String {
 /// `CreateCatalog` for a `Name` the account already holds a catalog under.
 ///
 /// RECORDED constant, and the whole message: the sentence is fixed text that names the
-/// resource kind, withholds the requested name and carries NO terminal full stop. Each
-/// surface words its own already-exists condition, so this one is not derived from the
-/// database duplicate's sentence ([`DATABASE_ALREADY_EXISTS`], which is
-/// period-terminated), nor from the catalog surface's own miss sentence
-/// ([`CATALOG_NOT_FOUND`], which is).
-pub const CATALOG_ALREADY_EXISTS: &str = "Catalog already exists";
+/// resource kind, withholds the requested name and closes on a full stop — the sentence this
+/// service words an already-exists condition with for every resource kind that has one
+/// ([`DATABASE_ALREADY_EXISTS`], [`CONNECTION_ALREADY_EXISTS`], [`CRAWLER_ALREADY_EXISTS`],
+/// [`REGISTRY_ALREADY_EXISTS`], [`TABLE_ALREADY_EXISTS`]), and the punctuation the catalog
+/// surface's own miss sentence carries too ([`CATALOG_NOT_FOUND`]).
+///
+/// Two recordings of this one refusal disagree about that stop, and the stop is what this
+/// constant states: it is the form the whole family of this service's already-exists
+/// sentences takes, so a single missing character in one transcription of otherwise identical
+/// fixed text is the likelier of the two to be wrong. The sentence is pinned per resource kind
+/// by `tests/all/catalog_duplicate_create_wording.rs`, so a change to any of them fails a test.
+pub const CATALOG_ALREADY_EXISTS: &str = "Catalog already exists.";
 
 /// `CreateCatalog` whose `Name` is the account's own id. Stated by the model: the
 /// catalog's name "Cannot be the same as the account ID" (`Catalog$Name`), because
