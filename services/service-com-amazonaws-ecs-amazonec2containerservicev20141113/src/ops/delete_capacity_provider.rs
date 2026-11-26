@@ -2,8 +2,9 @@
 
 //! @op DeleteCapacityProvider
 //! Deletes a capacity provider, over the capacity-provider store this service's state
-//! holds: the provider is retired when no live cluster is associated with it, and the
-//! delete an association holds off is reported on the provider itself.
+//! holds: the provider the request's own identifier resolves to is retired when no live
+//! cluster is associated with it, and the delete an association holds off is reported on
+//! the provider itself.
 //!
 //! ## Shape of an operation
 //!
@@ -196,37 +197,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The short name or full Amazon Resource Name (ARN) of the capacity provider to
         // delete": both forms name the same provider, which the store holds under its NAME.
+        //
+        // That name is the WHOLE identifier of the provider this call acts on: it is the
+        // operation's one required member and its `resourceIdentifier`
+        // (`CapacityProviderName`), and the ARN form a provider is also named by
+        // (`capacity-provider/<name>`, [`crate::state::capacity_provider_arn`]) carries no
+        // cluster segment — so a provider is unique in the account and the name resolves it
+        // without any other reference. `DeleteCapacityProvider$cluster` only says where a
+        // cluster-scoped provider lives ("the cluster that contains the capacity provider to
+        // delete"), so it narrows nothing here and is not a resource this call resolves: the
+        // delete is answered on the provider the identifier names, whether the request names
+        // a cluster, names one this account holds no cluster under, or names another cluster
+        // than the provider's own scope. The operations whose SUBJECT is the cluster —
+        // creating a provider in one, scoping a read or an update to one, associating
+        // providers with one — resolve their `cluster` and refuse a reference that names no
+        // live cluster of the account, which is unchanged.
         let name = crate::state::capacity_provider_name_from_reference(&input.capacity_provider);
-        // The `cluster` member names "the cluster that contains the capacity provider to
-        // delete", by short name or ARN — and names NO cluster when the request omits it,
-        // since an Auto Scaling group provider belongs to the account rather than to one
-        // cluster.
-        let cluster_name = input
-            .cluster
-            .as_deref()
-            .map(|reference| crate::state::cluster_name_from_reference(Some(reference)));
 
         let mut guard = state.lock();
         let now = ::std::time::SystemTime::now();
         guard.advance_clock(now);
-
-        // A deleted cluster is not one this operation may act in ("The cluster has been
-        // deleted"), so a tombstone is refused under the same error code a name that never
-        // existed earns — with the sentence that says it is still there, inactive.
-        if let Some(cluster_name) = cluster_name.as_deref() {
-            if !guard.has_active_cluster(cluster_name) {
-                return Err(
-                    DeleteCapacityProviderErrorModeled::ClusterNotFoundException(
-                        ClusterNotFoundException {
-                            message: Some(crate::state::cluster_refusal_message(
-                                guard.clusters.get(cluster_name),
-                            )),
-                        },
-                    )
-                    .into(),
-                );
-            }
-        }
 
         // "The FARGATE and FARGATE_SPOT capacity providers are reserved and can't be
         // deleted": they are resolved rather than stored
@@ -259,9 +249,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A name that resolves to no provider of this account names nothing to delete.
         // Amazon ECS answers an identifier it cannot RESOLVE in `ClientException` — "it
         // might be specifying an identifier that isn't valid" — keeping
-        // `InvalidParameterException` for a parameter value it will not accept (a provider
-        // scoped to another cluster below), so a client branching on the code can tell "no
-        // such provider" from "bad request".
+        // `InvalidParameterException` for a parameter value it will not accept, so a client
+        // branching on the code can tell "no such provider" from "bad request".
         let Some(stored) = guard.capacity_providers.get_mut(&name) else {
             return Err(DeleteCapacityProviderErrorModeled::ClientException(
                 ClientException {
@@ -272,28 +261,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-
-        // `DeleteCapacityProvider$cluster`: "Managed instances capacity providers are
-        // cluster-scoped and can only be deleted from their associated cluster" — so a
-        // provider scoped to a cluster is deleted THROUGH that cluster, and a request that
-        // names another one, or none at all, is not the delete of this provider.
-        if stored
-            .cluster
-            .as_deref()
-            .is_some_and(|scope| cluster_name.as_deref() != Some(scope))
-        {
-            return Err(
-                DeleteCapacityProviderErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(
-                            crate::state::CLUSTER_SCOPED_CAPACITY_PROVIDER_DELETE_MESSAGE
-                                .to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
-        }
 
         // A provider no live cluster lists is retired: `INACTIVE` from this instant, with
         // the release of the capacity it bound onto left in flight for the clock to finish

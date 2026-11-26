@@ -20,10 +20,11 @@
 //!   delete goes through;
 //! * the delete is `@idempotent`, so repeating it reports the stored provider and writes
 //!   nothing;
-//! * the reserved providers Amazon ECS manages for every account cannot be deleted, a name
-//!   that resolves to no provider and a `cluster` that resolves to no live cluster are
-//!   refused under the errors the model declares, and a cluster-scoped provider is deleted
-//!   only through the cluster it is scoped to — and a refused delete writes nothing.
+//! * the reserved providers Amazon ECS manages for every account cannot be deleted and a
+//!   name that resolves to no provider of the account is refused under the errors the model
+//!   declares — and a refused delete writes nothing. What the optional `cluster` member
+//!   names refuses nothing here, which the `capacity_provider_delete_cluster_member` suite
+//!   spans.
 //!
 //! The rows differ along what the rule generalises over: how the delete NAMES the provider
 //! (short name or full ARN), what BACKS it (an Auto Scaling group of the caller's, one
@@ -68,12 +69,6 @@ const UNRESOLVED_PROVIDER_REFUSAL: &str = "Failed to get info for provided Capac
 
 /// The error class that refusal carries.
 const UNRESOLVED_PROVIDER_CODE: &str = "ClientException";
-
-/// The sentence a delete of a CLUSTER-SCOPED provider that does not name its own cluster
-/// earns, which is the whole of the `cluster` member's own rule.
-const CLUSTER_SCOPED_REFUSAL: &str =
-    "Managed instances capacity providers are cluster-scoped and can only be deleted from \
-     their associated cluster.";
 
 /// The ARN form of a capacity provider of this account, which the `capacityProvider` member
 /// accepts beside the short name.
@@ -443,15 +438,6 @@ struct RefusalCase {
 async fn a_delete_outside_the_operations_rules_is_refused_and_writes_nothing() {
     let router = service();
     create_cluster(&router, "live", "setup").await;
-    create_cluster(&router, "otherlive", "setup").await;
-    create_cluster(&router, "deleted", "setup").await;
-    ok(
-        &router,
-        "DeleteCluster",
-        json!({ "cluster": "deleted" }),
-        "setup",
-    )
-    .await;
     create_provider(&router, "survivor", "asg-survivor", false, "setup").await;
     ok(
         &router,
@@ -466,10 +452,10 @@ async fn a_delete_outside_the_operations_rules_is_refused_and_writes_nothing() {
     .await;
 
     // The rows differ along WHICH rule the request breaks: a provider Amazon ECS reserves
-    // (both of them), a name that resolves to nothing, a `cluster` that resolves to no live
-    // cluster (never created, and a tombstone — one error code, two sentences), an
-    // identifier of another account, and a cluster-scoped provider named without its own
-    // cluster or with another one.
+    // (both of them), a name that resolves to nothing — by short name and by ARN — and an
+    // identifier of another account. What the request's optional `cluster` names breaks no
+    // rule of this operation, which the `capacity_provider_delete_cluster_member` suite
+    // spans.
     let rows = [
         RefusalCase {
             case: "the FARGATE provider Amazon ECS manages",
@@ -496,18 +482,6 @@ async fn a_delete_outside_the_operations_rules_is_refused_and_writes_nothing() {
             message: UNRESOLVED_PROVIDER_REFUSAL,
         },
         RefusalCase {
-            case: "a cluster this account never held",
-            request: || json!({ "capacityProvider": "survivor", "cluster": "nosuchcluster" }),
-            code: "ClusterNotFoundException",
-            message: "Cluster not found.",
-        },
-        RefusalCase {
-            case: "a cluster this account holds as a tombstone",
-            request: || json!({ "capacityProvider": "survivor", "cluster": "deleted" }),
-            code: "ClusterNotFoundException",
-            message: "The referenced cluster was inactive.",
-        },
-        RefusalCase {
             case: "a provider ARN of another account",
             request: || {
                 json!({
@@ -519,20 +493,6 @@ async fn a_delete_outside_the_operations_rules_is_refused_and_writes_nothing() {
             },
             code: "InvalidParameterException",
             message: "AccountIDs mismatch",
-        },
-        RefusalCase {
-            case: "a cluster-scoped provider named without its cluster",
-            request: || json!({ "capacityProvider": "scopedsurvivor" }),
-            code: "InvalidParameterException",
-            message: CLUSTER_SCOPED_REFUSAL,
-        },
-        RefusalCase {
-            case: "a cluster-scoped provider named with another live cluster",
-            request: || {
-                json!({ "capacityProvider": "scopedsurvivor", "cluster": "otherlive" })
-            },
-            code: "InvalidParameterException",
-            message: CLUSTER_SCOPED_REFUSAL,
         },
     ];
 

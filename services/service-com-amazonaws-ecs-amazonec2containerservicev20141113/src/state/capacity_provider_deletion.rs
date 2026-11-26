@@ -71,15 +71,6 @@ pub fn capacity_provider_update_refusal_message(resolved: bool) -> &'static str 
     }
 }
 
-/// `InvalidParameterException$message` for a delete of a CLUSTER-SCOPED capacity provider
-/// that does not name the cluster the provider is scoped to. The
-/// `DeleteCapacityProvider$cluster` doc states the whole rule in one sentence: "Managed
-/// instances capacity providers are cluster-scoped and can only be deleted from their
-/// associated cluster."
-pub const CLUSTER_SCOPED_CAPACITY_PROVIDER_DELETE_MESSAGE: &str =
-    "Managed instances capacity providers are cluster-scoped and can only be deleted from \
-     their associated cluster.";
-
 impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// Whether a LIVE cluster of this account still lists the capacity provider `name`
     /// among the providers associated with it, which is what a delete of that provider is
