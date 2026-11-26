@@ -22,43 +22,25 @@
 //! of the revision it names, how many tasks the block asks for, and the networking the
 //! block hands the run.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{InvocationOutcome, SERVICE_PRINCIPAL};
 
 use crate::target_dispatch::{
-    ec2, ecs, emulator, given_role, given_rule, invocations, publish, xml_text, Emulator,
+    described, ec2, ecs_ok, emulator, fargate_parameters, given_cluster, given_revision,
+    given_role, given_rule, invocations, publish, tasks_of, tasks_started_by, tasks_until,
+    xml_text, Emulator, POLL_INTERVAL, TASK_LAUNCH_BUDGET,
 };
 
 /// The action the role a task target names has to carry: EventBridge starts the task by
 /// making this call on the cluster.
 const RUN_TASK_ACTION: &str = "ecs:RunTask";
 
-/// The container image the registered revisions run. Nothing is pulled here — the revision
-/// only has to be one Fargate accepts.
-const IMAGE: &str = "public.ecr.aws/docker/library/busybox:1.36";
-
 /// The CIDR block the test VPC and its subnet are given, well inside the private ranges
 /// RFC 1918 reserves.
 const VPC_CIDR: &str = "10.42.0.0/16";
 const SUBNET_CIDR: &str = "10.42.1.0/24";
-
-/// How long a task a delivery ran is given to appear, and how long a read waits before
-/// looking again. The budget is generous: what the assertion depends on is the run having
-/// been made, not on how fast the host runs.
-const LAUNCH_BUDGET: Duration = Duration::from_secs(20);
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-/// One ECS call that must succeed.
-async fn ecs_ok(emulator: &Emulator, case: &str, operation: &str, body: &Value) -> Value {
-    let (status, answer) = ecs(emulator, operation, body).await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: ecs {operation} answered {status} {answer}"
-    );
-    answer
-}
 
 /// A VPC with one subnet in it, which is where an `awsvpc` task's interface is created;
 /// answers the subnet id.
@@ -144,80 +126,6 @@ async fn given_network(emulator: &Emulator, case: &str, routed: bool) -> String 
     subnet
 }
 
-/// A cluster called `name`; answers the ARN a rule's target names it by.
-async fn given_cluster(emulator: &Emulator, case: &str, name: &str) -> String {
-    let created = ecs_ok(emulator, case, "CreateCluster", &json!({ "clusterName": name })).await;
-    created["cluster"]["clusterArn"]
-        .as_str()
-        .unwrap_or_else(|| panic!("case {case:?}: no clusterArn in {created}"))
-        .to_string()
-}
-
-/// One `awsvpc`/Fargate revision of `family`; answers the ARN it was registered under,
-/// which carries its revision number.
-async fn given_revision(emulator: &Emulator, case: &str, family: &str) -> String {
-    let registered = ecs_ok(
-        emulator,
-        case,
-        "RegisterTaskDefinition",
-        &json!({
-            "family": family,
-            "networkMode": "awsvpc",
-            "requiresCompatibilities": ["FARGATE"],
-            "cpu": "256",
-            "memory": "512",
-            "containerDefinitions": [{
-                "name": "app",
-                "image": IMAGE,
-                "essential": true,
-            }],
-        }),
-    )
-    .await;
-    registered["taskDefinition"]["taskDefinitionArn"]
-        .as_str()
-        .unwrap_or_else(|| panic!("case {case:?}: no taskDefinitionArn in {registered}"))
-        .to_string()
-}
-
-/// The task ARNs the cluster holds, read as a client reads them.
-async fn tasks_of(emulator: &Emulator, case: &str, cluster: &str) -> Vec<String> {
-    let listed = ecs_ok(emulator, case, "ListTasks", &json!({ "cluster": cluster })).await;
-    listed["taskArns"]
-        .as_array()
-        .map(|arns| {
-            arns.iter()
-                .filter_map(|arn| arn.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// The cluster's tasks, read again until there are `wanted` of them or the budget runs out:
-/// a delivery is made inside `PutEvents`, so the first read usually answers, and the loop is
-/// what keeps the assertion about the run rather than about the host.
-async fn tasks_until(emulator: &Emulator, case: &str, cluster: &str, wanted: usize) -> Vec<String> {
-    let deadline = Instant::now() + LAUNCH_BUDGET;
-    let mut seen = tasks_of(emulator, case, cluster).await;
-    while seen.len() < wanted && Instant::now() < deadline {
-        tokio::time::sleep(POLL_INTERVAL).await;
-        seen = tasks_of(emulator, case, cluster).await;
-    }
-    seen
-}
-
-/// What `DescribeTasks` reports for `arns`.
-async fn described(emulator: &Emulator, case: &str, cluster: &str, arns: &[String]) -> Vec<Value> {
-    let described = ecs_ok(
-        emulator,
-        case,
-        "DescribeTasks",
-        &json!({ "cluster": cluster, "tasks": arns }),
-    )
-    .await;
-    described["tasks"].as_array().cloned().unwrap_or_default()
-}
-
 /// The target one of these rules carries: the cluster, the role, and the `EcsParameters`
 /// block the run is made from.
 fn ecs_target(cluster: &str, role: &str, parameters: Value) -> Value {
@@ -227,18 +135,6 @@ fn ecs_target(cluster: &str, role: &str, parameters: Value) -> Value {
         "RoleArn": role,
         "EcsParameters": parameters,
     }])
-}
-
-/// The `EcsParameters` a Fargate task of `task_definition` is run from, in the subnet
-/// `subnet`.
-fn fargate_parameters(task_definition: &str, subnet: &str) -> Value {
-    json!({
-        "TaskDefinitionArn": task_definition,
-        "LaunchType": "FARGATE",
-        "NetworkConfiguration": {
-            "awsvpcConfiguration": { "Subnets": [subnet], "AssignPublicIp": "DISABLED" },
-        },
-    })
 }
 
 /// The task a rule's firing ran, as a client FINDS it: `ListTasks` narrowed to the
@@ -256,7 +152,7 @@ async fn a_launched_task_is_found_by_the_rule_that_started_it_and_reaches_runnin
     let emulator = emulator();
     let subnet = given_routed_subnet(&emulator, case).await;
     let cluster = given_cluster(&emulator, case, "found-by-rule").await;
-    let revision = given_revision(&emulator, case, "ebecs-found").await;
+    let revision = given_revision(&emulator, case, "ebecs-found", None).await;
     let role = given_role(
         &emulator,
         "events-run-task",
@@ -274,11 +170,11 @@ async fn a_launched_task_is_found_by_the_rule_that_started_it_and_reaches_runnin
     publish(&emulator).await;
 
     // Found by the rule that ran it, with no other filter.
-    let deadline = Instant::now() + LAUNCH_BUDGET;
-    let mut arns = started_by(&emulator, case, &cluster, rule).await;
+    let deadline = Instant::now() + TASK_LAUNCH_BUDGET;
+    let mut arns = tasks_started_by(&emulator, case, &cluster, rule, None).await;
     while arns.is_empty() && Instant::now() < deadline {
         tokio::time::sleep(POLL_INTERVAL).await;
-        arns = started_by(&emulator, case, &cluster, rule).await;
+        arns = tasks_started_by(&emulator, case, &cluster, rule, None).await;
     }
     assert_eq!(
         arns.len(),
@@ -302,26 +198,6 @@ async fn a_launched_task_is_found_by_the_rule_that_started_it_and_reaches_runnin
         "case {case:?}: expected the launched task to reach RUNNING, got {last} ({:?})",
         invocations(&emulator)
     );
-}
-
-/// The tasks of `cluster` that `rule`'s firing ran, as `ListTasks` narrowed by `startedBy`
-/// reports them.
-async fn started_by(emulator: &Emulator, case: &str, cluster: &str, rule: &str) -> Vec<String> {
-    let listed = ecs_ok(
-        emulator,
-        case,
-        "ListTasks",
-        &json!({ "cluster": cluster, "startedBy": format!("events-rule/{rule}") }),
-    )
-    .await;
-    listed["taskArns"]
-        .as_array()
-        .map(|arns| {
-            arns.iter()
-                .filter_map(|arn| arn.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// WHICH revision a delivery runs is the one the target's `EcsParameters` pin: a reference
@@ -349,7 +225,7 @@ async fn a_task_target_runs_the_revision_its_parameters_pin() {
         let family = "ebecs-pinned";
         let mut registered = Vec::new();
         for _ in 0..3 {
-            registered.push(given_revision(&emulator, case, family).await);
+            registered.push(given_revision(&emulator, case, family, None).await);
         }
         let reference = match pinned {
             Some(revision) => family_arn(&registered[0], &format!("{family}:{revision}")),
@@ -413,7 +289,7 @@ async fn a_task_target_pinned_to_a_deregistered_revision_launches_nothing_until_
     let subnet = given_subnet(&emulator, case).await;
     let cluster = given_cluster(&emulator, case, "repinned").await;
     let family = "ebecs-repinned";
-    let first = given_revision(&emulator, case, family).await;
+    let first = given_revision(&emulator, case, family, None).await;
     let role =
         given_role(&emulator, "events-run-task", SERVICE_PRINCIPAL, Some(RUN_TASK_ACTION)).await;
     given_rule(
@@ -451,7 +327,7 @@ async fn a_task_target_pinned_to_a_deregistered_revision_launches_nothing_until_
     );
 
     // Re-pinned to a revision that IS active, the same rule and the same event launch.
-    let second = given_revision(&emulator, case, family).await;
+    let second = given_revision(&emulator, case, family, None).await;
     let (status, body) = crate::target_dispatch::events(
         &emulator,
         "PutTargets",
@@ -507,7 +383,7 @@ async fn assign_public_ip_governs_the_launched_tasks_interface() {
         let emulator = emulator();
         let subnet = default_subnet(&emulator, case).await;
         let cluster = given_cluster(&emulator, case, "public-ip").await;
-        let revision = given_revision(&emulator, case, "ebecs-public-ip").await;
+        let revision = given_revision(&emulator, case, "ebecs-public-ip", None).await;
         let role = given_role(
             &emulator,
             "events-run-task",
@@ -573,7 +449,7 @@ async fn default_subnet(emulator: &Emulator, case: &str) -> String {
 /// reports, read again until it is there: Amazon ECS creates and attaches that interface
 /// while the task provisions, so the detail appears once the interface is in place.
 async fn interface_of_launched_task(emulator: &Emulator, case: &str, cluster: &str) -> String {
-    let deadline = Instant::now() + LAUNCH_BUDGET;
+    let deadline = Instant::now() + TASK_LAUNCH_BUDGET;
     loop {
         for task in tasks_in_any_state(emulator, case, cluster).await {
             if let Some(id) = task["attachments"]
@@ -655,7 +531,7 @@ async fn a_task_target_runs_as_many_tasks_as_its_parameters_ask_for() {
         let emulator = emulator();
         let subnet = given_subnet(&emulator, case).await;
         let cluster = given_cluster(&emulator, case, "counted").await;
-        let revision = given_revision(&emulator, case, "ebecs-counted").await;
+        let revision = given_revision(&emulator, case, "ebecs-counted", None).await;
         let role = given_role(
             &emulator,
             "events-run-task",

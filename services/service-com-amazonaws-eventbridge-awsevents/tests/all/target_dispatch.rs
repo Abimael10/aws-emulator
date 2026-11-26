@@ -393,6 +393,151 @@ pub(crate) async fn ecs(emulator: &Emulator, operation: &str, body: &Value) -> (
     .await
 }
 
+/// One Amazon ECS call that must succeed, answered with its body.
+pub(crate) async fn ecs_ok(emulator: &Emulator, case: &str, operation: &str, body: &Value) -> Value {
+    let (status, answer) = ecs(emulator, operation, body).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: ecs {operation} answered {status} {answer}"
+    );
+    answer
+}
+
+/// The container image the revisions these suites register run. Nothing is pulled here — the
+/// revision only has to be one Fargate accepts.
+pub(crate) const ECS_IMAGE: &str = "public.ecr.aws/docker/library/busybox:1.36";
+
+/// How long a task a delivery ran is given to appear. The budget is generous: what an
+/// assertion about a run depends on is the run having been made, never how fast the host runs.
+pub(crate) const TASK_LAUNCH_BUDGET: Duration = Duration::from_secs(30);
+
+/// An Amazon ECS cluster called `name`; answers the ARN a rule's target names it by.
+pub(crate) async fn given_cluster(emulator: &Emulator, case: &str, name: &str) -> String {
+    let created = ecs_ok(emulator, case, "CreateCluster", &json!({ "clusterName": name })).await;
+    created["cluster"]["clusterArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: no clusterArn in {created}"))
+        .to_string()
+}
+
+/// One `awsvpc`/Fargate revision of `family`, declaring `execution_role` as the role its
+/// container agent acts as where a caller gives one; answers the ARN it was registered under,
+/// which carries its revision number.
+pub(crate) async fn given_revision(
+    emulator: &Emulator,
+    case: &str,
+    family: &str,
+    execution_role: Option<&str>,
+) -> String {
+    let mut request = json!({
+        "family": family,
+        "networkMode": "awsvpc",
+        "requiresCompatibilities": ["FARGATE"],
+        "cpu": "256",
+        "memory": "512",
+        "containerDefinitions": [{
+            "name": "app",
+            "image": ECS_IMAGE,
+            "essential": true,
+        }],
+    });
+    if let Some(execution_role) = execution_role {
+        request["executionRoleArn"] = json!(execution_role);
+    }
+    let registered = ecs_ok(emulator, case, "RegisterTaskDefinition", &request).await;
+    registered["taskDefinition"]["taskDefinitionArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: no taskDefinitionArn in {registered}"))
+        .to_string()
+}
+
+/// The task ARNs the cluster holds, read as a client reads them.
+pub(crate) async fn tasks_of(emulator: &Emulator, case: &str, cluster: &str) -> Vec<String> {
+    task_arns(ecs_ok(emulator, case, "ListTasks", &json!({ "cluster": cluster })).await)
+}
+
+/// What `Task$startedBy` carries for a task a delivery of the rule `rule` ran, which is what
+/// `ListTasks$startedBy` narrows such tasks by.
+pub(crate) fn started_by_rule(rule: &str) -> String {
+    format!("events-rule/{rule}")
+}
+
+/// The tasks of `cluster` that `rule`'s firing ran, as `ListTasks` narrowed by that stamp
+/// reports them; `desired_status` narrows it further where a caller asks for one.
+pub(crate) async fn tasks_started_by(
+    emulator: &Emulator,
+    case: &str,
+    cluster: &str,
+    rule: &str,
+    desired_status: Option<&str>,
+) -> Vec<String> {
+    let mut request = json!({ "cluster": cluster, "startedBy": started_by_rule(rule) });
+    if let Some(desired_status) = desired_status {
+        request["desiredStatus"] = json!(desired_status);
+    }
+    task_arns(ecs_ok(emulator, case, "ListTasks", &request).await)
+}
+
+/// The task ARNs one `ListTasks` answer carries.
+fn task_arns(listed: Value) -> Vec<String> {
+    listed["taskArns"]
+        .as_array()
+        .map(|arns| {
+            arns.iter()
+                .filter_map(|arn| arn.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The cluster's tasks, read again until there are `wanted` of them or
+/// [`TASK_LAUNCH_BUDGET`] runs out: a delivery is made inside `PutEvents`, so the first read
+/// usually answers, and the loop is what keeps the assertion about the run rather than about
+/// the host.
+pub(crate) async fn tasks_until(
+    emulator: &Emulator,
+    case: &str,
+    cluster: &str,
+    wanted: usize,
+) -> Vec<String> {
+    let deadline = Instant::now() + TASK_LAUNCH_BUDGET;
+    let mut seen = tasks_of(emulator, case, cluster).await;
+    while seen.len() < wanted && Instant::now() < deadline {
+        tokio::time::sleep(POLL_INTERVAL).await;
+        seen = tasks_of(emulator, case, cluster).await;
+    }
+    seen
+}
+
+/// What `DescribeTasks` reports for `arns`.
+pub(crate) async fn described(
+    emulator: &Emulator,
+    case: &str,
+    cluster: &str,
+    arns: &[String],
+) -> Vec<Value> {
+    let described = ecs_ok(
+        emulator,
+        case,
+        "DescribeTasks",
+        &json!({ "cluster": cluster, "tasks": arns }),
+    )
+    .await;
+    described["tasks"].as_array().cloned().unwrap_or_default()
+}
+
+/// The `EcsParameters` a Fargate task of `task_definition` is run from, in the subnet
+/// `subnet`.
+pub(crate) fn fargate_parameters(task_definition: &str, subnet: &str) -> Value {
+    json!({
+        "TaskDefinitionArn": task_definition,
+        "LaunchType": "FARGATE",
+        "NetworkConfiguration": {
+            "awsvpcConfiguration": { "Subnets": [subnet], "AssignPublicIp": "DISABLED" },
+        },
+    })
+}
+
 pub(crate) async fn sns(
     emulator: &Emulator,
     action: &str,
@@ -973,7 +1118,7 @@ fn epoch_seconds() -> f64 {
 /// the records that never arrived are a failed assertion, and how long a read
 /// sleeps before trying again.
 const DELIVERY_BUDGET: Duration = Duration::from_secs(10);
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// One shard of a stream: its id and the slice of the 128-bit hash key space it
 /// covers, as `ListShards` publishes them.
