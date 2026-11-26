@@ -19,12 +19,11 @@
 //! That is one rule about IAM's ordinary default deny over the ONE ACTION, applied to the one
 //! call CloudFormation makes on an ARN the TEMPLATE supplies: the action asked for is the
 //! documented action of the service being emulated, so a role that does not allow that action
-//! cannot make the call. It is not the reading the deployment's own provisioning calls get —
-//! those are this crate's approximation of a resource provider's API calls, so what the role's
-//! documents are asked about one of them is whether the role may act in the called SERVICE at
-//! all — which is why every row below grants its role one Amazon SNS action (the sibling topic
-//! the template declares is really created there) while leaving the PROVIDER call to be
-//! decided on its own.
+//! cannot make the call. The deployment's own provisioning calls are decided the same way, each
+//! against the action it invokes (`state::service_role`) — which is why every row below grants
+//! its role the two Amazon SNS actions the sibling topic the template declares needs (the topic
+//! is really created there, and really removed when a create rolls back) while leaving the
+//! PROVIDER call to be decided on its own.
 //!
 //! Four services have to agree for this to hold, and this crate's harness mounts them all on
 //! one engine: IAM holds the service role whose documents decide the call, AWS Lambda holds (and
@@ -264,12 +263,13 @@ fn statement(effect: &str, action: &str, resource: &str) -> Value {
 /// role: what it says about the call is the row's `grant`, stated over the action that row's
 /// transport performs and the ARN its token names.
 ///
-/// Every document also allows ONE Amazon SNS action: the sibling topic the template declares is
-/// created in Amazon SNS by the deployment itself, and a deployment's calls to a service the
-/// role may act in no way at all are refused for want of a grant
-/// (`state::service_role`) — so a role allowed nothing there would fail the sibling instead of
-/// reaching the call each row is about. It is `sns:CreateTopic` rather than a wildcard, so the
-/// `sns:Publish` a topic-backed `ServiceToken` performs is still a call no document allows.
+/// Every document also allows the two Amazon SNS actions the SIBLING topic's own lifecycle
+/// performs: that topic is created in Amazon SNS by the deployment itself and removed again when
+/// a failed create rolls back, and a deployment's call whose action no readable document allows
+/// is refused (`state::service_role`) — so a role allowed neither would fail the sibling instead
+/// of reaching the call each row is about. They are `sns:CreateTopic` and `sns:DeleteTopic`
+/// rather than a wildcard, so the `sns:Publish` a topic-backed `ServiceToken` performs is still a
+/// call no document allows.
 fn service_role_document(row: &Row, token: &str) -> Option<Value> {
     let action = row.token.action();
     let namespace = action.split(':').next().unwrap_or_default();
@@ -286,6 +286,7 @@ fn service_role_document(row: &Row, token: &str) -> Option<Value> {
         ],
     };
     statements.push(statement("Allow", "sns:CreateTopic", "*"));
+    statements.push(statement("Allow", "sns:DeleteTopic", "*"));
     Some(json!({ "Version": "2012-10-17", "Statement": statements }))
 }
 

@@ -7,15 +7,15 @@
 //! behalf" (`CreateStackInput$RoleARN`) — and the role keeps acting for every later operation
 //! that names no other one ("CloudFormation always uses this role for all future operations on
 //! the stack"), so a call that role is not permitted to make is not made: under IAM's default
-//! deny, a role whose readable identity documents allow it NO action of the service that owns
-//! a declared resource cannot create, change or delete that resource, and the resource fails
+//! deny, a role whose readable identity documents do not allow the ACTION a declared
+//! resource's handler call invokes, on the resource it is about, cannot create, change or
+//! delete that resource, and the resource fails
 //! with that service's own 403 authorization answer — the sentence naming the role session,
 //! the action and the resource, inside the diagnostic its SDK appends and the envelope
 //! CloudFormation quotes a provider's answer in, classified `AccessDenied`.** A role the
-//! documents DO allow an action of that service deploys the resource, whichever action and
-//! whichever resource that allow is scoped to, because the calls a deployment makes are this
-//! emulator's approximation of a provider's call set; an explicit `Deny` of the call refuses
-//! it whatever else is in force.
+//! documents DO allow that action deploys the resource, whether the allow names it in full or
+//! covers it with a wildcard; an explicit `Deny` of the call refuses it whatever else is in
+//! force.
 //!
 //! The rows differ along what the rule generalises over: which service owns the declared
 //! resource and which wire it speaks (Amazon SQS and AWS Systems Manager on awsJson, Amazon
@@ -288,16 +288,15 @@ fn rows() -> Vec<Row> {
             owner: Owner::Queue,
             expected: Expected::Created,
         },
-        // The deployment's own calls are this emulator's approximation of a provider's call
-        // set, so what the documents are asked is whether the role may act in the SERVICE at
-        // all: a grant of another of its actions is not evidence against the create.
+        // The least-privilege shape the rule exists for: a role holding every action of the
+        // service but the one the create invokes cannot make that call.
         Row {
             case: "another action of the called service",
             stack: "role-grant-other-action",
             statements: Some(|_| json!([statement("Allow", "sqs:DeleteQueue", "*")])),
             names_a_role: true,
             owner: Owner::Queue,
-            expected: Expected::Created,
+            expected: Expected::RefusedForWantOfAGrant,
         },
         Row {
             case: "the create action scoped to another resource of the called service",
@@ -311,7 +310,7 @@ fn rows() -> Vec<Row> {
             }),
             names_a_role: true,
             owner: Owner::Topic,
-            expected: Expected::Created,
+            expected: Expected::RefusedForWantOfAGrant,
         },
         // A `NotAction` element is about every action except the ones it names, so one that
         // excludes another action of the called service leaves this call's own allowed.

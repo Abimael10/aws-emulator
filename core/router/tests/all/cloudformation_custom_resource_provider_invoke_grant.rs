@@ -354,10 +354,14 @@ const DENIED: &[Denied] = &[
         case: "a topic provider the role carries no publish grant for",
         stack: "cr-grant-topic-silent",
         transport: Transport::Topic,
+        // The two Amazon SNS actions the provider TOPIC's own lifecycle needs — the deployment
+        // creates it there and the rollback removes it again, each call authorized against the
+        // action it invokes — while the publish that would reach the provider stays ungranted.
         statements: |_| {
             json!([
                 { "Effect": "Allow", "Action": "lambda:*", "Resource": "*" },
                 { "Effect": "Allow", "Action": "sns:CreateTopic", "Resource": "*" },
+                { "Effect": "Allow", "Action": "sns:DeleteTopic", "Resource": "*" },
             ])
         },
         explicit: false,

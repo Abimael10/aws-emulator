@@ -24,24 +24,20 @@
 //!
 //! The decision is [`::service_common::iam_authorization`]'s — the tree's ONE evaluation of
 //! IAM policy documents, so two services handed the same documents cannot answer
-//! differently. For the calls a DEPLOYMENT makes in the services that own a stack's resources
-//! ([`refusal`]) two answers refuse the call, each of them evidence that the role cannot make
-//! it:
+//! differently — and for the calls a DEPLOYMENT makes in the services that own a stack's
+//! resources ([`refusal`]) it is taken over the ACTION that call invokes. A handler's call is
+//! an ordinary request of the owning service made with the role's credentials, so the grant it
+//! needs is the grant that request needs: `<service prefix>:<operation name>`, which is how
+//! the resource type's own registry schema lists what each of its handlers requires. Two
+//! answers refuse such a call, each of them evidence that the role cannot make it:
 //!
 //! * an EXPLICIT `Deny` of the call, which refuses whatever else is in force ("an explicit
 //!   deny in any policy overrides any allows"); and
-//! * IAM's DEFAULT DENY, where no readable document of the role allows the call — asked of the
-//!   SERVICE the call is made to rather than of the one action: a role whose documents allow
-//!   it no action of that service at all can make none of the calls that create, change or
-//!   delete a resource there, so the resource fails with that service's own authorization
-//!   refusal.
-//!
-//! Why the service and not the action: the calls a deployment makes are this crate's
-//! ([`super::provisioner`]), not the resource provider AWS ships for the type, so the set of
-//! actions a deployment of one resource touches is not the set the real provider needs a grant
-//! for — refusing the call whose exact action no statement happens to name would refuse
-//! deployments the real service performs. Which SERVICE the provider has to call is not an
-//! approximation: a resource of a type lives in the service that owns it.
+//! * IAM's DEFAULT DENY, where no readable document of the role allows that action on the
+//!   resource the call is about — so a role holding every permission the type's handlers
+//!   require EXCEPT one cannot make the call that one action names, which is the
+//!   least-privilege scoping a client builds such a role to establish, and the resource fails
+//!   with that service's own authorization refusal.
 //!
 //! Nothing else is judged: a stack with no `RoleARN` runs with the caller's own permissions
 //! ("CloudFormation uses a temporary session that's generated from your user credentials"), an
@@ -50,13 +46,11 @@
 //! a role carrying no readable document at all is one whose permissions this emulator cannot
 //! establish, and a document it cannot read as a policy is evidence of nothing.
 //!
-//! A call CLOUDFORMATION ITSELF makes on a resource the TEMPLATE names is held to the default
-//! deny over the ONE ACTION ([`refusal_without_a_grant`]): such a call is not this
-//! crate's approximation of a provider's API calls but the documented call of the service
-//! being emulated, taken on an ARN the template itself supplies, so the action a grant is
-//! needed for is exactly the action AWS asks for — and a role that allows that action is the
-//! only role the call can be made under. The one call of that kind is the invocation of the provider a
-//! custom resource's `ServiceToken` names
+//! A call CLOUDFORMATION ITSELF makes on a resource the TEMPLATE names reaches the same
+//! decision through [`refusal_without_a_grant`], over the action the service being emulated
+//! documents for it and the ARN the template itself supplies rather than over an action read
+//! off the wire a deployment's call travels. The one call of that kind is the invocation of
+//! the provider a custom resource's `ServiceToken` names
 //! ([`super::provisioning::custom_resource`]). The same unreadability rule holds there as
 //! everywhere else in this module: a role carrying an attached policy whose document this
 //! emulator does not hold carries a grant that cannot be read, so the call is not refused for
@@ -178,11 +172,17 @@ impl ServiceRole {
     /// taken on `resource`, or `None` where the role's documents show nothing against that
     /// call.
     ///
-    /// The two answers that refuse it are the module docs': an explicit `Deny` of the call, and
-    /// IAM's default deny where no readable document of the role allows the role ANY action of
-    /// the called service. A role carrying no readable document at all, and one carrying an
-    /// attachment whose document this emulator does not hold, establish neither: refusing for
-    /// want of a grant that cannot be read would refuse a call AWS permits.
+    /// The call asks IAM for the action it invokes, so the decision is the one
+    /// [`Self::refusal_without_a_grant`] takes — an explicit `Deny` refuses it, and so does
+    /// IAM's default deny where no readable document allows that action on that resource —
+    /// asked of the action the called service would authorize the request under
+    /// ([`reported_action`]).
+    ///
+    /// A role carrying no readable document AT ALL is the one case this gate decides nothing
+    /// for: its permissions are not something this emulator holds any of, so refusing its
+    /// deployment's calls would refuse calls AWS permits. The same holds for a role carrying an
+    /// attachment whose document is not held, which [`Self::refusal_without_a_grant`] reads the
+    /// same way.
     ///
     /// The wording is the one AWS answers an unauthorized call with — the principal, the
     /// action, the resource and why — every part of it read off the call and the account's own
@@ -191,29 +191,10 @@ impl ServiceRole {
     /// decision cannot word it differently, and naming the action the way the service that
     /// refuses it words its own refusals ([`reported_action`]).
     fn refusal(&self, signing_name: &str, operation: &str, resource: &str) -> Option<String> {
-        let principal = self.principal.as_deref()?;
         if self.documents.is_empty() {
             return None;
         }
-        let action = reported_action(signing_name, operation);
-        // Read once, because both questions below are asked of the same documents.
-        let documents = iam::prepare_documents(&self.documents);
-        let request = iam::Request::new(&action, resource, &[]);
-        let reason = match iam::identity_decision_prepared(&documents, &request) {
-            Decision::Allowed => return None,
-            Decision::Denied => iam::IDENTITY_POLICY_EXPLICIT_DENY.to_string(),
-            Decision::NotStated => {
-                if self.unreadable_attachment
-                    || iam::identity_may_allow_an_action_of(&documents, signing_name)
-                {
-                    return None;
-                }
-                iam::no_identity_policy_allows(&action)
-            }
-        };
-        Some(iam::not_authorized_by_identity_policy(
-            principal, &action, resource, &reason,
-        ))
+        self.refusal_without_a_grant(&reported_action(signing_name, operation), resource)
     }
 
     /// The sentence refusing `action` on `resource` for want of a GRANT: the decision IAM
@@ -484,20 +465,20 @@ mod tests {
     const CREATE_QUEUE: &str = "CreateQueue";
 
     /// RULE: a DEPLOYMENT's call is refused by an explicit `Deny` about it, and — under IAM's
-    /// default deny — where no readable document allows the role any action of the service the
-    /// call is made to; a role allowed some action of that service is refused nothing, whichever
-    /// action and whichever resource that allow is scoped to, and so are a role carrying a grant
-    /// this emulator cannot read, a role carrying no readable document at all and a deployment
-    /// with no role.
+    /// default deny — where no readable document of the role allows the ACTION that call
+    /// invokes on the resource it is about; a role carrying a grant this emulator cannot read,
+    /// a role carrying no readable document at all and a deployment with no role are decided by
+    /// nothing.
     ///
-    /// The rows span what the decision turns on: whether a statement is about the called service
-    /// at all, how its action element is spelled (the call's own action, another action of that
-    /// service, a wildcard over it, every action, a `NotAction` excluding part of it and one
-    /// excluding all of it), what its resource element names, the effect it states, and what the
-    /// role carries beside its readable documents. The refusal's own wording is held to as well,
-    /// action included: the case is the refusing service's ([`reported_action`]).
+    /// The rows span what the decision turns on: whether a statement is about the call at all,
+    /// how its action element is spelled (the call's own action, another action of the same
+    /// service, a wildcard over that service, every action, a `NotAction` excluding another
+    /// action and one excluding the whole service), what its resource element names (the
+    /// resource itself, another one, every one), the effect it states, and what the role carries
+    /// beside its readable documents. The refusal's own wording is held to as well, action
+    /// included: the case is the refusing service's ([`reported_action`]).
     #[test]
-    fn a_deployment_call_is_refused_unless_the_role_may_act_in_the_called_service() {
+    fn a_deployment_call_is_refused_unless_a_readable_document_allows_that_action() {
         let action = reported_action(QUEUE_SERVICE, CREATE_QUEUE);
         // (case, the role, the expected reason clause or None for a call that is not refused)
         let rows: Vec<(&str, ServiceRole, Option<String>)> = vec![
@@ -506,10 +487,12 @@ mod tests {
                 role(&[document("Allow", "sqs:CreateQueue", QUEUE)], false),
                 None,
             ),
+            // The least-privilege case this gate exists for: every action of the service but
+            // the one the call invokes.
             (
                 "an allow of ANOTHER action of the called service",
                 role(&[document("Allow", "sqs:DeleteQueue", "*")], false),
-                None,
+                Some(iam::no_identity_policy_allows(&action)),
             ),
             (
                 "an allow of the call's action on another resource",
@@ -521,7 +504,7 @@ mod tests {
                     )],
                     false,
                 ),
-                None,
+                Some(iam::no_identity_policy_allows(&action)),
             ),
             (
                 "an allow under a wildcard over the called service",
