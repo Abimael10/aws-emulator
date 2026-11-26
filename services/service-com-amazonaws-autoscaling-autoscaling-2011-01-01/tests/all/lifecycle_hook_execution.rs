@@ -29,6 +29,12 @@
 //!    only `TerminateInstanceInAutoScalingGroup` takes it out. Under `terminate` the same
 //!    abandon shuts it down.
 //! 6. The per-group hook quota is refused with the LIMIT and no part of the request.
+//!
+//! This suite OWNS the lifecycle-HOLD harness for this crate's tests — the group, hook and
+//! callback writers, the readers the holds are asserted through and the clock drivers are
+//! defined here once, and `no_active_lifecycle_action_sentence.rs`, which covers the sentence
+//! a callback is refused with once the instance it names holds nothing, drives the same
+//! helpers rather than keeping a second copy.
 
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -44,21 +50,21 @@ const TEMPLATE: &str = "lt-hook-execution";
 /// The two transitions a hook can be created for, written out here (and not taken from the
 /// crate) so a wrong constant in the implementation cannot make a row pass. From the model's
 /// own documentation for `PutLifecycleHookType$LifecycleTransition`.
-const LAUNCHING: &str = "autoscaling:EC2_INSTANCE_LAUNCHING";
-const TERMINATING: &str = "autoscaling:EC2_INSTANCE_TERMINATING";
+pub(crate) const LAUNCHING: &str = "autoscaling:EC2_INSTANCE_LAUNCHING";
+pub(crate) const TERMINATING: &str = "autoscaling:EC2_INSTANCE_TERMINATING";
 
 /// The results a hook may default to and a callback may carry ("Valid values: CONTINUE |
 /// ABANDON").
-const CONTINUE: &str = "CONTINUE";
-const ABANDON: &str = "ABANDON";
+pub(crate) const CONTINUE: &str = "CONTINUE";
+pub(crate) const ABANDON: &str = "ABANDON";
 
 /// The `LifecycleState` values this suite asserts, spelled as the model's own
 /// `com.amazonaws.autoscaling#LifecycleState` enum does
 /// (`smithy_query(query="shape",shape="LifecycleState")`).
 const PENDING: &str = "Pending";
-const PENDING_WAIT: &str = "Pending:Wait";
-const IN_SERVICE: &str = "InService";
-const TERMINATING_WAIT: &str = "Terminating:Wait";
+pub(crate) const PENDING_WAIT: &str = "Pending:Wait";
+pub(crate) const IN_SERVICE: &str = "InService";
+pub(crate) const TERMINATING_WAIT: &str = "Terminating:Wait";
 const TERMINATING_RETAINED: &str = "Terminating:Retained";
 
 /// What Amazon EC2 reports for an instance it has finished starting, and for one it is
@@ -78,12 +84,13 @@ const MAX_HOOKS_PER_GROUP: usize = 50;
 /// How long a leg waits for what it is waiting on, and how often it looks: driven off what
 /// the group REPORTS rather than off a fixed sleep, and far above the work one capacity
 /// change makes, so a loaded machine delays a row instead of breaking it.
-const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
-const POLL: std::time::Duration = std::time::Duration::from_millis(25);
+pub(crate) const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const POLL: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// One emulator with Auto Scaling, Amazon EC2 and Elastic Load Balancing v2 on one engine,
 /// a launch template the groups launch from and one subnet to place into.
-async fn fixture() -> (MultiServiceRouter, std::sync::Arc<engine::InMemoryEngine>, String) {
+pub(crate) async fn fixture(
+) -> (MultiServiceRouter, std::sync::Arc<engine::InMemoryEngine>, String) {
     let (router, engine) = emulator();
     crate::support::create_launch_template(&router, TEMPLATE).await;
     let subnet = seed_subnets(&engine, 1)
@@ -96,7 +103,7 @@ async fn fixture() -> (MultiServiceRouter, std::sync::Arc<engine::InMemoryEngine
 
 /// Create the group `group` with `desired` capacity, carrying `extra` request members, and
 /// assert the create was served.
-async fn create_group(
+pub(crate) async fn create_group(
     router: &MultiServiceRouter,
     case: &str,
     group: &str,
@@ -121,7 +128,7 @@ async fn create_group(
 }
 
 /// Put one lifecycle hook on the group, and assert it was stored.
-async fn put_hook(
+pub(crate) async fn put_hook(
     router: &MultiServiceRouter,
     case: &str,
     group: &str,
@@ -144,7 +151,12 @@ async fn put_hook(
 }
 
 /// Ask for `desired` capacity on the group, which must be accepted.
-async fn set_capacity(router: &MultiServiceRouter, case: &str, group: &str, desired: i32) {
+pub(crate) async fn set_capacity(
+    router: &MultiServiceRouter,
+    case: &str,
+    group: &str,
+    desired: i32,
+) {
     let (status, body) = query(
         router,
         "SetDesiredCapacity",
@@ -162,7 +174,11 @@ async fn set_capacity(router: &MultiServiceRouter, case: &str, group: &str, desi
 
 /// The `LifecycleState` the group reports for each instance it holds, in the order it
 /// reports them.
-async fn reported_states(router: &MultiServiceRouter, case: &str, group: &str) -> Vec<String> {
+pub(crate) async fn reported_states(
+    router: &MultiServiceRouter,
+    case: &str,
+    group: &str,
+) -> Vec<String> {
     let (status, body) = query(
         router,
         "DescribeAutoScalingGroups",
@@ -193,7 +209,7 @@ async fn reported_instances(router: &MultiServiceRouter, case: &str, group: &str
 
 /// Look at the group until every instance it holds is reported in `expected`, and it holds
 /// `count` of them, or [`DEADLINE`] passes; answers those instance ids.
-async fn poll_states(
+pub(crate) async fn poll_states(
     router: &MultiServiceRouter,
     case: &str,
     group: &str,
@@ -248,7 +264,7 @@ async fn poll_ec2_state(router: &MultiServiceRouter, case: &str, instance_id: &s
 /// Read off the store because the token is published to the account's event bus and nowhere
 /// in this service's own API: it is taken from where the handler wrote it and passed back
 /// over the wire, which is the only way a callback can address the action at all.
-fn held_actions(
+pub(crate) fn held_actions(
     engine: &std::sync::Arc<engine::InMemoryEngine>,
     group: &str,
 ) -> Vec<(String, String, String)> {
@@ -308,7 +324,7 @@ fn launch_still_in_flight(engine: &std::sync::Arc<engine::InMemoryEngine>, group
 /// a row that is about the hook's own deadline drives the CLOCK: the deadline the hold stored
 /// is moved into the past and the next read materialises what that instant made due, exactly
 /// as it would have on its own.
-fn time_out_every_hold(engine: &std::sync::Arc<engine::InMemoryEngine>, group: &str) {
+pub(crate) fn time_out_every_hold(engine: &std::sync::Arc<engine::InMemoryEngine>, group: &str) {
     let state = autoscaling::state::service_state(&**engine)
         .expect("the Auto Scaling store is mounted on this engine");
     let mut store = state.lock();
@@ -325,7 +341,7 @@ fn time_out_every_hold(engine: &std::sync::Arc<engine::InMemoryEngine>, group: &
 }
 
 /// The `(code, message)` of a refused answer, with the message unescaped.
-fn refusal_of(body: &str) -> (String, String) {
+pub(crate) fn refusal_of(body: &str) -> (String, String) {
     (
         tag_value(body, "Code"),
         xml_unescape(&tag_value(body, "Message")),
@@ -552,7 +568,7 @@ async fn a_released_launch_is_admitted_on_the_next_read() {
 
 /// Post one `CompleteLifecycleAction` carrying `members` beyond the group and hook names,
 /// which must be accepted.
-async fn complete(
+pub(crate) async fn complete(
     router: &MultiServiceRouter,
     case: &str,
     group: &str,

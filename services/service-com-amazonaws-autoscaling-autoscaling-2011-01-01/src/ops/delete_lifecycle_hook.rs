@@ -152,8 +152,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let group_name = input.auto_scaling_group_name;
         let hook_name = input.lifecycle_hook_name;
 
+        let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
-        state.materialize_due(&*self.engine, ::std::time::SystemTime::now());
+        state.materialize_due(&*self.engine, now);
 
         // The call is addressed at ONE hook of one group, so a pair this service holds no
         // hook for names no hook to delete: the refusal reports the missing HOOK, naming
@@ -168,6 +169,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::absent_lifecycle_hook_message(&hook_name, &group_name),
             ));
         }
+        // "If there are any outstanding lifecycle actions, they are completed first (ABANDON
+        // for launching instances, CONTINUE for terminating instances)": a hook that was
+        // holding instances takes those holds with it, so the delete ends each one with the
+        // result its own transition documents rather than leaving an instance waiting at a
+        // hook no callback can address any more.
+        state.complete_lifecycle_actions_of_hook(&*self.engine, &group_name, &hook_name, now);
 
         crate::state::audit(
             ctx.parts(),
@@ -175,6 +182,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &format!("{group_name}/{hook_name}"),
             "lifecycle hook deleted",
         );
+        // An instance a completed hold released settles on the clock — a launch that carried
+        // on comes into service, one that was abandoned goes back to Amazon EC2 — so the pump
+        // is driven here exactly as the callback door drives it, with the store's lock
+        // released first: the pump takes it itself.
+        drop(state);
+        // Such an instance is also a target of the target groups the group is attached to, so
+        // one coming into service is registered and one leaving deregisters.
+        crate::state::settle_group_load_balancers(&*self.engine, &group_name);
+        crate::state::drive_lifecycle_clock(ctx, &self.engine);
         Ok(DeleteLifecycleHookOutput {})
     }
 }

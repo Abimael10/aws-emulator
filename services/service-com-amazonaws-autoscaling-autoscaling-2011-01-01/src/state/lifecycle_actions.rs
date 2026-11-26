@@ -211,6 +211,23 @@ impl HeldTransition {
         }
     }
 
+    /// What an outstanding action of this transition is COMPLETED with when the hook holding
+    /// it is deleted.
+    ///
+    /// "If there are any outstanding lifecycle actions, they are completed first (ABANDON for
+    /// launching instances, CONTINUE for terminating instances)"
+    /// (`smithy_query(query="doc",shape="DeleteLifecycleHook")`) — read off the transition the
+    /// hold is at, because that sentence states one result per direction.
+    #[must_use]
+    pub fn result_on_hook_delete(self) -> &'static str {
+        match self {
+            // The two results a lifecycle action can carry, as the hook collection spells
+            // them ("Valid values: CONTINUE | ABANDON").
+            Self::Launching => super::DEFAULT_LIFECYCLE_ACTION_RESULT,
+            Self::Terminating => LIFECYCLE_ACTION_CONTINUE,
+        }
+    }
+
     /// Whether `instance` is one this transition's hooks can still be put in front of.
     ///
     /// A launch is held while the instance is still coming into service, and a termination
@@ -249,8 +266,10 @@ pub struct HeldStep {
 /// ([`StoredInstance::pending_lifecycle_actions`]), so an action cannot be stored against an
 /// instance that disagrees with it. The hook's own values are copied in when the hold
 /// starts: the hold is what that hook said at the instant it took the instance, so a hook a
-/// client edits or deletes while an instance waits does not retune or orphan the wait it had
-/// already started.
+/// client edits while an instance waits does not retune the wait it had already started. A
+/// hook a client DELETES takes its outstanding actions with it
+/// ([`AutoScalingState::complete_lifecycle_actions_of_hook`]), so no hold outlives the hook
+/// that started it.
 #[derive(Debug, Clone)]
 pub struct StoredLifecycleAction {
     /// `LifecycleActionToken`: "a universally unique identifier (UUID) that identifies a
@@ -1382,6 +1401,67 @@ impl AutoScalingState {
                     event.notification_topics = topics.clone();
                 }
             }
+        }
+    }
+
+    /// Complete every outstanding lifecycle action the hook `hook_name` of `group_name` is
+    /// holding, each with the result its own transition documents
+    /// ([`HeldTransition::result_on_hook_delete`]).
+    ///
+    /// "If there are any outstanding lifecycle actions, they are completed first (ABANDON for
+    /// launching instances, CONTINUE for terminating instances)"
+    /// (`smithy_query(query="doc",shape="DeleteLifecycleHook")`) — so removing a hook ends the
+    /// holds it had taken rather than leaving them behind: from that instant the group holds
+    /// no active action under that hook, and the instances it was holding carry on exactly as
+    /// a callback carrying the same result would have taken them.
+    pub(crate) fn complete_lifecycle_actions_of_hook<Eng: Send + Sync + 'static>(
+        &mut self,
+        engine: &Eng,
+        group_name: &str,
+        hook_name: &str,
+        now: SystemTime,
+    ) {
+        // Collected first, then resolved: resolving one action of an instance can clear the
+        // rest, so the set is read once and each entry that is still held is applied.
+        let held: Vec<(String, String, HeldTransition)> = self
+            .groups
+            .get(group_name)
+            .map(|group| {
+                group
+                    .instances
+                    .iter()
+                    .flat_map(|instance| {
+                        instance
+                            .pending_lifecycle_actions
+                            .iter()
+                            .filter(|action| action.hook_name == hook_name)
+                            .map(|action| {
+                                (
+                                    instance.instance_id.clone(),
+                                    action.token.clone(),
+                                    action.transition,
+                                )
+                            })
+                            .collect::<Vec<(String, String, HeldTransition)>>()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (instance_id, token, transition) in held {
+            self.resolve_lifecycle_action(
+                engine,
+                &LifecycleActionResolution {
+                    group_name,
+                    instance_id: &instance_id,
+                    token: &token,
+                    result: transition.result_on_hook_delete(),
+                    // The delete COMPLETES the action, so the step it was holding reports the
+                    // same ending a callback carrying that result would have given it rather
+                    // than a deadline that never ran out.
+                    ending: LifecycleActionEnding::Callback,
+                },
+                now,
+            );
         }
     }
 
