@@ -269,18 +269,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // "You can update up to 100 features per call." The model bounds `Features` at
-        // `len 1..` only, so the documented maximum is this handler's to refuse. Every
-        // check from here to the store lock is on the REQUEST, so it answers the same
-        // whatever stores the caller named: a request this operation cannot act on is a
-        // request defect, not something an OfflineStore-only target excuses.
-        if input.features.len() > MAX_FEATURES_PER_UPDATE {
-            return Err(validation(format!(
-                "Features: at most {MAX_FEATURES_PER_UPDATE} features can be updated per \
-                 call, but {} were supplied",
-                input.features.len()
-            )));
-        }
         // `Features` is modelled `len 1..` and refused at the boundary; read it
         // fallibly all the same, so a handler reached with an empty list answers the
         // modelled error instead of applying an update that changes nothing.
@@ -294,6 +282,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // value the merge below settles on, so the event-time and identifier reads cannot
         // disagree with what is stored.
         let posted_features = crate::state::held_feature_values(&input.features);
+
+        // "You can update up to 100 features per call." The model bounds `Features` at
+        // `len 1..` only, so the documented maximum is this handler's to refuse. It
+        // bounds the FEATURES the call updates — one value per feature name, the reading
+        // every write of this data plane makes ([`crate::state::held_feature_values`]) and
+        // the count the store's own per-record bound is read on
+        // (`crate::state::FeatureGroupStore::insert_record`) — not the entries of a list
+        // that may name one feature more than once: such a call still updates that one
+        // feature, so it counts once. Every check from here to the store lock is on the
+        // REQUEST, so it answers the same whatever stores the caller named: a request this
+        // operation cannot act on is a request defect, not something an OfflineStore-only
+        // target excuses.
+        if posted_features.len() > MAX_FEATURES_PER_UPDATE {
+            return Err(validation(format!(
+                "Features: at most {MAX_FEATURES_PER_UPDATE} features can be updated per \
+                 call, but {} were supplied",
+                posted_features.len()
+            )));
+        }
 
         // The `EventTime` of an update is the value the group's own
         // `EventTimeFeatureName` carries among the posted features — the runtime API has
@@ -358,18 +365,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // group's record identifier feature", so an update that posts the group's
         // record-identifier feature must post the value of the record it is updating: a
         // record's identity is not what this operation changes.
+        // The posted feature is read for the one value it states
+        // ([`crate::state::held_scalar_feature`]), the same reading every whole-record
+        // write of this data plane makes, so a value this plane cannot read as one value
+        // is refused with the rule this crate states once
+        // ([`crate::state::identifier_not_scalar`]) rather than reported as a value that
+        // fails to match one.
         let identifier_feature = definition.record_identifier_feature_name.clone();
-        if let Some(posted) = posted_features
-            .iter()
-            .copied()
-            .find(|feature| feature.feature_name == identifier_feature)
-        {
-            if posted.value_as_string.as_deref() != Some(identifier.as_str()) {
+        match crate::state::held_scalar_feature(&posted_features, &identifier_feature) {
+            crate::state::ScalarFeature::Absent => {}
+            crate::state::ScalarFeature::Value(value) if value == identifier => {}
+            crate::state::ScalarFeature::Value(_) => {
                 return Err(validation(format!(
                     "Features: the record identifier feature '{identifier_feature}' must carry \
                      the RecordIdentifierValueAsString of the record being updated \
                      ('{identifier}')"
-                )));
+                )))
+            }
+            crate::state::ScalarFeature::Unreadable => {
+                return Err(validation(crate::state::identifier_not_scalar(
+                    &identifier_feature,
+                )))
             }
         }
 
@@ -506,11 +522,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The most feature values one `UpdateRecord` call may carry.
+/// The most FEATURES one `UpdateRecord` call may update.
 ///
 /// "You can update up to 100 features per call", from this operation's own
 /// documentation — `smithy_query(query="doc", shape="UpdateRecord")` on this crate's
 /// `smithy-model/`. A documented API limit, not an emulator capacity bound.
+///
+/// Counted in FEATURES, i.e. in the values the call updates — one per feature name
+/// ([`crate::state::held_feature_values`]) — and not in the entries of a list the wire
+/// admits one name more than once in.
 const MAX_FEATURES_PER_UPDATE: usize = 100;
 
 /// How this operation states an `EventTime` older than the record's current one.
