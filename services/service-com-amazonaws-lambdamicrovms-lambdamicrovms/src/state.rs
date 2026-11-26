@@ -1496,7 +1496,7 @@ pub struct MicrovmImageBuild {
     /// Where this build falls in the order the builds of one image version were
     /// RECORDED: the build's own creation sequence, which is what
     /// `ListMicrovmImageBuilds` pages in and what orders the reason a version reports.
-    /// The id itself is drawn ([`mint_prefixed_id`]), so it encodes no order at all.
+    /// The id itself is drawn ([`mint_build_request_id`]), so it encodes no order at all.
     pub created_seq: u64,
     /// A `BuildState`.
     pub state: String,
@@ -1930,6 +1930,20 @@ pub fn mint_guest_boot_id() -> String {
     mint_microvm_image_id()
 }
 
+/// Mint the `buildId` of one build request: a lowercase hyphenated 8-4-4-4-12 UUID,
+/// drawn the way every other identity of this store is ([`mint_microvm_image_id`]).
+///
+/// `MicrovmImageBuildSummary$buildId` and `GetMicrovmImageBuildOutput$buildId` are "the
+/// build request ID" (`smithy_query(query="shape",shape="MicrovmImageBuildSummary")`),
+/// a free-form `NonBlankString` whose concrete form the model fixes nothing about; the
+/// recorded responses carry a request id in that UUID form, with no service-chosen
+/// prefix and nothing of the request or of the store's history in it. This is the ONE
+/// place the identifier is formatted, so the build record it is written onto is what the
+/// listing row, the single-build read and the builds path label all answer with.
+pub fn mint_build_request_id() -> String {
+    mint_microvm_image_id()
+}
+
 /// 32 opaque bytes for one minted identifier.
 ///
 /// A digest over a process-wide counter (what makes two mints of the same instant
@@ -1966,8 +1980,6 @@ fn minted_bytes() -> [u8; 32] {
 /// The prefix a minted `microvmId` carries.
 pub const MICROVM_ID_PREFIX: &str = "mvm-";
 
-/// The prefix a minted `buildId` carries.
-pub const BUILD_ID_PREFIX: &str = "build-";
 
 /// How many times a mint redraws an identifier a store already holds before it keeps the
 /// last draw: a drawn identifier does not collide in practice, and the bound is what makes
@@ -2693,13 +2705,14 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
         microvm_network::link_local_address(self.next_microvm_seq)
     }
 
-    /// Mint the identity of the next build: its `buildId` and the CREATION SEQUENCE the
-    /// build record keeps, for the same reason as [`Self::next_microvm_id`] — the id is
-    /// drawn and the sequence is what `ListMicrovmImageBuilds` pages in.
+    /// Mint the identity of the next build: its `buildId` ([`mint_build_request_id`]) and
+    /// the CREATION SEQUENCE the build record keeps, for the same reason as
+    /// [`Self::next_microvm_id`] — the id is drawn, so it carries no ordering, and the
+    /// sequence is what `ListMicrovmImageBuilds` pages in.
     pub fn next_build_id(&mut self) -> (String, u64) {
         let seq = self.next_build_seq;
         self.next_build_seq += 1;
-        (mint_prefixed_id(BUILD_ID_PREFIX), seq)
+        (mint_build_request_id(), seq)
     }
 
     /// The builds a version's asynchronous build fans out into: one per target of
@@ -2731,7 +2744,7 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
                 if !builds.contains_key(&build_id) {
                     break;
                 }
-                build_id = mint_prefixed_id(BUILD_ID_PREFIX);
+                build_id = mint_build_request_id();
             }
             builds.insert(
                 build_id.clone(),

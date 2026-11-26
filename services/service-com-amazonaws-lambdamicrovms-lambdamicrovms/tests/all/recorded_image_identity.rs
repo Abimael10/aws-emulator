@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end tests for the identities this service MINTS: a MicroVM image's `id`, and
-//! the handles it draws for the resources it names by a prefix (a MicroVM's `microvmId`,
-//! a build request's `buildId`).
+//! End-to-end tests for the identities this service MINTS: a MicroVM image's `id`, the
+//! handle it draws for a resource it names by a prefix (a MicroVM's `microvmId`) and the
+//! bare drawn request id it mints for a build (`buildId`).
 //!
 //! RULE: every response that reports a stored MicroVM IMAGE record carries that
 //! record's own `id` — a lowercase hyphenated 8-4-4-4-12 version-4 UUID, minted once
@@ -10,10 +10,9 @@
 //! byte-identical in every later answer about that image (the read, every listing row,
 //! an update that mints a further version, and an idempotent repeat of the create).
 //!
-//! RULE: every other identifier this service mints is DRAWN for its resource under that
-//! resource's own prefix rather than rendered from how many the store has minted before
-//! it, so a listing pages in the order the records were created rather than in the order
-//! their identifiers sort.
+//! RULE: every other identifier this service mints is DRAWN for its resource rather than
+//! rendered from how many the store has minted before it, so a listing pages in the order
+//! the records were created rather than in the order their identifiers sort.
 //!
 //! The member is RECORDED rather than modelled: `CreateMicrovmImageResponse`,
 //! `GetMicrovmImageOutput`, `UpdateMicrovmImageResponse` and `MicrovmImageSummary`
@@ -30,8 +29,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
-    managed_base_image_arn, BUILD_ID_PREFIX, FIRST_IMAGE_VERSION, MANAGED_BASE_IMAGE_IDS,
-    MICROVM_ID_PREFIX,
+    managed_base_image_arn, FIRST_IMAGE_VERSION, MANAGED_BASE_IMAGE_IDS, MICROVM_ID_PREFIX,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -340,9 +338,9 @@ async fn every_listing_row_of_every_page_carries_its_images_id() {
 
 /// Whether `value` is the handle form this service mints for a resource it names by a
 /// short prefix: that prefix, then a drawn UUID in the same lowercase hyphenated
-/// 8-4-4-4-12 form a MicroVM image's own `id` carries ([`is_minted_id`]). The prefixes are
-/// the ones the service publishes (`state::MICROVM_ID_PREFIX`,
-/// `state::BUILD_ID_PREFIX`), read from the service rather than spelled out here.
+/// 8-4-4-4-12 form a MicroVM image's own `id` carries ([`is_minted_id`]). The prefix is
+/// the one the service publishes (`state::MICROVM_ID_PREFIX`), read from the service
+/// rather than spelled out here.
 fn is_minted_handle(value: &str, prefix: &str) -> bool {
     value.strip_prefix(prefix).is_some_and(is_minted_id)
 }
@@ -402,10 +400,10 @@ async fn listed_microvm_ids(router: &MultiServiceRouter, case: &str) -> Vec<Stri
 }
 
 /// RULE: every identifier this service MINTS for a resource of its own — a MicroVM's
-/// `microvmId`, a build request's `buildId` — is DRAWN per resource under that resource's
-/// prefix rather than rendered from how many the store has minted before it: the
-/// identifiers of one store are distinct and carry no ordering, so a listing pages in the
-/// order the records were created rather than in the order their identifiers sort.
+/// `microvmId`, a build request's `buildId` — is DRAWN per resource rather than rendered
+/// from how many the store has minted before it: the identifiers of one store are
+/// distinct and carry no ordering, so a listing pages in the order the records were
+/// created rather than in the order their identifiers sort.
 #[tokio::test]
 async fn every_minted_handle_is_drawn_rather_than_counted() {
     let router = emulator();
@@ -474,7 +472,8 @@ async fn every_minted_handle_is_drawn_rather_than_counted() {
     );
 
     // The same rule on the other identifier this service mints: the build requests one
-    // image version's build fans out into.
+    // image version's build fans out into. A build request id carries no prefix at all —
+    // it is the bare drawn UUID a request id is reported in.
     let builds = listed_build_ids(&router, &image_arn, FIRST_IMAGE_VERSION, "builds").await;
     assert!(
         !builds.is_empty(),
@@ -482,9 +481,8 @@ async fn every_minted_handle_is_drawn_rather_than_counted() {
     );
     for build_id in &builds {
         assert!(
-            is_minted_handle(build_id, BUILD_ID_PREFIX),
-            "case build {build_id:?}: expected {BUILD_ID_PREFIX:?} and a drawn UUID, got \
-             {build_id:?}"
+            is_minted_id(build_id),
+            "case build {build_id:?}: expected a lowercase 8-4-4-4-12 UUID, got {build_id:?}"
         );
         // The drawn identifier is the one handle on that build: the single-build read is
         // addressed by it and echoes it back unchanged.
