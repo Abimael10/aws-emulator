@@ -942,10 +942,19 @@ fn start_action(
         // lets a client that holds the token find the run its decision produced
         // (`GetPipelineState`'s `latestExecution.actionExecutionId`,
         // `ListActionExecutions`' `actionExecutionId` and, once answered, the provider's
-        // `externalExecutionId`). A later attempt of the action is a new action execution
-        // with a new id, so the token a displaced attempt published is no longer in force.
+        // `externalExecutionId`). `PutApprovalResult$token` states the same identity for
+        // the execution mode that publishes no token — "use the externalExecutionId in
+        // the response output from the ListActionExecutions action as the token in the
+        // approval request". A later attempt of the action is a new action execution with
+        // a new id, so the token a displaced attempt published is no longer in force.
         action.token = Some(action.action_execution_id.clone());
-        action.summary = config.get("CustomData").cloned();
+        // The reviewer reads the approval's own `CustomData`, which is what the action's
+        // summary reports — held, like every other summary this engine records, to the
+        // length the member carrying it is modelled for.
+        action.summary = config
+            .get("CustomData")
+            .cloned()
+            .map(|data| within(data, MAX_EXECUTION_SUMMARY));
         return None;
     }
 
@@ -2295,19 +2304,25 @@ async fn run_code_commit_source(
         }
     }
 
-    // The bytes of each file, read one blob at a time and accounted against the budget
-    // as they arrive, so no commit can drive an allocation past the stated figure.
+    // The bytes of each file, read one blob at a time: what the budget still allows is
+    // computed BEFORE the next file is retained, and a file that does not fit is dropped
+    // rather than kept — so the bytes this walk holds never exceed the stated figure,
+    // however many files the commit carries. The size of ONE answer is the source
+    // service's to bound: `GetBlob` is modelled with `FileTooLargeException` for a blob
+    // past the limit that service keeps, and the answer is dropped here unread when it
+    // does not fit what is left.
     let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(files.len());
     let mut packed = 0usize;
     for (path, blob_id) in files {
+        let remaining = MAX_SOURCE_BYTES.saturating_sub(packed);
         let blob = code_commit
             .get_blob()
             .repository_name(repository)
             .blob_id(&blob_id)
             .send()
             .await;
-        let content = match blob {
-            Ok(answer) => answer.content.into_inner(),
+        let answer = match blob {
+            Ok(answer) => answer,
             Err(err) => {
                 return JobOutcome::Failed {
                     code: FAILURE_JOB_FAILED.to_string(),
@@ -2319,8 +2334,8 @@ async fn run_code_commit_source(
                 }
             }
         };
-        packed = packed.saturating_add(content.len());
-        if packed > MAX_SOURCE_BYTES {
+        if answer.content.as_ref().len() > remaining {
+            drop(answer);
             return JobOutcome::Failed {
                 code: FAILURE_JOB_FAILED.to_string(),
                 message: format!(
@@ -2330,6 +2345,8 @@ async fn run_code_commit_source(
                 external_id: Some(commit_id),
             };
         }
+        let content = answer.content.into_inner();
+        packed = packed.saturating_add(content.len());
         entries.push((path, content));
     }
 
@@ -2337,8 +2354,12 @@ async fn run_code_commit_source(
     // which is what a later deploy action extracts. Building it is synchronous CPU work,
     // so it runs on the blocking pool rather than on the worker serving this request.
     let count = entries.len();
-    let archive = match ::tokio::task::spawn_blocking(move || zip_of(&entries)).await {
-        Ok(Ok(archive)) => archive,
+    // The archive's bytes are handed to each output as a shared buffer rather than copied
+    // per output, so an action producing several artifacts does not multiply the peak the
+    // budget above bounds.
+    let archive: ::bytes::Bytes = match ::tokio::task::spawn_blocking(move || zip_of(&entries)).await
+    {
+        Ok(Ok(archive)) => archive.into(),
         Ok(Err(detail)) => {
             return JobOutcome::Failed {
                 code: FAILURE_JOB_FAILED.to_string(),
