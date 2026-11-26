@@ -140,6 +140,42 @@ pub fn effective_filter_configuration(
     })
 }
 
+/// Why the TRANSFORMATION a subscriber would be left with is not one this
+/// service could hand its target, or `None` when it is.
+///
+/// Every reading of a subscriber's `Transformer` that answers
+/// `InvalidInputException` — "A request parameter is missing or not valid" — in
+/// ONE place, so every call that WRITES a subscriber's transformer admits
+/// exactly the same transformations: the create that mints one and the update
+/// that rewrites one. That matters beyond the wording of a refusal, because the
+/// delivery path hands a target what the transformer produces and nothing else,
+/// so a subscriber left holding a transformation this service cannot perform
+/// delivers NOTHING and reports nothing about why, while its publisher keeps
+/// being told its events were accepted.
+///
+/// The arguments are the transformation and the target configuration the call
+/// leaves behind rather than the members its request happened to carry, since
+/// either of the two may be the one being rewritten.
+///
+/// The readings, in the order a refusal takes them: the transformation against a
+/// universal target, which takes none ([`super::transformer_fault`]); the
+/// transformation itself — a type this service declares, with the configuration
+/// that type requires and an expression the language admits
+/// ([`super::transformer_configuration_fault`]); and the transformation a
+/// previous-generation target can be handed
+/// ([`super::classic_target_transformer_fault`]).
+pub fn transformation_fault(
+    invoke_configuration: &InvokeConfiguration,
+    transformer: Option<&Transformer>,
+) -> Option<String> {
+    super::transformer_fault(
+        invoke_configuration.universal_target_parameters.as_ref(),
+        transformer,
+    )
+    .or_else(|| super::transformer_configuration_fault(transformer))
+    .or_else(|| super::classic_target_transformer_fault(invoke_configuration, transformer))
+}
+
 /// Whether `transformer` is the one the SERVICE applies to a subscriber that
 /// configured none ([`effective_transformer`]) rather than one a caller asked
 /// for: the raw transformation and nothing beside it.

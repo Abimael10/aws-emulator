@@ -302,27 +302,11 @@ fn create(
         .into());
     }
 
-    // A `Transformer` and a universal target are mutually exclusive: the one
-    // rule both the create and the update of a subscriber are held to.
-    if let Some(reason) = crate::state::transformer_fault(
-        input
-            .invoke_configuration
-            .universal_target_parameters
-            .as_ref(),
-        input.transformer.as_ref(),
-    ) {
-        return Err(CreateSubscriberErrorModeled::InvalidInputException(
-            InvalidInputException {
-                message: Some(reason),
-            },
-        )
-        .into());
-    }
-
     // And the configuration it names has to be one a subscriber could deliver
     // under at all — the transformation, the target, the parameters member that
-    // goes with it, the values it carries and the batching it is invoked under
-    // ([`invalid_input`]).
+    // goes with it, the values it carries and the batching it is invoked under:
+    // the ONE contract both the create and the update of a subscriber are held
+    // to ([`crate::state::configuration_fault`]).
     if let Some(reason) = invalid_input(input) {
         return Err(CreateSubscriberErrorModeled::InvalidInputException(
             InvalidInputException {
@@ -550,20 +534,19 @@ fn create(
 /// of a subscriber be held to the same rules.
 ///
 /// The readings, in the order a refusal takes them: the transformation the
-/// request asks for ([`crate::state::transformer_configuration_fault`]), the
-/// parameters member the target takes
+/// request asks for, against the target that is handed it
+/// ([`crate::state::transformation_fault`], the chain the update of a subscriber
+/// is held to as well), the parameters member the target takes
 /// ([`crate::state::target_parameters_fault`]), the values that member carries
 /// ([`crate::state::configured_expression_fault`],
 /// [`crate::state::invocation_timeout_fault`]), the account the target belongs
-/// to ([`crate::state::target_account_fault`]), the call a universal target
+/// to ([`crate::state::target_account_fault`]) and the call a universal target
 /// names and the request it is made with
 /// ([`crate::state::universal_target_api_fault`],
 /// [`crate::state::universal_target_input_fault`],
-/// [`crate::state::universal_target_batch_fault`]) and what a
-/// previous-generation target can be handed
-/// ([`crate::state::classic_target_transformer_fault`]).
+/// [`crate::state::universal_target_batch_fault`]).
 fn invalid_input(input: &CreateSubscriberInput) -> Option<String> {
-    crate::state::transformer_configuration_fault(input.transformer.as_ref())
+    crate::state::transformation_fault(&input.invoke_configuration, input.transformer.as_ref())
         .or_else(|| crate::state::target_parameters_fault(&input.invoke_configuration))
         .or_else(|| crate::state::configured_expression_fault(&input.invoke_configuration))
         .or_else(|| crate::state::invocation_timeout_fault(&input.invoke_configuration))
@@ -574,12 +557,6 @@ fn invalid_input(input: &CreateSubscriberInput) -> Option<String> {
             crate::state::universal_target_batch_fault(
                 &input.invoke_configuration,
                 input.batch_configuration.as_ref(),
-            )
-        })
-        .or_else(|| {
-            crate::state::classic_target_transformer_fault(
-                &input.invoke_configuration,
-                input.transformer.as_ref(),
             )
         })
 }

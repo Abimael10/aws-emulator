@@ -1208,8 +1208,27 @@ pub const JSONATA_EXPRESSION_INVALID_MESSAGE: &str =
 pub const JSONATA_CONFIGURATION_REQUIRED_MESSAGE: &str =
     "JsonataConfiguration is required when Transformer.Type is JSONATA";
 
+/// The whole `Message` of the `InvalidInputException` a `Transformer` naming a
+/// type this service declares no `TransformerType` for is refused with.
+///
+/// `Transformer$Type` names the transformation a subscriber's target is handed
+/// the event under, and the declared types are the ones a delivery knows how to
+/// produce ([`crate::ops::types::TRANSFORMER_TYPE_VALUES`]) — so a type outside
+/// them names a transformation this service could never perform, and a
+/// subscriber left holding it would deliver nothing at all. Worded the way every
+/// other undeclared enum value of this service is refused: the member, the value
+/// the request stated and the shape it is no value of.
+pub fn transformer_type_undeclared_message(named: &str) -> String {
+    format!("Transformer.Type: {named} is not a TransformerType this service declares")
+}
+
 /// Why the transformation `transformer` asks for cannot be performed at all, or
 /// `None` when it can.
+///
+/// A type the model does not declare is the first reading
+/// ([`transformer_type_undeclared_message`]): the transformation is named before
+/// it is configured, and a name this service holds no transformation for cannot
+/// be configured into one.
 ///
 /// The expression is read by the one bounded seam onto the language this service
 /// evaluates expressions through
@@ -1218,6 +1237,11 @@ pub const JSONATA_CONFIGURATION_REQUIRED_MESSAGE: &str =
 /// runs: nothing is evaluated, because there is no event yet.
 pub fn transformer_configuration_fault(transformer: Option<&Transformer>) -> Option<String> {
     let transformer = transformer?;
+    if let Some(named) = transformer.r#type.as_deref() {
+        if !crate::ops::types::TRANSFORMER_TYPE_VALUES.contains(&named) {
+            return Some(transformer_type_undeclared_message(named));
+        }
+    }
     let Some(configuration) = transformer.jsonata_configuration.as_ref() else {
         return (transformer.r#type.as_deref() == Some(TRANSFORMER_TYPE_JSONATA))
             .then(|| JSONATA_CONFIGURATION_REQUIRED_MESSAGE.to_string());

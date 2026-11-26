@@ -319,20 +319,26 @@ fn apply(
         .into());
     }
 
-    // A `Transformer` and a universal target are mutually exclusive, read
-    // against the target configuration this update LEAVES the subscriber with:
-    // either member may be the one the request changes. What a caller ASKED for
-    // is what can conflict — the request's own transformer, or the one the
+    // The TRANSFORMATION this update leaves the subscriber with — the
+    // transformer the request carries or the one the subscriber already holds,
+    // against the target configuration it leaves behind — is held to the SAME
+    // contract a create's is, so an update cannot install a transformation a
+    // create would have refused: the delivery path hands a target what the
+    // transformer produces and nothing else, so a subscriber left holding a
+    // transformation this service cannot perform would deliver nothing and say
+    // nothing about why, while its publisher kept being told its events were
+    // accepted.
+    //
+    // Either member may be the one the request changes, so both are read as the
+    // update leaves them. What a caller ASKED for is what can conflict with a
+    // universal target — the request's own transformer, or the one the
     // subscriber was configured with — while the transformer the SERVICE applies
     // to a subscriber that configured none is not a configuration, so an update
     // that makes such a subscriber's target universal is served and leaves it
     // the transformation that target takes (none).
-    let universal_target = match input.invoke_configuration.as_ref() {
-        Some(requested) => requested.universal_target_parameters.clone(),
-        None => subscriber
-            .invoke_configuration
-            .universal_target_parameters
-            .clone(),
+    let invoke_configuration = match input.invoke_configuration.as_ref() {
+        Some(requested) => invoked(subscriber.invoke_configuration.target_arn.clone(), requested),
+        None => subscriber.invoke_configuration.clone(),
     };
     let transformer = match input.transformer.as_ref() {
         Some(requested) => Some(requested.clone()),
@@ -342,7 +348,7 @@ fn apply(
             .filter(|held| !crate::state::is_default_transformer(held)),
     };
     if let Some(reason) =
-        crate::state::transformer_fault(universal_target.as_ref(), transformer.as_ref())
+        crate::state::transformation_fault(&invoke_configuration, transformer.as_ref())
     {
         return Err(UpdateSubscriberErrorModeled::InvalidInputException(
             InvalidInputException {
