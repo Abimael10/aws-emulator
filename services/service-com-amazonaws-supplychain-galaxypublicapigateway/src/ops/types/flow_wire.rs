@@ -13,6 +13,11 @@
 //! here, exactly as the derive would emit them, from a member list that can be longer than
 //! the model's. The same module as `types/instance_wire.rs` does for `Instance`.
 //!
+//! WHICH read answers which of them is recorded behaviour too, so a member no recorded
+//! response of an operation carries is an `Option` here, left `None` by that operation's
+//! projection rather than written for every reader: a recorded listing entry carries no
+//! `triggerOptions` key, while a recorded single-flow read does.
+//!
 //! The model's own members keep the indices and the order the model gives them (the order
 //! `smithy_query(query="shape", shape="com.amazonaws.supplychain#DataIntegrationFlow")`
 //! lists them in), and a member the model does not declare is appended LAST with its shape
@@ -409,7 +414,7 @@ scn_schema_and_codec!(
     ),
 );
 
-/// How a reported flow is triggered: the `triggerOptions` member of the flow reads.
+/// How a reported flow is triggered: the `triggerOptions` member of the SINGLE-flow reads.
 ///
 /// RECORDED, not modelled — the whole structure, hence its shape id in
 /// [`RECORDED_NAMESPACE`]. The recorded response of a flow created through this API reports
@@ -418,6 +423,9 @@ scn_schema_and_codec!(
 /// trigger member), so the schedule members have no value to report and no shape a recording
 /// has fixed, and only the trigger type is reported here. A recording of a SCHEDULED flow is
 /// what fixes those two.
+///
+/// Which operations report it is recorded too, and they are not all of them: see
+/// [`DataIntegrationFlow::trigger_options`].
 #[derive(Debug, Clone, Default)]
 pub struct DataIntegrationFlowTriggerOptions {
     pub trigger_type: String,
@@ -487,6 +495,12 @@ impl ::aws_smithy_schema_server::DeserializableStruct for DataIntegrationFlowTri
 /// LAST and a later model refresh only has to move them into place; this is also why the
 /// schema and the codec are written out in this module rather than derived (see the module
 /// note).
+///
+/// An unmodelled member is reported by exactly the operations whose recordings carry it, so
+/// [`Self::trigger_options`] is an `Option`: a recorded single-flow read carries the trigger
+/// descriptor, a recorded listing carries no such member on its entries, and a projection
+/// that leaves it `None` serializes no `triggerOptions` key at all
+/// ([`crate::state::ComAmazonawsSupplychainGalaxypublicapigatewayState::flow_to_listing_wire`]).
 #[derive(Debug, Clone)]
 pub struct DataIntegrationFlow {
     pub instance_id: String,
@@ -497,7 +511,9 @@ pub struct DataIntegrationFlow {
     pub created_time: ::aws_smithy_types::DateTime,
     pub last_modified_time: ::aws_smithy_types::DateTime,
     pub managed_by: String,
-    pub trigger_options: DataIntegrationFlowTriggerOptions,
+    /// How the flow is triggered, on the reads that report it — `None` on a projection whose
+    /// recorded response carries no such member, which then serializes no key for it.
+    pub trigger_options: Option<DataIntegrationFlowTriggerOptions>,
 }
 
 scn_schema_and_codec!(
@@ -545,7 +561,7 @@ scn_schema_and_codec!(
         trigger_options,
         "triggerOptions",
         8,
-        req,
+        opt,
         recorded(struct_of(DataIntegrationFlowTriggerOptions))
     ),
 );

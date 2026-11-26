@@ -413,6 +413,38 @@ fn expected_trigger_options() -> Value {
     json!({ "triggerType": "SOURCE_CHANGE" })
 }
 
+/// Every member a LISTING entry carries, written out here rather than read from the crate so
+/// a drift in the listing's projection fails this suite instead of travelling with it.
+///
+/// The first seven are the modelled `DataIntegrationFlow` members; `managedBy` is reported
+/// beside them by the recorded responses, which carry no `triggerOptions` key on a listing
+/// entry — that one belongs to the single-flow read.
+const EXPECTED_LISTING_ENTRY_MEMBERS: [&str; 8] = [
+    "instanceId",
+    "name",
+    "sources",
+    "transformation",
+    "target",
+    "createdTime",
+    "lastModifiedTime",
+    "managedBy",
+];
+
+/// The entry the listing must report for the flow the single-flow read answered with `read`:
+/// that same projection of that same stored flow, minus the trigger descriptor, which a
+/// listing entry does not carry.
+fn expected_listing_entry(case: &str, read: &Value) -> Value {
+    let mut entry = flow_of(case, read);
+    let members = entry
+        .as_object_mut()
+        .unwrap_or_else(|| panic!("case {case:?}: a flow read answers an object, got {read}"));
+    assert!(
+        members.remove("triggerOptions").is_some(),
+        "case {case:?}: the single-flow read reports how the flow is triggered, got {read}"
+    );
+    entry
+}
+
 /// One row of the update table: the create that establishes the flow, and the update
 /// applied to it.
 struct UpdateRow {
@@ -2467,19 +2499,19 @@ fn minimal_flow_request(slot: &str) -> Value {
     })
 }
 
-/// Walk every page of one listing and return the flow names answered, in order, together
-/// with how many pages it took.
+/// Walk every page of one listing and return the flow ENTRIES answered, in order, together
+/// with how many pages it took. [`names_of`] is the name order of what it walked.
 async fn walk_flow_pages(
     emulator: &Emulator,
     case: &str,
     instance_id: &str,
     max_results: Option<i64>,
-) -> (Vec<String>, usize) {
+) -> (Vec<Value>, usize) {
     let limit = match max_results {
         Some(size) => usize::try_from(size).expect("a page size a case asks for is not negative"),
         None => FLOW_MAX_RESULTS_DEFAULT,
     };
-    let mut names = Vec::new();
+    let mut entries: Vec<Value> = Vec::new();
     let mut pages = 0;
     let mut token: Option<String> = None;
     // A listing of a bounded store terminates in a bounded number of pages; the cap is here
@@ -2497,7 +2529,7 @@ async fn walk_flow_pages(
             status, 200,
             "case {case:?}: page {pages} expected 200, got {status} with {body}"
         );
-        let page = listed_flow_names(case, &body);
+        let page = flows_of(case, &body);
         assert!(
             page.len() <= limit,
             "case {case:?}: page {pages} holds {} flows, more than maxResults {limit}",
@@ -2512,12 +2544,20 @@ async fn walk_flow_pages(
                  in a loop could never advance"
             );
         }
-        names.extend(page);
+        entries.extend(page);
         if token.is_none() {
-            return (names, pages);
+            return (entries, pages);
         }
     }
     panic!("case {case:?}: the listing never ran out of pages after {pages} pages");
+}
+
+/// The `name` of every entry of a walked listing, in the order answered.
+fn names_of(case: &str, entries: &[Value]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|flow| string_of(case, flow, "name"))
+        .collect()
 }
 
 /// RULE: the listing reports exactly the flows the store holds for the addressed instance,
@@ -2639,8 +2679,9 @@ async fn flow_listing_reports_exactly_the_stored_flows_of_the_addressed_instance
         "case {case:?}: one page holds every flow, so it must carry no nextToken: {body}"
     );
 
-    // Every listed flow is the record the single-flow read reports, member for member: the
-    // listing projects persisted state, not a summary of its own.
+    // Every listed flow is the record the single-flow read reports, member for member, bar
+    // the trigger descriptor a listing entry does not carry: the listing projects persisted
+    // state, not a summary of its own.
     for listed in flows_of(case, &body) {
         let name = string_of(case, &listed, "name");
         let (status, read) = emulator.get_flow(&instance_id, &name).await;
@@ -2650,8 +2691,9 @@ async fn flow_listing_reports_exactly_the_stored_flows_of_the_addressed_instance
         );
         assert_eq!(
             listed,
-            flow_of(case, &read),
-            "case {case:?}: the listed {name} must equal what GetDataIntegrationFlow reports"
+            expected_listing_entry(case, &read),
+            "case {case:?}: the listed {name} must equal what GetDataIntegrationFlow reports, \
+             bar the trigger descriptor"
         );
     }
 
@@ -2712,9 +2754,11 @@ async fn flow_pagination_walks_the_whole_order_exactly_once_at_every_page_size()
     ];
 
     for (row_case, max_results) in rows {
-        let (names, pages) = walk_flow_pages(&emulator, row_case, &instance_id, max_results).await;
+        let (entries, pages) =
+            walk_flow_pages(&emulator, row_case, &instance_id, max_results).await;
         assert_eq!(
-            names, all_names,
+            names_of(row_case, &entries),
+            all_names,
             "case {row_case:?}: the pages must concatenate to the whole name order exactly once"
         );
         let size = match max_results {
@@ -2984,10 +3028,11 @@ async fn flow_listing_reports_live_state_and_changes_nothing() {
     let (second, _) = walk_flow_pages(&emulator, case, &instance_id, Some(2)).await;
     assert_eq!(
         first, second,
-        "case {case:?}: two identical listings must answer identically"
+        "case {case:?}: two identical listings must answer identically, entry for entry"
     );
     assert_eq!(
-        first, names,
+        names_of(case, &first),
+        names,
         "case {case:?}: the listing must report every stored flow"
     );
 
@@ -3069,8 +3114,182 @@ async fn flow_listing_reports_live_state_and_changes_nothing() {
         );
         assert_eq!(
             flow,
-            flow_of(case, &read),
-            "case {case:?}: the listed {name} must equal what the single-flow read reports"
+            expected_listing_entry(case, &read),
+            "case {case:?}: the listed {name} must equal what the single-flow read reports, bar \
+             the trigger descriptor"
         );
+    }
+}
+
+/// RULE: a member the model does not declare is reported by exactly the reads whose recorded
+/// response carries it — the trigger descriptor is reported by the single-flow read and by no
+/// entry of the listing, which reports the same projection of the same stored flow (the
+/// modelled members plus `managedBy`) and nothing else, whatever the flow's pipeline, however
+/// the stored flow was last written, and at whatever page size the listing is cut.
+#[tokio::test]
+async fn flow_listing_entries_report_no_trigger_descriptor_whatever_the_flow() {
+    let case = "the projection of a listing entry";
+    let emulator = Emulator::new();
+    let instance_id = emulator.create_instance(case).await;
+    emulator
+        .given_namespace(case, &instance_id, "logistics")
+        .await;
+    let dataset = emulator
+        .given_dataset(case, &instance_id, "logistics", "orders")
+        .await;
+
+    // Rows differ along what the rule generalises over: the source type and how many sources
+    // the pipeline has, the transformation, the target type, and whether the stored flow was
+    // last written by the create or by an update.
+    let rows: Vec<(&str, &str, Value, Option<Value>)> = vec![
+        (
+            "one S3 source, no transformation, an S3 target",
+            "s3-passthrough",
+            minimal_flow_request("s3"),
+            None,
+        ),
+        (
+            "two S3 sources and a SQL transformation",
+            "sql-fan-in",
+            json!({
+                "sources": [
+                    s3_source("raw", "supply-landing", "raw/", Some("CSV")),
+                    s3_source("late", "supply-landing", "late/", Some("PARQUET")),
+                ],
+                "transformation": {
+                    "transformationType": "SQL",
+                    "sqlTransformation": { "query": "SELECT * FROM raw UNION ALL SELECT * FROM late" },
+                },
+                "target": {
+                    "targetType": "S3",
+                    "s3Target": { "bucketName": "supply-exports", "prefix": "sql/" },
+                },
+            }),
+            None,
+        ),
+        (
+            "a dataset source into a dataset target",
+            "dataset-to-dataset",
+            json!({
+                "sources": [dataset_source(
+                    "orders",
+                    &dataset,
+                    Some(json!({ "loadType": "INCREMENTAL", "dedupeRecords": true })),
+                )],
+                "transformation": { "transformationType": "NONE" },
+                "target": {
+                    "targetType": "DATASET",
+                    "datasetTarget": { "datasetIdentifier": dataset.clone() },
+                },
+            }),
+            None,
+        ),
+        (
+            "an S3 source into a dataset target, rewritten by an update",
+            "updated-pipeline",
+            json!({
+                "sources": [s3_source("orders", "supply-landing", "orders/", None)],
+                "transformation": { "transformationType": "NONE" },
+                "target": {
+                    "targetType": "DATASET",
+                    "datasetTarget": { "datasetIdentifier": dataset.clone() },
+                },
+            }),
+            Some(json!({
+                "transformation": {
+                    "transformationType": "SQL",
+                    "sqlTransformation": { "query": "SELECT id FROM orders" },
+                },
+            })),
+        ),
+    ];
+
+    for (row_case, name, request, update) in &rows {
+        let (status, body) = emulator
+            .create_flow(&instance_id, name, request.clone())
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {row_case:?}: the flow to list must be created, got {status} with {body}"
+        );
+        if let Some(update) = update {
+            let (status, body) = emulator.update_flow(&instance_id, name, update.clone()).await;
+            assert_eq!(
+                status, 200,
+                "case {row_case:?}: the update must be applied, got {status} with {body}"
+            );
+        }
+    }
+
+    // The page size changes nothing about an entry's members: the projection is the same
+    // whether a page holds one flow or every flow.
+    let page_sizes: Vec<(&str, Option<i64>)> = vec![
+        ("one flow per page", Some(1)),
+        ("two flows per page", Some(2)),
+        ("the largest modelled page", Some(FLOW_MAX_RESULTS_MAX)),
+        ("the modelled default page", None),
+    ];
+
+    for (size_case, max_results) in page_sizes {
+        let (entries, _) =
+            walk_flow_pages(&emulator, size_case, &instance_id, max_results).await;
+        assert_eq!(
+            entries.len(),
+            rows.len(),
+            "case {size_case:?}: the listing must report every stored flow, got {entries:?}"
+        );
+
+        for entry in entries {
+            let name = string_of(size_case, &entry, "name");
+            let case = format!("{size_case}, the entry for {name}");
+
+            // The member the model declares nowhere and a recorded listing entry does not
+            // carry: the trigger descriptor.
+            assert_eq!(
+                entry.get("triggerOptions"),
+                None,
+                "case {case:?}: a listing entry carries no trigger descriptor, got {entry}"
+            );
+
+            // ...and no other member beyond the ones a listing entry does carry.
+            let mut reported: Vec<&str> = entry
+                .as_object()
+                .unwrap_or_else(|| panic!("case {case:?}: an entry is an object, got {entry}"))
+                .keys()
+                .map(String::as_str)
+                .collect();
+            reported.sort_unstable();
+            let mut expected: Vec<&str> = EXPECTED_LISTING_ENTRY_MEMBERS.to_vec();
+            expected.sort_unstable();
+            assert_eq!(
+                reported, expected,
+                "case {case:?}: expected exactly the members a listing entry carries, got {entry}"
+            );
+            assert_eq!(
+                entry.get("managedBy").and_then(Value::as_str),
+                Some(EXPECTED_MANAGED_BY),
+                "case {case:?}: a flow a caller created is the caller's, got {entry}"
+            );
+
+            // The SINGLE-flow read of the same flow does report the trigger descriptor, and
+            // agrees with the entry on everything else: one stored record, two projections.
+            let (status, read) = emulator.get_flow(&instance_id, &name).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: GetDataIntegrationFlow expected 200, got {status} with {read}"
+            );
+            assert_eq!(
+                flow_of(&case, &read).get("triggerOptions"),
+                Some(&expected_trigger_options()),
+                "case {case:?}: the single-flow read reports how the flow is triggered, got \
+                 {read}"
+            );
+            assert_eq!(
+                entry,
+                expected_listing_entry(&case, &read),
+                "case {case:?}: the entry must be the read's projection without the trigger \
+                 descriptor"
+            );
+        }
     }
 }

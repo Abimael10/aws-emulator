@@ -3,8 +3,12 @@
 //! @op ListDataIntegrationFlows
 //! IMPLEMENTED: pages over the data-integration flows the shared store ([`crate::state`])
 //! holds for the addressed instance — exactly what `CreateDataIntegrationFlow` persisted and
-//! `UpdateDataIntegrationFlow` last wrote, projected the same way `GetDataIntegrationFlow`
-//! reports one — and emits a `nextToken` that names the flow the next page resumes at. The
+//! `UpdateDataIntegrationFlow` last wrote, projected from the same stored record
+//! `GetDataIntegrationFlow` reports one from
+//! ([`crate::state::ComAmazonawsSupplychainGalaxypublicapigatewayState::flow_to_listing_wire`],
+//! which reports the members a recorded listing entry carries: the read's projection without
+//! the trigger descriptor, a member the model declares nowhere) — and emits a `nextToken`
+//! that names the flow the next page resumes at. The
 //! store is a `BTreeMap` keyed by (`instanceId`, `name`), so one instance's flows are
 //! contiguous and the order a page is cut from is stable, which is what keeps a token
 //! meaningful across calls. Nothing here changes a stored flow, so repeated reads answer
@@ -249,9 +253,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 break;
             }
-            // Every flow is projected exactly as the single-flow read projects it, so a
-            // listed flow and the one `GetDataIntegrationFlow` reports cannot differ.
-            flows.push(store.flow_to_wire(record));
+            // Every flow is projected from the same stored record the single-flow read
+            // projects, so no value a listed flow carries can differ from the one
+            // `GetDataIntegrationFlow` reports; the entry carries the members a recorded
+            // listing entry carries, which is the read's projection without the trigger
+            // descriptor.
+            flows.push(store.flow_to_listing_wire(record));
         }
 
         Ok(ListDataIntegrationFlowsOutput { flows, next_token })

@@ -1559,11 +1559,16 @@ impl ComAmazonawsSupplychainGalaxypublicapigatewayState {
         self.flows.get(&flow_key(instance_id, name))
     }
 
-    /// `record` as the `DataIntegrationFlow` shape every flow read returns: the whole
+    /// `record` as the `DataIntegrationFlow` shape a SINGLE-flow read returns: the whole
     /// definition the flow carries — its pipeline ends and transformation, its timestamps,
     /// and how it is managed and triggered — with each dataset end resolved against THIS
     /// store's data lake, so the end reports the identity of the dataset it moves
     /// ([`flow_dataset_end_type`]).
+    ///
+    /// The trigger descriptor is one of the members the model does not declare, so what
+    /// reports it is recorded behaviour too: a recorded single-flow read carries it, which is
+    /// why it is filled in here, and a recorded LISTING entry does not, which is why the
+    /// listing projects [`Self::flow_to_listing_wire`] instead.
     pub fn flow_to_wire(&self, record: &DataIntegrationFlowRecord) -> DataIntegrationFlow {
         DataIntegrationFlow {
             instance_id: record.instance_id.clone(),
@@ -1601,9 +1606,28 @@ impl ComAmazonawsSupplychainGalaxypublicapigatewayState {
             created_time: as_date_time(record.created_time),
             last_modified_time: as_date_time(record.last_modified_time),
             managed_by: record.managed_by.clone(),
-            trigger_options: DataIntegrationFlowTriggerOptions {
+            trigger_options: Some(DataIntegrationFlowTriggerOptions {
                 trigger_type: record.trigger_type.clone(),
-            },
+            }),
+        }
+    }
+
+    /// `record` as one ENTRY of the flow listing: the same projection of the same stored
+    /// record as [`Self::flow_to_wire`], minus the one member a recorded listing entry does
+    /// not carry — the trigger descriptor.
+    ///
+    /// `triggerOptions` is not a member of the modelled `DataIntegrationFlow` at all (the
+    /// shape declares `instanceId`, `name`, `sources`, `transformation`, `target`,
+    /// `createdTime` and `lastModifiedTime` and nothing else), so the operations that report
+    /// it are fixed by the recordings rather than by the model: the recorded single-flow read
+    /// carries it, the recorded listing entry carries no such key, and nothing in this model
+    /// configures a trigger, so a client reads how a flow is triggered from the flow read.
+    /// Leaving the member `None` is what keeps the key off the wire; the trigger stays on the
+    /// stored record either way ([`DataIntegrationFlowRecord::trigger_type`]).
+    pub fn flow_to_listing_wire(&self, record: &DataIntegrationFlowRecord) -> DataIntegrationFlow {
+        DataIntegrationFlow {
+            trigger_options: None,
+            ..self.flow_to_wire(record)
         }
     }
 
