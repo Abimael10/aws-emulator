@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The published rows of the burstable performance family that runs on the Xen hypervisor,
+//! The published rows of the burstable performance families that run on the Xen hypervisor,
 //! read through [`super::published_instance_type_facts`] like every other row of the catalog.
 //!
 //! The T2 family is a current generation family on PRE-Nitro hardware, which is a combination
@@ -12,18 +12,40 @@
 //! column rather than a figure in Gigabit. The size multiplier in the name yields none of
 //! that.
 //!
-//! The figures come from the family's own specification ("Burstable performance instances"
+//! The T1 family before it is a previous generation family whose ONE size predates the CPU
+//! credit model the burstable member reports, so AWS publishes it as not a burstable
+//! performance type at all, with a memory figure that is no whole number of GiB, a network
+//! column of its own, Amazon EBS encryption its generation would not give it, EBS-backed AMIs
+//! alone, and an EBS volume limit shared with its other devices.
+//!
+//! The figures come from the families' own specification ("Burstable performance instances"
 //! and the T2 specification table: the network performance words and the processor's
-//! frequency), "Instance volume limits" (the shared attachment total), the published list of
-//! the types offered enhanced networking with ENA, which does not name this family, and the
+//! frequency), the "Previous generation instances" page (the T1 size's figures),
+//! "Instance volume limits" (the shared attachment total), the published list of
+//! the types offered enhanced networking with ENA, which does not name either family, and the
 //! "IP addresses per network interface per instance type" table (the interface and address
 //! limits of the sizes whose row is not the one their step of the size ladder publishes).
 
 use super::*;
 
-/// The published hardware facts of the burstable Xen family's instance types, one row per
+/// The published hardware facts of the burstable Xen families' instance types, one row per
 /// type.
 pub(super) static BURSTABLE_XEN_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
+    // T1 — the FIRST burstable family's one size, on the Xen hypervisor. It predates the CPU
+    // credit model `BurstablePerformanceSupported` reports, so AWS publishes it as not a
+    // burstable performance type; its published memory is 627 MiB, which is no whole number of
+    // GiB; its "Network performance" column reads `Very Low`, and the two figures that column
+    // stands for are its own rather than a share of a later host; Amazon EBS encryption IS
+    // supported on it, which its generation number alone would not give; its AMIs are
+    // EBS-backed ones alone; and its EBS volumes share their limit with its other devices.
+    PublishedInstanceTypeFacts::of("t1.micro")
+        .burstable_performance(false)
+        .memory_mib(627)
+        .ebs_encryption(true)
+        .shared_attachment_limit()
+        .root_devices(EBS_ROOT_DEVICE)
+        .network("Very Low")
+        .network_bandwidth(T1_BASELINE_GBPS, T1_PEAK_GBPS),
     // T2 — burstable performance on an Intel Xeon whose Turbo reaches a sustained 3.3 GHz, on
     // the Xen hypervisor. Every size reports: no EBS-optimized mode (so no EBS-optimized
     // performance either), 40 EBS volumes shared with its interfaces, no ENA, one thread per
@@ -101,3 +123,14 @@ pub(super) static BURSTABLE_XEN_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFact
 /// doubles at each step from 32 Megabit at the smallest size and reaches the device's own
 /// figure at the two largest, where the column stops reading `up to` anything.
 const BURSTABLE_XEN_PEAK_GBPS: f64 = 1.024;
+
+/// The Gigabit the first burstable family's one size sustains: 70 Megabit, the figure its
+/// `Very Low` column stands for.
+const T1_BASELINE_GBPS: f64 = 0.07;
+
+/// The Gigabit that same size can reach: 280 Megabit, four times what it sustains.
+const T1_PEAK_GBPS: f64 = 0.28;
+
+/// The `RootDeviceType` values a type whose AMIs may be backed by an EBS volume ALONE
+/// publishes — what a previous generation family that shipped no local devices reports.
+const EBS_ROOT_DEVICE: &[&str] = &["ebs"];

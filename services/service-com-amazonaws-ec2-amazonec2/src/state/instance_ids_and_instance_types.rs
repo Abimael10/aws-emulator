@@ -2083,7 +2083,7 @@ pub(super) const MAC_HOSTS: [(&str, i32, i64); 9] = [
     ("mac2-m2", 8, 24),
     ("mac2-m2pro", 12, 32),
     ("mac2-m1ultra", 20, 128),
-    ("mac-m3ultra", 28, 96),
+    ("mac-m3ultra", 28, 256),
     ("mac-m4", 10, 24),
     ("mac-m4pro", 14, 48),
     ("mac-m4max", 16, 128),
@@ -2723,7 +2723,12 @@ pub fn instance_type_record(instance_type: &str) -> Option<InstanceTypeRecord> {
         default_threads_per_core,
         memory_mib,
         bare_metal: name.bare_metal(),
-        burstable: name.burstable(),
+        // Whether the type is a burstable performance T instance type: the published answer
+        // where the catalog holds the type's row — the first burstable family predates the CPU
+        // credit model the member reports — else the family letter's own reading of it.
+        burstable: facts
+            .and_then(|facts| facts.burstable_performance_supported)
+            .unwrap_or_else(|| name.burstable()),
         current_generation: facts
             .and_then(|facts| facts.current_generation)
             .unwrap_or_else(|| name.current_generation()),

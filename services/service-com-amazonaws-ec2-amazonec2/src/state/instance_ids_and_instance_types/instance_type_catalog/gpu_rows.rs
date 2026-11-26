@@ -66,6 +66,25 @@ pub(super) static GPU_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .processor("AMD", 3.6)
         .dedicated_hosts(false)
         .ena_srd(false),
+    // Gr6f — the memory-rich graphics family's fractional size: the same 3rd generation AMD
+    // EPYC host and the same L4 accelerator, published with the `4xlarge`'s own 8,000 Mbps and
+    // 32,000 IOPS of dedicated EBS bandwidth and one 450 GB local NVMe device rather than the
+    // 600 GB one of the `gr6` size of that name. Its EBS volumes are attached to EBS hardware
+    // of the type's own, so its 32 attachments are the volumes' own; it is not offered on a
+    // Dedicated Host, ENA Express is not offered on the family, it is not migrated to another
+    // host on a user-initiated reboot and carries no local clock, and it takes no interface
+    // attachment from a secondary network, so it publishes none of the addresses such an
+    // interface would take.
+    PublishedInstanceTypeFacts::of("gr6f.4xlarge")
+        .ebs(8_000, 32_000, 8_000, 32_000)
+        .dedicated_ebs_attachments(32)
+        .instance_store(1, 450)
+        .gpus(1, L4_ACCELERATOR.0, NVIDIA, L4_ACCELERATOR.1, ML_AI_WORKLOAD)
+        .processor("AMD", 3.6)
+        .dedicated_hosts(false)
+        .ena_srd(false)
+        .host_features(false, false)
+        .ipv4_per_secondary_interface(0),
     // G6 — the sixth generation graphics family: NVIDIA L4 accelerators on a 3rd generation
     // AMD EPYC at a sustained 3.4 GHz, with 4 GiB of system memory per vCPU (the general
     // purpose ratio its family letter gives, which is why no row below publishes its memory)

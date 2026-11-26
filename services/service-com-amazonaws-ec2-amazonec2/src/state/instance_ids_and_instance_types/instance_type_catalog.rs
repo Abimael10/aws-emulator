@@ -43,6 +43,7 @@ mod general_purpose_nvme_rows;
 mod gpu_rows;
 mod intel_nvme_compute_rows;
 mod intel_storage_optimized_rows;
+mod mac_host_rows;
 mod memory_optimized_nvme_rows;
 mod network_optimized_rows;
 mod neuron_accelerated_rows;
@@ -329,6 +330,11 @@ pub struct PublishedInstanceTypeFacts {
     /// Is it "the latest generation instance type of an instance family" — AWS's "Previous
     /// generation instances" page answers per family, and a family that page lists is NOT.
     pub current_generation: Option<bool>,
+    /// Is it "a burstable performance T instance type"
+    /// (`InstanceTypeInfo$BurstablePerformanceSupported`), where the answer for the type is not
+    /// the one its family letter gives: the first burstable family predates the CPU credit
+    /// model that member reports, so AWS publishes it as not one.
+    pub burstable_performance_supported: Option<bool>,
     /// Its memory, in MiB, where the family's ratio of memory to vCPUs is its own.
     pub memory_mib: Option<i64>,
     /// The vCPUs it runs with, where AWS's figure for the type is its own rather than the one
@@ -489,6 +495,7 @@ impl PublishedInstanceTypeFacts {
         Self {
             instance_type,
             current_generation: None,
+            burstable_performance_supported: None,
             memory_mib: None,
             default_vcpus: None,
             threads_per_core: None,
@@ -542,6 +549,18 @@ impl PublishedInstanceTypeFacts {
     /// latest generation of its family.
     const fn previous_generation(mut self) -> Self {
         self.current_generation = Some(false);
+        self
+    }
+
+    /// Whether the type is a burstable performance T instance type, as AWS publishes it for the
+    /// type rather than as its family letter reads.
+    ///
+    /// This answers the REPORTED member (and the burst model that follows from it) alone: which
+    /// hypervisor the type runs on, whether it has an EBS-optimized mode and how its sizes are
+    /// read off the ladder stay the family letter's own, so a type published as not burstable
+    /// is still described by its family's hardware.
+    const fn burstable_performance(mut self, supported: bool) -> Self {
+        self.burstable_performance_supported = Some(supported);
         self
     }
 
@@ -744,6 +763,14 @@ impl PublishedInstanceTypeFacts {
     /// limit the one the derivation above counts.
     const fn dedicated_attachment_limit(mut self) -> Self {
         self.attachment_limit_type = Some(DEDICATED_ATTACHMENT_LIMIT);
+        self
+    }
+
+    /// The type's EBS volumes SHARE their limit with its network interfaces and its instance
+    /// store devices, where the published figure itself is not recorded yet, which leaves the
+    /// limit the one the derivation above counts.
+    const fn shared_attachment_limit(mut self) -> Self {
+        self.attachment_limit_type = Some(SHARED_ATTACHMENT_LIMIT);
         self
     }
 
@@ -1058,70 +1085,6 @@ const XEON6_SUSTAINED_GHZ: f64 = 3.9;
 /// limits" (the EBS attachment limit and whether it is dedicated), and the "IP addresses per
 /// network interface per instance type" table (the interface limits).
 static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
-    // C4 — compute optimized, 2nd generation Intel Xeon E5-2666 v3 (Haswell) at a sustained
-    // 2.9 GHz, EBS-optimized by default with a DEDICATED figure per size (a pre-Nitro type
-    // does not burst above it, so each size publishes one bandwidth and one IOPS figure), and
-    // no local instance store. The family is on AWS's "Previous generation instances" page, so
-    // it is not the latest generation of its family, and it predates the Elastic Network
-    // Adapter. Its EBS volumes share one attachment total with its other devices — 40, the
-    // figure "Instance volume limits" publishes for the type — rather than having a limit of
-    // their own. Dedicated Hosts ARE offered on the family, and reboot migration is, while a
-    // PTP hardware clock is not. Memory is the family's published 3.75 GiB per two vCPUs,
-    // which is not a whole number of GiB at the small sizes; the largest size carries 36
-    // vCPUs on two sockets rather than the 32 its step of the ladder would give, and its
-    // cores are configured one per socket.
-    PublishedInstanceTypeFacts::of("c4.large")
-        .previous_generation()
-        .memory_mib(3_840)
-        .ebs(500, 4_000, 500, 4_000)
-        .shared_ebs_attachments(40)
-        .network("Moderate")
-        .processor("Intel", 2.9)
-        .ena(ENA_UNSUPPORTED)
-        .dedicated_hosts(true)
-        .host_features(true, false),
-    PublishedInstanceTypeFacts::of("c4.xlarge")
-        .previous_generation()
-        .memory_mib(7_680)
-        .ebs(750, 6_000, 750, 6_000)
-        .shared_ebs_attachments(40)
-        .network("High")
-        .processor("Intel", 2.9)
-        .ena(ENA_UNSUPPORTED)
-        .dedicated_hosts(true)
-        .host_features(true, false),
-    PublishedInstanceTypeFacts::of("c4.2xlarge")
-        .previous_generation()
-        .memory_mib(15_360)
-        .ebs(1_000, 8_000, 1_000, 8_000)
-        .shared_ebs_attachments(40)
-        .network("High")
-        .processor("Intel", 2.9)
-        .ena(ENA_UNSUPPORTED)
-        .dedicated_hosts(true)
-        .host_features(true, false),
-    PublishedInstanceTypeFacts::of("c4.4xlarge")
-        .previous_generation()
-        .memory_mib(30_720)
-        .ebs(2_000, 16_000, 2_000, 16_000)
-        .shared_ebs_attachments(40)
-        .network("High")
-        .processor("Intel", 2.9)
-        .ena(ENA_UNSUPPORTED)
-        .dedicated_hosts(true)
-        .host_features(true, false),
-    PublishedInstanceTypeFacts::of("c4.8xlarge")
-        .previous_generation()
-        .memory_mib(61_440)
-        .vcpus(36)
-        .cores_in_steps_of(2)
-        .ebs(4_000, 32_000, 4_000, 32_000)
-        .shared_ebs_attachments(40)
-        .network("10 Gigabit")
-        .processor("Intel", 2.9)
-        .ena(ENA_UNSUPPORTED)
-        .dedicated_hosts(true)
-        .host_features(true, false),
     // C5ad — compute optimized, 2nd generation AMD EPYC 7002 series (7R32) at a sustained
     // 3.3 GHz, with local NVMe SSD devices. The family's EBS figures are DEDICATED from
     // `8xlarge` up — 3,170 Mbps and 13,300 IOPS there, then its own figure per size — and the
@@ -3036,7 +2999,9 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
     // eight Qualcomm AI100 accelerators of 16 GB each and NO local instance store, with the
     // 100 Gigabit network and the in-transit encryption of that class of adapter. Its EBS
     // volumes are limited to 19 attachments, below what the shared Nitro pool would leave, and
-    // its 48 cores sit on two sockets, so they are configured one per socket.
+    // its 48 cores sit on two sockets, so they are configured one per socket. It takes no
+    // interface attachment from a secondary network, so it publishes none of the addresses
+    // such an interface would take.
     PublishedInstanceTypeFacts::of("dl2q.24xlarge")
         .memory_gib(768)
         .cores_in_steps_of(2)
@@ -3046,6 +3011,7 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .network("100 Gigabit")
         .processor("Intel", 3.5)
         .encryption_in_transit(true)
+        .ipv4_per_secondary_interface(0)
         .inference(8, "Qualcomm AI100", "Qualcomm", 16_000),
     // F2 — FPGA accelerated, 3rd generation AMD EPYC (Milan) at a sustained 3.6 GHz, with
     // one Xilinx Virtex UltraScale+ (VU47P) accelerator of 80 GiB and one 1,900 GB local NVMe
@@ -4726,10 +4692,9 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
 /// NVMe devices, the seventh generation graphics family, the block storage optimized memory
 /// one on the newest AWS Graviton hardware, the two storage optimized families on the Xen
 /// hypervisor, the two Intel storage optimized ones, the two high-memory families on the
-/// Xen hypervisor and the sixth generation AWS Graviton general purpose one. A row is reached
-/// by its instance type
-/// alone, so which table it is written in is nothing but where the figures of one group of
-/// families are kept together.
+/// Xen hypervisor, the sixth generation AWS Graviton general purpose one and the EC2 Mac
+/// hosts. A row is reached by its instance type alone, so which table it is written in is
+/// nothing but where the figures of one group of families are kept together.
 fn published_rows() -> impl Iterator<Item = &'static PublishedInstanceTypeFacts> {
     PUBLISHED_INSTANCE_TYPE_FACTS
         .iter()
@@ -4770,6 +4735,7 @@ fn published_rows() -> impl Iterator<Item = &'static PublishedInstanceTypeFacts>
         .chain(intel_storage_optimized_rows::INTEL_STORAGE_OPTIMIZED_INSTANCE_TYPE_FACTS)
         .chain(xen_high_memory_rows::XEN_HIGH_MEMORY_INSTANCE_TYPE_FACTS)
         .chain(sixth_generation_graviton_rows::SIXTH_GENERATION_GRAVITON_INSTANCE_TYPE_FACTS)
+        .chain(mac_host_rows::MAC_HOST_INSTANCE_TYPE_FACTS)
 }
 
 /// The published facts of `instance_type`, or `None` where the catalog holds no row for it
