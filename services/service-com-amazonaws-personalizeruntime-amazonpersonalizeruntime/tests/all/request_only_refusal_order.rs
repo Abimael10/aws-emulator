@@ -17,8 +17,18 @@
 //! and column count, and the `promotions` members a promoted subset needs), the bound
 //! each one is measured against — including the lower maximum a request that asks for
 //! metadata gets — and the resource state the request names: unregistered,
-//! registered-but-wrong-recipe, registered-but-missing-the-input, and a promotion whose
-//! filter the registry does not hold.
+//! registered-but-wrong-recipe, registered-but-missing-the-input, a promotion whose
+//! filter the registry does not hold, and a request that names NO resource at all.
+//!
+//! Naming no resource is part of that last dimension, not of the request-only pass: a
+//! member the request left out is still that member read as a REFERENCE to a resource,
+//! so it is settled with the rest of resolution. Which is how the boundary already
+//! orders the bounds the model itself carries — `numResults` targets `NumResults`,
+//! modelled `range 0..`
+//! (`smithy_query(query="shape",shape="NumResults")`), and a negative value earns that
+//! clause whether or not the same request names a campaign. A documented maximum the
+//! model does not carry is the same kind of statement about the same member, so it is
+//! answered in the same place.
 //!
 //! A member the model leaves OPTIONAL is not such a refusal: it is an input of the
 //! resolved resource, so it is answered after resolution — see
@@ -132,6 +142,16 @@ struct RequestOnly {
 fn unresolvable(arn: &str) -> String {
     format!("{arn} does not exist or is not active yet.")
 }
+
+/// `GetRecommendations`'s refusal for a request that names NEITHER alternative — the
+/// arm of its resolution step that reads the two ARN members as references to nothing
+/// (`no_inference_target_refusal.rs` owns the sentence itself).
+const NO_INFERENCE_TARGET: &str = "campaignArn or recommenderArn required.";
+
+/// `GetActionRecommendations`'s refusal for a request that names no campaign at all:
+/// the same operation's reading of its one ARN member, reporting the value the request
+/// gave (`refusal_wording.rs` owns the sentence itself).
+const NO_CAMPAIGN_NAMED: &str = "The given campaign ARN is invalid: null";
 
 /// The refusal for `numResults` past the maximum that applies to the request.
 fn num_results_past(requested: usize, max: usize) -> String {
@@ -247,6 +267,11 @@ fn table(route: &str) -> (Value, Vec<Resource>, Vec<RequestOnly>) {
                     }),
                     refusal: unresolvable(UNREGISTERED_FILTER),
                 },
+                Resource {
+                    case: "a request naming neither alternative, so no target at all",
+                    members: json!({}),
+                    refusal: NO_INFERENCE_TARGET.to_string(),
+                },
             ],
             vec![
                 RequestOnly {
@@ -328,6 +353,11 @@ fn table(route: &str) -> (Value, Vec<Resource>, Vec<RequestOnly>) {
                          version trained with a PERSONALIZED_ACTIONS recipe."
                     ),
                 },
+                Resource {
+                    case: "a request naming no campaign at all",
+                    members: json!({}),
+                    refusal: NO_CAMPAIGN_NAMED.to_string(),
+                },
             ],
             vec![
                 RequestOnly {
@@ -346,10 +376,17 @@ fn table(route: &str) -> (Value, Vec<Resource>, Vec<RequestOnly>) {
                         MAX_NUM_ACTION_RESULTS,
                     ),
                 },
+                RequestOnly {
+                    case: "numResults at the maximum of the sibling operation, past this one's",
+                    members: json!({ "numResults": MAX_NUM_RESULTS }),
+                    refusal: num_results_past(MAX_NUM_RESULTS, MAX_NUM_ACTION_RESULTS),
+                },
             ],
         ),
         PERSONALIZE_RANKING => (
             json!({ "userId": "user-1", "inputList": ["item-1"] }),
+            // No row for a request naming no campaign: `GetPersonalizedRanking$campaignArn`
+            // is `@required`, so the boundary refuses its absence before the handler runs.
             vec![
                 Resource {
                     case: "an unregistered campaign",
@@ -884,5 +921,174 @@ async fn a_request_at_the_cap_and_at_its_lowered_bound_passes_every_request_only
             "case {case}: expected the refusal that needs the resolved catalog, got {:?}",
             refusal.message
         );
+    }
+}
+
+/// The routes whose operation models a `numResults` member, so the same member's bound
+/// can be compared across them: `GetPersonalizedRanking` models `inputList` instead.
+const NUM_RESULTS_ROUTES: [&str; 2] = [RECOMMENDATIONS, ACTION_RECOMMENDATIONS];
+
+/// The documented maximum `numResults` is measured against on `route`, for a request
+/// that asks for no metadata.
+fn num_results_maximum(route: &str) -> usize {
+    match route {
+        RECOMMENDATIONS => MAX_NUM_RESULTS,
+        ACTION_RECOMMENDATIONS => MAX_NUM_ACTION_RESULTS,
+        other => panic!("case {other}: no numResults maximum for this route"),
+    }
+}
+
+/// Every state the request's reading as a REFERENCE to a campaign can be in: one the
+/// registry serves for this route, one it does not hold, and the member left out
+/// altogether — plus the refusal each one earns once the request is well formed on its
+/// own terms.
+fn campaign_states(route: &str) -> [(&'static str, Value, String); 3] {
+    let (served, no_campaign) = match route {
+        RECOMMENDATIONS => (CAMPAIGN_USER, NO_INFERENCE_TARGET.to_string()),
+        ACTION_RECOMMENDATIONS => (CAMPAIGN_ACTIONS, NO_CAMPAIGN_NAMED.to_string()),
+        other => panic!("case {other}: no campaign states for this route"),
+    };
+    [
+        (
+            "the campaign the operation serves",
+            json!({ "campaignArn": served }),
+            String::new(),
+        ),
+        (
+            "a campaign the registry does not hold",
+            json!({ "campaignArn": UNREGISTERED_CAMPAIGN }),
+            unresolvable(UNREGISTERED_CAMPAIGN),
+        ),
+        ("no campaign at all", json!({}), no_campaign),
+    ]
+}
+
+/// Values of `numResults` below the modelled minimum (`NumResults` is modelled
+/// `range 0..`): just below it, and well below it.
+const BELOW_THE_MODELLED_MINIMUM: [i64; 3] = [-1, -5, -501];
+
+/// The clause the BOUNDARY answers for such a value — one validation error naming the
+/// member and the requirement, and quoting no value
+/// (`refusal_wording.rs` owns that wording).
+const MODELLED_RANGE_CLAUSE: &str = "1 validation error detected: Value at 'numResults' failed \
+                                     to satisfy constraint: Member must have value greater than \
+                                     or equal to 0";
+
+#[tokio::test]
+async fn the_modelled_bound_of_numresults_is_answered_whatever_campaign_the_request_names() {
+    // Where the rule the suite asserts comes from: the bound the MODEL carries on this
+    // member is settled by the request's own validation pass, so the clause naming the
+    // member comes back whether the request names a campaign the registry serves, one it
+    // does not hold, or none at all. A documented maximum the model does not carry is the
+    // same statement about the same member, so the suite below holds it to the same
+    // ordering.
+    let emulator = seeded();
+
+    for route in NUM_RESULTS_ROUTES {
+        for (described, members, _) in campaign_states(route) {
+            for requested in BELOW_THE_MODELLED_MINIMUM {
+                let body = merged(
+                    &merged(&json!({ "userId": "user-1" }), &members),
+                    &json!({ "numResults": requested }),
+                );
+                let case = format!("{route}: numResults {requested} with {described}");
+                let refusal = emulator.refusal(route, body).await;
+                assert_eq!(
+                    (refusal.status, refusal.code.as_str()),
+                    (400, "ValidationException"),
+                    "case {case}: expected the boundary's 400 ValidationException, got {refusal:?}"
+                );
+                assert_eq!(
+                    refusal.message, MODELLED_RANGE_CLAUSE,
+                    "case {case}: expected {MODELLED_RANGE_CLAUSE:?}, got {:?}",
+                    refusal.message
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn numresults_past_its_documented_maximum_is_answered_whatever_campaign_the_request_names() {
+    // The documented maximum, over the same three campaign states and over sizes past it:
+    // one past, well past, and the maximum the SIBLING operation publishes, which is past
+    // this route's own whenever the two differ. A request that is malformed in its
+    // `numResults` and names no campaign at all therefore earns the clause naming the
+    // member and the bound — not the refusal for the campaign reference it also lacks.
+    let emulator = seeded();
+
+    for route in NUM_RESULTS_ROUTES {
+        let max = num_results_maximum(route);
+        let sizes = [max + 1, max * 3, MAX_NUM_RESULTS.max(MAX_NUM_ACTION_RESULTS)];
+        for (described, members, resource_refusal) in campaign_states(route) {
+            for requested in sizes {
+                if requested <= max {
+                    continue;
+                }
+                let body = merged(
+                    &merged(&json!({ "userId": "user-1" }), &members),
+                    &json!({ "numResults": requested }),
+                );
+                let case = format!("{route}: numResults {requested} with {described}");
+                let refusal = emulator.refusal(route, body).await;
+                assert_eq!(
+                    (
+                        refusal.status,
+                        refusal.code.as_str(),
+                        refusal.errortype.as_str()
+                    ),
+                    (400, "InvalidInputException", "InvalidInputException"),
+                    "case {case}: expected 400 InvalidInputException, got {refusal:?}"
+                );
+                assert_eq!(
+                    refusal.message,
+                    num_results_past(requested, max),
+                    "case {case}: expected the bound clause {:?}, got {:?}",
+                    num_results_past(requested, max),
+                    refusal.message
+                );
+                assert!(
+                    resource_refusal.is_empty() || refusal.message != resource_refusal,
+                    "case {case}: the refusal of the request's campaign reference must not win \
+                     over the member's own bound, got {:?}",
+                    refusal.message
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_request_naming_no_campaign_is_served_its_campaign_refusal_at_its_bound() {
+    // The complement, which keeps the hoisted bound from swallowing the refusal of the
+    // campaign reference: at and below the documented maximum nothing about the request
+    // itself is wrong, so a request that names no campaign earns the clause naming that.
+    let emulator = seeded();
+
+    for route in NUM_RESULTS_ROUTES {
+        let max = num_results_maximum(route);
+        let (described, members, expected) = campaign_states(route)
+            .into_iter()
+            .next_back()
+            .expect("the campaign states end with the request that names none");
+        for requested in [0, 1, max - 1, max] {
+            let body = merged(
+                &merged(&json!({ "userId": "user-1" }), &members),
+                &json!({ "numResults": requested }),
+            );
+            let case = format!("{route}: numResults {requested} with {described}");
+            let refusal = emulator.refusal(route, body).await;
+            assert_eq!(
+                (refusal.status, refusal.code.as_str()),
+                (400, "InvalidInputException"),
+                "case {case}: expected 400 InvalidInputException, got {refusal:?}"
+            );
+            assert_eq!(
+                refusal.message, expected,
+                "case {case}: expected the refusal of the campaign reference {expected:?}, got \
+                 {:?}",
+                refusal.message
+            );
+        }
     }
 }

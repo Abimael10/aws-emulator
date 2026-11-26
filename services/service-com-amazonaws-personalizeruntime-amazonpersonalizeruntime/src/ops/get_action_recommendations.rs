@@ -9,20 +9,21 @@
 //! deploys a solution version trained with a PERSONALIZED_ACTIONS recipe." Every
 //! action id and score comes from the registry in [`crate::state`]:
 //!
-//! 1. `campaignArn` is resolved against the registry (400 "does not exist or is not
-//!    active yet" when it resolves to nothing — see
-//!    [`crate::state::Denied::unresolvable`]) and the
-//!    campaign must deploy a `PERSONALIZED_ACTIONS` solution version — otherwise 400.
-//!    `numResults` and the maximum it has to satisfy ("The default is 5. The maximum
-//!    is 100.") are facts about the REQUEST, so that bound is settled before the
-//!    campaign is resolved.
-//! 2. `userId` is the personalization input the RESOLVED campaign needs, not a fact
+//! 1. `numResults` and the maximum it has to satisfy ("The default is 5. The maximum
+//!    is 100.") are facts about the REQUEST, so that bound is settled first — before
+//!    `campaignArn` is read as a reference to a campaign at all.
+//! 2. `campaignArn` is then resolved against the registry (400 "The given campaign ARN
+//!    is invalid" when the request names none, 400 "does not exist or is not active
+//!    yet" when it resolves to nothing — see [`crate::state::Denied::unresolvable`])
+//!    and the campaign must deploy a `PERSONALIZED_ACTIONS` solution version —
+//!    otherwise 400.
+//! 3. `userId` is the personalization input the RESOLVED campaign needs, not a fact
 //!    about the request: the model marks it optional, so its absence is answered only
 //!    once the campaign is in hand, and the refusal names that campaign.
-//! 3. `filterArn` is resolved the same way (400 when unknown) and its expression, bound to
+//! 4. `filterArn` is resolved the same way (400 when unknown) and its expression, bound to
 //!    `filterValues`, decides which stored Actions-catalog entries come back — not
 //!    what any of them scores.
-//! 4. Each action's score is [`crate::state::scoring::Seed::relevance`] of its STORED
+//! 5. Each action's score is [`crate::state::scoring::Seed::relevance`] of its STORED
 //!    `base_score` and the request's `userId`, so an identical request returns an
 //!    identical ordering (the operation is `@idempotent`), and the list is reported
 //!    descending by score. The scores are normalized across the whole stored Actions
@@ -179,21 +180,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = SystemTime::now();
         let mut guard = state.lock();
 
-        // 1. What the REQUEST alone settles, before anything is resolved.
+        // 1. What the REQUEST alone settles, before any member is read as a reference to
+        //    a resource: the value the caller sent measured against the bound it has to
+        //    satisfy.
         //
-        //    `campaignArn` carries no `@required` in the model, but it is "the campaign
-        //    to use for getting action recommendations" — a request that gives no
-        //    campaign ARN gives this operation nothing to recommend from, and the
-        //    refusal reports the ARN it WAS given (see [`invalid_campaign_arn`]).
-        let Some(campaign_arn) = registry::present(input.campaign_arn.as_deref()) else {
-            return Err(invalid_campaign_arn(input.campaign_arn.as_deref()));
-        };
         //    How many results to compute is the value the caller sent against the
         //    documented maximum ("The default is 5. The maximum is 100."), both facts
-        //    about the request — so it is answered BEFORE the campaign is resolved,
-        //    exactly as the sibling operations settle their request-only bounds: a
-        //    `numResults` past the bound is refused whatever the campaign turns out to
-        //    be.
+        //    about the request — so it is answered first, exactly as the boundary answers
+        //    the `@range` minimum the same member carries and as the sibling operations
+        //    settle their own request-only bounds: a `numResults` past the bound is
+        //    refused whatever campaign the request named, and whether it named one at
+        //    all.
         let num_results = registry::effective_num_results(
             input.num_results,
             registry::DEFAULT_NUM_ACTION_RESULTS,
@@ -201,11 +198,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(deny)?;
 
-        // 2. The campaign, and the recipe type this operation serves. WHICH operation
-        //    serves a campaign is the registry's rule, stated once in
+        // 2. The campaign this call recommends from, and the recipe type this operation
+        //    serves.
+        //
+        //    `campaignArn` carries no `@required` in the model, but it is "the campaign
+        //    to use for getting action recommendations" — a request that gives no
+        //    campaign ARN gives this operation nothing to recommend from, and the
+        //    refusal reports the ARN it WAS given (see [`invalid_campaign_arn`]). That is
+        //    this operation's arm for a request naming no inference target, the one the
+        //    sibling `GetRecommendations` answers inside its own resolution step, so it
+        //    is reached once the request is well formed on its own terms.
+        //
+        //    WHICH operation serves a campaign is the registry's rule, stated once in
         //    [`RecipeType::operation`]: this handler asks it with its own name
         //    ([`RecipeType::served_by`]) rather than naming the recipe type it expects,
         //    so a recipe type added to the enum cannot leak into the wrong operation.
+        let Some(campaign_arn) = registry::present(input.campaign_arn.as_deref()) else {
+            return Err(invalid_campaign_arn(input.campaign_arn.as_deref()));
+        };
         let campaign = guard.campaign(campaign_arn).map_err(deny)?.clone();
         if !campaign.recipe_type.served_by(Self::NAME) {
             return Err(invalid(format!(
@@ -317,6 +327,10 @@ fn referenced_resources(input: &GetActionRecommendationsInput) -> Vec<&str> {
 /// resource reference on the inference path goes through. The sentence is the registry's
 /// one invalid-reference sentence ([`Denied::invalid_arn`]), the same one a `campaignArn`
 /// that references another resource type earns.
+///
+/// It is a refusal of the request's REFERENCE to a campaign, so it belongs to the
+/// resolution step and not in front of it: a request whose own members are out of the
+/// bounds they have to satisfy earns the clause naming the member and the bound first.
 fn invalid_campaign_arn(given: Option<&str>) -> GetActionRecommendationsError {
     deny(Denied::invalid_arn(
         registry::ResourceKind::Campaign,
