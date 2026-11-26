@@ -17,6 +17,11 @@
 //! The rows differ along what the rule generalises over: whether the account holds the role,
 //! what its trust document says, which account the value names, where in the document the
 //! option sits, how many roles one document names, and whether it names one at all.
+//!
+//! This is also the suite's one harness for a configuration body and the IAM records its roles
+//! are resolved against: `validate_pipeline_report` reaches the helpers below rather than
+//! keeping a second copy, so the two suites cannot drift about how a role is created, how a
+//! body names one, or how the refusal is worded.
 
 use std::sync::Arc;
 
@@ -25,37 +30,37 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// A Region that is NOT the emulator default, so nothing here passes because it was pinned
 /// to the default one.
-const REGION: &str = "eu-west-2";
+pub(crate) const REGION: &str = "eu-west-2";
 
 /// The canonical emulator account id, which is the account IAM answers for.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// An account that is NOT this one: a role of another account is not this emulator's IAM to
 /// resolve.
-const OTHER_ACCOUNT: &str = "123456789012";
+pub(crate) const OTHER_ACCOUNT: &str = "123456789012";
 
 /// The service principal a role a pipeline names has to trust, as the refusal states it.
-const INGESTION_PRINCIPAL: &str = "osis-pipelines.amazonaws.com";
+pub(crate) const INGESTION_PRINCIPAL: &str = "osis-pipelines.amazonaws.com";
 
 /// What one call answered: the status, the modelled error code (empty on success) and the
 /// parsed body.
 #[derive(Debug)]
-struct Answer {
-    status: u16,
-    error_type: String,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) error_type: String,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// The `message` member of a refusal.
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         self.body["message"].as_str().unwrap_or_default().to_string()
     }
 }
 
 /// This service and IAM on ONE engine: the roles a configuration names are resolved against
 /// the records IAM holds, so the test creates them through IAM's own wire.
-fn new_router() -> MultiServiceRouter {
+pub(crate) fn new_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signature verification is the emulator's own concern and is exercised elsewhere;
@@ -72,7 +77,12 @@ fn new_router() -> MultiServiceRouter {
     router
 }
 
-async fn call(router: &MultiServiceRouter, method: &str, path: &str, body: Option<Value>) -> Answer {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Answer {
     let payload = match body {
         Some(value) => bytes::Bytes::from(serde_json::to_vec(&value).expect("serialize body")),
         None => bytes::Bytes::new(),
@@ -165,7 +175,7 @@ async fn iam(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)])
 }
 
 /// A trust document with one statement, as a client sends one.
-fn trust(effect: &str, principal: &str) -> Value {
+pub(crate) fn trust(effect: &str, principal: &str) -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -177,7 +187,12 @@ fn trust(effect: &str, principal: &str) -> Value {
 }
 
 /// Create a role called `name` carrying `document`, and answer the ARN IAM persisted.
-async fn given_role(router: &MultiServiceRouter, case: &str, name: &str, document: &Value) -> String {
+pub(crate) async fn given_role(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    document: &Value,
+) -> String {
     let document = document.to_string();
     let (status, created) = iam(
         router,
@@ -202,12 +217,12 @@ async fn given_role(router: &MultiServiceRouter, case: &str, name: &str, documen
 }
 
 /// The ARN of a role of `account` called `name`, whether or not IAM holds it.
-fn role_arn(account: &str, name: &str) -> String {
+pub(crate) fn role_arn(account: &str, name: &str) -> String {
     format!("arn:aws:iam::{account}:role/{name}")
 }
 
 /// A configuration body whose SINK assumes `role_arn`.
-fn sink_role_body(role_arn: &str) -> String {
+pub(crate) fn sink_role_body(role_arn: &str) -> String {
     format!(
         "version: \"2\"\nlog-pipeline:\n  source:\n    http:\n      path: \"/ingest\"\n  \
          sink:\n    - opensearch:\n        hosts:\n          - \
@@ -217,7 +232,7 @@ fn sink_role_body(role_arn: &str) -> String {
 }
 
 /// A configuration body whose SOURCE assumes `role_arn`.
-fn source_role_body(role_arn: &str) -> String {
+pub(crate) fn source_role_body(role_arn: &str) -> String {
     format!(
         "version: \"2\"\nlog-pipeline:\n  source:\n    s3:\n      codec:\n        newline: {{}}\n      \
          aws:\n        sts_role_arn: \"{role_arn}\"\n        region: \"{REGION}\"\n  \
@@ -226,7 +241,7 @@ fn source_role_body(role_arn: &str) -> String {
 }
 
 /// A configuration body whose source and sink assume two DIFFERENT roles.
-fn two_role_body(source_role_arn: &str, sink_role_arn: &str) -> String {
+pub(crate) fn two_role_body(source_role_arn: &str, sink_role_arn: &str) -> String {
     format!(
         "version: \"2\"\nlog-pipeline:\n  source:\n    s3:\n      aws:\n        sts_role_arn: \
          \"{source_role_arn}\"\n  sink:\n    - s3:\n        bucket: \"records\"\n        aws:\n          \
@@ -234,26 +249,35 @@ fn two_role_body(source_role_arn: &str, sink_role_arn: &str) -> String {
     )
 }
 
-/// The refusal a configuration naming the unassumable roles `role_arns` is answered with.
+/// The validation message one role this service cannot assume raises.
 ///
-/// Spelled out here rather than taken from the crate, so the wording itself is under test:
-/// the member that did not validate, then one `ValidationMessage` per role with the role ARN
-/// copied from the request as its only variable part.
-fn expected_message(role_arns: &[&str]) -> String {
+/// Spelled out here rather than taken from the crate, so the wording itself is under test: the
+/// text is fixed and the role ARN, copied from the submitted document, is its only variable
+/// part. It is the per-error message `ValidatePipeline` reports and the create wraps
+/// ([`expected_message`]), which is why both suites read it from here.
+pub(crate) fn unable_to_assume(role_arn: &str) -> String {
+    format!(
+        "Unable to assume the STS role {role_arn}. This role must contain a trust relationship \
+         with '{INGESTION_PRINCIPAL}'."
+    )
+}
+
+/// The refusal a configuration naming the unassumable roles `role_arns` is answered with: the
+/// member that did not validate, then one `ValidationMessage` per role.
+pub(crate) fn expected_message(role_arns: &[&str]) -> String {
     let listed = role_arns
         .iter()
-        .map(|role_arn| {
-            format!(
-                "ValidationMessage(message=Unable to assume the STS role {role_arn}. This role \
-                 must contain a trust relationship with '{INGESTION_PRINCIPAL}'.)"
-            )
-        })
+        .map(|role_arn| format!("ValidationMessage(message={})", unable_to_assume(role_arn)))
         .collect::<Vec<_>>()
         .join(", ");
     format!("pipelineConfigurationBody is invalid with the following errors: [{listed}]")
 }
 
-async fn create_pipeline(router: &MultiServiceRouter, name: &str, body: &str) -> Answer {
+pub(crate) async fn create_pipeline(
+    router: &MultiServiceRouter,
+    name: &str,
+    body: &str,
+) -> Answer {
     call(
         router,
         "POST",
@@ -268,7 +292,7 @@ async fn create_pipeline(router: &MultiServiceRouter, name: &str, body: &str) ->
     .await
 }
 
-async fn get_pipeline(router: &MultiServiceRouter, name: &str) -> Answer {
+pub(crate) async fn get_pipeline(router: &MultiServiceRouter, name: &str) -> Answer {
     call(
         router,
         "GET",
@@ -278,7 +302,7 @@ async fn get_pipeline(router: &MultiServiceRouter, name: &str) -> Answer {
     .await
 }
 
-async fn list_pipeline_names(router: &MultiServiceRouter) -> Vec<String> {
+pub(crate) async fn list_pipeline_names(router: &MultiServiceRouter) -> Vec<String> {
     let listed = call(router, "GET", "/2022-01-01/osis/listPipelines", None).await;
     assert_eq!(
         listed.status, 200,

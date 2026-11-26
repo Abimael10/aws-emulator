@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ValidatePipeline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ValidatePipeline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ValidatePipeline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports on a submitted `PipelineConfigurationBody` without creating anything: the body is
+//! judged by the crate's one judgement of a configuration document
+//! ([`crate::state::configuration_validation_messages`]), and the messages it raises are
+//! answered as this operation's `Errors` list, with `isValid` saying whether it raised any.
+//! `CreatePipeline` and `UpdatePipeline` refuse a submit over those same messages, so a
+//! caller that validates a body and then creates a pipeline with it gets one verdict twice.
+//!
+//! Nothing is persisted and nothing of this service's own store is read: the question is
+//! about the submitted document and the account's IAM records, not about a pipeline.
+//!
+//! WHAT IS JUDGED, and what is not: the judgement is the roles the document names, which is
+//! the one judgement a create applies too. The SYNTAX of a configuration body is not judged
+//! here — the service's own wording for a body that does not parse as a Data Prepper document
+//! is in neither the model nor its documentation, so such a body submits no role to resolve
+//! and is reported the way a body naming no role is, rather than being refused with an
+//! invented message. A caller must not read `isValid` as a statement about anything beyond
+//! the roles; closing that gap needs AWS's wording for it and is its own change.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +157,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ValidatePipeline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ValidatePipelineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ValidatePipeline"))
+        // This operation answers about the submitted document and the account's IAM records,
+        // so it holds nothing of this service's own: the store is not reached, and a call
+        // that only reports writes nothing.
+        let _ = &self.engine;
+        let region = crate::state::request_region(ctx);
+
+        // The `@length(1, 100000)` on the member is modelled, so the boundary validator
+        // already refused a body outside it; what is judged here is what the document SAYS.
+        let reported = crate::state::configuration_validation_messages(
+            ctx,
+            &region,
+            &input.pipeline_configuration_body,
+        )
+        .await;
+
+        Ok(ValidatePipelineOutput {
+            is_valid: Some(reported.is_empty()),
+            // `Errors` is "a list of errors if the configuration is invalid" (the member's
+            // own doc), so a body that raised none carries no list rather than an empty one.
+            errors: (!reported.is_empty()).then(|| {
+                reported
+                    .into_iter()
+                    .map(|message| ValidationMessage {
+                        message: Some(message),
+                    })
+                    .collect()
+            }),
+        })
     }
 }

@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 mod blueprint_format;
+mod change_progress;
 mod configuration_roles;
 mod ingest_delivery;
 mod ingest_endpoint;
@@ -20,9 +21,12 @@ pub use blueprint_format::{
     document_as_json, BlueprintFormat, UnrenderableBlueprint, BLUEPRINT_FORMATS,
     BLUEPRINT_FORMAT_JSON, BLUEPRINT_FORMAT_PATTERN, BLUEPRINT_FORMAT_YAML,
 };
+pub use change_progress::{
+    create_change_progress, CHANGE_COMPLETED, CHANGE_FAILED, CHANGE_IN_PROGRESS,
+};
 pub use configuration_roles::{
-    configuration_body_invalid, configuration_role_arns, unable_to_assume_role,
-    unassumable_configuration_roles, INGESTION_SERVICE_PRINCIPAL,
+    configuration_body_invalid, configuration_role_arns, configuration_validation_messages,
+    unable_to_assume_role, unassumable_configuration_roles, INGESTION_SERVICE_PRINCIPAL,
 };
 pub use ingest_delivery::{
     delivered, object_bytes, object_key, DeliveredObject, UndeliveredRecords,

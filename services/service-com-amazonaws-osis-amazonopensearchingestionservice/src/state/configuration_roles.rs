@@ -120,22 +120,28 @@ pub fn configuration_body_invalid(messages: &[String]) -> String {
     format!("pipelineConfigurationBody is invalid with the following errors: [{listed}]")
 }
 
-/// The `ValidationException` message for a submitted configuration body naming a role this
-/// service cannot assume, or `None` when every role it names is one it can.
+/// Every validation message a submitted `PipelineConfigurationBody` raises, in the order the
+/// document raised them — empty for a body this service finds nothing to report about.
 ///
-/// Asked BEFORE a pipeline is minted or updated, by every operation that takes a
-/// `PipelineConfigurationBody`, so one submitted document is judged the same way whichever
-/// of them was called. What makes a role unassumable is IAM's answer about it
+/// This is the crate's ONE judgement of a submitted configuration body, so the operation that
+/// REPORTS on a body (`ValidatePipeline`) and the operations that SUBMIT one with a pipeline
+/// (`CreatePipeline`, `UpdatePipeline`) cannot disagree about the same document: the reporter
+/// answers these messages as its `ValidationMessage` list and the others refuse the call with
+/// them wrapped in [`configuration_body_invalid`].
+///
+/// What it judges is the roles the document names: a configuration reaches its sources and
+/// sinks under them, so one naming a role this service cannot take on describes a pipeline
+/// that could never run. What makes a role unassumable is IAM's answer about it
 /// ([`::service_common::iam_role::role_is_unassumable`]): this account holds no role under
 /// that name, or the trust policy the stored role carries does not admit the ingestion
-/// service principal. A value naming no role of this account establishes nothing, so it is
-/// not refused.
-pub async fn unassumable_configuration_roles(
+/// service principal. A value naming no role of this account establishes nothing, so nothing
+/// is reported about it.
+pub async fn configuration_validation_messages(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     configuration_body: &str,
-) -> Option<String> {
-    let mut refused = Vec::new();
+) -> Vec<String> {
+    let mut reported = Vec::new();
     for role_arn in configuration_role_arns(configuration_body) {
         if ::service_common::iam_role::role_is_unassumable(
             ctx,
@@ -145,10 +151,26 @@ pub async fn unassumable_configuration_roles(
         )
         .await
         {
-            refused.push(unable_to_assume_role(&role_arn));
+            reported.push(unable_to_assume_role(&role_arn));
         }
     }
-    (!refused.is_empty()).then(|| configuration_body_invalid(&refused))
+    reported
+}
+
+/// The `ValidationException` message for a submitted configuration body naming a role this
+/// service cannot assume, or `None` when every role it names is one it can.
+///
+/// Asked BEFORE a pipeline is minted or updated, by every operation that takes a
+/// `PipelineConfigurationBody` as part of a pipeline, so one submitted document is judged the
+/// same way whichever of them was called — the judgement itself is
+/// [`configuration_validation_messages`], and this states how a SUBMIT reports it.
+pub async fn unassumable_configuration_roles(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    configuration_body: &str,
+) -> Option<String> {
+    let reported = configuration_validation_messages(ctx, region, configuration_body).await;
+    (!reported.is_empty()).then(|| configuration_body_invalid(&reported))
 }
 
 #[cfg(test)]
