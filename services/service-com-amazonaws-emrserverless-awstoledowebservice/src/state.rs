@@ -811,6 +811,13 @@ pub struct JobRunRecord {
     /// or a cancel moved it to since. Bounded by
     /// [`job_run_logs::MAX_JOB_RUN_LOG_EVENTS`].
     pub log_events: Vec<job_run_logs::JobRunLogEvent>,
+    /// What the run's DRIVER itself wrote while it executed: the lines of the standard error
+    /// of the submitted application's own process ([`spark_job_run`]), which are what the
+    /// published driver log carries beside the lifecycle
+    /// ([`job_run_logs::driver_log_text`]). Empty for a run whose work nothing has executed
+    /// yet, and for one whose driver wrote nothing. Bounded by
+    /// [`job_run_logs::MAX_DRIVER_OUTPUT_LINES`].
+    pub driver_output: Vec<String>,
     /// Whether the clock owes this run's artifacts a publication: set when the run
     /// reaches a state it never leaves, and cleared by the call that writes them, so one
     /// finished run publishes once however many calls arrive afterwards.
@@ -964,6 +971,25 @@ impl JobRunRecord {
             state: self.job_run.state.clone(),
             state_details: Some(self.job_run.state_details.clone()),
         });
+    }
+
+    /// Record what this run's DRIVER wrote while it executed, as the lines its log carries.
+    ///
+    /// Held as the lines of the application's own standard error, each one cut to
+    /// [`job_run_logs::MAX_DRIVER_OUTPUT_LINE_CHARS`] and the whole kept to
+    /// [`job_run_logs::MAX_DRIVER_OUTPUT_LINES`], so what one run's record holds is bounded
+    /// however much its application wrote. Recorded once, by the execution that answered for
+    /// the run ([`spark_job_run`]).
+    pub fn record_driver_output(&mut self, output: &[String]) {
+        self.driver_output = output
+            .iter()
+            .take(job_run_logs::MAX_DRIVER_OUTPUT_LINES)
+            .map(|line| {
+                line.chars()
+                    .take(job_run_logs::MAX_DRIVER_OUTPUT_LINE_CHARS)
+                    .collect()
+            })
+            .collect();
     }
 
     /// The `JobRunSummary` projection `ListJobRuns` returns: the stored record's own

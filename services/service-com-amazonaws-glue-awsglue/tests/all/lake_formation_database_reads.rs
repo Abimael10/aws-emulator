@@ -286,6 +286,33 @@ async fn governed_catalog() -> Governed {
             ],
         )
         .await;
+        // Each role is granted every Data Catalog action in IAM, because a catalog read needs
+        // BOTH halves: the caller's own identity-based grant, and the Lake Formation permission
+        // on the resource. What these rows are about is the second half, so the first is given
+        // to every row's reader and what decides a read is the Lake Formation state alone.
+        query(
+            &router,
+            "iam",
+            "2010-05-08",
+            "PutRolePolicy",
+            &[
+                ("RoleName", role_name.to_string()),
+                ("PolicyName", format!("{role_name}-catalog")),
+                (
+                    "PolicyDocument",
+                    json!({
+                        "Version": "2012-10-17",
+                        "Statement": [{
+                            "Effect": "Allow",
+                            "Action": ["glue:*"],
+                            "Resource": "*",
+                        }],
+                    })
+                    .to_string(),
+                ),
+            ],
+        )
+        .await;
     }
     let assumed = query(
         &router,

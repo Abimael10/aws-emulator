@@ -486,7 +486,10 @@ fn rows() -> Vec<Row> {
             driver: None,
             arguments: Vec::new(),
             comes: Comes::Failed {
-                says: "SystemExit",
+                // The STATUS the program exited with is what failed the run: "the main
+                // function must exit with a zero exit code" is the rule a submitted program's
+                // run ends by.
+                says: "exited with status",
                 no_key: "out/run-6/sums.csv".to_string(),
             },
         },

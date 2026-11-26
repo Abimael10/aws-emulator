@@ -121,8 +121,14 @@ pub(crate) fn emulator_with_catalog_and_s3() -> (MultiServiceRouter, Arc<engine:
     (router, engine)
 }
 
-/// Seed the role a run is performed as: one Glue can assume, allowed every Amazon S3 call,
-/// so what decides a catalog read is the Lake Formation state and nothing else.
+/// Seed the role a run is performed as: one Glue can assume, allowed every Amazon S3 call and
+/// every Data Catalog call, so what decides a catalog read is the Lake Formation state and
+/// nothing else.
+///
+/// The catalog half is there because a script's catalog reads are made as THIS role and the
+/// Data Catalog authorizes them against the policies in force on it, exactly as the object
+/// store authorizes the object reads beside them: a role carrying no catalog grant is refused
+/// by the catalog itself, which is a different question from the one these rows ask.
 pub(crate) fn job_role(engine: &Arc<engine::InMemoryEngine>, role_name: &str) -> String {
     let arn = seed_role(engine, role_name, Some(glue_trust()));
     let state = engine.state::<IamState>();
@@ -135,7 +141,11 @@ pub(crate) fn job_role(engine: &Arc<engine::InMemoryEngine>, role_name: &str) ->
             policy_name,
             policy_document: json!({
                 "Version": "2012-10-17",
-                "Statement": [{ "Effect": "Allow", "Action": ["s3:*"], "Resource": "*" }],
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": ["s3:*", "glue:*"],
+                    "Resource": "*",
+                }],
             })
             .to_string(),
         },

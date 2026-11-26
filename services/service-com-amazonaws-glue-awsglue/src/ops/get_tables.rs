@@ -527,6 +527,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
         }
+        // ... and whether IAM lets the CALLER list the tables of this database is decided here.
+        // A listing addresses every table under the database it names, which is the resource a
+        // statement about it is written over (`crate::state::identity_authorization`).
+        if let Some(message) = crate::state::identity_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::table_arn(&region, &catalog_id, &input.database_name, "*"),
+        ) {
+            return Err(GetTablesErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         // The scope every continuation token of THIS listing is bound to, built once from
         // the catalog and database the request addressed.

@@ -432,7 +432,9 @@ fn rows() -> Vec<Row> {
             arguments: Vec::new(),
             // A program that exited non-zero wrote nothing, so nothing is under this prefix.
             absent: vec!["out/exited/part-00000"],
-            ends: Ends::Fails(vec!["SystemExit"], Vec::new()),
+            // What failed the run is the STATUS the program exited with: "the main function
+            // must exit with a zero exit code" is the rule a submitted program's run ends by.
+            ends: Ends::Fails(vec!["exited with status 9"], Vec::new()),
         },
     ]
 }

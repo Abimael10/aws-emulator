@@ -410,6 +410,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
         }
+        // ... and whether IAM lets the CALLER register a table at all is decided here, on the
+        // table this request names, before anything is looked up or stored
+        // (`crate::state::identity_authorization`).
+        if let Some(message) = crate::state::identity_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::table_arn(
+                &region,
+                &catalog_id,
+                &input.database_name,
+                &table_input.name,
+            ),
+        ) {
+            return Err(CreateTableErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // The catalog's security configuration is "applied to every catalog write
         // thereafter" (`PutDataCatalogEncryptionSettings`), so the key THIS write is
         // encrypted under is read from the stored setting and the table's data key

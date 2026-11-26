@@ -220,6 +220,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
         }
+        // ... and whether IAM lets the CALLER remove this table is decided here, on the table
+        // the request names, before anything is looked up or removed
+        // (`crate::state::identity_authorization`).
+        if let Some(message) = crate::state::identity_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::table_arn(
+                &crate::state::request_region(ctx.parts()),
+                &catalog_id,
+                &input.database_name,
+                &input.name,
+            ),
+        ) {
+            return Err(DeleteTableErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         let folded_table = crate::state::fold_name(&input.name);
 
         let mut store = state.lock();

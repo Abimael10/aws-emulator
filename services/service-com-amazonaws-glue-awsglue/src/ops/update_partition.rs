@@ -101,9 +101,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 // here — hence the `UpdatePartitionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.glue#UpdatePartition")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.glue#UpdatePartition",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum UpdatePartitionErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     EntityNotFoundException(EntityNotFoundException),
     GlueEncryptionException(GlueEncryptionException),
     InternalServiceException(InternalServiceException),
@@ -173,6 +177,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
         let region = crate::state::request_region(ctx.parts());
+        // Whether IAM lets the CALLER write this table's partitions is decided here, on the
+        // table they belong to — which is the resource a Data Catalog partition call is taken
+        // on — before anything is looked up or stored
+        // (`crate::state::identity_authorization`).
+        if let Some(message) = crate::state::identity_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::table_arn(
+                &region,
+                &catalog_id,
+                &input.database_name,
+                &input.table_name,
+            ),
+        ) {
+            return Err(UpdatePartitionErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // An update STORES a definition, so it is a catalog write: the key it is encrypted
         // under is the one the catalog's setting names NOW and not the one the partition's
         // create used, because "the specified encryption is applied to every catalog write

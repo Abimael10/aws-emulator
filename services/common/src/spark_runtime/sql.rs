@@ -6,7 +6,7 @@
 pub(super) const SQL_SOURCE: &str = r#"
 """The Spark session of one application, and the rows a dataset of them holds."""
 
-from pyspark import filesystem, parquet
+from pyspark import catalog, filesystem, parquet
 from pyspark.conf import SparkConf
 from pyspark.context import SparkContext
 from pyspark.jvm import JavaSparkContext, SPARK_VERSION, gateway
@@ -240,6 +240,21 @@ def _partition_text(value):
     if isinstance(value, bool):
         return "true" if value else "false"
     return filesystem.escape_path_name(str(value))
+
+
+def _partition_of(within, column):
+    """The value one partition column holds in the path a partitioned write laid rows under.
+
+    The path is the Hive layout's `<name>=<value>` segments ([`DataFrameWriter._grouped`]), so
+    the value is the one the segment of that column spells — read back through the layout's own
+    escaping, and left as the name Hive gives the partition of an absent value where that is
+    what the segment carries, because that is the value the catalog holds for it.
+    """
+    for segment in str(within).strip("/").split("/"):
+        name, _marker, value = segment.partition("=")
+        if filesystem.unescape_path_name(name) == column:
+            return filesystem.unescape_path_name(value)
+    return ""
 
 
 class DataFrameReader(object):
@@ -509,6 +524,16 @@ class DataFrameReader(object):
         return read
 
 
+# The save modes a write may name, as `DataFrameWriter.mode` documents them — `append`,
+# `overwrite`, `error`/`errorifexists` and `ignore` — with the `default` spelling Spark's own
+# reading of the member maps onto `errorifexists` beside them. A value outside this set names no
+# behaviour, which is what makes it a refusal rather than a choice.
+SAVE_MODES = ("append", "overwrite", "error", "errorifexists", "default", "ignore")
+
+# The modes that REFUSE an output already there, which is what a write naming no mode does.
+REFUSING_MODES = ("error", "errorifexists", "default")
+
+
 class DataFrameWriter(object):
     """Where a dataset of rows is WRITTEN: through the filesystem its path resolves in.
 
@@ -528,7 +553,21 @@ class DataFrameWriter(object):
         self._partitions = []
 
     def mode(self, saveMode):
-        self._mode = str(saveMode).lower()
+        """The save mode this write names, which decides what an output ALREADY THERE means.
+
+        "Specifies the behavior when data or table already exists" (`DataFrameWriter.mode`):
+        `append`, `overwrite`, `error`/`errorifexists` (the default) and `ignore`. A value
+        outside them names no behaviour at all, so it is REFUSED the way Spark refuses one
+        rather than read as any of them — a misspelled `overwrite` must not be what deletes a
+        table's data.
+        """
+        held = str(saveMode).lower()
+        if held not in SAVE_MODES:
+            raise ValueError(
+                "Unknown save mode: %s. Accepted save modes are 'overwrite', 'append', "
+                "'ignore', 'error', 'errorifexists'." % (saveMode,)
+            )
+        self._mode = held
         return self
 
     def format(self, source):
@@ -594,7 +633,7 @@ class DataFrameWriter(object):
             grouped[within].append(row)
         return [(within, grouped[within]) for within in order]
 
-    def _write(self, kind, path):
+    def _write(self, kind, path, part_offset=0):
         if path is None:
             raise AnalysisException("a write names no path")
         prefix = filesystem._text(path).rstrip("/")
@@ -603,32 +642,38 @@ class DataFrameWriter(object):
         held = [
             column for column in self._frame.columns if column not in self._partitions
         ]
+        written = []
         for within, rows in self._grouped():
             at = "%s/%s" % (prefix, within) if within else prefix
             if kind == "parquet":
-                self._parquet_parts(at, held, rows)
+                self._parquet_parts(at, held, rows, part_offset)
             else:
-                self._text_parts(kind, at, held, rows)
+                self._text_parts(kind, at, held, rows, part_offset)
+            written.append((within, at))
         if MARKS_SUCCESSFUL_JOBS:
             filesystem.write_text("%s/_SUCCESS" % (prefix,), "")
-        return None
+        # The directories this write laid its rows out under, which is what a PARTITIONED
+        # table's partitions are registered from ([`DataFrameWriter.saveAsTable`]).
+        return written
 
-    def _text_parts(self, kind, at, held, rows):
+    def _text_parts(self, kind, at, held, rows, part_offset=0):
         """One part file per PARTITION of the dataset, as text.
 
         That is the output layout a write leaves: `coalesce` and `repartition` are what a
         program names that count with, so a write of a dataset coalesced to one partition
         leaves one part file, and a write of one repartitioned leaves a part per partition
-        the rows were spread over.
+        the rows were spread over. `part_offset` is where the numbering starts, so a write
+        that APPENDS to a path leaves its parts beside the ones already there instead of
+        over them.
         """
         lines = self._rendered(kind, [_without(row, held) for row in rows])
         for index, part in enumerate(slices(lines, self._frame.partitions())):
             filesystem.write_text(
-                "%s/part-%05d" % (at, index),
+                "%s/part-%05d" % (at, index + part_offset),
                 "".join("%s\n" % (line,) for line in part),
             )
 
-    def _parquet_parts(self, at, held, rows):
+    def _parquet_parts(self, at, held, rows, part_offset=0):
         """The same part files, each one an Apache Parquet file of its own rows.
 
         The bytes are the format's own ([`pyspark.parquet`]): the values themselves in the
@@ -646,19 +691,24 @@ class DataFrameWriter(object):
                 declared,
                 compression,
             )
-            filesystem.write_bytes("%s/part-%05d%s.parquet" % (at, index, suffix), body)
+            filesystem.write_bytes(
+                "%s/part-%05d%s.parquet" % (at, index + part_offset, suffix), body
+            )
 
     def csv(self, path, **named):
         self.options(**named)
-        return self._write("csv", path)
+        self._write("csv", path)
+        return None
 
     def text(self, path, **named):
         self.options(**named)
-        return self._write("text", path)
+        self._write("text", path)
+        return None
 
     def json(self, path, **named):
         self.options(**named)
-        return self._write("json", path)
+        self._write("json", path)
+        return None
 
     def parquet(self, path, mode=None, partitionBy=None, compression=None, **named):
         if mode is not None:
@@ -668,7 +718,8 @@ class DataFrameWriter(object):
         if compression is not None:
             self.option("compression", compression)
         self.options(**named)
-        return self._write("parquet", path)
+        self._write("parquet", path)
+        return None
 
     def save(self, path=None, format=None, mode=None, partitionBy=None, **named):
         if format is not None:
@@ -678,7 +729,125 @@ class DataFrameWriter(object):
         if partitionBy is not None:
             self.partitionBy(partitionBy)
         self.options(**named)
-        return self._write(self._format or "parquet", path)
+        self._write(self._format or "parquet", path)
+        return None
+
+    def saveAsTable(self, name, format=None, mode=None, partitionBy=None, **named):
+        """Write this dataset as the TABLE `name` of the session's data catalog.
+
+        "Saves the content of the DataFrame as the specified table" (`saveAsTable`): the rows
+        are written as the table's data and the TABLE ITSELF is registered in the catalog —
+        its columns, the partition keys it is laid out by and the location its data lives at —
+        so another engine over the same catalog resolves the table a program wrote. Both
+        halves are real here: the data is written through the filesystem the path resolves in
+        ([`pyspark.filesystem`]) and the registration is a call to the catalog itself
+        ([`pyspark.catalog`]), signed as the identity the program runs as, so a program whose
+        role may not register a table in that catalog fails with the catalog's own refusal.
+
+        WHERE the data goes is resolved the way Spark resolves a table's location: the `path`
+        option the write names, else the location the registered table already has, else the
+        database's own location with the table's name under it, else the session's warehouse
+        directory ([`pyspark.catalog.table_location`]).
+
+        The `mode` decides what a table that is ALREADY there means: the default fails,
+        `ignore` leaves it alone, `overwrite` replaces its data and its definition, and
+        `append` adds this dataset's rows to it.
+        """
+        if format is not None:
+            self.format(format)
+        if mode is not None:
+            self.mode(mode)
+        if partitionBy is not None:
+            self.partitionBy(partitionBy)
+        self.options(**named)
+        kind = self._format or "parquet"
+        session = SparkSession.getActiveSession()
+        current = session.catalog.currentDatabase() if session is not None else None
+        database_name, table_name = catalog.resolve(name, current)
+        # The catalog is asked about the database and the table BEFORE anything is written:
+        # where the data goes is read off them, and a mode that forbids replacing a table
+        # that is there must not have written its rows first.
+        database_record = catalog.database(database_name)
+        existing = catalog.table(database_name, table_name)
+        if existing is not None and self._mode in REFUSING_MODES:
+            raise AnalysisException(
+                "Table `%s`.`%s` already exists." % (database_name, table_name)
+            )
+        if existing is not None and self._mode == "ignore":
+            return None
+        warehouse = None
+        if session is not None:
+            warehouse = session.conf.get(catalog.WAREHOUSE_PROPERTY)
+        location = catalog.table_location(
+            self._options.get("path"),
+            existing,
+            database_record,
+            warehouse,
+            database_name,
+            table_name,
+        )
+        if location is None:
+            raise AnalysisException(
+                "Table `%s`.`%s` names no location: neither the write, the table nor the "
+                "database `%s` states one and the session configures no %s."
+                % (
+                    database_name,
+                    table_name,
+                    database_name,
+                    catalog.WAREHOUSE_PROPERTY,
+                )
+            )
+        held = [
+            column for column in self._frame.columns if column not in self._partitions
+        ]
+        types = dict(self._frame.dtypes)
+        offset = 0
+        if self._mode == "append":
+            # An append leaves this dataset's parts BESIDE the ones already under the
+            # table's location rather than over them, so the table holds both.
+            offset = len(
+                [
+                    stored
+                    for stored, _size in filesystem.list_objects(location)
+                    if not _hidden(stored)
+                ]
+            )
+        elif self._mode == "overwrite" and existing is not None:
+            # "Overwrite mode means that when saving a DataFrame to a data source, if
+            # data/table already exists, existing data is expected to be overwritten by the
+            # contents of the DataFrame": the objects the table held are removed before its
+            # new ones are written, so the table's data is this dataset and not both.
+            bucket, _prefix = filesystem.prefix_of(location)
+            store = filesystem.FileSystem.get(location)
+            for stored, _size in filesystem.list_objects(location):
+                store.delete(filesystem.uri(bucket, stored))
+        written = self._write(kind, location, offset)
+        definition = catalog.table_definition(
+            table_name,
+            held,
+            types,
+            self._partitions,
+            location,
+            kind,
+            existing,
+        )
+        if existing is None:
+            catalog.create_table(database_name, definition)
+        else:
+            catalog.update_table(database_name, definition)
+        if self._partitions:
+            # Each directory the write laid rows under is one partition of the table, which a
+            # partitioned table holds in the catalog beside its definition.
+            inputs = []
+            for within, at in written:
+                values = [
+                    _partition_of(within, column) for column in self._partitions
+                ]
+                inputs.append(
+                    catalog.partition_input(values, at, kind, held, types)
+                )
+            catalog.create_partitions(database_name, table_name, inputs)
+        return None
 
 
 def _without(row, held):
@@ -1442,6 +1611,7 @@ class SparkSession(object):
         self._jvm_gateway = gateway()
         self._java_context = JavaSparkContext(sparkContext.getConf())
         self._stopped = False
+        self._catalog = None
         SparkSession._active = self
 
     @property
@@ -1460,6 +1630,19 @@ class SparkSession(object):
     def read(self):
         """Returns a DataFrameReader that can be used to read data in as a DataFrame."""
         return DataFrameReader(self)
+
+    @property
+    def catalog(self):
+        """The interface through which the user may create, drop, alter or query underlying
+        databases, tables and functions — the session's data catalog
+        ([`pyspark.catalog`]), which is the account's own AWS Glue Data Catalog.
+
+        One per session, because the current database is a property of the session: a
+        program that sets it sees it set for every later table name it resolves.
+        """
+        if self._catalog is None:
+            self._catalog = catalog.Catalog(self)
+        return self._catalog
 
     # The gateway and the Java context an application reaches the Hadoop filesystem
     # through, under the names PySpark gives them.

@@ -27,7 +27,15 @@
 //! * what the RUN reports is what that execution answered: an application that ran to its end
 //!   reaches `SUCCESS`, one that raised reaches `FAILED` carrying its own exception in
 //!   `stateDetails`, and one stopped by a bound of this emulator reaches `FAILED` saying which
-//!   bound. Nothing is ever reported as a success nothing computed.
+//!   bound. Nothing is ever reported as a success nothing computed;
+//! * and what its DRIVER wrote is the run's driver log: the application runs through the entry
+//!   module every service of this workspace runs a submitted Spark program from, which reports
+//!   the status it exited with and the two console streams it wrote
+//!   ([`::service_common::spark_runtime`]), and its standard error — the engine's own logging
+//!   and the traceback it ended on — is what this run publishes to the destinations its
+//!   monitoring configuration names ([`super::job_run_logs`]). So a client reading a failed
+//!   run's driver log finds the WORKLOAD's own failure there, which is how one failure class is
+//!   told from another.
 //!
 //! A driver this emulator runs NOTHING for — a Hive query, an entry point that is not a Python
 //! application — is answered at once and says so ([`JOB_RUN_NOT_RUNNABLE_LEAD`]), rather than
@@ -57,7 +65,8 @@
 //! The submitted application is caller-supplied code, so every bound is this emulator's and
 //! none of them is reachable from the application: how many run at once
 //! ([`MAX_CONCURRENT_WORKLOAD_RUNS`], whose permit is taken before anything is spawned and
-//! travels into the thread that runs it), how many ONE call starts
+//! travels into the thread that runs it — a run that finds every one of them busy WAITS for one
+//! rather than being dropped, [`WORKLOAD_INTERPRETER_WAIT`]), how many ONE call starts
 //! ([`MAX_WORKLOAD_RUNS_PER_CALL`] over at most [`WORKLOAD_CALL_CEILING`] of that call's own
 //! time), how large the application may be ([`MAX_APPLICATION_BYTES`], enforced by the ranged
 //! read), the span of the RUN's own time it may last — the caller's own
@@ -156,6 +165,17 @@ pub const WORKLOAD_STOP_GRACE: Duration = Duration::from_secs(5);
 pub const WORKLOAD_HOST_WAIT: Duration =
     WORKLOAD_HOST_CEILING.saturating_add(WORKLOAD_STOP_GRACE);
 
+/// How long a run whose work found every interpreter of this process BUSY waits for one.
+///
+/// A submitted application is work AWS performs whoever is watching, so a run that found no
+/// free interpreter is not dropped: it keeps its claim and a task of this process waits this
+/// long for one ([`await_interpreter`]). The wait is the whole span one run may hold an
+/// interpreter for ([`WORKLOAD_HOST_WAIT`]) taken over every run that can hold one at once
+/// ([`MAX_CONCURRENT_WORKLOAD_RUNS`]), which is how long the runs already in flight can keep
+/// every interpreter; past it the claim goes back and a later call performs the application.
+pub const WORKLOAD_INTERPRETER_WAIT: Duration =
+    WORKLOAD_HOST_WAIT.saturating_mul(MAX_CONCURRENT_WORKLOAD_RUNS as u32);
+
 /// How long the call that STARTS a run waits for it before leaving it to run on.
 ///
 /// CHOSEN: short, because the application is caller-supplied code and no client's call may be
@@ -224,10 +244,22 @@ const MAX_WORKLOAD_SCRATCH_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_WORKLOAD_RECURSION: usize = 2_000;
 
 /// How much of an application's output is kept, and how large a value it may answer with.
-/// Neither reaches the wire: a job run reports no program output.
+///
+/// What the application wrote to its own console streams IS reported: a Spark driver's standard
+/// error is the run's driver log, which is published to the destinations the run's monitoring
+/// configuration names ([`super::job_run_logs`]). The value it answers with is this emulator's
+/// own seam ([`read_outcome`]) and reaches no wire.
 const MAX_WORKLOAD_LOG_BYTES: usize = 64 * 1024;
 /// See [`MAX_WORKLOAD_LOG_BYTES`].
 const MAX_WORKLOAD_ANSWER_BYTES: usize = 64 * 1024;
+
+/// How many characters of EACH of the driver's console streams one run keeps.
+///
+/// The entry module every service of this workspace runs a submitted Spark program from bounds
+/// each stream by this ([`::service_common::spark_runtime`]), so what the run ANSWERS with stays
+/// inside [`MAX_WORKLOAD_ANSWER_BYTES`] whatever the application wrote, and the driver log the
+/// run publishes carries at most this much of each stream.
+const DRIVER_STREAM_CHARACTERS: usize = 16 * 1024;
 
 /// The ROLE-SESSION NAME a job run's session of its `executionRoleArn` is opened under.
 ///
@@ -309,6 +341,18 @@ pub fn job_run_application_failed(error_type: &str, error_message: &str) -> Stri
     format!("{JOB_RUN_FAILED_LEAD} {error_type}: {error_message}")
 }
 
+/// `JobRun$stateDetails` of a run whose application RAISED NOTHING and still exited with a
+/// non-zero status.
+///
+/// A submitted application is a program, so the way it ends is its exit status: "for a step to
+/// be considered complete, the main function must exit with a zero exit code" is the same rule a
+/// Spark submit's entry point ends its job run by, and a status this emulator reports is the one
+/// the program really exited with.
+#[must_use]
+pub fn job_run_application_exited(status: i32) -> String {
+    format!("{JOB_RUN_FAILED_LEAD} the application exited with status {status}.")
+}
+
 /// `JobRun$stateDetails` of a run stopped because it ran past one of this emulator's own bounds
 /// on the application — the span one run may last, its step budget, its memory ceiling or the
 /// size of the value it answered.
@@ -381,6 +425,33 @@ impl WorkloadOutcome {
         match self {
             Self::Succeeded => SUCCESS_STATE_DETAILS.to_string(),
             Self::Failed(details) => held_to_state_details(details),
+        }
+    }
+}
+
+/// Everything one execution of a job run's workload left behind: the state it decided, and
+/// WHAT THE DRIVER WROTE while it ran.
+///
+/// Both are recorded on the run together ([`record_outcome`]), because both are what that one
+/// execution answered: the state a client polls for, and the driver log it then reads to find
+/// out why ([`super::job_run_logs`]).
+#[derive(Debug, Clone)]
+pub struct ExecutedWorkload {
+    /// The state the execution decided.
+    pub outcome: WorkloadOutcome,
+    /// The lines the driver's own standard error carried, in the order it wrote them. Empty
+    /// for an execution that produced no driver at all — a workload nothing ran, an
+    /// application that could not be read.
+    pub driver_output: Vec<String>,
+}
+
+impl ExecutedWorkload {
+    /// An answer about a run whose DRIVER wrote nothing, because none ran: the outcome alone.
+    #[must_use]
+    pub fn of(outcome: WorkloadOutcome) -> Self {
+        Self {
+            outcome,
+            driver_output: Vec::new(),
         }
     }
 }
@@ -689,7 +760,12 @@ async fn perform_owed_waiting<Eng: ::std::marker::Send + ::std::marker::Sync + '
                 job_run_id,
                 outcome,
             } => {
-                record_outcome(&state, &application_id, &job_run_id, &outcome);
+                record_outcome(
+                    &state,
+                    &application_id,
+                    &job_run_id,
+                    &ExecutedWorkload::of(outcome),
+                );
                 started += 1;
                 continue;
             }
@@ -725,12 +801,13 @@ async fn perform_owed_waiting<Eng: ::std::marker::Send + ::std::marker::Sync + '
     }
 }
 
-/// Record what one execution came to on the run it belongs to.
+/// Record what one execution came to on the run it belongs to: the state it decided and what
+/// its driver wrote.
 fn record_outcome(
     state: &::engine::ServiceState<ComAmazonawsEmrserverlessAwstoledowebserviceState>,
     application_id: &str,
     job_run_id: &str,
-    outcome: &WorkloadOutcome,
+    executed: &ExecutedWorkload,
 ) {
     let mut store = state.lock();
     if let Some(record) = store
@@ -738,7 +815,8 @@ fn record_outcome(
         .get_mut(application_id)
         .and_then(|application| application.job_runs.get_mut(job_run_id))
     {
-        record.record_execution(outcome, SystemTime::now());
+        record.record_driver_output(&executed.driver_output);
+        record.record_execution(&executed.outcome, SystemTime::now());
     }
 }
 
@@ -762,9 +840,10 @@ fn release_claim(
 ///
 /// Every answer is grounded in what really happened: the object store's own refusal for an
 /// application it does not serve, the exception the application raised, or the bound the
-/// interpreter stopped it at. An execution NOTHING performed — no free interpreter, a thread
-/// that could not be started — records nothing and gives the claim back, so a later call runs it
-/// rather than anything reporting an outcome no execution produced.
+/// interpreter stopped it at. An execution NOTHING performed — a thread that could not be
+/// started — records nothing and gives the claim back, so a later call runs it rather than
+/// anything reporting an outcome no execution produced; one that found every interpreter busy
+/// keeps its claim and WAITS for one ([`await_interpreter`]).
 async fn perform_workload(
     state: &::engine::ServiceState<ComAmazonawsEmrserverlessAwstoledowebserviceState>,
     callback: &::smithy_server_runtime::EmbeddedEmulator,
@@ -779,7 +858,7 @@ async fn perform_workload(
             state,
             &workload.application_id,
             &workload.job_run_id,
-            &outcome,
+            &ExecutedWorkload::of(outcome),
         );
     };
     let Some((bucket, key)) = ::service_common::s3_uri::object_address(&workload.entry_point)
@@ -809,16 +888,77 @@ async fn perform_workload(
     // applications this process RUNS at once, and a read is not a run — holding one across the
     // read would let a cross-service read nothing answers keep an interpreter from every other
     // job run of this process.
-    let Ok(permit) = ::std::sync::Arc::clone(&WORKLOAD_RUN_PERMITS).try_acquire_owned() else {
-        ::tracing::debug!(
-            application = %workload.application_id,
-            job_run = %workload.job_run_id,
-            "an EMR Serverless job run found no free interpreter, so it stays owed one"
-        );
+    match ::std::sync::Arc::clone(&WORKLOAD_RUN_PERMITS).try_acquire_owned() {
+        Ok(permit) => {
+            run_application(state, workload, &source, &key, access, permit, first_wait).await;
+        }
+        // Every interpreter of this process is busy. The work is still owed, and nothing else
+        // will hand it off — a client that reads the run once and never calls again would then
+        // never see it finish, and AWS runs a submitted job whoever is watching — so the run
+        // keeps its claim and a TASK of this process waits for an interpreter and performs it
+        // ([`await_interpreter`]).
+        Err(_) => {
+            ::tracing::debug!(
+                application = %workload.application_id,
+                job_run = %workload.job_run_id,
+                "an EMR Serverless job run found no free interpreter, so it waits for one"
+            );
+            await_interpreter(state, workload, source, key, access);
+        }
+    }
+}
+
+/// Wait for an interpreter on a TASK of this process, and run `workload` on it once one is free.
+///
+/// The claim on the run is NOT given back: this task is what performs it, so no other call
+/// starts the same application twice, and the task is held on the store like every other
+/// execution this service began
+/// ([`ComAmazonawsEmrserverlessAwstoledowebserviceState::in_flight_workloads`]) rather than
+/// detached. A wait that runs out of [`WORKLOAD_INTERPRETER_WAIT`] gives the claim back, so a
+/// later call runs the application rather than anything reporting an outcome nothing produced —
+/// and where there is no task to carry the wait at all, the claim goes back at once.
+fn await_interpreter(
+    state: &::engine::ServiceState<ComAmazonawsEmrserverlessAwstoledowebserviceState>,
+    workload: &JobRunWorkload,
+    source: String,
+    key: String,
+    access: Option<AwsAccess>,
+) {
+    let Ok(runtime) = ::tokio::runtime::Handle::try_current() else {
         release_claim(state, &workload.application_id, &workload.job_run_id);
         return;
     };
-    run_application(state, workload, &source, &key, access, permit, first_wait).await;
+    let performed = ::engine::ServiceState::clone(state);
+    let held = workload.clone();
+    let task = runtime.spawn(async move {
+        let waited = ::tokio::time::timeout(
+            WORKLOAD_INTERPRETER_WAIT,
+            ::std::sync::Arc::clone(&WORKLOAD_RUN_PERMITS).acquire_owned(),
+        )
+        .await;
+        match waited {
+            Ok(Ok(permit)) => {
+                // Nobody is waiting for this execution, so it waits for none of it here either:
+                // what it comes to is recorded by the task that performs it.
+                run_application(
+                    &performed,
+                    &held,
+                    &source,
+                    &key,
+                    access,
+                    permit,
+                    Duration::ZERO,
+                )
+                .await;
+            }
+            _ => release_claim(&performed, &held.application_id, &held.job_run_id),
+        }
+    });
+    state.lock().hold_in_flight_workload(
+        &workload.application_id,
+        &workload.job_run_id,
+        PendingWorkloadRun { task },
+    );
 }
 
 /// Why an application was not read: the two answers that are told apart, because the run words
@@ -953,22 +1093,22 @@ async fn run_application(
         "path": path,
         "source": source,
         "arguments": workload.entry_point_arguments,
+        "streamCharacters": DRIVER_STREAM_CHARACTERS,
     })
     .to_string();
-    let modules = ::std::iter::once(PackageModule {
-        path: format!("{APPLICATION_ENTRY_MODULE}.py"),
-        source: APPLICATION_ENTRY_SOURCE.to_string(),
-    })
-    // The ONE in-process Spark runtime of this workspace, which is what a submitted Spark
-    // program resolves its own imports against.
-    .chain(
-        ::service_common::spark_runtime::pyspark_modules(workload.spark_version.as_deref())
-            .into_iter()
-            .map(|(path, source)| PackageModule { path, source }),
+    // The ONE in-process Spark runtime of this workspace: the `pyspark` package a submitted
+    // program resolves its own imports against, and the entry module every service of this
+    // workspace runs a submitted program FROM — which runs it as `spark-submit` runs one and
+    // reports the status it exited with, the console streams it wrote and the exception it ended
+    // on ([`::service_common::spark_runtime`]).
+    let modules = ::service_common::spark_runtime::submitted_program_modules(
+        workload.spark_version.as_deref(),
     )
+    .into_iter()
+    .map(|(path, source)| PackageModule { path, source })
     .collect::<Vec<_>>();
     let job_run_id = workload.job_run_id.clone();
-    let handler = format!("{APPLICATION_ENTRY_MODULE}.{APPLICATION_ENTRY_FUNCTION}");
+    let handler = ::service_common::spark_runtime::submitted_program_handler();
     let (sender, mut receiver) = ::tokio::sync::oneshot::channel();
     let spawned = ::std::thread::Builder::new()
         .name("emr-serverless-job-run".to_string())
@@ -1034,7 +1174,7 @@ async fn run_application(
                 state,
                 &application_id,
                 &job_run_id,
-                &WorkloadOutcome::Failed(job_run_workload_unanswered()),
+                &ExecutedWorkload::of(WorkloadOutcome::Failed(job_run_workload_unanswered())),
             );
         }
         // Still running: the run stays `RUNNING` and the rest of the wait is carried by a TASK
@@ -1072,7 +1212,7 @@ fn hand_off_execution(
             state,
             application_id,
             job_run_id,
-            &WorkloadOutcome::Failed(job_run_workload_unanswered()),
+            &ExecutedWorkload::of(WorkloadOutcome::Failed(job_run_workload_unanswered())),
         );
         return;
     };
@@ -1116,91 +1256,118 @@ async fn perform_handed_off_workload(
         Ok(Ok(finished)) => read_outcome(&finished.completion),
         // The thread ended without reporting, or the whole host wait passed: nothing is known
         // about what the application came to.
-        Ok(Err(_)) | Err(_) => WorkloadOutcome::Failed(job_run_workload_unanswered()),
+        Ok(Err(_)) | Err(_) => {
+            ExecutedWorkload::of(WorkloadOutcome::Failed(job_run_workload_unanswered()))
+        }
     };
     record_outcome(state, application_id, job_run_id, &outcome);
 }
 
-/// What the run reports for an application the interpreter answered for.
-fn read_outcome(completion: &python::Completion) -> WorkloadOutcome {
+/// What the run reports for an application the interpreter answered for: the state it came to,
+/// and what its driver wrote.
+fn read_outcome(completion: &python::Completion) -> ExecutedWorkload {
     match completion {
-        // A submitted application is a program rather than a function, so what it ANSWERED is
-        // not part of the run: an application that ran to its end exited cleanly.
-        python::Completion::Returned(_) | python::Completion::Streamed { .. } => {
-            WorkloadOutcome::Succeeded
+        // The entry module REPORTS what the run came to ([`::service_common::spark_runtime`]):
+        // the status the application exited with, the two console streams it wrote, and the
+        // exception it ended on when it ended on one.
+        python::Completion::Returned(answered) => reported_run(answered),
+        // A streaming answer is one nothing here asks for, so a run that produced one is a run
+        // this emulator has no outcome for.
+        python::Completion::Streamed { .. } => {
+            ExecutedWorkload::of(WorkloadOutcome::Failed(job_run_workload_unanswered()))
         }
+        // The entry module itself raised, which is not the application's own report: the engine
+        // reports the exception, and what it ran is still what failed.
         python::Completion::Raised {
             error_type,
             error_message,
             ..
-        } => WorkloadOutcome::Failed(job_run_application_failed(error_type, error_message)),
-        python::Completion::Stopped(python::Stop::Deadline) => WorkloadOutcome::Failed(
-            job_run_bound_reached("the span this emulator runs one submitted application for"),
-        ),
-        python::Completion::Stopped(python::Stop::Steps) => WorkloadOutcome::Failed(
-            job_run_bound_reached("the step budget this emulator gives one application"),
-        ),
-        python::Completion::Stopped(python::Stop::Memory) => WorkloadOutcome::Failed(
-            job_run_bound_reached("the memory ceiling this emulator gives one application"),
-        ),
-        python::Completion::Stopped(python::Stop::Response) => WorkloadOutcome::Failed(
-            job_run_bound_reached("the size of the value one application may answer with"),
-        ),
+        } => ExecutedWorkload::of(WorkloadOutcome::Failed(job_run_application_failed(
+            error_type,
+            error_message,
+        ))),
+        python::Completion::Stopped(python::Stop::Deadline) => {
+            ExecutedWorkload::of(WorkloadOutcome::Failed(job_run_bound_reached(
+                "the span this emulator runs one submitted application for",
+            )))
+        }
+        python::Completion::Stopped(python::Stop::Steps) => {
+            ExecutedWorkload::of(WorkloadOutcome::Failed(job_run_bound_reached(
+                "the step budget this emulator gives one application",
+            )))
+        }
+        python::Completion::Stopped(python::Stop::Memory) => {
+            ExecutedWorkload::of(WorkloadOutcome::Failed(job_run_bound_reached(
+                "the memory ceiling this emulator gives one application",
+            )))
+        }
+        python::Completion::Stopped(python::Stop::Response) => {
+            ExecutedWorkload::of(WorkloadOutcome::Failed(job_run_bound_reached(
+                "the size of the value one application may answer with",
+            )))
+        }
         // Not a bound of the application's own run: the host time one run may take is this
         // emulator giving up on the execution, so the run says this emulator has no outcome for
         // it rather than that the application was stopped for taking too long.
         python::Completion::Stopped(python::Stop::HostCeiling) => {
-            WorkloadOutcome::Failed(job_run_workload_unanswered())
+            ExecutedWorkload::of(WorkloadOutcome::Failed(job_run_workload_unanswered()))
         }
-        python::Completion::Internal(detail) => {
-            WorkloadOutcome::Failed(job_run_application_failed("InternalError", detail))
-        }
+        python::Completion::Internal(detail) => ExecutedWorkload::of(WorkloadOutcome::Failed(
+            job_run_application_failed("InternalError", detail),
+        )),
     }
 }
 
-/// The module this emulator runs the submitted application FROM, and the function in it the
-/// engine calls.
-const APPLICATION_ENTRY_MODULE: &str = "__emr_serverless_job_run";
-/// See [`APPLICATION_ENTRY_MODULE`].
-const APPLICATION_ENTRY_FUNCTION: &str = "run";
-
-/// The Python source of that module: it runs the submitted application the way a Python program
-/// is run — as the `__main__` module, with the submit's `entryPointArguments` on `sys.argv` —
-/// and lets whatever the application raises travel out to the engine, which is what reports it.
+/// What the run reports for the document the entry module reported one execution in.
 ///
-/// An application is a PROGRAM, so the way it ENDS is its exit status: `sys.exit()` raises
-/// `SystemExit`, whose `code` is `None` for a plain `sys.exit()` and the status for
-/// `sys.exit(status)` — and Python's own rule is that `None` is equivalent to zero and any other
-/// object means a failure. So an application that exits with a status of zero (or with none at
-/// all) ran to its end and the run SUCCEEDS, while one that exits with any other status failed
-/// and that status travels on as the program's own, exactly as a non-zero exit of a Spark
-/// submit's entry point fails its job run.
-///
-/// Nothing here is a bound or a containment: both are the engine's, in host code no application
-/// can reach.
-const APPLICATION_ENTRY_SOURCE: &str = r#"
-"""Runs the application a Spark submit named, as a Python program with its arguments."""
-
-import sys
-
-
-def run(event, context):
-    # The command line a Spark submit's entry point reads its arguments off: the
-    # application's own path followed by the submit's `entryPointArguments`.
-    sys.argv = [event["path"]] + list(event["arguments"])
-    # An application is run as a program, so its globals are those of the main module and its
-    # `if __name__ == "__main__":` guard holds, exactly as on an EMR Serverless worker.
-    program_globals = {"__name__": "__main__", "__file__": event["path"]}
-    try:
-        exec(compile(event["source"], event["path"], "exec"), program_globals)
-    except SystemExit as exiting:
-        # How a program ENDS: `sys.exit()` with no status, or with zero, is an application that
-        # ran to its end. Any other status is the application failing, and it travels on to the
-        # engine as the program's own exit status.
-        if exiting.code is not None and exiting.code != 0:
-            raise
-    return None
-"#;
+/// The status the application exited with IS the run's end — zero is an application that ran to
+/// its end and anything else is one that failed, carrying its own exception where it ended on
+/// one and the status it exited with where it did not — and the driver's standard error is what
+/// the run's driver log carries either way, whether the application succeeded or failed. A
+/// document this emulator cannot read is one nothing is known from, so the run says it has no
+/// outcome rather than claiming one nothing reported.
+fn reported_run(answered: &str) -> ExecutedWorkload {
+    let Ok(document) = ::serde_json::from_str::<::serde_json::Value>(answered) else {
+        return ExecutedWorkload::of(WorkloadOutcome::Failed(job_run_workload_unanswered()));
+    };
+    let Some(status) = document
+        .get("exitStatus")
+        .and_then(::serde_json::Value::as_i64)
+        .and_then(|status| i32::try_from(status).ok())
+    else {
+        return ExecutedWorkload::of(WorkloadOutcome::Failed(job_run_workload_unanswered()));
+    };
+    let text = |member: &str| {
+        document
+            .get(member)
+            .and_then(::serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    // The DRIVER's log is its standard error: the engine's own logging and whatever traceback
+    // the application ended on go there, which is what a client reads a failed run's log for.
+    let driver_output = text("stderr")
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<String>>();
+    let outcome = if status == 0 {
+        WorkloadOutcome::Succeeded
+    } else {
+        let error_type = text("errorType");
+        if error_type.is_empty() {
+            WorkloadOutcome::Failed(job_run_application_exited(status))
+        } else {
+            WorkloadOutcome::Failed(job_run_application_failed(
+                &error_type,
+                &text("errorMessage"),
+            ))
+        }
+    };
+    ExecutedWorkload {
+        outcome,
+        driver_output,
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1211,19 +1378,54 @@ mod tests {
     /// else, carrying what really happened.
     ///
     /// One row per completion the engine has, so a bound added to the engine has to be answered
-    /// here too.
+    /// here too. The REPORT of a run that answered is the entry module's document, so its rows
+    /// carry one ([`reported_run`]).
     #[test]
     fn the_state_a_run_rests_in_is_what_its_execution_answered() {
+        /// The document the shared entry module reports one run in.
+        fn reported(status: i32, error_type: &str, error_message: &str, stderr: &str) -> String {
+            ::serde_json::json!({
+                "exitStatus": status,
+                "stdout": "",
+                "stderr": stderr,
+                "errorType": error_type,
+                "errorMessage": error_message,
+            })
+            .to_string()
+        }
         // (case, what the engine answered, the state the run rests in, what its details say)
         let cases: Vec<(&str, python::Completion, &str, &str)> = vec![
             (
                 "an application that ran to its end",
-                python::Completion::Returned("null".to_string()),
+                python::Completion::Returned(reported(0, "", "", "")),
                 "SUCCESS",
                 SUCCESS_STATE_DETAILS,
             ),
             (
                 "an application that raised",
+                python::Completion::Returned(reported(
+                    1,
+                    "ValueError",
+                    "the input partition is malformed",
+                    "Traceback (most recent call last):\n",
+                )),
+                "FAILED",
+                "ValueError: the input partition is malformed",
+            ),
+            (
+                "an application that exited with a status and raised nothing",
+                python::Completion::Returned(reported(3, "", "", "")),
+                "FAILED",
+                "exited with status 3",
+            ),
+            (
+                "an execution that reported nothing this emulator can read",
+                python::Completion::Returned("null".to_string()),
+                "FAILED",
+                "no outcome to report for the job run",
+            ),
+            (
+                "an entry module that raised instead of reporting",
                 python::Completion::Raised {
                     error_type: "ValueError".to_string(),
                     error_message: "the input partition is malformed".to_string(),
@@ -1271,7 +1473,8 @@ mod tests {
             ),
         ];
         for (case, completion, state, says) in cases {
-            let outcome = read_outcome(&completion);
+            let executed = read_outcome(&completion);
+            let outcome = executed.outcome.clone();
             assert_eq!(
                 outcome.job_run_state(),
                 state,
@@ -1432,17 +1635,17 @@ mod tests {
                 "path": "/tmp/main.py",
                 "source": source,
                 "arguments": Vec::<String>::new(),
+                "streamCharacters": DRIVER_STREAM_CHARACTERS,
             })
             .to_string();
             let finished = ::std::thread::Builder::new()
                 .stack_size(WORKLOAD_STACK_BYTES)
                 .spawn(move || {
-                    let modules = vec![PackageModule {
-                        path: format!("{APPLICATION_ENTRY_MODULE}.py"),
-                        source: APPLICATION_ENTRY_SOURCE.to_string(),
-                    }];
-                    let handler =
-                        format!("{APPLICATION_ENTRY_MODULE}.{APPLICATION_ENTRY_FUNCTION}");
+                    let modules = ::service_common::spark_runtime::submitted_program_modules(None)
+                        .into_iter()
+                        .map(|(path, source)| PackageModule { path, source })
+                        .collect::<Vec<_>>();
+                    let handler = ::service_common::spark_runtime::submitted_program_handler();
                     python::run_against(
                         &python::Run {
                             modules: &modules,
@@ -1471,11 +1674,11 @@ mod tests {
                 .expect("the thread one run is given can be started")
                 .join()
                 .expect("the thread one run is given answers");
-            let outcome = read_outcome(&finished.completion);
+            let executed = read_outcome(&finished.completion);
             assert_eq!(
-                outcome.job_run_state(),
+                executed.outcome.job_run_state(),
                 state,
-                "case {case:?}: expected the run to rest in {state}, got {outcome:?} from \
+                "case {case:?}: expected the run to rest in {state}, got {executed:?} from \
                  {:?}",
                 finished.completion
             );

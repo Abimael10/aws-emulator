@@ -383,8 +383,14 @@ sys.exit(3)
             .to_string(),
             arguments: Vec::new(),
             parameters: None,
-            // A non-zero exit is the program failing, and the status travels on as its own.
-            ends: Ends::Fails(vec!["SystemExit".to_string(), "3".to_string()]),
+            // A non-zero exit is the program failing, and the STATUS it exited with is what
+            // the run reports: "the main function must exit with a zero exit code" is the rule
+            // a submitted program's run ends by, so what failed the run is that status and not
+            // the interpreter's class for an exit.
+            ends: Ends::Fails(vec![
+                "exited with status".to_string(),
+                "3".to_string(),
+            ]),
         },
     ]
 }

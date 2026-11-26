@@ -351,6 +351,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
         }
+        // ... and whether IAM lets the CALLER read this table is decided here, on the table the
+        // request names, before anything is looked up
+        // (`crate::state::identity_authorization`).
+        if let Some(message) = crate::state::identity_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::table_arn(&region, &catalog_id, &input.database_name, &input.name),
+        ) {
+            return Err(GetTableErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // The answer is built under the store's guard and the guard released before KMS
         // is asked anything: the key material travels out with the answer.
         let (table, encryption) = {

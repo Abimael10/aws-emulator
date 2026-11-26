@@ -209,6 +209,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // ... and whether IAM lets the CALLER create a database at all is decided here, on the
+        // database this request names, before anything is stored
+        // (`crate::state::identity_authorization`).
+        if let Some(message) = crate::state::identity_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::database_arn(&region, &catalog_id, &input.database_input.name),
+        ) {
+            return Err(CreateDatabaseErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // The catalog's security configuration is "applied to every catalog write
         // thereafter" (`PutDataCatalogEncryptionSettings`), so the key THIS write is
         // encrypted under is read from the stored setting and the database's data key

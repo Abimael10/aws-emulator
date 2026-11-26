@@ -54,6 +54,7 @@
 //! These modules add no host surface of their own: they reach the object store through the
 //! same SDK seam any guest call uses, and nothing else.
 
+mod catalog;
 mod column;
 mod context;
 mod dataset;
@@ -139,6 +140,10 @@ pub fn pyspark_modules_of(environment: SparkEnvironment<'_>) -> Vec<(String, Str
             defaults_source(environment.settings),
         ),
         ("pyspark/conf.py".to_string(), CONF_SOURCE.to_string()),
+        (
+            "pyspark/catalog.py".to_string(),
+            catalog::CATALOG_SOURCE.to_string(),
+        ),
         (
             "pyspark/filesystem.py".to_string(),
             filesystem::FILESYSTEM_SOURCE.to_string(),

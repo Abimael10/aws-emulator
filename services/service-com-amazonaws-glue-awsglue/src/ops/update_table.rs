@@ -308,6 +308,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
         }
+        // ... and whether IAM lets the CALLER write this table is decided here, on the table the
+        // request names, before anything is looked up or stored
+        // (`crate::state::identity_authorization`).
+        if let Some(message) = crate::state::identity_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::table_arn(
+                &region,
+                &catalog_id,
+                &input.database_name,
+                &table_input.name,
+            ),
+        ) {
+            return Err(UpdateTableErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // An update is a catalog WRITE, so it is encrypted under the key the catalog's
         // setting names NOW, not under the one the create used: "the specified encryption
         // is applied to every catalog write thereafter"

@@ -32,10 +32,15 @@
 //! are what the finished run left behind.
 //!
 //! The log's TEXT is the run's own persisted record — the submit, the identity that made
-//! it, the engine and release it was admitted on, and every state the clock moved it
-//! through with the `stateDetails` of each — rendered as a driver's log lines. It states
-//! what this service did and nothing it did not: the line for a terminal state carries the
-//! `stateDetails` that run's own execution answered with and nothing else. The driver's
+//! it, the engine and release it was admitted on, every state the clock moved it
+//! through with the `stateDetails` of each, and WHAT THE DRIVER ITSELF WROTE while the
+//! application executed ([`super::JobRunRecord::driver_output`]): a Spark driver's standard
+//! error is the application's own output and the exception it ended on, which is how a
+//! client finds out why a run failed and tells one failure class from another. Those lines
+//! are the application's own, carried as it wrote them and stamped and levelled by nobody.
+//! Around them the log states what this service did and nothing it did not: the line for a
+//! terminal state carries the `stateDetails` that run's own execution answered with and
+//! nothing else. The driver's
 //! `@sensitive` members (a `sparkSubmit` entry point and
 //! its parameters, a `hive` query) are deliberately left OUT of the published text: the
 //! value a caller marked sensitive is not written into an object a bucket policy exposes
@@ -103,6 +108,19 @@ const HIVE_ENGINE_TYPE: &str = "hive";
 /// magnitude above what any run can produce; past it a line is dropped rather than
 /// queued, so a record nobody reads cannot grow without limit.
 pub const MAX_JOB_RUN_LOG_EVENTS: usize = 32;
+
+/// How many lines of the DRIVER's own output one run's log keeps
+/// ([`super::JobRunRecord::record_driver_output`]).
+///
+/// The application's output is already bounded where it is produced — the interpreter keeps
+/// at most the characters per stream the run was given ([`super::spark_job_run`]) — so this
+/// is the second bound, on what the RECORD holds: a chatty application cannot grow a stored
+/// run without limit, and what is dropped is the oldest part of nothing, since the lines are
+/// taken from the start of the stream.
+pub const MAX_DRIVER_OUTPUT_LINES: usize = 2_000;
+
+/// How many characters of ONE such line are kept, for the same reason.
+pub const MAX_DRIVER_OUTPUT_LINE_CHARS: usize = 4_000;
 
 /// The scheme of the `s3://` URI a log destination is named by.
 const S3_SCHEME: &str = "s3";
@@ -293,6 +311,7 @@ pub fn driver_log_text(record: &JobRunRecord) -> String {
             run.created_by, run.execution_role
         ),
     ];
+    let mut driver_output = Some(&record.driver_output).filter(|output| !output.is_empty());
     for event in &record.log_events {
         let at = crate::state::now_timestamp(event.at)
             .fmt(::aws_smithy_types::date_time::Format::DateTime)
@@ -303,6 +322,21 @@ pub fn driver_log_text(record: &JobRunRecord) -> String {
             "{at} {level} Job run {} is {}. {details}",
             run.job_run_id, event.state
         ));
+        // What the DRIVER wrote belongs where it happened: the application executes while the
+        // run is `RUNNING`, so its own output stands between the line for that state and the
+        // line for the state the execution's outcome brought the run to. The lines are the
+        // application's own, carried as it wrote them — this service stamps and levels its
+        // OWN lines and neither re-words nor re-stamps the driver's.
+        if event.state == crate::state::RUNNING_JOB_RUN_STATE {
+            if let Some(output) = driver_output.take() {
+                lines.extend(output.iter().cloned());
+            }
+        }
+    }
+    // A run whose log holds no `RUNNING` line and whose driver wrote anyway — a record settled
+    // past that state — still reports what the driver wrote, after the lifecycle.
+    if let Some(output) = driver_output {
+        lines.extend(output.iter().cloned());
     }
     let mut text = lines.join("\n");
     text.push('\n');

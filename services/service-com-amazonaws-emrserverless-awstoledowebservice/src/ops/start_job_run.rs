@@ -377,6 +377,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartJobRun<Eng> 
                         configuration_overrides.as_ref(),
                     ),
                 log_events: Vec::new(),
+                // Nothing has executed the run's work yet, so its driver has written
+                // nothing (`crate::state::spark_job_run`).
+                driver_output: Vec::new(),
                 log_publication_due: false,
                 // The work this submit named is owed from the instant it was ACCEPTED,
                 // and it is handed off below, once this service's guard is released

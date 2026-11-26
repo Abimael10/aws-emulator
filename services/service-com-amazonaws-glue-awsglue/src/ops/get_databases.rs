@@ -414,6 +414,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
         }
+        // ... and whether IAM lets the CALLER list this catalog's databases is decided here. A
+        // listing addresses every database of the catalog it names, which is the resource a
+        // statement about it is written over (`crate::state::identity_authorization`).
+        if let Some(message) = crate::state::identity_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::database_arn(&region, &catalog_id, "*"),
+        ) {
+            return Err(GetDatabasesErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         // Absent `MaxResults`, page at the largest value the model accepts for it
         // (`CatalogGetterPageSize`, range 1..100). The clamp re-states that range in the
