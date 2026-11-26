@@ -188,7 +188,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateOnlineEvaluationConfigErrorModeled::InternalServerException(
                 InternalServerException {
@@ -196,7 +195,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
+
+        // The resource the PATH addresses is resolved BEFORE this operation's own judgement
+        // of the body, so an id naming no stored configuration is the modelled 404 whatever
+        // the body carries. Decided under its own guard, which is DROPPED before the
+        // cross-service call below — a lock is not held across an await — and the
+        // configuration is read again under the guard that WRITES, because nothing promises
+        // it is still there.
+        {
+            let mut store = state.lock();
+            // A configuration whose accepted deletion the clock has already made due is gone
+            // before this call looks for it, so a change asked of it is the modelled 404.
+            store.expire_deleted_online_evaluation_configs(now);
+            if !store
+                .online_evaluation_configs
+                .contains_key(&input.online_evaluation_config_id)
+            {
+                return Err(
+                    UpdateOnlineEvaluationConfigErrorModeled::ResourceNotFoundException(
+                        crate::state::online_evaluation_config_not_found(),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // An update that replaces the execution role resolves the role it would store
+        // against this account's IAM before anything is written — the same gate
+        // `CreateOnlineEvaluationConfig` applies to the role it stores, because the
+        // evaluation runs as whichever role the configuration ends up carrying.
+        if let Some(role_arn) = input.evaluation_execution_role_arn.as_deref() {
+            if crate::state::execution_role_is_unassumable(ctx, &region, role_arn).await {
+                return Err(
+                    UpdateOnlineEvaluationConfigErrorModeled::ValidationException(
+                        crate::state::evaluation_execution_role_validation_failed(),
+                    )
+                    .into(),
+                );
+            }
+        }
+
         let mut store = state.lock();
         // A configuration whose accepted deletion the clock has already made due is gone
         // before this call looks for it, so a change asked of it is the modelled 404.

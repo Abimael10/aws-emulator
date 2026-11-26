@@ -175,14 +175,14 @@ struct Row {
     body: Value,
 }
 
-/// The rows: configurations that differ in the members they carry, in whether their
-/// evaluation was running, in the length of their name, and in what the configuration was
-/// doing when the deletion was asked of it.
+/// The rows: configurations that differ in the members they carry, in which of the two
+/// evaluation subjects they name, in whether their evaluation was running, in the length of
+/// their name, and in what the configuration was doing when the deletion was asked of it.
 fn rows() -> Vec<Row> {
     vec![
         Row {
-            case: "a configuration with the required members alone, deleted while still \
-                   settling",
+            case: "a configuration with the required members and one evaluator alone, deleted \
+                   while still settling",
             settled_first: false,
             body: json!({
                 "onlineEvaluationConfigName": "minimalDeleted",
@@ -191,6 +191,7 @@ fn rows() -> Vec<Row> {
                     "serviceNames": ["agentservice"],
                     "logGroupNames": ["/aws/agentcore/minimal"]
                 })),
+                "evaluators": [{"evaluatorId": "Builtin.Correctness"}],
                 "evaluationExecutionRoleArn": EXECUTION_ROLE,
                 "enableOnCreate": false
             }),
@@ -212,7 +213,6 @@ fn rows() -> Vec<Row> {
                     "logGroupNames": ["/aws/agentcore/one", "/aws/agentcore/two"]
                 })),
                 "evaluators": [{"evaluatorId": "Builtin.Correctness"}],
-                "insights": [{"insightId": "Builtin.TopicClusters"}],
                 "clusteringConfig": {"frequencies": ["DAILY"]},
                 "outputConfig": {"cloudWatchConfig": {
                     "logGroupName": "/aws/agentcore/evaluations",
@@ -238,6 +238,7 @@ fn rows() -> Vec<Row> {
                     "logGroupNamePrefixes": ["/aws/agentcore/"]
                 })),
                 "evaluators": [],
+                "insights": [{"insightId": "Builtin.TopicClusters"}],
                 "evaluationExecutionRoleArn": EXECUTION_ROLE,
                 "enableOnCreate": true
             }),
@@ -365,6 +366,7 @@ async fn deleting_an_id_naming_no_config_is_not_found() {
                 "serviceNames": ["agentservice"],
                 "logGroupNames": ["/aws/agentcore/held"]
             })),
+            "evaluators": [{"evaluatorId": "Builtin.Correctness"}],
             "evaluationExecutionRoleArn": EXECUTION_ROLE,
             "enableOnCreate": false
         }),
@@ -435,6 +437,7 @@ async fn a_config_being_deleted_refuses_a_change() {
                 "serviceNames": ["agentservice"],
                 "logGroupNames": ["/aws/agentcore/deleting"]
             })),
+            "evaluators": [{"evaluatorId": "Builtin.Correctness"}],
             "evaluationExecutionRoleArn": EXECUTION_ROLE,
             "enableOnCreate": true
         }),

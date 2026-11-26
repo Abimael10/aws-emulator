@@ -94,3 +94,35 @@ Cause 5 — CreateOnlineEvaluationConfig, bedrock-agentcore-control-online-evalu
 5. Cause 3: replay fixture bedrock-agentcore-control-not-found-error-paths to step task#3 — GET /online-evaluation-configs/{onlineEvaluationConfigId} for an id that was never created; the 404 message interpolates the id instead of being AWS's fixed 'Online evaluation configuration not found'.
 6. Cause 4: replay fixture bedrock-agentcore-control-online-evaluation-config-create-validation-errors step task#1 — POST /online-evaluation-configs/create with required name, rule, dataSourceConfig, evaluationExecutionRoleArn and enableOnCreate but with NEITHER evaluators nor insights; the emulator answers 202 and creates the config instead of 400 ValidationException.
 7. Cause 5: same fixture, step task#2 — POST /online-evaluation-configs/create with a syntactically valid evaluationExecutionRoleArn that cannot be assumed; the emulator answers 409 ConflictException (duplicate name) instead of 400 ValidationException about the unassumable execution role. Step task#3 repeats it.
+
+## Resolution
+
+Causes 4 and 5 are fixed by this change, both in `CreateOnlineEvaluationConfig`'s input
+validation, ahead of the duplicate-name conflict:
+
+- a create now has to name exactly one of `evaluators` / `insights`, else it is refused
+  `ValidationException` (400) with `Exactly one of evaluators or insights must be provided`
+  and nothing is persisted (`state/online_evaluation_configs.rs`
+  `names_one_evaluation_subject` / `evaluation_subject_validation_failed`);
+- the `evaluationExecutionRoleArn` is now resolved against this account's IAM through the
+  shared reading every write of this service that stores a role it runs as uses
+  (`state::execution_role_is_unassumable`), and a role IAM answers cannot be assumed is
+  refused `ValidationException` (400) with `The provided execution role cannot be assumed.
+  Please verify the role exists and its trust policy allows this service to assume it.`
+  `UpdateOnlineEvaluationConfig` applies the same gate to the role it would store.
+
+Causes 1, 2 and 3 were already closed on mainline by the time this issue was picked up:
+`UpdateGatewayRateLimit` renders both `DateTimestamp` members through `state::timestamp` and
+the operation's member schemas (pinned by
+`tests/all/gateway_rate_limit_wire_shape.rs::every_reported_rate_limit_date_time_member_is_an_rfc3339_string`,
+which covers the update envelope), its not-found path raises
+`state::gateway_rate_limit_not_found` (`Rate limit not found: <rateLimitId>`, pinned by
+`tests/all/gateway_rate_limit_update.rs`), and
+`state::online_evaluation_config_not_found` is the fixed `Online evaluation configuration
+not found` (pinned by `tests/all/online_evaluation_config_lifecycle.rs`). The replay of the
+two online-evaluation-config fixtures and of
+`bedrock-agentcore-control-not-found-error-paths` passes; the rate-limit fixture still
+diverges at its own `setup#2` on `CreateGateway`'s `$.gatewayUrl`, a cause this issue does
+not carry and which
+`20261102T055559Z-bedrock-agentcore-control-creategateway-and-getgateway-gateway-representation-diverges-gatewayurl-carries.md`
+owns, so its `UpdateGatewayRateLimit` steps are never graded.

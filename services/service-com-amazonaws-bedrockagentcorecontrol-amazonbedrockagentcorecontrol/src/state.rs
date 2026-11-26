@@ -4511,8 +4511,11 @@ pub fn role_validation_failed(role_arn: &str) -> ValidationException {
 ///
 /// Not every `roleArn` of this service is gated on it: the recorded service
 /// ACCEPTS a `CreateGateway` whose role cannot be assumed, so only the
-/// operations that store an agent runtime's execution role
-/// (`CreateAgentRuntime`, `UpdateAgentRuntime`) call this.
+/// operations that store a role the service itself RUNS AS — an agent runtime's
+/// execution role (`CreateAgentRuntime`, `UpdateAgentRuntime`) and an online
+/// evaluation's (`CreateOnlineEvaluationConfig`,
+/// `UpdateOnlineEvaluationConfig`) — call this. Each family words its own
+/// refusal, which is why this answers only the question.
 ///
 /// `false` means the request may be written. That includes every case where
 /// nothing is KNOWN about the role — a value that names no IAM role of this

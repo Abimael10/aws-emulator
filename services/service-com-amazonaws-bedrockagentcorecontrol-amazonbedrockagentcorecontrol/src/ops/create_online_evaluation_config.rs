@@ -205,6 +205,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
+
+        // An online evaluation evaluates sampled sessions EITHER against evaluators OR
+        // through insight analyses, so a create has to name exactly one of the two lists:
+        // one naming neither asks for an evaluation with nothing to do, and one naming both
+        // asks for two evaluations at once. Either way nothing is persisted
+        // (`crate::state::names_one_evaluation_subject`).
+        if !crate::state::names_one_evaluation_subject(
+            input.evaluators.as_deref(),
+            input.insights.as_deref(),
+        ) {
+            return Err(
+                CreateOnlineEvaluationConfigErrorModeled::ValidationException(
+                    crate::state::evaluation_subject_validation_failed(),
+                )
+                .into(),
+            );
+        }
+
+        // The evaluation this configuration describes RUNS AS the role the caller names, so
+        // the role is resolved against this account's IAM before anything is written — the
+        // same gate every write of this service that stores an execution role applies
+        // (`crate::state::execution_role_is_unassumable`). It is settled BEFORE the store is
+        // locked, both because a lock is not held across an await and because a role this
+        // service cannot assume is a fault in the request itself, decided ahead of what this
+        // account already holds.
+        if crate::state::execution_role_is_unassumable(
+            ctx,
+            &region,
+            &input.evaluation_execution_role_arn,
+        )
+        .await
+        {
+            return Err(
+                CreateOnlineEvaluationConfigErrorModeled::ValidationException(
+                    crate::state::evaluation_execution_role_validation_failed(),
+                )
+                .into(),
+            );
+        }
+
         let mut store = state.lock();
         // A configuration whose accepted deletion the clock has already made due is gone
         // before this create looks at the names this account holds, so the name it reserved is

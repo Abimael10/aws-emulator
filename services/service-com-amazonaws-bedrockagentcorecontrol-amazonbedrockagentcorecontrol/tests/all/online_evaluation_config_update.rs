@@ -153,7 +153,8 @@ fn status_conflict_message(id: &str, status: &str) -> String {
 
 /// The configuration a create carries, which every row of the patch table starts from: every
 /// member an update can replace is set here, so an omitted member has a stored value to be
-/// left at.
+/// left at — bar `insights`, which a create may not name beside `evaluators`, exactly one of
+/// the two being what a configuration evaluates.
 fn base_body(name: &str, enable_on_create: bool) -> Value {
     json!({
         "onlineEvaluationConfigName": name,
@@ -171,7 +172,6 @@ fn base_body(name: &str, enable_on_create: bool) -> Value {
             "logGroupNames": ["/aws/agentcore/as-created"]
         })),
         "evaluators": [{"evaluatorId": "Builtin.Correctness"}],
-        "insights": [{"insightId": "Builtin.TopicClusters"}],
         "clusteringConfig": {"frequencies": ["DAILY"]},
         "outputConfig": {"cloudWatchConfig": {
             "logGroupName": "/aws/agentcore/as-created",

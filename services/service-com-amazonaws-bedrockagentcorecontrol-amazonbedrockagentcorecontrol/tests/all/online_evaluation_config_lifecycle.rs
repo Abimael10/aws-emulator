@@ -124,13 +124,15 @@ struct Row {
     body: Value,
 }
 
-/// The rows: creates that differ in the members they carry, the sizes of the lists in them,
-/// the form of the data source, the sampling percentage (each published bound of
-/// `SamplingPercentage`'s 0.01..100 range) and the name's length.
+/// The rows: creates that differ in the members they carry, which of the two evaluation
+/// subjects they name, the sizes of the lists in them, the form of the data source, the
+/// sampling percentage (each published bound of `SamplingPercentage`'s 0.01..100 range) and
+/// the name's length.
 fn rows() -> Vec<Row> {
     vec![
         Row {
-            case: "the required members alone, at the sampling range's minimum",
+            case: "the required members and one evaluator alone, at the sampling range's \
+                   minimum",
             body: json!({
                 "onlineEvaluationConfigName": "minimalConfig",
                 "rule": {"samplingConfig": {"samplingPercentage": 0.01}},
@@ -138,6 +140,7 @@ fn rows() -> Vec<Row> {
                     "serviceNames": ["agentservice"],
                     "logGroupNames": ["/aws/agentcore/minimal"]
                 })),
+                "evaluators": [{"evaluatorId": "Builtin.Correctness"}],
                 "evaluationExecutionRoleArn": EXECUTION_ROLE,
                 "enableOnCreate": false
             }),
@@ -165,7 +168,6 @@ fn rows() -> Vec<Row> {
                     {"evaluatorId": "Builtin.Correctness"},
                     {"evaluatorId": "ThirdParty.vendor.quality"}
                 ],
-                "insights": [{"insightId": "Builtin.TopicClusters"}],
                 "clusteringConfig": {"frequencies": ["DAILY", "WEEKLY", "MONTHLY"]},
                 "outputConfig": {"cloudWatchConfig": {
                     "logGroupName": "/aws/agentcore/evaluations",
@@ -178,8 +180,9 @@ fn rows() -> Vec<Row> {
             }),
         },
         Row {
-            case: "a name at the member's maximum length, the prefix form of the data source \
-                   and the lists at their minimum size",
+            case: "a name at the member's maximum length, the prefix form of the data source, \
+                   insights as the evaluation subject and the evaluator list at its minimum \
+                   size",
             body: json!({
                 // `EvaluationConfigName` is `^[a-zA-Z][a-zA-Z0-9_]{0,47}$`.
                 "onlineEvaluationConfigName": format!("c{}", "x".repeat(47)),
@@ -195,7 +198,7 @@ fn rows() -> Vec<Row> {
                     "logGroupNamePrefixes": ["/aws/agentcore/", "/aws/lambda/"]
                 })),
                 "evaluators": [],
-                "insights": [],
+                "insights": [{"insightId": "Builtin.TopicClusters"}],
                 "clusteringConfig": {"frequencies": []},
                 "evaluationExecutionRoleArn": EXECUTION_ROLE,
                 "enableOnCreate": true
@@ -355,6 +358,7 @@ async fn the_execution_status_follows_enable_on_create() {
                 "serviceNames": ["agentservice"],
                 "logGroupNames": ["/aws/agentcore/enablement"]
             })),
+            "evaluators": [{"evaluatorId": "Builtin.Correctness"}],
             "evaluationExecutionRoleArn": EXECUTION_ROLE,
             "enableOnCreate": enable_on_create
         });
@@ -390,6 +394,7 @@ async fn a_name_this_account_already_holds_is_a_conflict() {
             "serviceNames": ["agentservice"],
             "logGroupNames": ["/aws/agentcore/first"]
         })),
+        "evaluators": [{"evaluatorId": "Builtin.Correctness"}],
         "evaluationExecutionRoleArn": EXECUTION_ROLE,
         "enableOnCreate": false
     });
@@ -442,6 +447,7 @@ async fn a_repeated_client_token_answers_with_the_first_config() {
             "serviceNames": ["agentservice"],
             "logGroupNames": ["/aws/agentcore/idempotent"]
         })),
+        "evaluators": [{"evaluatorId": "Builtin.Correctness"}],
         "evaluationExecutionRoleArn": EXECUTION_ROLE,
         "enableOnCreate": false
     });
@@ -486,6 +492,7 @@ async fn an_id_naming_no_config_is_not_found() {
                 "serviceNames": ["agentservice"],
                 "logGroupNames": ["/aws/agentcore/held"]
             })),
+            "evaluators": [{"evaluatorId": "Builtin.Correctness"}],
             "evaluationExecutionRoleArn": EXECUTION_ROLE,
             "enableOnCreate": false
         }),
@@ -552,6 +559,7 @@ async fn a_created_config_settles_from_creating_to_active() {
                 "serviceNames": ["agentservice"],
                 "logGroupNames": ["/aws/agentcore/settling"]
             })),
+            "evaluators": [{"evaluatorId": "Builtin.Correctness"}],
             "evaluationExecutionRoleArn": EXECUTION_ROLE,
             "enableOnCreate": true
         }),

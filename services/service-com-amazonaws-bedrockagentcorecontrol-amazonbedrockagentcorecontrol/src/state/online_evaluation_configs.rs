@@ -106,6 +106,76 @@ pub fn online_evaluation_config_not_found() -> ResourceNotFoundException {
     }
 }
 
+/// How a create states that it was not told what the online evaluation should evaluate.
+///
+/// `evaluators` ("The list of evaluators to apply during online evaluation") and `insights`
+/// ("The list of insight types to run against agent sessions") are the two lists a
+/// configuration names its evaluation subject in, and they are alternatives: one evaluates
+/// each sampled session against evaluators, the other runs insight analyses over the
+/// sessions. Both are optional in the model
+/// (`smithy_query operation=CreateOnlineEvaluationConfig`), which states no rule between
+/// them, so this is the service's own: the sentence is FIXED, names the two members and
+/// echoes nothing of the request, because the remedy is the same whichever way the request
+/// got it wrong.
+const EVALUATION_SUBJECT_MESSAGE: &str = "Exactly one of evaluators or insights must be provided";
+
+/// The modelled validation error for a create that names neither evaluation subject, or
+/// both.
+///
+/// `reason` is [`VALIDATION_REASON_FIELD_VALIDATION_FAILED`] — members of the request are
+/// what is wrong with it — and there is no `fieldList`: the fault is not in either list on
+/// its own but in the pair of them, which no single `fieldList` entry can name.
+pub fn evaluation_subject_validation_failed() -> ValidationException {
+    ValidationException {
+        message: EVALUATION_SUBJECT_MESSAGE.to_string(),
+        reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: None,
+    }
+}
+
+/// Whether a create names EXACTLY ONE of the two evaluation subjects — the rule
+/// [`evaluation_subject_validation_failed`] refuses a request for breaking.
+///
+/// A list is "provided" when it names at least one evaluator or insight: an AWS SDK carries
+/// an unset list as an empty one, so a service cannot tell `[]` from a member the request
+/// omitted, and a configuration whose list is empty names nothing to evaluate either way.
+pub fn names_one_evaluation_subject(
+    evaluators: Option<&[EvaluatorReference]>,
+    insights: Option<&[Insight]>,
+) -> bool {
+    let evaluators = evaluators.is_some_and(|named| !named.is_empty());
+    let insights = insights.is_some_and(|named| !named.is_empty());
+    evaluators != insights
+}
+
+/// How a write of an online evaluation configuration states that the execution role it was
+/// given is not one this service can take on.
+///
+/// `evaluationExecutionRoleArn` is the role "that grants permissions to read from CloudWatch
+/// logs, write evaluation results, and invoke Amazon Bedrock models for evaluation"
+/// (`smithy_query doc shape=CreateOnlineEvaluationConfigRequest
+/// member=evaluationExecutionRoleArn`), so the evaluation RUNS AS it. The sentence is FIXED
+/// and quotes no value back: it states both halves of the fault — the role may not be there,
+/// or may not let this service assume it — which is exactly what
+/// [`super::execution_role_is_unassumable`] answers as one question.
+const EVALUATION_EXECUTION_ROLE_MESSAGE: &str =
+    "The provided execution role cannot be assumed. Please verify the role exists and its \
+     trust policy allows this service to assume it.";
+
+/// The modelled validation error for an evaluation execution role this service could not
+/// assume.
+///
+/// `reason` is [`VALIDATION_REASON_FIELD_VALIDATION_FAILED`] — the request member names a
+/// role this service cannot use — and there is no `fieldList`, because the sentence already
+/// names the role class and nothing else about the request failed.
+pub fn evaluation_execution_role_validation_failed() -> ValidationException {
+    ValidationException {
+        message: EVALUATION_EXECUTION_ROLE_MESSAGE.to_string(),
+        reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: None,
+    }
+}
+
 /// The modelled conflict for a change asked of an online evaluation configuration whose own
 /// asynchronous work is still under way: the configuration is not `ACTIVE`, so the request
 /// collides with the operation already running on it, exactly as a change asked of a busy
