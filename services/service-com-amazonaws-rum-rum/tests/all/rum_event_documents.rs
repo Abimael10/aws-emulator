@@ -4,9 +4,10 @@
 //!
 //! The rule under test: an event `PutRumEvents` accepts is reported by
 //! `GetAppMonitorData` as the service's own RUM event document — the fields RUM publishes
-//! for a RUM event, each computed from the delivered batch and from the app monitor's
-//! stored state, with the event's instant as `event_timestamp` in MILLISECONDS since the
-//! epoch, which is the unit `TimeRange`'s bounds are expressed in. The client's own
+//! for a RUM event, each computed from the delivered batch, from the app monitor's stored
+//! state and from what the service itself knows about the delivery, with the event's
+//! instant as `event_timestamp` in MILLISECONDS since the epoch, which is the unit
+//! `TimeRange`'s bounds are expressed in. The client's own
 //! `{id, timestamp, type, metadata, details}` structure is not what a reader gets back.
 //!
 //! The fields are the first-level keys the model enumerates for a RUM event
@@ -18,12 +19,29 @@
 //! the application's id spelled `application_id` as the wire document spells it, and the
 //! `metadata_keys` / `metadata_values` projections of `metadata` beside it.
 //!
+//! Four of those fields are the SERVICE's own derivations rather than anything echoed, and
+//! each is pinned here and by a test of its own below:
+//!
+//! * `log_stream` carries the event's INSTANT as `{"seconds": …, "nanos": …}`, not the name
+//!   of the CloudWatch Logs stream a batch's copies accumulate in;
+//! * `metadata` is the client's document ENRICHED with where the caller is —
+//!   `countryCode`, `subdivisionCode` and `localityName`, the members no client serializes
+//!   and the first of which the model names as the extended-metric dimension
+//!   `"metadata.countryCode": "CountryCode"` (`smithy_query(query="doc",
+//!   shape="MetricDefinitionRequest", member="DimensionKeys")`) and as the attribute
+//!   `GetAppMonitorData`'s `Country` filter searches;
+//! * `metadata_values` carries one `<key>=<value>` text per first-level member of
+//!   `metadata`, positionally aligned with `metadata_keys`;
+//! * `event_interaction` is the IDENTIFIER of the interaction the event belongs to,
+//!   percent-encoded, and not the interaction counter a client's payload carries beside it.
+//!
 //! The rows span what the rule generalises over: whether the batch carries `metadata` at
 //! all, whether that metadata is a JSON object, the TYPES its values have, whether the
 //! client stamped a schema version or an interaction on the event (and in which of the two
-//! documents), whether the batch names a user session, the shape of `details` (an object, a
-//! nested one, an array, text that is no JSON at all), and the value of the instant (an
-//! ordinary one, one with a subsecond part, one before the epoch).
+//! documents, and with or without a parent interaction), whether the batch names a user
+//! session, the shape of `details` (an object, a nested one, an array, text that is no JSON
+//! at all), and the value of the instant (an ordinary one, one with a subsecond part, one
+//! before the epoch).
 //!
 //! Each row also asserts the unit: the window that covers the event in MILLISECONDS does,
 //! and the same instant read as SECONDS covers nothing.
@@ -37,6 +55,20 @@ use crate::support::{call, create, emulator, ACCOUNT};
 /// restJson1 carries a `Timestamp` as, while the document and the query window are in epoch
 /// milliseconds.
 const MILLIS_PER_SECOND: i64 = 1_000;
+
+/// How many nanoseconds one millisecond is: the unit `log_stream`'s subsecond member is in.
+const NANOS_PER_MILLI: i64 = 1_000_000;
+
+/// The members RUM adds to an event's `metadata` for where the caller is, in the order the
+/// recorded document carries them.
+///
+/// Source: the recorded enriched document, whose `metadata` carries these three beside the
+/// members the client serialized; the model names the first of them as an extended-metric
+/// dimension (`"metadata.countryCode": "CountryCode"`, `smithy_query(query="doc",
+/// shape="MetricDefinitionRequest", member="DimensionKeys")`). Their VALUES are the
+/// environment's, so no value is stated here: what is asserted is that the service adds
+/// them and what KIND of text each is.
+const CALLER_LOCATION_MEMBERS: [&str; 3] = ["countryCode", "subdivisionCode", "localityName"];
 
 /// One delivered event, and the document the read then owes for it.
 struct Row {
@@ -64,9 +96,11 @@ struct Row {
     /// The `event_version` the document must report: the version the client stamped its
     /// payload with, where it stamped one.
     event_version: Option<&'static str>,
-    /// The `event_interaction` the document must report: the interaction the client
-    /// reported, and the session's zeroth where it reported none.
-    interaction: Value,
+    /// The `event_interaction` the document must report: the percent-encoded identifier of
+    /// the interaction the event belongs to, the separator, and the identifier of the
+    /// interaction it descends from — and no identifier at all for an event that names
+    /// none, whatever interaction COUNTER its payload carries.
+    interaction: &'static str,
 }
 
 impl Row {
@@ -106,19 +140,33 @@ impl Row {
         })
     }
 
-    /// `metadata` as the document reports it: the document the client serialized, and
-    /// nothing at all for an event that carried none.
-    fn reported_metadata(&self) -> Value {
-        match self.metadata {
+    /// `metadata` as the document reports it: the document the client serialized with the
+    /// caller's location added to it, the empty document plus that location for an event
+    /// that carried none, and metadata the client did not serialize as an object exactly as
+    /// it arrived, since such a document has no members to add any to.
+    fn reported_metadata(&self, location: &Map<String, Value>) -> Value {
+        let mut carried = match self.metadata {
             Some(metadata) => as_json(metadata),
             None => json!({}),
+        };
+        if let Some(members) = carried.as_object_mut() {
+            for (member, value) in location {
+                members.insert(member.clone(), value.clone());
+            }
         }
+        carried
     }
 
     /// The whole document the read owes for this row's event, for the monitor
-    /// `monitor`/`monitor_id` it was delivered to.
-    fn expected_document(&self, monitor: &str, monitor_id: &str) -> Value {
-        let metadata = self.reported_metadata();
+    /// `monitor`/`monitor_id` it was delivered to and the caller location `location` the
+    /// service reported for it.
+    fn expected_document(
+        &self,
+        monitor: &str,
+        monitor_id: &str,
+        location: &Map<String, Value>,
+    ) -> Value {
+        let metadata = self.reported_metadata(location);
         let (keys, values) = projections(&metadata);
         let mut document = json!({
             "application_id": monitor_id,
@@ -126,7 +174,7 @@ impl Row {
             "event_id": self.event_id,
             "event_timestamp": self.millis,
             "event_type": self.event_type,
-            "log_stream": self.session_id.unwrap_or(monitor_id),
+            "log_stream": instant_of(self.millis),
             "batch_id": self.batch_id,
             "metadata": metadata,
             "metadata_keys": keys,
@@ -134,7 +182,7 @@ impl Row {
             "event_details": as_json(self.details),
             "user_details": {},
             "account_id": ACCOUNT,
-            "event_interaction": self.interaction.clone(),
+            "event_interaction": self.interaction,
         });
         if let Some(version) = self.version {
             document["application_version"] = json!(version);
@@ -160,28 +208,71 @@ fn as_json(text: &str) -> Value {
     serde_json::from_str(text).unwrap_or_else(|_| json!(text))
 }
 
+/// The instant `millis` since the epoch as `log_stream` carries it: the whole second it
+/// falls in and the nanoseconds within that second, so an instant with a subsecond part
+/// keeps it and one before the epoch names the second BELOW it.
+fn instant_of(millis: i64) -> Value {
+    json!({
+        "seconds": millis.div_euclid(MILLIS_PER_SECOND),
+        "nanos": millis.rem_euclid(MILLIS_PER_SECOND) * NANOS_PER_MILLI,
+    })
+}
+
 /// The `metadata_keys` / `metadata_values` projections of a metadata document: its
-/// first-level keys in the order it holds them, and each of its values as the text it is
-/// written as. Metadata that is no JSON object has no first-level keys, so it projects
-/// nothing.
+/// first-level keys in the order it holds them, and the `<key>=<value>` text of the member
+/// at each of those positions. Metadata that is no JSON object has no first-level keys, so
+/// it projects nothing.
 fn projections(metadata: &Value) -> (Vec<Value>, Vec<Value>) {
     metadata
         .as_object()
         .map(|members| {
             members
                 .iter()
-                .map(|(key, value)| {
-                    (
-                        json!(key),
-                        match value {
-                            Value::String(text) => json!(text),
-                            other => json!(other.to_string()),
-                        },
-                    )
-                })
+                .map(|(key, value)| (json!(key), json!(format!("{key}={}", value_text(value)))))
                 .unzip()
         })
         .unwrap_or_default()
+}
+
+/// One metadata value as the text a projection carries it as: a string as itself, every
+/// other JSON value as the text it is written as.
+fn value_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// The caller location `document`'s metadata reports, asserting the service added all three
+/// members and that each is the kind of text it names: an ISO 3166-1 alpha-2 country code
+/// (two uppercase letters), a non-empty subdivision code and a non-empty locality name.
+fn caller_location(case: &str, document: &Value) -> Map<String, Value> {
+    let metadata = document["metadata"].as_object().unwrap_or_else(|| {
+        panic!("case {case:?}: expected the document's metadata to be an object, got {document}")
+    });
+    let mut location = Map::new();
+    for member in CALLER_LOCATION_MEMBERS {
+        let value = metadata.get(member).unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected RUM to add {member:?} to the event's metadata, got \
+                 {document}"
+            )
+        });
+        let text = value.as_str().unwrap_or_else(|| {
+            panic!("case {case:?}: expected {member:?} to be a text, got {value}")
+        });
+        assert!(
+            !text.is_empty(),
+            "case {case:?}: expected {member:?} to name somewhere, got {text:?}"
+        );
+        location.insert(member.to_string(), json!(text));
+    }
+    let country = location["countryCode"].as_str().unwrap_or_default();
+    assert!(
+        country.len() == 2 && country.chars().all(|letter| letter.is_ascii_uppercase()),
+        "case {case:?}: expected countryCode to be an ISO 3166-1 alpha-2 code, got {country:?}"
+    );
+    location
 }
 
 /// The rows every case below delivers.
@@ -201,9 +292,12 @@ fn rows() -> Vec<Row> {
                 "{\"version\":\"1.0.0\",\"pageId\":\"/home\",\"browserName\":\"Chrome\",\
                  \"interaction\":3}",
             ),
-            details: "{\"version\":\"1.0.0\",\"pageId\":\"/home\"}",
+            details: "{\"version\":\"1.0.0\",\"pageId\":\"/home\",\
+                      \"pageInteractionId\":\"/home-0\",\"interaction\":0.0}",
             event_version: Some("1.0.0"),
-            interaction: json!(3),
+            // The identifier names the interaction; the counters both documents carry are
+            // not it.
+            interaction: "%2Fhome-0 &",
         },
         Row {
             case: "an event carrying no metadata at all",
@@ -220,7 +314,7 @@ fn rows() -> Vec<Row> {
             // The details are the event's own, so a version stamped there is the event's
             // version even when the session's metadata is absent.
             event_version: Some("0.9.0"),
-            interaction: json!(0),
+            interaction: "",
         },
         Row {
             case: "metadata whose values are not all strings",
@@ -237,7 +331,8 @@ fn rows() -> Vec<Row> {
             ),
             details: "{\"request\":{\"method\":\"GET\",\"status\":200}}",
             event_version: None,
-            interaction: json!(7),
+            // An interaction COUNTER names no interaction, so this event belongs to none.
+            interaction: "",
         },
         Row {
             case: "a batch that names no session, no user and no version",
@@ -252,7 +347,7 @@ fn rows() -> Vec<Row> {
             metadata: Some("{\"browserName\":\"Edge\"}"),
             details: "{}",
             event_version: None,
-            interaction: json!(0),
+            interaction: "",
         },
         Row {
             case: "details that are a JSON array",
@@ -267,7 +362,7 @@ fn rows() -> Vec<Row> {
             metadata: Some("{\"version\":\"1.2.3\"}"),
             details: "[1,2,3]",
             event_version: Some("1.2.3"),
-            interaction: json!(0),
+            interaction: "",
         },
         Row {
             case: "metadata and details that are no JSON at all",
@@ -282,10 +377,10 @@ fn rows() -> Vec<Row> {
             metadata: Some("not a document"),
             details: "neither is this",
             event_version: None,
-            interaction: json!(0),
+            interaction: "",
         },
         Row {
-            case: "an instant carrying a subsecond part",
+            case: "an instant carrying a subsecond part, and an interaction with a parent",
             batch_id: "77777777-2222-4333-8444-555555555555",
             user_id: Some("cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee"),
             session_id: Some("dddddddd-eeee-4ddd-8ccc-bbbbbbbbbbbb"),
@@ -295,9 +390,10 @@ fn rows() -> Vec<Row> {
             millis: 1_704_085_200_750,
             event_type: "com.amazon.rum.page_view_event",
             metadata: Some("{\"pageId\":\"/pricing\"}"),
-            details: "{\"pageTitle\":\"Pricing\"}",
+            details: "{\"pageTitle\":\"Pricing\",\"pageInteractionId\":\"/pricing-2\",\
+                      \"parentPageInteractionId\":\"/home-0\"}",
             event_version: None,
-            interaction: json!(0),
+            interaction: "%2Fpricing-2 &%2Fhome-0",
         },
         Row {
             case: "an instant before the epoch",
@@ -312,7 +408,37 @@ fn rows() -> Vec<Row> {
             metadata: Some("{\"pageId\":\"/past\"}"),
             details: "{\"pageTitle\":\"Past\"}",
             event_version: None,
-            interaction: json!(0),
+            interaction: "",
+        },
+        Row {
+            case: "an interaction identifier whose text has to be encoded",
+            batch_id: "99999999-3333-4333-8444-555555555555",
+            user_id: Some("cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee"),
+            session_id: Some("dddddddd-eeee-4ddd-8ccc-bbbbbbbbbbbb"),
+            version: Some("1.0.0"),
+            event_id: "99111111-1234-4234-8234-123456789012",
+            timestamp: json!(1_704_088_800_i64),
+            millis: 1_704_088_800_000,
+            event_type: "com.amazon.rum.page_view_event",
+            metadata: Some("{\"pageId\":\"/search\"}"),
+            details: "{\"pageInteractionId\":\"/search?q=a b&c-1\"}",
+            event_version: None,
+            interaction: "%2Fsearch%3Fq%3Da%20b%26c-1 &",
+        },
+        Row {
+            case: "an interaction only the session's metadata names",
+            batch_id: "aaaaaaaa-3333-4333-8444-555555555555",
+            user_id: Some("cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee"),
+            session_id: Some("dddddddd-eeee-4ddd-8ccc-bbbbbbbbbbbb"),
+            version: Some("1.0.0"),
+            event_id: "aa111111-1234-4234-8234-123456789012",
+            timestamp: json!(1_704_092_400_i64),
+            millis: 1_704_092_400_000,
+            event_type: "com.amazon.rum.page_view_event",
+            metadata: Some("{\"pageInteractionId\":\"/cart-3\"}"),
+            details: "{\"pageTitle\":\"Cart\"}",
+            event_version: None,
+            interaction: "%2Fcart-3 &",
         },
     ]
 }
@@ -335,19 +461,25 @@ async fn deliver(router: &MultiServiceRouter, case: &str, monitor_id: &str, body
 }
 
 /// The documents `GetAppMonitorData` reports for `monitor` over the window `[after,
-/// before]`, both in milliseconds since the epoch.
-async fn reported(
+/// before]`, both in milliseconds since the epoch, narrowed by `filters` when a case names
+/// any.
+async fn selected(
     router: &MultiServiceRouter,
     case: &str,
     monitor: &str,
     after: i64,
     before: i64,
+    filters: Option<Value>,
 ) -> Vec<Value> {
+    let mut body = json!({"TimeRange": {"After": after, "Before": before}});
+    if let Some(filters) = filters {
+        body["Filters"] = filters;
+    }
     let reply = call(
         router,
         "POST",
         &format!("/appmonitor/{monitor}/data"),
-        Some(json!({"TimeRange": {"After": after, "Before": before}})),
+        Some(body),
     )
     .await;
     assert_eq!(
@@ -370,6 +502,17 @@ async fn reported(
             })
         })
         .collect()
+}
+
+/// The same read with no filters at all.
+async fn reported(
+    router: &MultiServiceRouter,
+    case: &str,
+    monitor: &str,
+    after: i64,
+    before: i64,
+) -> Vec<Value> {
+    selected(router, case, monitor, after, before, None).await
 }
 
 /// The field names a document carries, sorted — what a missing or an extra field shows up
@@ -414,7 +557,17 @@ async fn every_accepted_event_is_reported_as_the_rum_event_document() {
              accepted event, got {documents:?}",
             row.case
         );
-        let expected = row.expected_document(&monitor, &monitor_id);
+        // Where the caller is, as the service reported it: the three members and the kind
+        // of text each is are the requirement, while the place itself is the
+        // environment's.
+        let location = if row.metadata == Some("not a document") {
+            // Metadata the client did not serialize as an object has no members for the
+            // service to add any to, so this row's document carries no location.
+            Map::new()
+        } else {
+            caller_location(row.case, &documents[0])
+        };
+        let expected = row.expected_document(&monitor, &monitor_id, &location);
         assert_eq!(
             fields(&documents[0]),
             fields(&expected),
@@ -461,6 +614,413 @@ async fn every_accepted_event_is_reported_as_the_rum_event_document() {
 }
 
 #[tokio::test]
+async fn log_stream_carries_the_events_own_instant() {
+    // Each row: the case, `RumEvent$timestamp` as the wire carries it, and the instant in
+    // milliseconds the document must then place the event at. The rows span the instant's
+    // surface — a whole second, a subsecond part, the epoch itself, an instant before it,
+    // and one far in the future — because the instant is what this field carries.
+    let rows: [(&str, Value, i64); 5] = [
+        ("a whole second", json!(1_704_067_200_i64), 1_704_067_200_000),
+        (
+            "a subsecond part",
+            json!(1_704_067_200.125_f64),
+            1_704_067_200_125,
+        ),
+        ("the epoch itself", json!(0_i64), 0),
+        ("an instant before the epoch", json!(-2.25_f64), -2_250),
+        (
+            "an instant far in the future",
+            json!(4_102_444_800_i64),
+            4_102_444_800_000,
+        ),
+    ];
+
+    // The session is named on every batch, so the field cannot be the stream name without
+    // the assertion below noticing.
+    let session = "ffffffff-eeee-4ddd-8ccc-bbbbbbbbbbbb";
+    for (index, (case, timestamp, millis)) in rows.into_iter().enumerate() {
+        let (router, _engine) = emulator();
+        let monitor = format!("instant-{index}");
+        let monitor_id = create(
+            &router,
+            case,
+            json!({"Name": &monitor, "Domain": "documents.example.com"}),
+        )
+        .await;
+        deliver(
+            &router,
+            case,
+            &monitor_id,
+            json!({
+                "BatchId": "11111111-2222-4333-8444-5555555555ff",
+                "AppMonitorDetails": {"name": monitor, "id": monitor_id},
+                "UserDetails": {"sessionId": session},
+                "RumEvents": [{
+                    "id": "aaaa1111-1234-4234-8234-123456789012",
+                    "timestamp": timestamp,
+                    "type": "com.amazon.rum.page_view_event",
+                    "details": "{}",
+                }],
+            }),
+        )
+        .await;
+
+        let documents = reported(&router, case, &monitor, millis, millis).await;
+        assert_eq!(
+            documents.len(),
+            1,
+            "case {case:?}: expected the one delivered event, got {documents:?}"
+        );
+        let reported_stream = &documents[0]["log_stream"];
+        assert_eq!(
+            *reported_stream,
+            instant_of(millis),
+            "case {case:?}: expected log_stream to carry the event's instant {}, got \
+             {reported_stream}",
+            instant_of(millis)
+        );
+        assert_ne!(
+            reported_stream.as_str(),
+            Some(session),
+            "case {case:?}: log_stream is an instant, not the name of the stream the copies \
+             accumulate in, got {reported_stream}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_metadata_member_is_projected_as_a_key_and_a_key_equals_value_text() {
+    // Each row: the case and `RumEvent$metadata` as the client serialized it. The rows span
+    // the shapes a metadata document takes — several members, values of each JSON type, a
+    // value carrying the separator itself, a nested document, an empty document and one
+    // that is no object at all — because the projection is over whatever the client sent.
+    let rows: [(&str, Option<&str>); 7] = [
+        (
+            "texts",
+            Some("{\"version\":\"1.0.0\",\"pageId\":\"/checkout\",\"title\":\"Checkout\"}"),
+        ),
+        (
+            "values of every JSON type",
+            Some(
+                "{\"pageId\":42,\"cached\":true,\"sampleRate\":0.25,\"absent\":null,\
+                 \"tags\":[\"a\",\"b\"]}",
+            ),
+        ),
+        (
+            "a value carrying the separator",
+            Some("{\"query\":\"a=b\",\"pageId\":\"/x=y\"}"),
+        ),
+        (
+            "a nested document",
+            Some("{\"page\":{\"id\":\"/home\",\"depth\":2}}"),
+        ),
+        ("an empty document", Some("{}")),
+        ("no metadata at all", None),
+        ("metadata that is no document", Some("not a document")),
+    ];
+
+    for (index, (case, metadata)) in rows.into_iter().enumerate() {
+        let (router, _engine) = emulator();
+        let monitor = format!("projected-{index}");
+        let monitor_id = create(
+            &router,
+            case,
+            json!({"Name": &monitor, "Domain": "documents.example.com"}),
+        )
+        .await;
+        let instant = 1_704_067_200_i64;
+        let mut event = json!({
+            "id": "bbbb1111-1234-4234-8234-123456789012",
+            "timestamp": instant,
+            "type": "com.amazon.rum.page_view_event",
+            "details": "{}",
+        });
+        if let Some(metadata) = metadata {
+            event["metadata"] = json!(metadata);
+        }
+        deliver(
+            &router,
+            case,
+            &monitor_id,
+            json!({
+                "BatchId": "11111111-2222-4333-8444-5555555555ee",
+                "AppMonitorDetails": {"name": monitor, "id": monitor_id},
+                "UserDetails": {},
+                "RumEvents": [event],
+            }),
+        )
+        .await;
+
+        let millis = instant * MILLIS_PER_SECOND;
+        let documents = reported(&router, case, &monitor, millis, millis).await;
+        assert_eq!(
+            documents.len(),
+            1,
+            "case {case:?}: expected the one delivered event, got {documents:?}"
+        );
+        let document = &documents[0];
+        let keys = document["metadata_keys"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: metadata_keys must be a list, got {document}"))
+            .clone();
+        let values = document["metadata_values"]
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: metadata_values must be a list, got {document}")
+            })
+            .clone();
+        assert_eq!(
+            keys.len(),
+            values.len(),
+            "case {case:?}: the two projections are positionally aligned, so they have one \
+             length, got {keys:?} and {values:?}"
+        );
+
+        match document["metadata"].as_object() {
+            None => {
+                // Metadata that is no object has no first-level members to project.
+                assert!(
+                    keys.is_empty() && values.is_empty(),
+                    "case {case:?}: metadata that is no document projects nothing, got \
+                     {keys:?} and {values:?}"
+                );
+            }
+            Some(members) => {
+                let expected_keys: Vec<Value> = members.keys().map(|key| json!(key)).collect();
+                assert_eq!(
+                    keys, expected_keys,
+                    "case {case:?}: expected one key per first-level member of the reported \
+                     metadata, got {keys:?}"
+                );
+                for (position, (key, value)) in members.iter().enumerate() {
+                    let expected = format!("{key}={}", value_text(value));
+                    assert_eq!(
+                        values[position].as_str(),
+                        Some(expected.as_str()),
+                        "case {case:?}: expected the member at position {position} to be \
+                         projected as {expected:?}, got {}",
+                        values[position]
+                    );
+                }
+                // The caller's location is a first-level member like any other, so it is
+                // projected like any other: the three members RUM adds are in both lists.
+                for member in CALLER_LOCATION_MEMBERS {
+                    let value = members.get(member).unwrap_or_else(|| {
+                        panic!(
+                            "case {case:?}: expected RUM to add {member:?} to the event's \
+                             metadata, got {document}"
+                        )
+                    });
+                    let pair = format!("{member}={}", value_text(value));
+                    assert!(
+                        keys.contains(&json!(member)) && values.contains(&json!(pair)),
+                        "case {case:?}: expected the location member {member:?} to be \
+                         projected as {pair:?}, got {keys:?} and {values:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_caller_location_is_added_to_every_event_and_can_be_filtered_on() {
+    // One monitor, two events: one whose client sent metadata and one whose client sent
+    // none — the service's reading of where the telemetry came from is on both.
+    let (router, _engine) = emulator();
+    let case = "the caller's location on every event";
+    let monitor = "located";
+    let monitor_id = create(
+        &router,
+        case,
+        json!({"Name": monitor, "Domain": "documents.example.com"}),
+    )
+    .await;
+    let instants: [i64; 2] = [1_704_067_200, 1_704_067_260];
+    let metadata: [Option<&str>; 2] = [Some("{\"pageId\":\"/home\"}"), None];
+    let events: Vec<Value> = instants
+        .iter()
+        .zip(metadata)
+        .enumerate()
+        .map(|(step, (instant, metadata))| {
+            let mut event = json!({
+                "id": format!("cccc111{step}-1234-4234-8234-123456789012"),
+                "timestamp": instant,
+                "type": "com.amazon.rum.page_view_event",
+                "details": "{}",
+            });
+            if let Some(metadata) = metadata {
+                event["metadata"] = json!(metadata);
+            }
+            event
+        })
+        .collect();
+    deliver(
+        &router,
+        case,
+        &monitor_id,
+        json!({
+            "BatchId": "11111111-2222-4333-8444-5555555555dd",
+            "AppMonitorDetails": {"name": monitor, "id": monitor_id},
+            "UserDetails": {},
+            "RumEvents": events,
+        }),
+    )
+    .await;
+
+    let after = instants[0] * MILLIS_PER_SECOND;
+    let before = instants[1] * MILLIS_PER_SECOND;
+    let documents = reported(&router, case, monitor, after, before).await;
+    assert_eq!(
+        documents.len(),
+        instants.len(),
+        "case {case:?}: expected one document per delivered event, got {documents:?}"
+    );
+    let location = caller_location(case, &documents[0]);
+    for (step, document) in documents.iter().enumerate() {
+        let step_case = format!("{case}, event {step}");
+        assert_eq!(
+            caller_location(&step_case, document),
+            location,
+            "case {step_case:?}: every event of one delivery is reported from one place, got \
+             {document}"
+        );
+    }
+
+    // And the location is a member of the event, so the modelled `Country` filter — "Valid
+    // values for `Name` are `Browser` | `Device` | `Country` | `Page` | `OS` | `EventType`
+    // | `Invert`" (`smithy_query(query="doc", shape="QueryFilter", member="Name")`) —
+    // selects on it: the country the events came from reports all of them, and any other
+    // country reports none.
+    let country = location["countryCode"].as_str().unwrap_or_default();
+    let selected_here = selected(
+        &router,
+        case,
+        monitor,
+        after,
+        before,
+        Some(json!([{"Name": "Country", "Values": [country]}])),
+    )
+    .await;
+    assert_eq!(
+        selected_here.len(),
+        instants.len(),
+        "case {case:?}: a Country filter naming {country:?} must report every event, got \
+         {selected_here:?}"
+    );
+    let elsewhere = if country == "JP" { "DE" } else { "JP" };
+    let selected_elsewhere = selected(
+        &router,
+        case,
+        monitor,
+        after,
+        before,
+        Some(json!([{"Name": "Country", "Values": [elsewhere]}])),
+    )
+    .await;
+    assert!(
+        selected_elsewhere.is_empty(),
+        "case {case:?}: a Country filter naming {elsewhere:?} matches no event delivered \
+         from {country:?}, got {selected_elsewhere:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_location_member_the_client_reported_is_reported_as_it_arrived() {
+    // One batch, two events: the first names a country and a locality of its own, the
+    // second names no metadata at all. `metadata` is the client's own document, so the
+    // first event keeps what it sent and is only ADDED the member it left out, while the
+    // second carries the service's reading of all three.
+    let (router, _engine) = emulator();
+    let case = "a client that reported a location of its own";
+    let monitor = "client-located";
+    let monitor_id = create(
+        &router,
+        case,
+        json!({"Name": monitor, "Domain": "documents.example.com"}),
+    )
+    .await;
+    let claimed_country = "ZW";
+    let claimed_locality = "Nowhere";
+    let instants: [i64; 2] = [1_704_067_200, 1_704_067_260];
+    deliver(
+        &router,
+        case,
+        &monitor_id,
+        json!({
+            "BatchId": "11111111-2222-4333-8444-5555555555cc",
+            "AppMonitorDetails": {"name": monitor, "id": monitor_id},
+            "UserDetails": {},
+            "RumEvents": [
+                {
+                    "id": "dddd1110-1234-4234-8234-123456789012",
+                    "timestamp": instants[0],
+                    "type": "com.amazon.rum.page_view_event",
+                    "metadata": format!(
+                        "{{\"countryCode\":\"{claimed_country}\",\
+                          \"localityName\":\"{claimed_locality}\"}}"
+                    ),
+                    "details": "{}",
+                },
+                {
+                    "id": "dddd1111-1234-4234-8234-123456789012",
+                    "timestamp": instants[1],
+                    "type": "com.amazon.rum.page_view_event",
+                    "details": "{}",
+                },
+            ],
+        }),
+    )
+    .await;
+
+    let documents = reported(
+        &router,
+        case,
+        monitor,
+        instants[0] * MILLIS_PER_SECOND,
+        instants[1] * MILLIS_PER_SECOND,
+    )
+    .await;
+    assert_eq!(
+        documents.len(),
+        2,
+        "case {case:?}: expected one document per delivered event, got {documents:?}"
+    );
+    // What the service reports where the client reported nothing.
+    let observed = caller_location(case, &documents[1]);
+    // The event that reported two of the members: those two are its own, the third is the
+    // service's, and all three are projected like any other member.
+    let claimed = caller_location(case, &documents[0]);
+    assert_eq!(
+        claimed["countryCode"].as_str(),
+        Some(claimed_country),
+        "case {case:?}: expected the country the client reported, got {}",
+        documents[0]
+    );
+    assert_eq!(
+        claimed["localityName"].as_str(),
+        Some(claimed_locality),
+        "case {case:?}: expected the locality the client reported, got {}",
+        documents[0]
+    );
+    assert_eq!(
+        claimed["subdivisionCode"], observed["subdivisionCode"],
+        "case {case:?}: the member the client left out is the service's, got {}",
+        documents[0]
+    );
+    for (member, value) in &claimed {
+        let pair = json!(format!("{member}={}", value_text(value)));
+        assert!(
+            documents[0]["metadata_values"]
+                .as_array()
+                .is_some_and(|values| values.contains(&pair)),
+            "case {case:?}: expected {pair} among the projected members, got {}",
+            documents[0]
+        );
+    }
+}
+
+#[tokio::test]
 async fn one_document_is_reported_for_every_event_of_a_batch() {
     // The projection is per EVENT, not per batch: a batch carrying several events is
     // reported as several documents, each carrying that event's own id, instant, type and
@@ -485,7 +1045,9 @@ async fn one_document_is_reported_for_every_event_of_a_batch() {
                 "timestamp": millis / MILLIS_PER_SECOND,
                 "type": "com.amazon.rum.page_view_event",
                 "metadata": format!("{{\"pageId\":\"/page-{step}\"}}"),
-                "details": format!("{{\"pageTitle\":\"Page {step}\"}}"),
+                "details": format!(
+                    "{{\"pageTitle\":\"Page {step}\",\"pageInteractionId\":\"/page-{step}-0\"}}"
+                ),
             })
         })
         .collect();
@@ -539,10 +1101,15 @@ async fn one_document_is_reported_for_every_event_of_a_batch() {
             "case {case:?}: expected every document to carry the batch's id, got {document}"
         );
         assert_eq!(
-            document["log_stream"].as_str(),
-            Some(session),
-            "case {case:?}: expected every document to name the session's stream, got \
+            document["log_stream"],
+            instant_of(instants[step]),
+            "case {case:?}: expected every document to carry its own event's instant, got \
              {document}"
+        );
+        assert_eq!(
+            document["event_interaction"].as_str(),
+            Some(format!("%2Fpage-{step}-0 &").as_str()),
+            "case {case:?}: expected each event's own interaction identifier, got {document}"
         );
         assert_eq!(
             document["application_id"].as_str(),

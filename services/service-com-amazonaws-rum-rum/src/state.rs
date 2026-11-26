@@ -37,6 +37,10 @@ use crate::ops::types::{
 /// evaluation every operation in this service runs before it reads or writes.
 pub mod authorization;
 
+/// Where the caller a batch of telemetry arrived from is, which RUM adds to every event's
+/// metadata at ingestion.
+pub mod caller_location;
+
 /// The CloudWatch Logs side of `DataStorage.CwLog`: the permission turning log delivery
 /// on requires, the vended log group RUM provisions when it is on, and the copies of
 /// delivered telemetry it stores there.

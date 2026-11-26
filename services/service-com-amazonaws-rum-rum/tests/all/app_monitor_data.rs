@@ -301,19 +301,29 @@ async fn reported_events_are_the_enriched_documents_of_what_the_data_plane_accep
             document["event_details"], fixture.details,
             "case {case:?}: expected the details the batch carried, got {document}"
         );
-        match &fixture.metadata {
-            Some(metadata) => assert_eq!(
-                &document["metadata"], metadata,
-                "case {case:?}: expected the metadata the batch carried, got {document}"
-            ),
-            // Metadata is part of every RUM event document; an event that carried none has
-            // nothing in it rather than no field at all.
-            None => assert_eq!(
-                document["metadata"],
-                json!({}),
-                "case {case:?}: an event that carried no metadata reports an empty one, got \
+        // `metadata` is the client's document ENRICHED by the service with where the caller
+        // is — `rum_event_documents` owns that rule — so what this suite asserts is that
+        // every member the batch carried is reported with the value it carried, and that
+        // the field is part of every document whether the batch carried one or not.
+        let reported_metadata = document["metadata"].as_object().unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: metadata is part of every RUM event document, as an object, \
+                 got {document}"
+            )
+        });
+        for (member, value) in fixture
+            .metadata
+            .as_ref()
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+        {
+            assert_eq!(
+                reported_metadata.get(member),
+                Some(value),
+                "case {case:?}: expected the member {member:?} the batch carried, got \
                  {document}"
-            ),
+            );
         }
     }
 }
@@ -523,7 +533,11 @@ async fn an_event_matching_one_of_the_filters_is_reported() {
                 {"Name": "EventType", "Values": ["com.amazon.rum.session_start_event"]},
                 {"Name": "Country", "Values": ["US"]},
             ]),
-            vec![1, 2, 3, 4, 6],
+            // The fifth event's client reported no country of its own, so the country it is
+            // reported from is the one the service read for the caller its batch arrived
+            // from — which is the country this case names, so the `Country` filter selects
+            // it beside the two events whose clients named that country themselves.
+            vec![1, 2, 3, 4, 5, 6],
         ),
         (
             "two filters between them covering every event carrying that dimension",

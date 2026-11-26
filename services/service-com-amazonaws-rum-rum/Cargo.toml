@@ -25,6 +25,9 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Hex codec for that id's bytes and for the opaque ListAppMonitors NextToken.
 hex = { workspace = true }
+# RFC 3986 percent-encoding, which is the form a RUM event document reports the
+# identifier of the interaction an event belongs to in (`event_interaction`).
+percent-encoding = "2.3"
 # `iam_authorization`: the shared evaluation of IAM policy documents against
 # (action, resource, principal), which every RUM operation's authorization check runs.
 service-common = { path = "../common" }

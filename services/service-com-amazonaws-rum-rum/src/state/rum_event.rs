@@ -7,7 +7,7 @@
 //! `BatchId`, `AppMonitorDetails` and `UserDetails` — while what a reader gets back is the
 //! SERVICE's own document: that event ENRICHED, at ingestion, with the batch's context and
 //! with what only the service knows (the app monitor the batch was delivered to, the
-//! account that owns it, the log stream its copies accumulate in), under the field names
+//! account that owns it, where the caller is), under the field names
 //! RUM publishes for a RUM event.
 //!
 //! Those names are the model's own. `MetricDefinitionRequest` enumerates the first-level
@@ -25,13 +25,23 @@
 //! the `application_Id` the documentation of those metric members spells — one is the
 //! event's field name, the other is what a metric definition is judged against.
 //!
-//! Recorded behaviour pins three things the model leaves open:
+//! Recorded behaviour pins the shape of the fields the model leaves open:
 //!
 //! * `event_timestamp` is an epoch instant in MILLISECONDS, which is the unit
 //!   `TimeRange`'s bounds are expressed in as well, so a query and an event are placed on
 //!   ONE scale ([`event_timestamp_millis`], [`event_instant_millis`]);
-//! * `metadata` is reported as the document the client serialized it as, with the
-//!   `metadata_keys` / `metadata_values` projections of it beside it;
+//! * `log_stream` carries an INSTANT rather than a name — the `{seconds, nanos}` structure
+//!   [`instant_document`] writes, holding the instant of the event itself — so the name of
+//!   the CloudWatch Logs stream a batch's copies accumulate in
+//!   ([`super::cw_log_delivery::delivery_stream_name`]) is no part of the document;
+//! * `metadata` is the document the client serialized it as, ENRICHED with where the
+//!   caller is ([`super::caller_location`]), with the `metadata_keys` / `metadata_values`
+//!   projections of it beside it: the keys are its first-level member names, and each value
+//!   entry is that member as the `<key>=<value>` text [`metadata_projections`] writes, so a
+//!   consumer reading the two lists positionally recovers the pairs;
+//! * `event_interaction` is the IDENTIFIER of the interaction the event belongs to
+//!   ([`event_interaction`]), not the interaction counter a client's payload carries beside
+//!   it;
 //! * the document's `userId` and `sessionId` are reported BOTH at the top level and inside
 //!   `user_details`, which is why the model's field list carries all three.
 
@@ -57,6 +67,24 @@ pub const METADATA_KEYS_FIELD: &str = "metadata_keys";
 /// with [`METADATA_KEYS_FIELD`].
 pub const METADATA_VALUES_FIELD: &str = "metadata_values";
 
+/// The field carrying the instant of the event, as the `{seconds, nanos}` structure
+/// [`instant_document`] writes.
+pub const LOG_STREAM_FIELD: &str = "log_stream";
+
+/// The field carrying the identifier of the interaction the event belongs to
+/// ([`event_interaction`]).
+pub const EVENT_INTERACTION_FIELD: &str = "event_interaction";
+
+/// The member an instant carries its whole seconds since the epoch under
+/// ([`instant_document`]).
+const INSTANT_SECONDS_MEMBER: &str = "seconds";
+
+/// The member an instant carries the nanoseconds WITHIN that second under.
+const INSTANT_NANOS_MEMBER: &str = "nanos";
+
+/// What one [`METADATA_VALUES_FIELD`] entry joins its member's name to its value with.
+const METADATA_PAIR_SEPARATOR: &str = "=";
+
 /// How many milliseconds one second is, for the instant codec below.
 const MILLIS_PER_SECOND: i64 = 1_000;
 
@@ -69,14 +97,35 @@ const NANOS_PER_MILLI: u32 = 1_000_000;
 /// stamps every event's payload with the version of the schema it serialized it under.
 const CLIENT_VERSION_MEMBER: &str = "version";
 
-/// The member a client's metadata (or event details) reports the interaction the event
-/// belongs to under, which the document promotes to its own `event_interaction`.
-const CLIENT_INTERACTION_MEMBER: &str = "interaction";
+/// The member a client's event details (or its session metadata) reports the IDENTIFIER of
+/// the interaction the event belongs to under, which the document promotes to its own
+/// `event_interaction` ([`event_interaction`]).
+///
+/// It is the identifier and not the `interaction` counter a RUM web client stamps its
+/// payload with beside it: the recorded document reports the interaction as a text naming
+/// it, while the counter is a number saying how many interactions of the session precede
+/// it.
+const CLIENT_INTERACTION_ID_MEMBER: &str = "pageInteractionId";
 
-/// The `event_interaction` of an event whose client reported no interaction at all: the
-/// field is part of every RUM event document, and an event that follows no interaction of
-/// the session is at the session's zeroth.
-const NO_INTERACTION: i64 = 0;
+/// The member reporting the identifier of the interaction THAT interaction descends from,
+/// which a RUM web client reports beside it for an interaction reached from another one.
+const CLIENT_PARENT_INTERACTION_ID_MEMBER: &str = "parentPageInteractionId";
+
+/// What [`event_interaction`] joins an event's interaction identifier to the identifier of
+/// the interaction it descends from with: the recorded value carries the separator even for
+/// an event that descends from no interaction, where nothing follows it.
+const INTERACTION_SEPARATOR: &str = " &";
+
+/// The bytes of an interaction identifier [`event_interaction`] leaves as they are: RFC
+/// 3986's unreserved set (`ALPHA` / `DIGIT` / `-` / `.` / `_` / `~`). Every other byte is
+/// percent-encoded, which is what the recorded value does to the `/` a page's interaction
+/// identifier starts with.
+const INTERACTION_UNRESERVED: &::percent_encoding::AsciiSet =
+    &::percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
 
 /// `RumEvent$timestamp` as a RUM event document carries it: the instant in MILLISECONDS
 /// since the epoch, which is the unit `TimeRange$After`/`$Before` bound an event at.
@@ -138,9 +187,6 @@ pub struct Delivery<'a> {
     pub user_id: Option<&'a str>,
     /// `UserDetails$sessionId` of that session.
     pub session_id: Option<&'a str>,
-    /// The CloudWatch Logs stream this batch's copies accumulate in
-    /// ([`super::cw_log_delivery::delivery_stream_name`]): the document's `log_stream`.
-    pub log_stream: &'a str,
 }
 
 /// One delivered `RumEvent` as the RUM event document the service holds, reports and
@@ -154,11 +200,7 @@ pub struct Delivery<'a> {
 /// than nested as escaped text; a value that is not valid JSON is kept verbatim as a
 /// string, since the model constrains neither.
 pub fn event_document(delivery: &Delivery<'_>, event: &RumEvent) -> String {
-    let metadata = event
-        .metadata
-        .as_deref()
-        .map(json_member)
-        .unwrap_or_else(|| Value::Object(Map::new()));
+    let metadata = reported_metadata(event.metadata.as_deref());
     let details = json_member(&event.details);
 
     // The fields go in in the order RUM reports them in, which is the order a recorded
@@ -195,15 +237,15 @@ pub fn event_document(delivery: &Delivery<'_>, event: &RumEvent) -> String {
         super::EVENT_TYPE_FIELD.to_string(),
         Value::String(event.r#type.clone()),
     );
-    // The schema version and the interaction are the event's own, as the client stamped
-    // its payload with them: the details first, since they describe THIS event, and the
-    // session's metadata after it.
+    // The schema version is the event's own, as the client stamped its payload with it:
+    // the details first, since they describe THIS event, and the session's metadata after
+    // it.
     if let Some(version) = client_member(&details, &metadata, CLIENT_VERSION_MEMBER) {
         document.insert("event_version".to_string(), version);
     }
     document.insert(
-        "log_stream".to_string(),
-        Value::String(delivery.log_stream.to_string()),
+        LOG_STREAM_FIELD.to_string(),
+        instant_document(&event.timestamp),
     );
     document.insert(
         "batch_id".to_string(),
@@ -220,11 +262,88 @@ pub fn event_document(delivery: &Delivery<'_>, event: &RumEvent) -> String {
         Value::String(::engine::emulator_account_id().to_string()),
     );
     document.insert(
-        "event_interaction".to_string(),
-        client_member(&details, &metadata, CLIENT_INTERACTION_MEMBER)
-            .unwrap_or_else(|| Value::from(NO_INTERACTION)),
+        EVENT_INTERACTION_FIELD.to_string(),
+        Value::String(event_interaction(&details, &metadata)),
     );
     Value::Object(document).to_string()
+}
+
+/// One instant as a RUM event document carries it: the whole `seconds` since the epoch and
+/// the `nanos` within that second.
+///
+/// The two members are the one instant split, never rounded: an instant with a subsecond
+/// part reports it in `nanos`, and an instant before the epoch reports the second it falls
+/// IN (the one below it) with the nanoseconds from that second's start, which is the
+/// invariant an [`::aws_smithy_types::DateTime`] holds its own halves under.
+fn instant_document(instant: &::aws_smithy_types::DateTime) -> Value {
+    let mut carried = Map::new();
+    carried.insert(
+        INSTANT_SECONDS_MEMBER.to_string(),
+        Value::from(instant.secs()),
+    );
+    carried.insert(
+        INSTANT_NANOS_MEMBER.to_string(),
+        Value::from(instant.subsec_nanos()),
+    );
+    Value::Object(carried)
+}
+
+/// The event's `metadata` as the SERVICE reports it: the document the client serialized,
+/// with where the caller is added to it ([`super::caller_location`]).
+///
+/// The geolocation is RUM's own, so it is added to the metadata of EVERY event — including
+/// one whose batch carried no metadata at all, whose document is then the location alone.
+/// A member of the same name the CLIENT serialized is left exactly as it arrived, because
+/// `metadata` is the document the client sent ("a JSON serialization of the identity of the
+/// user for this session") and the service fills in what it did not report rather than
+/// re-writing what it did. Metadata the client did not serialize as a JSON object has no
+/// members to add any to, so it is reported exactly as it arrived.
+fn reported_metadata(serialized: Option<&str>) -> Value {
+    let mut carried = serialized
+        .map(json_member)
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    if let Some(members) = carried.as_object_mut() {
+        for (member, value) in super::caller_location::OBSERVED_CALLER_LOCATION.members() {
+            members
+                .entry(member.to_string())
+                .or_insert_with(|| Value::String(value.to_string()));
+        }
+    }
+    carried
+}
+
+/// The `event_interaction` of one event: the identifier of the interaction it belongs to,
+/// percent-encoded, the separator, and the identifier of the interaction that one descends
+/// from — which an event reached from no other interaction does not name, so nothing
+/// follows the separator for it.
+///
+/// An event that names no interaction at all belongs to none, so it carries no identifier.
+/// Both identifiers are read from the event's own `details` first and from the session's
+/// `metadata` after it, the two documents a client stamps its payload in, and each is
+/// percent-encoded ([`INTERACTION_UNRESERVED`]) because an interaction is identified by the
+/// page it happened on, whose identifier is a path.
+fn event_interaction(details: &Value, metadata: &Value) -> String {
+    let interaction = client_text(details, metadata, CLIENT_INTERACTION_ID_MEMBER);
+    let parent = client_text(details, metadata, CLIENT_PARENT_INTERACTION_ID_MEMBER);
+    if interaction.is_none() && parent.is_none() {
+        return String::new();
+    }
+    format!(
+        "{}{INTERACTION_SEPARATOR}{}",
+        percent_encoded(&interaction.unwrap_or_default()),
+        percent_encoded(&parent.unwrap_or_default())
+    )
+}
+
+/// `text` with every byte outside [`INTERACTION_UNRESERVED`] percent-encoded.
+fn percent_encoded(text: &str) -> String {
+    ::percent_encoding::utf8_percent_encode(text, INTERACTION_UNRESERVED).to_string()
+}
+
+/// The TEXT the client reported for `member` ([`client_member`]), as the document writes a
+/// value of any other type.
+fn client_text(details: &Value, metadata: &Value, member: &str) -> Option<String> {
+    client_member(details, metadata, member).map(|value| projected_text(&value))
 }
 
 /// The value the client reported for `member` in this event's `details`, or failing that in
@@ -238,11 +357,12 @@ fn client_member(details: &Value, metadata: &Value, member: &str) -> Option<Valu
 }
 
 /// The `metadata_keys` / `metadata_values` projections of a metadata document: its
-/// first-level keys, and its values at the same positions.
+/// first-level keys, and the `<key>=<value>` text of the member at each of those positions.
 ///
 /// They are a FLAT pair of lists over one document, so each value is projected as the text
-/// it is written as; metadata the client did not serialize as a JSON object projects
-/// nothing, since it has no first-level keys to flatten.
+/// it is written as, carrying the member's own name ahead of it so a consumer that reads
+/// the two lists positionally recovers the pairs; metadata the client did not serialize as
+/// a JSON object projects nothing, since it has no first-level keys to flatten.
 fn metadata_projections(metadata: &Value) -> (Vec<Value>, Vec<Value>) {
     let Some(members) = metadata.as_object() else {
         return (Vec::new(), Vec::new());
@@ -252,7 +372,10 @@ fn metadata_projections(metadata: &Value) -> (Vec<Value>, Vec<Value>) {
         .map(|(key, value)| {
             (
                 Value::String(key.clone()),
-                Value::String(projected_text(value)),
+                Value::String(format!(
+                    "{key}{METADATA_PAIR_SEPARATOR}{}",
+                    projected_text(value)
+                )),
             )
         })
         .unzip()

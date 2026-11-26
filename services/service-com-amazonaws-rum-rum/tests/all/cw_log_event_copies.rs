@@ -20,7 +20,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::authorization::{Emulator, ACCOUNT_KEY};
 
@@ -59,15 +59,24 @@ impl Event {
         event
     }
 
-    /// The `event_interaction` the copy carries for this event: the `interaction` the
-    /// client stamped its payload with, and the session's zeroth for an event that names
-    /// none — which is every event of this suite, since none of these fixtures reports one.
+    /// The `event_interaction` the copy carries for this event: the percent-encoded
+    /// identifier of the interaction the event belongs to and the separator, and no
+    /// identifier at all for an event that names none — which is every event of this suite
+    /// but the one row whose details carry a `pageInteractionId`.
     fn interaction(&self) -> Value {
-        [self.details, self.metadata.unwrap_or("{}")]
-            .into_iter()
-            .filter_map(|document| parsed(document).get("interaction").cloned())
-            .find(|value| !value.is_null())
-            .unwrap_or_else(|| json!(0))
+        match parsed(self.details).get("pageInteractionId").cloned() {
+            Some(Value::String(identifier)) => {
+                json!(format!("{} &", identifier.replace('/', "%2F")))
+            }
+            _ => json!(""),
+        }
+    }
+
+    /// The instant this event's document carries as `log_stream`: the whole seconds since
+    /// the epoch and the nanoseconds within that second, which is zero for every fixture
+    /// here, since the wire carries each of these instants as whole seconds.
+    fn instant(&self) -> Value {
+        json!({"seconds": self.timestamp, "nanos": 0})
     }
 }
 
@@ -114,8 +123,26 @@ impl Delivery {
 
     /// The copy this batch owes the log group for `event`: the RUM event document the data
     /// plane enriched that event into, under the field names RUM publishes for a RUM event.
-    fn expected_copy(&self, event: &Event, monitor: &str, monitor_id: &str) -> Value {
-        let metadata = event.metadata.map(parsed).unwrap_or_else(|| json!({}));
+    ///
+    /// `location` is where the service reported the caller to be, read off the document the
+    /// monitor's own buffer holds for the same event: the members are the requirement, the
+    /// place itself is the environment's, and what this asserts is that the COPY carries
+    /// the same bytes.
+    fn expected_copy(
+        &self,
+        event: &Event,
+        monitor: &str,
+        monitor_id: &str,
+        location: &Map<String, Value>,
+    ) -> Value {
+        let mut metadata = event.metadata.map(parsed).unwrap_or_else(|| json!({}));
+        if let Some(members) = metadata.as_object_mut() {
+            for (member, value) in location {
+                members
+                    .entry(member.clone())
+                    .or_insert_with(|| value.clone());
+            }
+        }
         let (keys, values) = projections(&metadata);
         let mut copy = json!({
             "account_id": engine::emulator_account_id(),
@@ -127,7 +154,7 @@ impl Delivery {
             "event_timestamp": event.instant_millis,
             "event_type": event.event_type,
             "event_details": parsed(event.details),
-            "log_stream": self.stream(monitor_id),
+            "log_stream": event.instant(),
             "metadata": metadata,
             "metadata_keys": keys,
             "metadata_values": values,
@@ -162,8 +189,8 @@ fn parsed(text: &str) -> Value {
 }
 
 /// The `metadata_keys` / `metadata_values` projections a document carries beside its
-/// `metadata`: the metadata's first-level keys, and its values at the same positions as
-/// the text each is written as.
+/// `metadata`: the metadata's first-level keys, and at the same positions the
+/// `<key>=<value>` text of each member.
 fn projections(metadata: &Value) -> (Vec<Value>, Vec<Value>) {
     metadata
         .as_object()
@@ -173,15 +200,50 @@ fn projections(metadata: &Value) -> (Vec<Value>, Vec<Value>) {
                 .map(|(key, value)| {
                     (
                         json!(key),
-                        match value {
-                            Value::String(text) => json!(text),
-                            other => json!(other.to_string()),
-                        },
+                        json!(format!(
+                            "{key}={}",
+                            match value {
+                                Value::String(text) => text.clone(),
+                                other => other.to_string(),
+                            }
+                        )),
                     )
                 })
                 .unzip()
         })
         .unwrap_or_default()
+}
+
+/// The members RUM adds to an event's `metadata` for where the caller is.
+///
+/// Source: the recorded enriched document; the model names the first of them as an
+/// extended-metric dimension (`"metadata.countryCode": "CountryCode"`,
+/// `smithy_query(query="doc", shape="MetricDefinitionRequest", member="DimensionKeys")`).
+/// Their values are the environment's, so none is stated here.
+const CALLER_LOCATION_MEMBERS: [&str; 3] = ["countryCode", "subdivisionCode", "localityName"];
+
+/// Where `document`'s metadata says the caller is, asserting the service added all three
+/// members as texts.
+fn caller_location(case: &str, document: &Value) -> Map<String, Value> {
+    let metadata = document["metadata"].as_object().unwrap_or_else(|| {
+        panic!("case {case:?}: expected the document's metadata to be an object, got {document}")
+    });
+    CALLER_LOCATION_MEMBERS
+        .into_iter()
+        .map(|member| {
+            let value = metadata.get(member).unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected RUM to add {member:?} to the event's metadata, \
+                     got {document}"
+                )
+            });
+            assert!(
+                value.as_str().is_some_and(|text| !text.is_empty()),
+                "case {case:?}: expected {member:?} to name somewhere, got {value}"
+            );
+            (member.to_string(), value.clone())
+        })
+        .collect()
 }
 
 /// Now, in milliseconds since the epoch — the unit a log event's timestamp is in.
@@ -465,8 +527,6 @@ async fn every_delivered_event_is_copied_into_the_vended_log_group() {
     );
 
     // What each stream owes, in the order the batches were delivered.
-    let mut expected: std::collections::BTreeMap<String, Vec<Value>> =
-        std::collections::BTreeMap::new();
     let before = now_ms();
     for delivery in deliveries() {
         deliver(
@@ -476,15 +536,53 @@ async fn every_delivered_event_is_copied_into_the_vended_log_group() {
             delivery.wire(monitor, &monitor_id),
         )
         .await;
+    }
+    let after = now_ms();
+
+    // Where the service reported the caller to be, read off the copy of an event whose
+    // client sent NO metadata of its own, so the three members are the service's own
+    // reading: they are the requirement, the place itself is the environment's, and every
+    // document below is then owed that location wherever its client named none.
+    let probe = "the service's own reading of the caller's location";
+    let mut location = Map::new();
+    for delivery in deliveries() {
+        if location.is_empty() {
+            let stream = delivery.stream(&monitor_id).to_string();
+            let copies = messages(
+                probe,
+                &log_events_in(&emulator, probe, &log_group, &stream).await,
+            );
+            for event in &delivery.events {
+                if event.metadata.is_some() {
+                    continue;
+                }
+                if let Some(copy) = copies
+                    .iter()
+                    .find(|copy| copy["event_id"].as_str() == Some(event.id))
+                {
+                    location = caller_location(probe, copy);
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        !location.is_empty(),
+        "case {probe:?}: the batches must deliver one event whose client sent no metadata, \
+         so the location the service reads for the caller is observable"
+    );
+
+    let mut expected: std::collections::BTreeMap<String, Vec<Value>> =
+        std::collections::BTreeMap::new();
+    for delivery in deliveries() {
         let stream = delivery.stream(&monitor_id).to_string();
         for event in &delivery.events {
             expected
                 .entry(stream.clone())
                 .or_default()
-                .push(delivery.expected_copy(event, monitor, &monitor_id));
+                .push(delivery.expected_copy(event, monitor, &monitor_id, &location));
         }
     }
-    let after = now_ms();
 
     // One stream per session the monitor collected from, plus the monitor's own for the
     // batch that named no session — and nothing else.

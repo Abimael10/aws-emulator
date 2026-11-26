@@ -19,7 +19,7 @@
 //! Both destinations hold the SERVICE's document, not the client's structure: every
 //! accepted event is enriched once, here, with the batch's context and with what only the
 //! service knows — the app monitor the batch was delivered to, the account that owns it
-//! and the log stream the copies accumulate in — under the field names RUM publishes for a
+//! and where the caller is — under the field names RUM publishes for a
 //! RUM event ([`crate::state::rum_event::event_document`]).
 //!
 //! ## Shape of an operation
@@ -248,9 +248,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let batch_id = input.batch_id;
         let user_id = input.user_details.user_id;
         let session_id = input.user_details.session_id;
-        // The stream this batch's copies accumulate in, resolved BEFORE the events are
-        // built because it is part of every one of their documents: an enriched event
-        // reports the log stream it is stored under.
+        // The stream this batch's copies accumulate in: the session it was collected from,
+        // which is the CloudWatch Logs side of the delivery alone and no part of the
+        // enriched event document.
         let log_stream =
             crate::state::cw_log_delivery::delivery_stream_name(session_id.as_deref(), &input.id);
         // What the service enriches every event of this batch with: the monitor the `Id`
@@ -262,7 +262,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             batch_id: &batch_id,
             user_id: user_id.as_deref(),
             session_id: session_id.as_deref(),
-            log_stream: &log_stream,
         };
         // Built once, as a Vec, because the batch has TWO destinations: this monitor's own
         // buffer (what `GetAppMonitorData` reports) and — when the monitor stores copies in
