@@ -273,8 +273,10 @@ fn assert_oauth2_error(
 ///
 /// The rows differ along what the endpoint judges, in the order it judges it: the OAuth 2.0
 /// client (absent, empty, not a client this endpoint knows, each of the two it does know),
-/// then the grant type (absent, supplied with no value, another grant, the right name in the
-/// wrong case), then the
+/// then the grant type (absent, supplied with no value, another grant this form does not
+/// serve — the client-credentials and device-code grants — the right name in the wrong case,
+/// and a grant named under the OTHER form's binding key, which this form does not read and so
+/// leaves it with no grant to act on), then the
 /// parameters the named grant requires — each of the authorization-code grant's three and
 /// the refresh grant's one, every one of which the model requires "only when" that grant is
 /// named, so the refusal states the `invalid_request` description rather than the parameter.
@@ -336,6 +338,22 @@ async fn the_anonymous_token_endpoint_is_reached_and_judges_its_own_request() {
         (
             "the refresh grant in the wrong case",
             json!({"clientId": known, "grantType": "REFRESH_TOKEN"}),
+            UNSUPPORTED_GRANT_TYPE,
+            UNSUPPORTED_GRANT_TYPE_DESCRIPTION.to_string(),
+            JSON,
+        ),
+        (
+            "the device-code grant, which neither form serves",
+            json!({"clientId": known,
+                   "grantType": "urn:ietf:params:oauth:grant-type:device_code"}),
+            UNSUPPORTED_GRANT_TYPE,
+            UNSUPPORTED_GRANT_TYPE_DESCRIPTION.to_string(),
+            JSON,
+        ),
+        (
+            "a grant named under the IAM form's binding, which this form does not read",
+            json!({"clientId": known, "grant_type": "refresh_token",
+                   "refreshToken": "ASORaaaa"}),
             UNSUPPORTED_GRANT_TYPE,
             UNSUPPORTED_GRANT_TYPE_DESCRIPTION.to_string(),
             JSON,
@@ -436,13 +454,19 @@ async fn a_code_this_service_never_issued_is_not_redeemed() {
 /// A request that supplies no grant type at all leaves the server with no grant to act on,
 /// which is the grant-type class on either form: `unsupported_grant_type`.
 ///
+/// Which class a request earns is decided BEFORE the parameters of the grant are, so a row
+/// that also leaves out `resource` or states one past its ceiling still earns its grant class.
+///
 /// The rows differ along both parameters the endpoint judges: the grant type away from
-/// `client_credentials` (another OAuth grant name, the wrong case, the name with trailing
-/// text), the grant type supplied with no value and left out altogether, and the resource —
-/// absent, empty, at each published bound of `@length(min: 1, max: 2048)` and one character
-/// past the ceiling. A request that states no resource is incomplete for this grant, and what
-/// the refusal names is the first of the grant's own parameters the body supplies no value
-/// for.
+/// `client_credentials` (four other OAuth 2.0 grant names — the two the anonymous form
+/// serves, the device-code grant and the resource-owner password grant — the wrong case, the
+/// name with trailing text, with a leading space, and hyphenated instead of underscored), the
+/// grant type supplied with no value, left out altogether, named under the ANONYMOUS form's
+/// binding key (which this form does not read, so the request supplies no grant at all) and
+/// left out by a body that binds no parameter whatever, and the resource — absent, empty, at
+/// each published bound of `@length(min: 1, max: 2048)` and one character past the ceiling. A
+/// request that states no resource is incomplete for this grant, and what the refusal names
+/// is the first of the grant's own parameters the body supplies no value for.
 #[tokio::test]
 async fn the_iam_token_endpoint_judges_its_own_request() {
     let resource = "aws-mcp.amazonaws.com";
@@ -518,6 +542,68 @@ async fn the_iam_token_endpoint_judges_its_own_request() {
             VALIDATION_ERROR_CODE,
             INVALID_REQUEST_MESSAGE.to_string(),
             JSON_WITH_CHARSET,
+        ),
+        (
+            "the device-code grant",
+            json!({"grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                   "resource": resource}),
+            VALIDATION_ERROR_CODE,
+            INVALID_REQUEST_MESSAGE.to_string(),
+            JSON_WITH_CHARSET,
+        ),
+        (
+            "the resource-owner password grant",
+            json!({"grant_type": "password", "resource": resource}),
+            VALIDATION_ERROR_CODE,
+            INVALID_REQUEST_MESSAGE.to_string(),
+            JSON_WITH_CHARSET,
+        ),
+        (
+            "the grant name with a leading space",
+            json!({"grant_type": " client_credentials", "resource": resource}),
+            VALIDATION_ERROR_CODE,
+            INVALID_REQUEST_MESSAGE.to_string(),
+            JSON_WITH_CHARSET,
+        ),
+        (
+            "the grant name hyphenated instead of underscored",
+            json!({"grant_type": "client-credentials", "resource": resource}),
+            VALIDATION_ERROR_CODE,
+            INVALID_REQUEST_MESSAGE.to_string(),
+            JSON_WITH_CHARSET,
+        ),
+        (
+            // The grant is judged before the parameters that grant would require, so a
+            // supplied value the member does not admit is the value class whatever else
+            // the body leaves out.
+            "a grant this form does not serve, with no resource either",
+            json!({"grant_type": "password"}),
+            VALIDATION_ERROR_CODE,
+            INVALID_REQUEST_MESSAGE.to_string(),
+            JSON_WITH_CHARSET,
+        ),
+        (
+            "the grant name under the anonymous form's binding, which this form does not read",
+            json!({"grantType": CLIENT_CREDENTIALS, "resource": resource}),
+            UNSUPPORTED_GRANT_TYPE,
+            UNSUPPORTED_GRANT_TYPE_DESCRIPTION.to_string(),
+            JSON,
+        ),
+        (
+            "a body that binds no parameter at all",
+            json!({}),
+            UNSUPPORTED_GRANT_TYPE,
+            UNSUPPORTED_GRANT_TYPE_DESCRIPTION.to_string(),
+            JSON,
+        ),
+        (
+            // Likewise the other way round: with no grant to act on, the grant-type class
+            // is answered without reaching the resource the request does supply.
+            "no grant type, with a resource one character past the modelled ceiling",
+            json!({"resource": "r".repeat(2049)}),
+            UNSUPPORTED_GRANT_TYPE,
+            UNSUPPORTED_GRANT_TYPE_DESCRIPTION.to_string(),
+            JSON,
         ),
     ];
     let accepted: Vec<(&str, Value)> = vec![
@@ -711,3 +797,4 @@ async fn a_mint_returns_its_own_token_for_each_accepted_request() {
         "each mint must return its own token, got {minted:?}"
     );
 }
+
