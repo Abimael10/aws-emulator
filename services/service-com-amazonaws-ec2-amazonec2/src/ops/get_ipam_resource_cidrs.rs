@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetIpamResourceCidrs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetIpamResourceCidrs`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: reports the resource CIDRs IPAM monitors in one of its scopes, DERIVED from
+//! [`crate::state`] — every IPv4 range of the account's VPCs and subnets in a Region the scope's
+//! IPAM operates in, each carrying the pool of the scope that hands out its space and the
+//! management, compliance and overlap states that follow from it, narrowed by the request's
+//! selectors and `Filters` and answered one `MaxResults`-sized page at a time. A reporting
+//! operation: it stores nothing of its own, and the only write it makes is to materialise the
+//! state transitions the clock has ALREADY made due (an IPAM scope's `create-in-progress` ->
+//! `create-complete`), which were owed at the same instant whether or not anybody called. This is
 //! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetIpamResourceCidrs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What a caller decides about a resource CIDR — whether IPAM monitors it and which scope it sits
+//! in — is what `ModifyIpamResourceCidr` records, and this report reads it back through the one
+//! derivation of a scope's resource CIDRs
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::ipam_resource_cidrs_in_scope`]), so the two
+//! cannot disagree about one range.
+//!
+//! A resource CIDR sits in the PRIVATE scope of the IPAM that monitors it unless a transfer moved
+//! it to another of that IPAM's scopes: the ranges of VPCs and subnets are the account's private
+//! space ("the private scope is intended for all private IP address space", `IpamScope`). So a
+//! scope that holds none of them — a public scope, or a private one nothing has been transferred
+//! into — reports an empty set rather than a refusal, which is what a scope with nothing monitored
+//! in it has to report.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +164,356 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetIpamResourceCidrs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetIpamResourceCidrsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetIpamResourceCidrs"))
+        use crate::state::{
+            CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
+            MAX_FILTERS, MAX_PAGE_SIZE, MatchBudget, PageTokenRule,
+        };
+
+        // `ctx` carries request metadata only, and this operation reads none of it: the Regions
+        // whose resources are monitored are the operating Regions of the IPAM the scope belongs
+        // to, not the Region this request was signed for. The store is reached through the engine
+        // held on `self`.
+        let _ = ctx;
+
+        // "The token for the next page of results" (`$NextToken`) — anything else is refused
+        // rather than read as a position, and it is refused before any other member is looked at,
+        // so whether a bogus token is caught never depends on the rest of the request.
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(crate::state::invalid_pagination_token)?,
+            ),
+        };
+
+        // Matching cost is filters x values x held values x monitored resource CIDRs and the model
+        // bounds none of them (`Filters` is a plain `FilterList`), so the request-controlled
+        // factors are capped here, before any work proportional to them is done — and their
+        // PRODUCT is charged to one [`MatchBudget`] below, which is the bound the per-factor caps
+        // cannot give.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+        // A filter name this operation does not resolve is refused whether or not any resource
+        // CIDR would have matched it, so an unsupported filter can never read as "no results".
+        // Each filter's values are parsed into their wildcard patterns ONCE here, not once per
+        // candidate.
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !IPAM_RESOURCE_CIDR_FILTERS.contains(&name) {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the product
+            // of the pattern's length and the value's, so each value's size is bounded too, before
+            // any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // The FORM of each id the request names, before anything is resolved: "not an id of this
+        // kind" is a fact about the request, so it is answered `.Malformed` ahead of the DryRun arm
+        // below and never as a missing scope or pool.
+        let scope_id = input.ipam_scope_id.as_str();
+        crate::state::require_well_formed_id(
+            crate::state::IPAM_SCOPE_ID_PREFIX,
+            scope_id,
+            crate::state::INVALID_IPAM_SCOPE_ID_MALFORMED,
+        )?;
+        if let Some(pool_id) = input.ipam_pool_id.as_deref() {
+            crate::state::require_well_formed_id(
+                crate::state::IPAM_POOL_ID_PREFIX,
+                pool_id,
+                crate::state::INVALID_IPAM_POOL_ID_MALFORMED,
+            )?;
+        }
+        // "The resource tag" (`$ResourceTag`): the tag is selected by its KEY, with the value
+        // narrowing it further — "use this filter to find all resources assigned a tag with a
+        // specific key, regardless of the tag value" (`RequestIpamResourceTag$Key`) — so an entry
+        // naming no key selects nothing and is a request missing that member rather than a page.
+        if let Some(resource_tag) = input.resource_tag.as_ref() {
+            if resource_tag
+                .key
+                .as_deref()
+                .is_none_or(|key| key.is_empty())
+            {
+                return Err(crate::state::missing_required_parameter("ResourceTag.Key"));
+            }
+        }
+
+        // "A check for whether you have the required permissions for the action without actually
+        // making the request" (`$DryRun`). Every caller of this emulator is permitted, so a dry run
+        // reports that outcome and reads nothing. It sits AFTER every parameter has been validated:
+        // the flag asks whether the request WOULD have succeeded, so one that would have been
+        // refused is refused with that reason instead.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        let state = crate::state::require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // The clock-owed moves this read is allowed to apply — the same call every other IPAM read
+        // makes: a scope answered as `create-in-progress` is `create-complete` once its due instant
+        // has passed, whether or not anybody called, so applying them here changes nothing a later
+        // caller would not have seen anyway.
+        store.materialize_due_transitions();
+
+        // "The ID of the scope that the resource is in" (`$IpamScopeId`, required): a scope this
+        // account holds none of is an error, not an empty page — which is what lets a client tell a
+        // dangling reference from a scope nothing is monitored in.
+        if !store.ipam_scopes.contains_key(scope_id) {
+            return Err(crate::state::invalid_ipam_scope_id_not_found(scope_id));
+        }
+        // "The ID of the IPAM pool that the resource is in" (`$IpamPoolId`): a pool the account
+        // holds none of is a dangling reference on exactly the same terms.
+        if let Some(pool_id) = input
+            .ipam_pool_id
+            .as_deref()
+            .filter(|pool_id| !store.ipam_pools.contains_key(*pool_id))
+        {
+            return Err(crate::state::id_not_found(
+                crate::state::INVALID_IPAM_POOL_ID_NOT_FOUND,
+                crate::state::IPAM_POOL_ID_KIND,
+                pool_id,
+            ));
+        }
+
+        // The resource CIDRs the scope holds, narrowed by the members that name one — each of them
+        // an attribute of the reported resource CIDR, so a request naming it asks about the rows
+        // carrying that value — and then by every filter ("if you specify multiple filters, the
+        // filters are joined with an AND" — `Filter`). Every comparison is charged to ONE budget,
+        // so the PRODUCT of monitored resource CIDRs, filters, values and value length is bounded
+        // however the caller combines them, which is also what bounds how long this holds the state
+        // lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<SelectedResourceCidr> = Vec::new();
+        for view in store.ipam_resource_cidrs_in_scope(scope_id) {
+            if budget.exhausted() {
+                break;
+            }
+            if !named_by_the_request(&input, &view) {
+                continue;
+            }
+            if crate::state::matches_every_filter(&selectors, &mut budget, &|name| {
+                filter_values(&view, name)
+            }) {
+                selected.push(SelectedResourceCidr {
+                    position: position_of(&view),
+                    view,
+                });
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as a
+        // result: the request asked for more filtering than one call will do, and is told so rather
+        // than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                     comparisons to evaluate; narrow them or page with MaxResults"
+                ),
+            ));
+        }
+
+        // Page in the order the cursor below names a position in: the resource and the range
+        // together ([`position_of`]), which is a TOTAL order over the rows — one resource holds one
+        // range once — so the cursor always advances.
+        selected.sort_by(|left, right| left.position.cmp(&right.position));
+
+        // "The maximum number of items to return for this request" (`$MaxResults`). A request that
+        // names none gets the largest page this service serves, so the `NextToken` path below
+        // behaves the same whether or not a page size was asked for. The model's `range 5..1000`
+        // has already refused anything outside it, so the only value that cannot convert is one the
+        // boundary validator would have rejected.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .min(MAX_PAGE_SIZE);
+
+        // "This value is null when there are no more results to return" (`$NextToken`): a token
+        // only when a resource CIDR follows this page.
+        let (page, next_token) = crate::state::page_from_cursor(
+            &selected,
+            cursor.as_deref(),
+            Some(limit),
+            PageTokenRule::WhenAnotherItemFollows,
+            |selected| selected.position.as_str(),
+        );
+
+        Ok(GetIpamResourceCidrsOutput {
+            ipam_resource_cidrs: Some(page.iter().map(|row| row.view.clone()).collect()),
+            next_token,
+        })
+    }
+}
+
+/// One selected resource CIDR and the position it is paged by.
+///
+/// The position is held beside the view rather than recomputed per comparison: it is the key the
+/// page order and the cursor are both read off ([`position_of`]), and the reported shape carries no
+/// single member that names one row.
+struct SelectedResourceCidr {
+    position: String,
+    view: IpamResourceCidr,
+}
+
+/// The position `view` is paged at: the resource and the range it holds, which together name ONE
+/// reported resource CIDR — a resource can hold several ranges and a range can be held by several
+/// resources, so neither alone is a total order and the cursor needs one.
+fn position_of(view: &IpamResourceCidr) -> String {
+    format!(
+        "{resource_id}/{resource_cidr}",
+        resource_id = view.resource_id.as_deref().unwrap_or_default(),
+        resource_cidr = view.resource_cidr.as_deref().unwrap_or_default(),
+    )
+}
+
+/// Whether `view` is a resource CIDR the request's own selectors name.
+///
+/// Each selector is an attribute of the reported resource CIDR — the resource, its type, its owner,
+/// the pool holding its space, a tag on it — so a request naming one asks about the rows carrying
+/// that value, and a request naming none asks about every row of the scope. They are joined with
+/// AND, as the `Filters` are.
+fn named_by_the_request(input: &GetIpamResourceCidrsInput, view: &IpamResourceCidr) -> bool {
+    // "The ID of the resource" (`$ResourceId`).
+    if input
+        .resource_id
+        .as_deref()
+        .filter(|named| !named.is_empty())
+        .is_some_and(|named| view.resource_id.as_deref() != Some(named))
+    {
+        return false;
+    }
+    // "The resource type" (`$ResourceType`), one of the modelled `IpamResourceType` values — the
+    // boundary validator has already refused anything else.
+    if input
+        .resource_type
+        .as_deref()
+        .filter(|named| !named.is_empty())
+        .is_some_and(|named| view.resource_type.as_deref() != Some(named))
+    {
+        return false;
+    }
+    // "The ID of the Amazon Web Services account that owns the resource" (`$ResourceOwner`).
+    if input
+        .resource_owner
+        .as_deref()
+        .filter(|named| !named.is_empty())
+        .is_some_and(|named| view.resource_owner_id.as_deref() != Some(named))
+    {
+        return false;
+    }
+    // "The ID of the IPAM pool that the resource is in" (`$IpamPoolId`): the pool of the scope
+    // whose space the resource holds, which only a MANAGED resource CIDR carries.
+    if input
+        .ipam_pool_id
+        .as_deref()
+        .filter(|named| !named.is_empty())
+        .is_some_and(|named| view.ipam_pool_id.as_deref() != Some(named))
+    {
+        return false;
+    }
+    // "The resource tag" (`$ResourceTag`): a tag the resource carries. The value narrows the key
+    // when the request names one, and a request naming only the key selects every value of it.
+    if let Some(resource_tag) = input.resource_tag.as_ref() {
+        let key = resource_tag.key.as_deref().unwrap_or_default();
+        let value = resource_tag.value.as_deref();
+        if !view.resource_tags.iter().flatten().any(|tag| {
+            tag.key.as_deref() == Some(key)
+                && value.is_none_or(|value| tag.value.as_deref().unwrap_or_default() == value)
+        }) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The filter names this operation resolves.
+///
+/// `GetIpamResourceCidrsRequest$Filters` documents no list of its own — "one or more filters for the
+/// request" is all of it
+/// (`smithy_query(query="doc",shape="GetIpamResourceCidrsRequest",member="Filters")`) — so the names
+/// are the ones EC2's filtering convention gives: each member of the resource the operation reports,
+/// spelled in kebab-case. This list is therefore derived mechanically from the `IpamResourceCidr`
+/// shape (`smithy_query(query="shape",shape="IpamResourceCidr")`), one entry per SCALAR member;
+/// `ResourceTags` is a LIST, whose entries carry no single value to compare a filter value against,
+/// and the request has its own `ResourceTag` member for selecting on one. Every entry must be
+/// answered by [`filter_values`].
+const IPAM_RESOURCE_CIDR_FILTERS: [&str; 15] = [
+    "availability-zone-id",
+    "compliance-status",
+    "ip-usage",
+    "ipam-id",
+    "ipam-pool-id",
+    "ipam-scope-id",
+    "management-state",
+    "overlap-status",
+    "resource-cidr",
+    "resource-id",
+    "resource-name",
+    "resource-owner-id",
+    "resource-region",
+    "resource-type",
+    "vpc-id",
+];
+
+/// The values the EC2 filter `name` compares against this resource CIDR.
+///
+/// A filter naming an attribute this row does not carry compares against NO values, so it selects
+/// nothing — the same answer AWS gives for, say, `ipam-pool-id` on a resource no pool hands space
+/// to.
+fn filter_values<'a>(view: &'a IpamResourceCidr, name: &str) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "availability-zone-id" => text(view.availability_zone_id.as_deref()),
+        "compliance-status" => text(view.compliance_status.as_deref()),
+        // The one member that is not text: compared as the decimal it is reported as, so a filter
+        // value a caller read out of a previous answer matches it.
+        "ip-usage" => view
+            .ip_usage
+            .map(|usage| Cow::Owned(usage.to_string()))
+            .into_iter()
+            .collect(),
+        "ipam-id" => text(view.ipam_id.as_deref()),
+        "ipam-pool-id" => text(view.ipam_pool_id.as_deref()),
+        "ipam-scope-id" => text(view.ipam_scope_id.as_deref()),
+        "management-state" => text(view.management_state.as_deref()),
+        "overlap-status" => text(view.overlap_status.as_deref()),
+        "resource-cidr" => text(view.resource_cidr.as_deref()),
+        "resource-id" => text(view.resource_id.as_deref()),
+        "resource-name" => text(view.resource_name.as_deref()),
+        "resource-owner-id" => text(view.resource_owner_id.as_deref()),
+        "resource-region" => text(view.resource_region.as_deref()),
+        "resource-type" => text(view.resource_type.as_deref()),
+        "vpc-id" => text(view.vpc_id.as_deref()),
+        _ => Vec::new(),
     }
 }

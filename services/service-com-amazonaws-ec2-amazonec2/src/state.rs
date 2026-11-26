@@ -1975,7 +1975,7 @@ use crate::ops::types::{
     Ipam, IpamInternetRegistryAssociation, IpamOperatingRegion, IpamPolicy, IpamPool,
     IpamPoolAllocation, IpamPoolCidr, IpamPoolCidrFailureReason,
     IpamPrefixListResolver, IpamPrefixListResolverRule, IpamPrefixListResolverTarget,
-    IpamResourceDiscovery, IpamResourceDiscoveryAssociation, IpamResourceTag,
+    IpamResourceCidr, IpamResourceDiscovery, IpamResourceDiscoveryAssociation, IpamResourceTag,
     IpamRoutingPolicyRegistration, IpamRoutingPolicyRegistrationDelta, IpamScope,
     MemoryInfo, NetworkCardInfo, NetworkInfo, NitroTpmInfo, PlacementGroupInfo, ProcessorInfo,
     VCpuInfo,
@@ -3174,6 +3174,12 @@ mod ipam_pool_cidrs;
 /// rather than as more lines here. Everything it declares is re-exported below, so a handler
 /// reaches these as `crate::state::<item>` like any primitive of this module.
 mod ipam_pool_allocations;
+/// The resource CIDRs IPAM MONITORS in a scope — the derivation of that set from the account's
+/// own VPCs and subnets, the monitoring a `ModifyIpamResourceCidr` records about one, and the
+/// management, compliance and overlap states a reported one carries — in a file of its own rather
+/// than as more lines here. Everything it declares is re-exported below, so a handler reaches
+/// these as `crate::state::<item>` like any primitive of this module.
+mod ipam_resource_cidrs;
 mod vpc_endpoints_and_transit_gateway_attachments;
 mod prefix_lists_and_dedicated_hosts;
 /// Which instances are ON a Dedicated Host — the recompute of `Host$Instances` from the
@@ -3383,6 +3389,7 @@ pub use ipam_prefix_list_resolver_rules::*;
 pub use ipam_prefix_list_resolver_target_sync::*;
 pub use ipam_pool_cidrs::*;
 pub use ipam_pool_allocations::*;
+pub use ipam_resource_cidrs::*;
 pub use capacity_billing_and_recycle_bins::*;
 pub use image_usage_report_store::*;
 pub use image_block_public_access_and_metadata_defaults::*;

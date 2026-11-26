@@ -3475,6 +3475,18 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// this is the store "you cannot delete an IPAM pool if there are allocations in it"
     /// (`DeleteIpamPool`) is asked of, through [`Self::ipam_pool_allocated_cidrs`].
     pub ipam_pool_allocations: BTreeMap<String, IpamPoolAllocationRecord>,
+    /// What a `ModifyIpamResourceCidr` has recorded about one RESOURCE CIDR of one IPAM, by the
+    /// IPAM, the resource and the range together — see [`IpamResourceCidrSettings`] and the
+    /// `ipam_resource_cidrs` module.
+    ///
+    /// Only the two facts a CALLER decides are held here: whether IPAM monitors the resource CIDR
+    /// and which of its IPAM's scopes the row sits in. Everything else `GetIpamResourceCidrs`
+    /// reports is derived from the resources this store already holds and the pools of the scope
+    /// ([`Self::ipam_resource_cidrs_in_scope`]), so a resource CIDR is never stored twice and this
+    /// report cannot drift from `DescribeVpcs` or `GetIpamPoolAllocations`. A fresh account has
+    /// modified nothing, so it starts empty and every resource CIDR is monitored in its IPAM's
+    /// private default scope.
+    pub ipam_resource_cidr_settings: BTreeMap<IpamResourceCidrKey, IpamResourceCidrSettings>,
     /// An `AllocateIpamPoolCidr` `ClientToken` and the `IpamPoolAllocationId` that call
     /// minted, so a replay of the same request answers with that allocation instead of
     /// handing out a second range: "a unique, case-sensitive identifier that you provide to
@@ -4371,6 +4383,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // Nothing has allocated a CIDR out of a pool either, so no `ClientToken` has
             // minted an allocation.
             ipam_pool_allocations: BTreeMap::new(),
+            ipam_resource_cidr_settings: BTreeMap::new(),
             ipam_pool_allocation_client_tokens: HashMap::new(),
             ipam_delete_at: BTreeMap::new(),
             // Nothing has created a prefix list resolver or a target against one yet.

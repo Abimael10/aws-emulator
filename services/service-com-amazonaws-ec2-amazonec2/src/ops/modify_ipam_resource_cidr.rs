@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyIpamResourceCidr
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyIpamResourceCidr`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: records what a caller decides about ONE resource CIDR IPAM monitors — whether IPAM
+//! monitors it at all, and which scope of its IPAM the row sits in — against [`crate::state`], and
+//! answers the resource CIDR as the store then holds it, read back through the one derivation
+//! `GetIpamResourceCidrs` reports from
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::ipam_resource_cidrs_in_scope`]) so the two
+//! cannot disagree about one range. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyIpamResourceCidr::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A resource CIDR is not a record a caller creates: the rows are the ranges of the account's own
+//! resources as IPAM discovers them, so this operation resolves the row the request names in the
+//! scope it names it in — a resource CIDR that is not in that scope is refused rather than created
+//! — and stores only the monitoring decision.
+//!
+//! "If set to false, the resource will not be tracked for overlap, it cannot be auto-imported into
+//! a pool, and it will be removed from any pool it has an allocation in" (`$Monitored`): the
+//! allocation that held the range in a pool of the scope goes with the monitoring, so the pool
+//! reports the range as free space from this call onwards.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +155,170 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyIpamResourceCidr` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyIpamResourceCidrErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyIpamResourceCidr"))
+        // `ctx` carries request metadata only, and this operation reads none of it: the Region the
+        // resource is in is the request's own `ResourceRegion` member, not the one its credential
+        // scope was signed for. The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // The three members that NAME the resource CIDR. Each is `clientOptional` in the model, so
+        // a request that left one out arrives here as the empty string: a resource CIDR cannot be
+        // named without them, so that is a request missing a parameter rather than one naming a
+        // resource CIDR that does not exist. The sentence is the one this surface's own input
+        // validation words, so a member the BOUNDARY resolves as absent and one that arrives empty
+        // are refused alike.
+        let resource_id = input.resource_id.as_str();
+        if resource_id.is_empty() {
+            return Err(crate::state::missing_required_parameter("ResourceId"));
+        }
+        let resource_cidr = input.resource_cidr.as_str();
+        if resource_cidr.is_empty() {
+            return Err(crate::state::missing_required_parameter("ResourceCidr"));
+        }
+        let resource_region = input.resource_region.as_str();
+        if resource_region.is_empty() {
+            return Err(crate::state::missing_required_parameter("ResourceRegion"));
+        }
+
+        // The FORM of each scope id the request names, before anything is resolved: "not an id of
+        // this kind" is a fact about the request, so it is answered `.Malformed` ahead of the
+        // DryRun arm below and never as a missing scope.
+        let current_scope_id = input.current_ipam_scope_id.as_str();
+        crate::state::require_well_formed_id(
+            crate::state::IPAM_SCOPE_ID_PREFIX,
+            current_scope_id,
+            crate::state::INVALID_IPAM_SCOPE_ID_MALFORMED,
+        )?;
+        let destination_scope_id = input
+            .destination_ipam_scope_id
+            .as_deref()
+            .filter(|scope_id| !scope_id.is_empty());
+        if let Some(scope_id) = destination_scope_id {
+            crate::state::require_well_formed_id(
+                crate::state::IPAM_SCOPE_ID_PREFIX,
+                scope_id,
+                crate::state::INVALID_IPAM_SCOPE_ID_MALFORMED,
+            )?;
+        }
+
+        let state = crate::state::require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // The clock-owed moves this call applies before reading, the same ones every IPAM
+        // operation applies: a scope answered as `create-in-progress` is `create-complete` once its
+        // due instant has passed, whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // "The ID of the current scope that the resource CIDR is in" (`$CurrentIpamScopeId`,
+        // required): a scope this account holds none of is an error, not a resource CIDR that could
+        // not be found in it.
+        let Some(current_scope) = store.ipam_scopes.get(current_scope_id).cloned() else {
+            return Err(crate::state::invalid_ipam_scope_id_not_found(
+                current_scope_id,
+            ));
+        };
+        // The resource CIDRs a caller modifies are the ranges of the account's own resources, which
+        // is private space, so the scope they are monitored in is a PRIVATE one — the one reader of
+        // that question, which words the refusal the way EC2 words it.
+        crate::state::require_private_ipam_scope(&current_scope, current_scope_id)?;
+        let Some(ipam_id) = store.ipam_id_of_scope(current_scope_id) else {
+            return Err(crate::state::invalid_ipam_scope_id_not_found(
+                current_scope_id,
+            ));
+        };
+
+        // The resource CIDR the request names, resolved IN THE SCOPE IT NAMES IT IN: the three
+        // members together name one row of that scope, so a row the scope does not hold — a
+        // resource CIDR of another scope, of another Region, or of no resource at all — is a range
+        // IPAM has nothing to modify under.
+        let held = store
+            .ipam_resource_cidr_in_scope(current_scope_id, resource_id, resource_cidr)
+            .filter(|view| view.resource_region.as_deref() == Some(resource_region));
+        if held.is_none() {
+            return Err(crate::state::invalid_resource_cidr_not_found());
+        }
+
+        // "The ID of the scope you want to transfer the resource CIDR to"
+        // (`$DestinationIpamScopeId`): the scope the row moves to. A scope of ANOTHER IPAM is not
+        // one this IPAM's monitoring can be transferred to — the destination has to be a scope of
+        // the IPAM that monitors the resource — and it is held to being private on exactly the
+        // terms the current scope is.
+        let destination_scope_id = match destination_scope_id {
+            None => None,
+            Some(scope_id) if scope_id == current_scope_id => None,
+            Some(scope_id) => {
+                let Some(destination) = store.ipam_scopes.get(scope_id).cloned() else {
+                    return Err(crate::state::invalid_ipam_scope_id_not_found(scope_id));
+                };
+                crate::state::require_private_ipam_scope(&destination, scope_id)?;
+                if store.ipam_id_of_scope(scope_id).as_deref() != Some(ipam_id.as_str()) {
+                    return Err(crate::state::invalid_parameter_value(format!(
+                        "Invalid value '{scope_id}' for destinationIpamScopeId. It must name a \
+                         scope of the IPAM '{ipam_id}'"
+                    )));
+                }
+                Some(scope_id)
+            }
+        };
+        // The scope the row sits in once this call lands: the destination when one was named, and
+        // the scope it is already in otherwise.
+        let scope_id = destination_scope_id.unwrap_or(current_scope_id).to_string();
+
+        // What this call would store, held to the store's ceilings BEFORE anything is written: a
+        // resource CIDR this IPAM has no record for yet adds one, so a count ceiling and the
+        // caller-chosen byte budget are both asked first — a modification of one it already holds
+        // adds no record.
+        let settings = crate::state::IpamResourceCidrSettings {
+            monitored: input.monitored,
+            ipam_scope_id: scope_id.clone(),
+        };
+        let key: crate::state::IpamResourceCidrKey = (
+            ipam_id.clone(),
+            resource_id.to_string(),
+            resource_cidr.to_string(),
+        );
+        let payload_bytes = crate::state::ipam_resource_cidr_settings_payload_bytes(&key, &settings);
+        let already_held = store
+            .ipam_resource_cidr_settings_of(&ipam_id, resource_id, resource_cidr)
+            .is_some();
+        if !already_held {
+            if !store.has_ipam_resource_cidr_setting_capacity() {
+                return Err(crate::state::resource_limit_exceeded(format!(
+                    "This emulator holds {max} IPAM resource CIDR modifications, which is as many \
+                     as it stores",
+                    max = crate::state::MAX_STORED_RECORDS_PER_STORE,
+                )));
+            }
+            if store.would_exceed_stored_bytes(payload_bytes) {
+                return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                    "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                     so it cannot store {payload_bytes} more",
+                    held = store.stored_bytes(),
+                    max = crate::state::MAX_STORED_BYTES,
+                )));
+            }
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "if you have the
+        // required permissions, the error response is DryRunOperation" (`$DryRun`). Nothing has
+        // been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        // The one writer of a resource CIDR's monitoring, which also gives back the space a
+        // resource IPAM stops monitoring held in a pool of the scope.
+        let Some(view) = store.set_ipam_resource_cidr_monitoring(
+            &ipam_id,
+            &scope_id,
+            resource_id,
+            resource_cidr,
+            input.monitored,
+        ) else {
+            return Err(crate::state::internal_error(
+                "the resource CIDR just modified could not be read back",
+            ));
+        };
+        Ok(ModifyIpamResourceCidrOutput {
+            ipam_resource_cidr: Some(view),
+        })
     }
 }
