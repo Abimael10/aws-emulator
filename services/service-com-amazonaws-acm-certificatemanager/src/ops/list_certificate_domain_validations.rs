@@ -5,18 +5,20 @@
 //! Reports one `DomainValidationSummary` per name on a stored certificate, projected
 //! from that certificate's persisted per-domain validation records: the method the
 //! certificate was requested with, the status that validation currently stands at, and
-//! the kind of challenge that method asks for, all under the summary's
+//! the challenge that method's evidence is carried in, all under the summary's
 //! `RequestedValidationConfiguration`. Nothing here is echoed from the request beyond
 //! the certificate it names — `RequestCertificate` wrote those records, and this
 //! operation reads them.
 //!
-//! The challenge names the KIND of evidence the requested method asks for, read off that
-//! same stored record: the DNS arm says the domain is proved by publishing a CNAME, and
-//! the record to publish is the certificate's own to report, on
-//! `CertificateDetail$DomainValidationOptions[*].ResourceRecord`. The email arm carries
-//! the addresses ACM has mailed and names the covered name this summary is about, while
-//! the mail SUFFIX ACM writes to for that name stays the certificate detail's
-//! `[*].ValidationDomain`.
+//! The challenge carries the evidence ACM has PUBLISHED for that method, read off that
+//! same stored record: the DNS arm carries the CNAME to publish once the challenge has
+//! landed on the domain's validation configuration — "retrieve the CNAME records required
+//! for DNS validation" is what this operation's own doc says the results are for — and
+//! the empty arm for the span before then, which is what the recorded configuration of a
+//! certificate just requested carries. The email arm likewise carries the addresses ACM
+//! has already mailed, the empty list until the dispatch falls due, and names the covered
+//! name this summary is about, while the mail SUFFIX ACM writes to for that name stays
+//! the certificate detail's `[*].ValidationDomain`.
 //!
 //! The summaries are reported in DOMAIN-NAME order, the total order this paginated read
 //! cuts and resumes its pages in.
@@ -237,8 +239,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already owes it: a validation whose outcome fell due before this call is
         // reported as it stands now, so this reader and `DescribeCertificate` cannot
         // report one store at two different instants.
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        store.materialize_due_in(&*self.engine, ::std::time::SystemTime::now());
+        store.materialize_due_in(&*self.engine, now);
         let Some(certificate) = store.certificates.get(&input.certificate_arn) else {
             return Err(
                 ListCertificateDomainValidationsErrorModeled::ResourceNotFoundException(
@@ -290,7 +293,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let summaries: Vec<DomainValidationSummary> = page[..emitted]
             .iter()
-            .map(domain_validation_summary)
+            .map(|record| domain_validation_summary(record, now))
             .collect();
         // A token is issued only when this page stopped short of the certificate's
         // remaining domains, and it names the last domain the page emitted.
@@ -335,11 +338,12 @@ const MAX_PAGE_SIZE: usize = 1000;
 /// report beside the requested one.
 fn domain_validation_summary(
     record: &crate::state::DomainValidationRecord,
+    now: ::std::time::SystemTime,
 ) -> DomainValidationSummary {
     DomainValidationSummary {
         domain_name: record.domain_name.clone(),
         active_validation_configuration: None,
-        requested_validation_configuration: Some(requested_configuration(record)),
+        requested_validation_configuration: Some(requested_configuration(record, now)),
     }
 }
 
@@ -347,16 +351,18 @@ fn domain_validation_summary(
 /// `DomainStatus` that validation currently has, and the challenge the method asks for.
 fn requested_configuration(
     record: &crate::state::DomainValidationRecord,
+    now: ::std::time::SystemTime,
 ) -> ValidationConfiguration {
     ValidationConfiguration {
         validation_method: Some(record.validation_method.clone()),
         validation_status: Some(record.validation_status.clone()),
-        validation_challenge: validation_challenge(record),
+        validation_challenge: validation_challenge(record, now),
     }
 }
 
-/// The challenge a domain's validation configuration carries: the KIND of evidence the
-/// requested method asks for, read off the record `RequestCertificate` stored.
+/// The challenge a domain's validation configuration carries: the evidence the method
+/// that domain stands under asks for, as far as ACM has published it, read off the record
+/// `RequestCertificate` stored.
 ///
 /// `ValidationChallenge` is a union with one member per method whose challenge the
 /// model describes — `EmailValidationChallenge` (the mailboxes ACM mails and the domain
@@ -366,21 +372,27 @@ fn requested_configuration(
 /// so an HTTP-validated domain carries no challenge here rather than one of the two
 /// shapes that would describe evidence it does not use.
 ///
-/// Which arm is set is what this reports — the method a domain stands under, said in the
-/// shape of the challenge that method asks for:
+/// Which arm is set says which method a domain stands under; what the arm carries is the
+/// evidence ACM has published for it:
 ///
 /// * the email arm names the addresses ACM has used — the empty list until a dispatch
 ///   has used one — and `ValidationDomain` is the name this summary is about: the
 ///   covered domain name as the request wrote it, its wildcard label included. The mail
 ///   SUFFIX ACM writes to for that name is the certificate's own record to report,
 ///   on `CertificateDetail$DomainValidationOptions[*].ValidationDomain`;
-/// * the DNS arm carries no `ResourceRecord`: the CNAME a client publishes for a
-///   DNS-validated name is reported where the certificate's detail reports it,
-///   `CertificateDetail$DomainValidationOptions[*].ResourceRecord`, and this summary says
-///   only that the domain stands under the method that asks for one, which is what the
-///   recorded summaries of a DNS-validated certificate carry.
+/// * the DNS arm carries the CNAME a client publishes for a DNS-validated name —
+///   "contains a `DnsValidationChallenge` with the CNAME record to add"
+///   (`ValidationConfiguration$ValidationChallenge` doc), the record
+///   `DnsValidationChallenge$ResourceRecord` is "the CNAME record that ACM creates for
+///   DNS validation" — from the instant ACM publishes that challenge into the domain's
+///   validation configuration ([`crate::state::DomainValidationRecord::published_resource_record`]),
+///   and NO record for the span before then, which is what the recorded configuration of
+///   a certificate just requested carries. The record is the certificate's own either
+///   way: its detail reports the same stored one on
+///   `CertificateDetail$DomainValidationOptions[*].ResourceRecord`.
 fn validation_challenge(
     record: &crate::state::DomainValidationRecord,
+    now: ::std::time::SystemTime,
 ) -> Option<ValidationChallenge> {
     match record.validation_method.as_str() {
         crate::state::VALIDATION_METHOD_EMAIL => Some(
@@ -389,11 +401,12 @@ fn validation_challenge(
                 validation_domain: Some(record.domain_name.clone()),
             }),
         ),
-        // The DNS challenge this domain stands under: the kind of evidence the method
-        // asks for, with the record to publish left to the certificate's own detail.
+        // The DNS challenge this domain stands under, carrying the record to publish once
+        // ACM has published it into this configuration — the evidence the challenge is
+        // for — and nothing inside the arm until then.
         crate::state::VALIDATION_METHOD_DNS => Some(
             ValidationChallenge::DnsValidationChallenge(DnsValidationChallenge {
-                resource_record: None,
+                resource_record: record.published_resource_record(now),
             }),
         ),
         // `HTTP`: the union models no member for it, so there is no challenge to

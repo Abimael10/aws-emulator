@@ -116,9 +116,10 @@ fn assert_configuration_member(case: &str, summary: &Value, method: &str, status
              arm, got {summary}"
         ),
         "DNS" => {
-            // The arm names the KIND of evidence the method asks for and carries no
-            // record inside it: the CNAME to publish is reported on the certificate's
-            // own `DomainValidationOptions[*].ResourceRecord`.
+            // The arm carries no record while the challenge ACM minted for the name has
+            // not landed on this configuration yet, which is what every row here holds
+            // out; the CNAME is reported from the moment it is minted on the
+            // certificate's own `DomainValidationOptions[*].ResourceRecord`.
             assert_eq!(
                 challenge["DnsValidationChallenge"],
                 json!({}),

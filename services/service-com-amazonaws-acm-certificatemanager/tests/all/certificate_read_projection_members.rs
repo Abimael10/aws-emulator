@@ -215,8 +215,8 @@ async fn the_dns_challenge_names_the_method_and_the_detail_carries_the_cname() {
             assert_eq!(
                 challenge,
                 &json!({}),
-                "case {row}: a DNS-validated name carries the DNS challenge arm and nothing \
-                 inside it, got {configuration}"
+                "case {row}: a DNS-validated name whose challenge has not landed yet carries \
+                 the DNS challenge arm and nothing inside it, got {configuration}"
             );
 
             // The record is a real CNAME under the name being proven, reported by the

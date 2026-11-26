@@ -276,6 +276,25 @@ pub const VALIDATION_SETTLE_DELAY: Duration = OWED_TRANSITION_SPAN;
 /// waiting on proof of domain control is never mailed.
 pub const VALIDATION_EMAIL_DISPATCH_DELAY: Duration = Duration::from_secs(4);
 
+/// How long after the call that starts a domain's validation the challenge ACM publishes
+/// for it LANDS on that domain's validation CONFIGURATION — the span the configuration's
+/// DNS challenge reports no CNAME for.
+///
+/// A CHOSEN span, not a documented one: ACM mints the record when it accepts the request
+/// and publishes it into the per-domain validation configuration itself, a little
+/// afterwards — the recorded configuration of a certificate just requested carries the
+/// DNS challenge with no record inside it, and a client that polls that challenge reads
+/// the record seconds later. It is [`OWED_TRANSITION_SPAN`], for the reason that span
+/// exists: a client that lists the validations straight after requesting the certificate
+/// still observes the challenge before the record landed, so the answer does not depend
+/// on how fast that client calls.
+///
+/// Stored on the record the challenge belongs to
+/// ([`DomainValidationRecord::challenge_published_at`]) and never slept on, exactly as
+/// the other spans the clock owes a request are: the instant is fixed by the call that
+/// minted the challenge, so it lands whether or not anybody calls again.
+pub const VALIDATION_CHALLENGE_PUBLICATION_DELAY: Duration = OWED_TRANSITION_SPAN;
+
 /// How long ACM waits for proof of domain control before the request times out.
 ///
 /// A DOCUMENTED span, not a chosen one: "ACM makes repeated attempts to validate a
@@ -1003,8 +1022,31 @@ pub struct DomainValidationRecord {
     pub validation_emails: Vec<String>,
     /// The CNAME to publish, for DNS validation.
     pub resource_record: Option<ResourceRecord>,
+    /// When the challenge this record holds lands on the domain's validation
+    /// CONFIGURATION, which is where this service reports the evidence ACM has published
+    /// for the name ([`VALIDATION_CHALLENGE_PUBLICATION_DELAY`]): the instant fixed by
+    /// the call that minted the record, and never slept on. The certificate's own DETAIL
+    /// reports the minted record from the moment the record exists — `ResourceRecord`
+    /// "is used by the DescribeCertificate action" (`ResourceRecord` doc) — so this
+    /// instant decides what the validation configuration carries, not what the record is.
+    pub challenge_published_at: SystemTime,
     /// The URLs the CA fetches, for HTTP validation.
     pub http_redirect: Option<HttpRedirect>,
+}
+
+impl DomainValidationRecord {
+    /// The challenge record this domain's validation CONFIGURATION carries at `now`: the
+    /// CNAME this record holds once ACM has published it into the configuration, and
+    /// nothing at all before then ([`Self::challenge_published_at`]).
+    ///
+    /// A pure read of the instant the mint stored, so two readers at one instant agree
+    /// and no reporting call is what makes the challenge land.
+    pub fn published_resource_record(&self, now: SystemTime) -> Option<ResourceRecord> {
+        if now < self.challenge_published_at {
+            return None;
+        }
+        self.resource_record.clone()
+    }
 }
 
 /// How the validation of a requested certificate resolves.
@@ -3900,10 +3942,12 @@ pub fn is_validation_domain_for(validation_domain: &str, domain_name: &str) -> b
 ///
 /// DNS validation publishes a CNAME, email validation names the mailboxes ACM wrote
 /// to, and HTTP validation names the URL the CA fetches; `validation_method` decides
-/// which. Every value is derived from the certificate's own id, so the same
-/// `(certificate, domain, method)` always yields the same record — a later
+/// which. Every value of the evidence is derived from the certificate's own id, so the
+/// same `(certificate, domain, method)` always yields the same record — a later
 /// `DescribeCertificate` reports exactly what was stored, and a certificate migrated
-/// back to a method it already used reports the record it had.
+/// back to a method it already used reports the record it had. `minted_at` is the
+/// instant this call mints it at, which is what the challenge's own publication
+/// ([`DomainValidationRecord::challenge_published_at`]) is measured from.
 ///
 /// Shared, because the method a certificate validates its domains by is set when the
 /// certificate is requested and can be changed afterwards
@@ -3914,6 +3958,7 @@ pub fn domain_validation_record(
     validation_method: &str,
     validation_domain: Option<&str>,
     validation_zone: &str,
+    minted_at: SystemTime,
 ) -> DomainValidationRecord {
     let target = validation_target(domain_name);
     let mut record = DomainValidationRecord {
@@ -3942,6 +3987,10 @@ pub fn domain_validation_record(
         // `ResendValidationEmail` record.
         validation_emails: Vec::new(),
         resource_record: None,
+        // ACM publishes the challenge into the domain's validation configuration itself,
+        // a bounded span after the call that minted it, so the instant it lands is fixed
+        // here rather than waited for.
+        challenge_published_at: minted_at + VALIDATION_CHALLENGE_PUBLICATION_DELAY,
         http_redirect: None,
     };
     match validation_method {

@@ -81,14 +81,16 @@ pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryE
 }
 
 /// Hold every stored certificate in the state its request created for the rest of the
-/// test, by moving each transition the clock owes it — the validation outcome and the
-/// initial domain-validation email — an hour out.
+/// test, by moving each transition the clock owes it — the validation outcome, the
+/// initial domain-validation email, and the publication of each domain's validation
+/// challenge — an hour out.
 ///
 /// This writes only the due instants the emulator itself stores; each transition is
 /// still materialised by `materialize_due` on the next request, exactly as in
 /// production. A test about the state a request creates therefore cannot be made flaky
-/// by the [`state::VALIDATION_SETTLE_DELAY`] or
-/// [`state::VALIDATION_EMAIL_DISPATCH_DELAY`] span elapsing mid-test.
+/// by the [`state::VALIDATION_SETTLE_DELAY`],
+/// [`state::VALIDATION_EMAIL_DISPATCH_DELAY`] or
+/// [`state::VALIDATION_CHALLENGE_PUBLICATION_DELAY`] span elapsing mid-test.
 pub(crate) fn hold_pending_validations(engine: &Arc<engine::InMemoryEngine>) {
     let store = engine.state::<state::ComAmazonawsAcmCertificatemanagerState>();
     let mut store = store.lock();
@@ -99,6 +101,9 @@ pub(crate) fn hold_pending_validations(engine: &Arc<engine::InMemoryEngine>) {
         }
         if certificate.pending_validation_email.is_some() {
             certificate.pending_validation_email = Some(held);
+        }
+        for validation in &mut certificate.domain_validations {
+            validation.challenge_published_at = held;
         }
     }
 }
@@ -117,6 +122,24 @@ pub(crate) fn dispatch_validation_mail_now(engine: &Arc<engine::InMemoryEngine>)
     for certificate in store.certificates.values_mut() {
         if certificate.pending_validation_email.is_some() {
             certificate.pending_validation_email = Some(past);
+        }
+    }
+}
+
+/// Move the publication of every stored domain validation's challenge into the past, so
+/// the next request reports the record ACM published into that domain's validation
+/// configuration.
+///
+/// Like [`hold_pending_validations`] this writes only the instant the emulator stores
+/// ([`state::VALIDATION_CHALLENGE_PUBLICATION_DELAY`] after the mint), so a test that
+/// needs the published challenge does not have to wait that span out on the wall clock.
+pub(crate) fn publish_validation_challenges_now(engine: &Arc<engine::InMemoryEngine>) {
+    let store = engine.state::<state::ComAmazonawsAcmCertificatemanagerState>();
+    let mut store = store.lock();
+    let past = std::time::SystemTime::now() - std::time::Duration::from_millis(1);
+    for certificate in store.certificates.values_mut() {
+        for validation in &mut certificate.domain_validations {
+            validation.challenge_published_at = past;
         }
     }
 }

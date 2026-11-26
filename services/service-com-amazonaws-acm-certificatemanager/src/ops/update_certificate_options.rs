@@ -221,11 +221,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // Every handler materialises what the clock already owes first, so this call
         // decides on the status a reader would see at this instant rather than on a
         // validation outcome that had fallen due with nobody to apply it.
-        store.materialize_due_in(&*self.engine, ::std::time::SystemTime::now());
+        store.materialize_due_in(&*self.engine, now);
         let Some(certificate) = store.certificates.get_mut(&input.certificate_arn) else {
             return Err(
                 UpdateCertificateOptionsErrorModeled::ResourceNotFoundException(
@@ -359,6 +360,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &method,
                         record.requested_validation_domain.as_deref(),
                         &validation_zone,
+                        // The migration is the call that mints this challenge, so the
+                        // instant it lands on the domain's validation configuration is
+                        // measured from here.
+                        now,
                     );
                     *record = crate::state::DomainValidationRecord {
                         validation_status: record.validation_status.clone(),

@@ -166,6 +166,10 @@ pub(crate) fn assert_resource_record(case: &str, record: &Value, domain: &Value)
 /// Assert one summary against the `DescribeCertificate` record of the same domain:
 /// same method, same status, and the challenge the model describes for that method,
 /// naming the evidence that method asks for.
+///
+/// Every caller holds the challenge publication out, so the DNS arm here is the one a
+/// configuration carries before the minted CNAME lands on it
+/// (`crate::dns_validation_challenge_publication` covers the landed arm).
 pub(crate) fn assert_summary_matches_record(
     case: &str,
     summary: &Value,
@@ -200,8 +204,9 @@ pub(crate) fn assert_summary_matches_record(
     let challenge = &requested["ValidationChallenge"];
     match method {
         // `DnsValidationChallenge` says the domain is proved by publishing a CNAME, and
-        // carries no record of its own: the CNAME to publish is the one
-        // `DescribeCertificate` reports for the same name on
+        // carries no record while the challenge ACM minted for the name has not landed on
+        // this configuration yet. The CNAME itself is reported from the moment it is
+        // minted by `DescribeCertificate`, on
         // `DomainValidationOptions[*].ResourceRecord`.
         "DNS" => {
             assert_eq!(

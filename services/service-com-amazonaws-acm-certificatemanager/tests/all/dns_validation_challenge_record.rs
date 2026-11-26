@@ -4,13 +4,16 @@
 //! WHERE the CNAME that proves it is reported, over the wire (`POST /`,
 //! `X-Amz-Target: CertificateManager.<Op>`, awsJson1_1).
 //!
-//! RULE under test: a domain validation summary's `ValidationChallenge` names the KIND of
-//! evidence the domain's current validation method asks for, and no more — the `DNS` arm is
-//! reported for a DNS-validated name and carries no `ResourceRecord`, exactly as the recorded
-//! summaries of a DNS-validated certificate do. The record a client publishes is the
-//! certificate's own to report, on
+//! RULE under test: a domain validation summary's `ValidationChallenge` carries the
+//! evidence ACM has published for the domain's current validation method — the `DNS` arm is
+//! reported for a DNS-validated name and carries no `ResourceRecord` until the challenge
+//! ACM mints for that name has landed on the configuration, exactly as the recorded
+//! summaries of a just-requested certificate do. Whatever the challenge carries, the record
+//! is also the certificate's own to report, on
 //! `CertificateDetail$DomainValidationOptions[*].ResourceRecord`: a fully populated
-//! `ResourceRecord{Name, Type: CNAME, Value}` per covered name.
+//! `ResourceRecord{Name, Type: CNAME, Value}` per covered name, from the moment it is
+//! minted. What the challenge carries once it HAS landed is
+//! [`crate::dns_validation_challenge_publication`].
 //!
 //! The tables span what the rule generalises over: the form of each covered name (apex,
 //! subdomain, deep label, wildcard), how many names one certificate covers, the page the
@@ -32,6 +35,7 @@ use crate::certificate_domain_validations::{
 use crate::certificate_lifecycle::{
     call, hold_pending_validations, request_certificate, router_with_engine, validation_zone,
 };
+
 use crate::certificate_validation_state_machine::make_validation_due_now;
 
 /// The status a validation that has not resolved stands at
@@ -70,7 +74,9 @@ async fn paged_summaries(
     }
 }
 
-/// Assert the summary for `domain` reports the DNS challenge arm and nothing inside it.
+/// Assert the summary for `domain` reports the DNS challenge arm and nothing inside it,
+/// which is what it carries while the challenge ACM minted for the name has not landed on
+/// the configuration yet (every caller holds that publication out).
 fn assert_dns_challenge_is_bare(case: &str, list: &[Value], domain: &str) {
     let summary = list
         .iter()
@@ -289,6 +295,9 @@ async fn a_domain_migrated_onto_dns_reports_the_dns_arm_and_a_new_cname() {
         }
 
         migrate_to(&router, case, &arn, "DNS").await;
+        // The migration minted this certificate's DNS challenges, so their publication is
+        // held out the same way the request's own transitions were.
+        hold_pending_validations(&engine);
         let (migrated, _next) = summaries(&router, &json!({ "CertificateArn": arn })).await;
         let described = described_validations(&router, &arn).await;
         for name in *names {
