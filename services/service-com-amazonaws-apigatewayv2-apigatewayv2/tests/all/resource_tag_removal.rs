@@ -38,7 +38,7 @@ use crate::path_label::addressed;
 
 /// The tags collection every tag operation is addressed under
 /// (`smithy_query(query="operation", operation="UntagResource")`: `/v2/tags/{ResourceArn}`).
-const TAGS: &str = "/v2/tags";
+pub(crate) const TAGS: &str = "/v2/tags";
 
 /// The emulator's canonical account id, the account segment of the ARNs this service mints
 /// for its portal-plane resources.
@@ -57,10 +57,10 @@ const RESOURCE_NOT_FOUND: &str = "Resource was not found";
 
 /// One resource class the rule spans: the ARN that names the resource created for a row,
 /// and the URI its own reader reports it at.
-struct Target {
-    kind: &'static str,
-    arn: String,
-    read_uri: String,
+pub(crate) struct Target {
+    pub(crate) kind: &'static str,
+    pub(crate) arn: String,
+    pub(crate) read_uri: String,
 }
 
 /// An ACM certificate ARN, the only source `DomainNameConfiguration$CertificateArn`
@@ -92,7 +92,7 @@ fn portal_content(display_name: &str) -> Value {
 /// stage, the VPC link and the custom domain name are named by the account-less management
 /// ARN API Gateway documents for its own control-plane resources; the portal and the portal
 /// product report an ARN of their own, which is read back from the create.
-async fn taggable_resources(
+pub(crate) async fn taggable_resources(
     emulator: &MultiServiceRouter,
     label: &str,
     tags: &Value,
