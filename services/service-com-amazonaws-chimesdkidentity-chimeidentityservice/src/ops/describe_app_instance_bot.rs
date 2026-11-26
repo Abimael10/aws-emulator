@@ -153,39 +153,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A reporting operation: it reads the stored bot and writes nothing.
         //
-        // An `AppInstanceBotArn` this service holds no bot for is reported as ABSENT, in
-        // the shape this operation's model gives that answer: the model declares
-        // `NotFoundException` (404) here — "one or more of the resources in the request
-        // does not exist in the system" — so the absence sentence this service words the
-        // same way for every missing resource is carried by that 404 class rather than by
-        // the 400 `BadRequestException` the sibling bot operations have to borrow it for,
-        // their models declaring no 404 shape.
+        // An `AppInstanceBotArn` this service holds no bot for is REFUSED as a request
+        // this caller may not make — the permanent 403 `ForbiddenException` carrying the
+        // one forbidden-request sentence — and never answered with a report of what the
+        // store does or does not hold: a read of a bot this service cannot resolve says
+        // nothing about whether that bot exists, so the refusal is the same however the
+        // ARN came to be unresolvable (a bot never minted, one deleted, one cascaded away
+        // with its `AppInstance`, or an ARN naming another resource kind, account or
+        // region) and names no ARN back to the caller.
         //
-        // The permanent 403 refusal stays reserved for the one condition it states
-        // across this service: an ARN at or under an `AppInstance` this store has
-        // DELETED, where the instance that would authorize the read is gone, so a bot
-        // cascaded away with its parent is refused as a request this caller may no longer
-        // make rather than reported as a bot that never was.
+        // The refusal therefore does NOT depend on
+        // [`crate::state::UnresolvedArn`](crate::state::UnresolvedArn): the arm for an
+        // ARN at or under a DELETED `AppInstance` and the arm for one that never named a
+        // bot mint the same answer, so neither is distinguished here.
         let Some(record) = state.bot(&input.app_instance_bot_arn) else {
-            return Err(match state.unresolved_arn(&input.app_instance_bot_arn) {
-                crate::state::UnresolvedArn::DeletedAppInstance => {
-                    DescribeAppInstanceBotErrorModeled::ForbiddenException(ForbiddenException {
-                        code: Some("Forbidden".to_string()),
-                        message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
-                    })
-                    .into()
-                }
-                crate::state::UnresolvedArn::NeverExisted => {
-                    DescribeAppInstanceBotErrorModeled::NotFoundException(NotFoundException {
-                        code: Some("NotFound".to_string()),
-                        message: Some(format!(
-                            "AppInstanceBot {} does not exist",
-                            input.app_instance_bot_arn
-                        )),
-                    })
-                    .into()
-                }
-            });
+            return Err(
+                DescribeAppInstanceBotErrorModeled::ForbiddenException(ForbiddenException {
+                    code: Some("Forbidden".to_string()),
+                    message: Some(crate::state::FORBIDDEN_REQUEST_MESSAGE.to_string()),
+                })
+                .into(),
+            );
         };
 
         Ok(DescribeAppInstanceBotOutput {
