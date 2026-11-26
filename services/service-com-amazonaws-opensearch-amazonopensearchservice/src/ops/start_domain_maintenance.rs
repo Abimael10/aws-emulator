@@ -25,11 +25,10 @@
 //! maintenance record this call creates — nothing else about the domain moves: node
 //! maintenance is not a configuration change of it.
 //!
-//! The record is written `PENDING` and the clock owes it the rest of its run, within
-//! the span [`crate::state::MAINTENANCE_STEP`] bounds: a maintenance action defers no
-//! state change to its due instants, so that span is bounded by the next read a
-//! polling client makes rather than chosen for a caller to observe (see
-//! [`crate::state::Domain::begin_maintenance`]).
+//! The record is written `PENDING` and the clock owes it the rest of its run, one
+//! [`crate::state::MAINTENANCE_STEP`] per step: a client that starts an action and then
+//! polls for its outcome therefore reads the action running before it reads it finished
+//! (see [`crate::state::Domain::begin_maintenance`]).
 //!
 //! ## Shape of an operation
 //!

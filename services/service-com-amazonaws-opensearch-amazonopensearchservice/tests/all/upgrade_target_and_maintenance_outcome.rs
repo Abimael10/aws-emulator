@@ -51,7 +51,7 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
 };
 
 use super::compatible_versions::{compatible, entries, target_versions};
-use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, SETTLE_WAIT};
+use super::domain_lifecycle::{error_code, poll_until, string_member, Answer, Emulator, SETTLE_WAIT};
 use super::domain_maintenance::{census, create, every_role, list, start, status, MAINTENANCE_TYPES};
 use super::package_associations::{available_packages, stored_status};
 use super::package_dissociation::{dissociate_many, dissociate_one, with_associations};
@@ -433,8 +433,25 @@ async fn a_finished_maintenance_action_is_reported_with_the_services_terminal_st
         ));
     }
 
-    // The clock finishes every action, with no call having asked for the move.
-    tokio::time::sleep(SETTLE_WAIT).await;
+    // The clock finishes every action, with no call having asked for the move. The
+    // CONDITION is waited for rather than a span slept, so the case does not depend on how
+    // fast the host runs, and it is waited for through the listing the assertions below
+    // read — a read of the records, which asks for no move.
+    let ids: Vec<String> = started.iter().map(|(id, _)| id.clone()).collect();
+    poll_until("ListDomainMaintenances(maintenance-outcome)", || async {
+        let listed = list(&emulator, domain, "").await;
+        let rows = listed.body["DomainMaintenances"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        ids.iter().all(|id| {
+            rows.iter().any(|row| {
+                row["MaintenanceId"].as_str() == Some(id.as_str())
+                    && row["Status"].as_str() == Some(MAINTENANCE_STATUS_SUCCESS)
+            })
+        })
+    })
+    .await;
     let listed = list(&emulator, domain, "").await;
     assert_eq!(
         listed.status, 200,

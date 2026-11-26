@@ -538,10 +538,9 @@ impl Domain {
     /// its run ([`Maintenance::settle`]), so the record walks the statuses the service
     /// reports an action under rather than being put straight into its outcome.
     ///
-    /// What the clock owes it falls due inside [`MAINTENANCE_STEP`], which is as short
-    /// as it is for the reason stated there: this is the one span of this service with
-    /// no state change behind it, so it is bounded by the next read a polling client
-    /// makes rather than chosen for a caller to observe.
+    /// Each step the clock owes it falls due one [`MAINTENANCE_STEP`] after the one
+    /// before, so an action a client starts is reported running before it is reported
+    /// finished.
     pub fn begin_maintenance(
         &mut self,
         action: &str,
@@ -1665,32 +1664,22 @@ pub const MAINTENANCE_STATUS_SUCCESS: &str = "SUCCESS";
 
 /// How long each step of a maintenance action takes before the clock owes the next.
 ///
-/// The due instants are stored on the record and materialised by whichever later call
-/// reads it ([`Maintenance::settle`]) — nothing sleeps — so what this span decides is
-/// not how the record moves but WHEN, and that is why it is the shortest span of this
-/// service rather than one of the seconds-long ones the records around it carry.
+/// An accepted action is written `PENDING`; the clock owes it `IN_PROGRESS` one span
+/// after the call that started it, and its terminal status one span after that. The due
+/// instants are stored on the record and materialised by whichever later call reads it
+/// ([`Maintenance::settle`]) — nothing sleeps.
 ///
-/// Every other span here holds a status open because the clock materialises a STATE
-/// CHANGE at its due instant that other calls then observe: the cluster of a domain
-/// coming up ([`DOMAIN_WORK`]), a configuration landing on its options, a package
-/// becoming associable, an endpoint's subnets applying. A maintenance action changes
-/// nothing — it restarts a process on one node and leaves the domain exactly as it
-/// found it, and no gate of this service reads the record — so the only thing a longer
-/// span would decide is how many polls a client waiting for the action's outcome has
-/// to issue before it can read one. It is therefore bounded by the NEXT READ such a
-/// client makes, which is the shortest span that still orders the two steps: the
-/// record is written `PENDING`, and the clock owes it `IN_PROGRESS` and then its
-/// terminal status within a millisecond of the call.
-///
-/// Measured against a client that polls the way an AWS-targeting client polls work
-/// AWS takes minutes over — one read right after the call that starts the action, and
-/// the next one an interval later: with this span at half a second that first read
-/// still answers `PENDING`, and the interval the client then waits out is longer than
-/// the deadline it allows the whole lifecycle, so it never reads an outcome at all; at
-/// a millisecond the outcome is there on that first read. What the span costs such a
-/// client is therefore a whole poll interval, whatever fraction of a second it is set
-/// to, which is why it is set below the gap between two of its calls.
-pub const MAINTENANCE_STEP: Duration = Duration::from_millis(1);
+/// The span is [`DOMAIN_WORK`], the span this control plane gives work on a domain:
+/// maintaining a node IS work on the domain's cluster — it stops and restarts the
+/// process running on one of its nodes — so the reasoning stated there applies here
+/// unchanged, and in particular the span is NOT shorter than the gap between two calls
+/// of a client. What a maintenance action reports while it runs are its non-terminal
+/// statuses, and the client that reads them is the one that started the action and polls
+/// for its outcome: an action already finished by that client's first poll is one whose
+/// run it never observes at all, which is the state no span of this service leaves a
+/// caller in. Both steps still fall due well inside the window such a client waits for
+/// an outcome in, so it reads the action running and then reads it finished.
+pub const MAINTENANCE_STEP: Duration = DOMAIN_WORK;
 
 /// How many maintenance actions a domain's history keeps — the emulator's own bound
 /// on the store, like [`CHANGE_HISTORY`], so a caller starting actions forever cannot
