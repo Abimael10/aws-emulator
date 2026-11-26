@@ -21,8 +21,9 @@
 //! * the uploaded-list FAMILY, because the rule is the family's and not one operation's:
 //!   the IPSet, the threat list and the two entity sets each store a `Location`;
 //! * the SHAPE of the URI — the depth of the key, the characters a bucket and a key
-//!   carry, percent-encoding, letter case in the key and in the scheme — since none of
-//!   that is any part of what the member reports;
+//!   carry, percent-encoding, letter case in the key and in the scheme, and the SCRIPT the
+//!   key or the bucket is written in, multi-byte UTF-8 included — since none of that is any
+//!   part of what the member reports;
 //! * the ENDPOINT the read arrives at, which decides nothing;
 //! * the published `@length` bound of the member, at the bound and one past it.
 //!
@@ -40,14 +41,14 @@ use crate::detector_lifecycle::{call_at, enabled_detector, new_router, Router};
 /// are members of `IpSetFormat`, `ThreatIntelSetFormat`, `ThreatEntitySetFormat` and
 /// `TrustedEntitySetFormat`
 /// (`smithy_query(shape="IpSetFormat,ThreatIntelSetFormat,ThreatEntitySetFormat,TrustedEntitySetFormat")`).
-struct Family {
-    segment: &'static str,
-    id_member: &'static str,
-    format: &'static str,
+pub(crate) struct Family {
+    pub(crate) segment: &'static str,
+    pub(crate) id_member: &'static str,
+    pub(crate) format: &'static str,
 }
 
 /// The four uploaded-list families, each storing a `Location` of its own.
-const FAMILIES: [Family; 4] = [
+pub(crate) const FAMILIES: [Family; 4] = [
     Family {
         segment: "ipset",
         id_member: "ipSetId",
@@ -72,13 +73,13 @@ const FAMILIES: [Family; 4] = [
 
 /// The endpoint the creates of this suite are sent to: where a request landed is no part
 /// of what a read reports.
-const CREATE_ENDPOINT: &str = "127.0.0.1:39461";
+pub(crate) const CREATE_ENDPOINT: &str = "127.0.0.1:39461";
 
 /// The endpoint authorities every row is read at: this emulator's own endpoint as a
 /// loopback literal with a port and by a loopback name with another port, each the only
 /// address such a client resolves, and this service's own published host, which is no
 /// address of this emulator's.
-fn read_endpoints() -> [&'static str; 3] {
+pub(crate) fn read_endpoints() -> [&'static str; 3] {
     [
         "127.0.0.1:39461",
         "localhost:4566",
@@ -91,6 +92,13 @@ fn read_endpoints() -> [&'static str; 3] {
 /// carry (dashes, dots, digits), percent-encoding in the key, letter case in the key, and
 /// the case of the scheme itself — a URI scheme is case-insensitive, so an upper-case one
 /// addresses the same object and is still the caller's own string, reported as written.
+///
+/// The last rows reach past ASCII, since the REPERTOIRE a key or a bucket is written in is
+/// no part of the answer either: accented Latin, Cyrillic, a right-to-left script, a code
+/// point outside the BMP and a combining sequence, plus the percent-ENCODED spelling of one
+/// of them beside its raw one — two different strings naming one object, each reported as
+/// submitted, which a projection that parsed the URI and re-emitted it would escape or
+/// collapse into the other.
 fn stored_locations() -> Vec<(&'static str, String)> {
     vec![
         ("a single-segment key", "s3://gd-lists/list.txt".to_string()),
@@ -114,13 +122,41 @@ fn stored_locations() -> Vec<(&'static str, String)> {
             "an upper-case scheme",
             "S3://gd-lists/list.txt".to_string(),
         ),
+        (
+            "accented Latin in the key",
+            "s3://gd-lists/listes/liste-dé.txt".to_string(),
+        ),
+        (
+            "the percent-encoded spelling of that same key",
+            "s3://gd-lists/listes/liste-d%C3%A9.txt".to_string(),
+        ),
+        (
+            "Cyrillic in the key",
+            "s3://gd-lists/списки/доверенные.txt".to_string(),
+        ),
+        (
+            "a right-to-left script in the key",
+            "s3://gd-lists/قوائم/موثوق.txt".to_string(),
+        ),
+        (
+            "a code point outside the BMP in the key",
+            "s3://gd-lists/lists/trusted-\u{1F512}.txt".to_string(),
+        ),
+        (
+            "a combining sequence in the key",
+            "s3://gd-lists/lists/trusted-e\u{0301}.txt".to_string(),
+        ),
+        (
+            "non-ASCII in the bucket",
+            "s3://gd-liştes/lists/trusted.txt".to_string(),
+        ),
     ]
 }
 
 /// A router holding one enabled detector. One per row: a detector holds at most one
 /// trusted entity set and the account at most one ACTIVATED IPSet, and neither allowance
 /// is this rule's business.
-async fn detector() -> (Router, String) {
+pub(crate) async fn detector() -> (Router, String) {
     let router = new_router();
     let detector_id = enabled_detector(&router).await;
     (router, detector_id)
@@ -128,7 +164,7 @@ async fn detector() -> (Router, String) {
 
 /// Create a list of `segment` holding `location`, and return the id the create reported.
 /// `activate` is false throughout: the activation allowances are other suites' rules.
-async fn create_list(
+pub(crate) async fn create_list(
     router: &Router,
     detector_id: &str,
     family: &Family,
@@ -160,7 +196,7 @@ async fn create_list(
 }
 
 /// Read the list back at `endpoint`, asserting the read is served.
-async fn read_list(router: &Router, endpoint: &str, path: &str, case: &str) -> Value {
+pub(crate) async fn read_list(router: &Router, endpoint: &str, path: &str, case: &str) -> Value {
     let (status, body) = call_at(router, endpoint, "GET", path, None).await;
     assert_eq!(
         status, 200,
