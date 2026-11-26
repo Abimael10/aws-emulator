@@ -181,8 +181,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             filters.push((key, values, operator));
         }
 
-        let page_size = compliance::compliance_page_size(input.max_results)
-            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        // The page this read serves: "Currently, you can specify null or 50"
+        // (`ListComplianceSummariesRequest$MaxResults`) narrows the member's modelled range to
+        // the one value, so a request naming any OTHER in-range page size is refused rather
+        // than served a page the service would not honour.
+        let page_size = compliance::only_stated_page_size(
+            Self::NAME,
+            input.max_results,
+            compliance::ONLY_SUMMARY_PAGE_SIZE,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
 
         // Systems Manager is regional: the compliance of a node is reached through the
         // endpoint of the Region that node is registered with, which is the Region this

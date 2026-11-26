@@ -12,10 +12,12 @@
 //! `SeveritySummary` count is "the total number of resources or compliance items that have a
 //! severity level of" that level, which is what the ITEMS of that status carry**
 //! (`smithy_query(query="closure", operation="ListComplianceSummaries")`). Around that
-//! computation: a `Filters` entry narrows the items the roll-up is over, a key that names no
-//! member of a compliance item is refused `InvalidFilter`, the page is capped by `MaxResults`
-//! with a `NextToken` that resumes after the type it stopped at, and a token this endpoint did
-//! not mint is refused `InvalidNextToken`.
+//! computation: a `Filters` entry narrows the items the roll-up is over — the same filter keys
+//! the item read narrows by — a key that names no member of a compliance item is refused
+//! `InvalidFilter`, the page is capped by the one `MaxResults` the member's documentation names
+//! ("Currently, you can specify null or 50", so every other in-range value is refused
+//! `ValidationException`) with a `NextToken` that resumes after the type it stopped at, and a
+//! token this endpoint did not mint is refused `InvalidNextToken`.
 //!
 //! Every case goes through the front door a client uses: the shared harness in
 //! `all/parameter_store.rs` dispatches `POST /` with
@@ -26,14 +28,27 @@
 //! call of this service registers one.
 //!
 //! The rows span what the rule generalises over: how many resources hold items of a type, how
-//! many items each holds, whether they agree on the status, the severities they carry, and
-//! whether the type is a caller's own or Patch Manager's.
+//! many items each holds, whether they agree on the status, the severities they carry, whether
+//! the type is a caller's own or Patch Manager's, and which `MaxResults` the request carries —
+//! the documented value, none, values the modelled range admits and values past either of its
+//! ends.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::compliance_items::{put, register, MANAGED_INSTANCE};
-use crate::parameter_store::{call_in_region, error_code, router_with_engine, REGION};
+use crate::parameter_store::{call_in_region, error_code, error_message, router_with_engine, REGION};
+
+/// The ONE page size this read serves beside an absent `MaxResults`: "The maximum number of
+/// items to return for this call. Currently, you can specify null or 50"
+/// (`smithy_query(query="doc", shape="ListComplianceSummariesRequest", member="MaxResults")`),
+/// written out here so the cases pin the documented value rather than echo the emulator's.
+const ONLY_PAGE_SIZE: i64 = 50;
+
+/// How many CUSTOM compliance types one resource may hold reports of ("you can specify a
+/// maximum of 10 different types", `ComplianceTypeCountLimitExceededException`), which is what
+/// spreads a paging case's types over several nodes.
+const CUSTOM_TYPES_PER_RESOURCE: usize = 10;
 
 /// The nodes the cases report compliance about: node ids of the forms the modelled
 /// `InstanceId` pattern admits.
@@ -328,13 +343,25 @@ async fn a_filter_narrows_the_items_the_summary_is_computed_from() {
 #[tokio::test]
 async fn the_summaries_page_over_the_types_by_the_token_the_read_hands_out() {
     let (router, engine) = router_with_engine();
-    register(&engine, REGION, FIRST_NODE);
-    for compliance_type in [AUDIT_TYPE, SCAN_TYPE] {
+    // One type past the page this read serves, so the first page is full and one type is left
+    // waiting behind the token it hands out. The types are spread over as many nodes as the
+    // per-resource ceiling on CUSTOM types needs ("you can specify a maximum of 10 different
+    // types", `ComplianceTypeCountLimitExceededException`).
+    let types: Vec<String> = (0..=ONLY_PAGE_SIZE)
+        .map(|position| format!("Custom:Page{position:03}"))
+        .collect();
+    let mut registered: Vec<String> = Vec::new();
+    for (position, compliance_type) in types.iter().enumerate() {
+        let node = format!("i-{:08}", position / CUSTOM_TYPES_PER_RESOURCE);
+        if !registered.contains(&node) {
+            register(&engine, REGION, &node);
+            registered.push(node.clone());
+        }
         let (status, answered) = put(
             &router,
             REGION,
             MANAGED_INSTANCE,
-            FIRST_NODE,
+            &node,
             compliance_type,
             json!([item("probe", "LOW", COMPLIANT)]),
         )
@@ -345,48 +372,56 @@ async fn the_summaries_page_over_the_types_by_the_token_the_read_hands_out() {
         );
     }
 
-    let case = "a page of one";
-    let (status, first) = call_in_region(
-        &router,
-        REGION,
-        "ListComplianceSummaries",
-        &json!({"MaxResults": 1}),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: the read must be served, got {status} with {first}"
-    );
-    let page = first["ComplianceSummaryItems"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    assert_eq!(
-        page.len(),
-        1,
-        "case {case:?}: expected the page the request asked for, got {first}"
-    );
-    // The types are answered in ascending order, so the first page carries the first of them.
-    assert_eq!(
-        page[0]["ComplianceType"].as_str(),
-        Some(AUDIT_TYPE),
-        "case {case:?}: expected the first type, got {first}"
-    );
-    let token = first["NextToken"]
-        .as_str()
-        .unwrap_or_else(|| panic!("case {case:?}: a full page hands out a token, got {first}"));
+    // (what the row covers, the body the first page is asked for with)
+    let rows: &[(&str, Value)] = &[
+        ("the page size this read serves", json!({ "MaxResults": ONLY_PAGE_SIZE })),
+        ("no page size at all, which is served the same page", json!({})),
+    ];
+    for (case, body) in rows {
+        let (status, first) = call_in_region(&router, REGION, "ListComplianceSummaries", body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the read must be served, got {status} with {first}"
+        );
+        let page = first["ComplianceSummaryItems"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            page.len() as i64,
+            ONLY_PAGE_SIZE,
+            "case {case:?}: expected a full page of {ONLY_PAGE_SIZE}, got {} in {first}",
+            page.len()
+        );
+        // The types are answered in ascending order, so the first page carries all but the
+        // last of them.
+        let reported: Vec<&str> = page
+            .iter()
+            .filter_map(|summary| summary["ComplianceType"].as_str())
+            .collect();
+        assert_eq!(
+            reported,
+            types[..types.len() - 1]
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<&str>>(),
+            "case {case:?}: expected the first page in ascending order, got {reported:?}"
+        );
+        let token = first["NextToken"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: a full page hands out a token, got {first}"));
 
-    let next = summaries(&router, case, &json!({"MaxResults": 1, "NextToken": token})).await;
-    assert_eq!(
-        next.len(),
-        1,
-        "case {case:?}: expected the type the first page stopped before, got {next:?}"
-    );
-    assert_eq!(
-        next[0]["ComplianceType"].as_str(),
-        Some(SCAN_TYPE),
-        "case {case:?}: expected the second type, got {next:?}"
-    );
+        let next = summaries(&router, case, &json!({ "NextToken": token })).await;
+        let resumed: Vec<&str> = next
+            .iter()
+            .filter_map(|summary| summary["ComplianceType"].as_str())
+            .collect();
+        assert_eq!(
+            resumed,
+            vec![types[types.len() - 1].as_str()],
+            "case {case:?}: expected the type the first page stopped before, got {resumed:?}"
+        );
+    }
 
     // A token this endpoint never minted is refused rather than served a page it never
     // offered.
@@ -407,4 +442,120 @@ async fn the_summaries_page_over_the_types_by_the_token_the_read_hands_out() {
         "InvalidNextToken",
         "case \"a token nothing minted\": expected the modelled refusal, got {answered}"
     );
+}
+
+/// RULE: the member's own documentation narrows the page sizes this read serves — "Currently,
+/// you can specify null or 50" — so an absent `MaxResults` and that one value are served and
+/// every OTHER value inside the modelled 1..50 range is refused `ValidationException` naming
+/// the operation and the set it serves, while a value outside the modelled range keeps the
+/// constraint clause of that range.
+#[tokio::test]
+async fn only_the_documented_page_sizes_are_served() {
+    let (router, engine) = router_with_engine();
+    register(&engine, REGION, FIRST_NODE);
+    let (status, answered) = put(
+        &router,
+        REGION,
+        MANAGED_INSTANCE,
+        FIRST_NODE,
+        SCAN_TYPE,
+        json!([item("probe", "LOW", COMPLIANT)]),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the setup put must be served, got {status} with {answered}"
+    );
+
+    // The values the read SERVES: the one the documentation names, and no member at all.
+    for body in [json!({ "MaxResults": ONLY_PAGE_SIZE }), json!({})] {
+        let case = format!("the served page size {body}");
+        let reported = summaries(&router, &case, &body).await;
+        assert_eq!(
+            reported.len(),
+            1,
+            "case {case:?}: expected the one type the Region holds, got {reported:?}"
+        );
+    }
+
+    // Every other value inside the modelled range, including both of its ends and a value in
+    // between: the operation's own sentence, which names it and the set it serves.
+    let in_range_refusal = format!("ListComplianceSummaries only support MaxResults as null or {ONLY_PAGE_SIZE}");
+    for requested in [1, 2, 7, 25, ONLY_PAGE_SIZE - 1] {
+        let case = format!("the in-range page size {requested}");
+        let (status, answered) = call_in_region(
+            &router,
+            REGION,
+            "ListComplianceSummaries",
+            &json!({ "MaxResults": requested }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the request refused, got {status} with {answered}"
+        );
+        assert_eq!(
+            error_code(&answered),
+            "ValidationException",
+            "case {case:?}: expected a ValidationException, got {answered}"
+        );
+        assert_eq!(
+            error_message(&answered),
+            in_range_refusal,
+            "case {case:?}: expected {in_range_refusal:?}, got {answered}"
+        );
+    }
+
+    // A value OUTSIDE the modelled range is the range's own refusal: the envelope and the
+    // clause stating the member, the value and the bound it broke.
+    let case = "one past the modelled maximum";
+    let (status, answered) = call_in_region(
+        &router,
+        REGION,
+        "ListComplianceSummaries",
+        &json!({ "MaxResults": ONLY_PAGE_SIZE + 1 }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected the request refused, got {status} with {answered}"
+    );
+    assert_eq!(
+        error_code(&answered),
+        "ValidationException",
+        "case {case:?}: expected a ValidationException, got {answered}"
+    );
+    assert_eq!(
+        error_message(&answered),
+        format!(
+            "1 validation error detected: Value '{}' at 'maxResults' failed to satisfy \
+             constraint: Member must have value less than or equal to {ONLY_PAGE_SIZE}",
+            ONLY_PAGE_SIZE + 1
+        ),
+        "case {case:?}: expected the modelled range's clause, got {answered}"
+    );
+
+    // Below the modelled minimum is the same class of refusal — the range's clause rather
+    // than the narrower sentence, which is about values the range admits.
+    for requested in [0, -1] {
+        let case = format!("the page size {requested}, below the modelled minimum");
+        let (status, answered) = call_in_region(
+            &router,
+            REGION,
+            "ListComplianceSummaries",
+            &json!({ "MaxResults": requested }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the request refused, got {status} with {answered}"
+        );
+        let stated = error_message(&answered);
+        assert!(
+            stated.starts_with("1 validation error detected:")
+                && stated.contains("at 'maxResults' failed to satisfy constraint")
+                && !stated.contains("only support MaxResults"),
+            "case {case:?}: expected the modelled range's clause, got {stated:?}"
+        );
+    }
 }

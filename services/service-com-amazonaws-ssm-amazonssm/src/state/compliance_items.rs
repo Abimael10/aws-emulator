@@ -244,6 +244,36 @@ pub fn compliance_page_size(max_results: Option<i32>) -> Result<usize, String> {
     )
 }
 
+/// The one `MaxResults` a compliance-SUMMARY read serves beside an absent one: "Currently,
+/// you can specify null or 50"
+/// (`smithy_query(query="doc", shape="ListComplianceSummariesRequest", member="MaxResults")`)
+/// narrows that member's modelled 1..50 range to the single value, which is the modelled
+/// maximum ([`MAX_COMPLIANCE_PAGE_SIZE`]).
+pub const ONLY_SUMMARY_PAGE_SIZE: i32 = MAX_COMPLIANCE_PAGE_SIZE;
+
+/// The page size a read whose `MaxResults` documentation names the only values it accepts
+/// serves, or the refusal message for a value outside them.
+///
+/// A member's own documentation narrowing the modelled range is a rule the service ENFORCES:
+/// an absent `MaxResults` and `accepted` are served, and every other value inside the
+/// modelled range is refused in the operation's own words — its name followed by the set it
+/// serves — rather than silently honoured as some other page. A value outside the modelled
+/// range is the range's own refusal ([`compliance_page_size`]), which the boundary walk
+/// states ahead of any handler.
+pub fn only_stated_page_size(
+    operation: &str,
+    max_results: Option<i32>,
+    accepted: i32,
+) -> Result<usize, String> {
+    let page_size = compliance_page_size(max_results)?;
+    if max_results.is_some_and(|requested| requested != accepted) {
+        return Err(format!(
+            "{operation} only support MaxResults as null or {accepted}"
+        ));
+    }
+    Ok(page_size)
+}
+
 /// How this service states a filter key that names no member of a compliance item.
 /// `InvalidFilter`'s own documentation is "the filter name isn't valid. Verify that you
 /// entered the correct name and try again", which is the sentence this service's other

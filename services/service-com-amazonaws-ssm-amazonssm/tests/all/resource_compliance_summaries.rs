@@ -54,6 +54,16 @@ const AUDIT_TYPE: &str = "Custom:Audit";
 const COMPLIANT: &str = "COMPLIANT";
 const NON_COMPLIANT: &str = "NON_COMPLIANT";
 
+/// The page the TYPE-level roll-up beside this read serves, which is what has to be filled for
+/// it to hand out a token: "Currently, you can specify null or 50"
+/// (`smithy_query(query="doc", shape="ListComplianceSummariesRequest", member="MaxResults")`).
+const TYPE_LEVEL_PAGE: usize = 50;
+
+/// How many CUSTOM compliance types one resource may hold reports of ("you can specify a maximum
+/// of 10 different types", `ComplianceTypeCountLimitExceededException`), which is what spreads
+/// those types over several nodes.
+const CUSTOM_TYPES_PER_RESOURCE: usize = 10;
+
 /// What a row expects one summary to report: `(Status, OverallSeverity, the compliant items it
 /// counts, the items that are not)`.
 type Expected = (&'static str, &'static str, i64, i64);
@@ -602,14 +612,35 @@ async fn the_summaries_page_over_the_resources_by_the_token_the_read_hands_out()
     }
 
     // A token this read never minted is refused rather than served a page it never offered — and
-    // so is one the type-level roll-up minted, which names a position in another walk.
-    let (status, typewise) = call_in_region(
-        &router,
-        REGION,
-        "ListComplianceSummaries",
-        &json!({"MaxResults": 1}),
-    )
-    .await;
+    // so is one the type-level roll-up minted, which names a position in another walk. That
+    // roll-up hands a token out only once a page of the one size it serves is full ("Currently,
+    // you can specify null or 50", `ListComplianceSummariesRequest$MaxResults`), so the Region is
+    // first given one compliance type more than that page, spread over as many nodes as the
+    // per-resource ceiling on custom types needs ("you can specify a maximum of 10 different
+    // types", `ComplianceTypeCountLimitExceededException`).
+    for position in 0..=TYPE_LEVEL_PAGE {
+        let node = format!("i-{:08}", position / CUSTOM_TYPES_PER_RESOURCE);
+        if position % CUSTOM_TYPES_PER_RESOURCE == 0 {
+            register(&engine, REGION, &node);
+        }
+        let compliance_type = format!("Custom:Page{position:03}");
+        let (status, answered) = put(
+            &router,
+            REGION,
+            MANAGED_INSTANCE,
+            &node,
+            &compliance_type,
+            json!([item("probe", "LOW", COMPLIANT)]),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "the setup put of {compliance_type} about {node} must be served, got {status} with \
+             {answered}"
+        );
+    }
+    let (status, typewise) =
+        call_in_region(&router, REGION, "ListComplianceSummaries", &json!({})).await;
     assert_eq!(
         status, 200,
         "the type-level read must be served, got {status} with {typewise}"
