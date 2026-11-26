@@ -287,8 +287,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         if let Some(subnet_ids) = input.subnet_ids.as_ref() {
-            if let Some(refusal) =
-                crate::state::ec2_subnets::violation(ctx, &region, subnet_ids).await
+            // A placement this update would store is judged against the cluster's OWN VPC as
+            // well as against existence: "The subnets must be in the same VPC as the
+            // cluster" (`UpdateComputeNodeGroupRequest$subnetIds`). The cluster's stored
+            // control-plane placement is read out of the store and the guard DROPPED before
+            // the hop; an identifier that resolves to no cluster leaves nothing to compare
+            // against and is answered as a cluster refusal below.
+            let cluster_subnet_ids = {
+                let held = state.lock();
+                held.cluster(&input.cluster_identifier)
+                    .and_then(|cluster| cluster.networking.subnet_ids.clone())
+                    .unwrap_or_default()
+            };
+            if let Some(refusal) = crate::state::ec2_subnets::placement_violation(
+                ctx,
+                &region,
+                subnet_ids,
+                &cluster_subnet_ids,
+            )
+            .await
             {
                 return Err(
                     UpdateComputeNodeGroupErrorModeled::ValidationException(refusal).into(),

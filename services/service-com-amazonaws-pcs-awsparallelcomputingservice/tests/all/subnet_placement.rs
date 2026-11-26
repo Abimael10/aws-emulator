@@ -22,6 +22,11 @@
 //! Region nobody created, one that was created and then deleted), and which operation names
 //! them. Nothing here reaches into either store: a subnet exists only because EC2 answered
 //! for it.
+//!
+//! WHICH VPC a placement has to be in is its own suite, in the submodule below
+//! (`tests/all/subnet_placement/cluster_vpc_placement.rs`): a compute node group's subnets
+//! must be in the same VPC as the cluster it joins, which is a comparison against the
+//! cluster's own stored placement rather than a question about one subnet.
 
 use std::sync::Arc;
 
@@ -29,6 +34,14 @@ use serde_json::{json, Value};
 use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
 use crate::cluster_lifecycle::{call, emulator};
+
+// `tests/all/subnet_placement.rs` is itself loaded by `#[path]` from `tests/all.rs`, so a
+// submodule of it is looked up beside it rather than in a directory named after it: the
+// `#[path]` here is what points at `tests/all/subnet_placement/`. The layout check declares
+// suites DIRECTLY under `tests/all/`; a file deeper than that is declared by its own parent
+// module, which is this one.
+#[path = "subnet_placement/cluster_vpc_placement.rs"]
+mod cluster_vpc_placement;
 
 /// The region every case signs for, matching the scope `crate::cluster_lifecycle` signs
 /// with: the Region a request is signed for is the one its subnets are resolved in.

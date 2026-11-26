@@ -315,12 +315,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The subnets this group would launch instances in are EC2's as well ("the list of
         // subnet IDs where the compute node group launches instances"), so they are
         // resolved against EC2 the same way the cluster's control-plane subnets are, before
-        // anything of this service's own is resolved or stored. The list was bounded above,
-        // so the hop is not sized by the request — and it goes nowhere: in-process over the
-        // emulator's own callback transport, with the Region read as a LABEL before it can
-        // reach the endpoint authority (see `crate::state::ec2_subnets`).
-        if let Some(refusal) =
-            crate::state::ec2_subnets::violation(ctx, &region, &input.subnet_ids).await
+        // anything of this service's own is resolved or stored — and they are resolved
+        // against the cluster's OWN VPC too, because "Subnets must be in the same VPC as the
+        // cluster" (`CreateComputeNodeGroupRequest$subnetIds`). The VPC the request is
+        // judged against is the one the cluster was created over, so the cluster's stored
+        // control-plane placement is read out of the store and the guard DROPPED before the
+        // hop; an identifier that resolves to no cluster leaves nothing to compare against
+        // and is answered as a cluster refusal below. Both lists are bounded, so the hops
+        // are not sized by the request — and they go nowhere: in-process over the emulator's
+        // own callback transport, with the Region read as a LABEL before it can reach the
+        // endpoint authority (see `crate::state::ec2_subnets`).
+        let cluster_subnet_ids = {
+            let held = state.lock();
+            held.cluster(&input.cluster_identifier)
+                .and_then(|cluster| cluster.networking.subnet_ids.clone())
+                .unwrap_or_default()
+        };
+        if let Some(refusal) = crate::state::ec2_subnets::placement_violation(
+            ctx,
+            &region,
+            &input.subnet_ids,
+            &cluster_subnet_ids,
+        )
+        .await
         {
             return Err(CreateComputeNodeGroupErrorModeled::ValidationException(refusal).into());
         }
