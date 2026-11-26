@@ -66,7 +66,10 @@ const ROWS: &[Row] = &[
         value: 10_000.0,
         unit: "None",
         adjustable: true,
-        description: None,
+        description: Some(
+            "Maximum number of requests per second for PutEvents API. Additional requests \
+             are throttled.",
+        ),
         period: Some((1, "SECOND")),
     },
     Row {
@@ -370,9 +373,16 @@ const DISPLACED_QUOTA_NAMES: &[(&str, &str)] = &[
         "events",
         "ListTargetsByRule throttle limit in transactions per second",
     ),
+    ("events", "PutRule throttle limit in transactions per second"),
     ("fms", "Rate of ListPolicies requests"),
+    ("fms", "Rate of GetNotificationChannel requests"),
+    ("fms", "Rate of GetAdminAccount requests"),
+    ("fms", "Rate of DeleteResourceSet requests"),
+    ("fms", "Rate of ListMemberAccounts requests"),
     ("fsx", "ONTAP volumes per file system"),
     ("gamelift", "Matchmaking rule sets"),
+    ("gamelift", "Builds"),
+    ("gamelift", "Rate of CreateGameSession requests"),
     ("glue", "Partitions per table"),
     ("glue", "Connections per account"),
     ("glue", "Rate of StartCrawler requests"),
@@ -380,7 +390,9 @@ const DISPLACED_QUOTA_NAMES: &[(&str, &str)] = &[
     ("glue", "Development endpoints per account"),
     ("glue", "Machine learning transforms per account"),
     ("glue", "Rate of GetTable requests"),
-    ("imagebuilder", "Lifecycle policies"),
+    ("imagebuilder", "Workflows"),
+    ("imagebuilder", "Rate of CreateImagePipeline requests"),
+    ("imagebuilder", "Rate of CreateImageRecipe requests"),
     ("imagebuilder", "Concurrent image builds"),
 ];
 

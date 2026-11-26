@@ -797,6 +797,13 @@ async fn a_request_rate_row_names_the_operation_it_throttles() {
                  targets. After the limit is reached, the invocations are throttled; that \
                  is, they still happen but they are delayed."
                     .to_string()
+            } else if *service_code == "events" && api == "PutEvents" {
+                // The event-INGEST rate, which that recorded listing words WITHOUT the
+                // leading article its endpoint-API rates carry.
+                format!(
+                    "Maximum number of requests per second for {api} API. Additional \
+                     requests are throttled."
+                )
             } else if *service_code == "events" {
                 format!(
                     "The maximum number of requests per second for {api} API. Additional \

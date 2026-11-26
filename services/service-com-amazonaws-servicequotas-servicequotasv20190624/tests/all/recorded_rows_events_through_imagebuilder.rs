@@ -49,10 +49,15 @@ const SERVICE_CODES: &[&str] = &[
 
 /// The `(ServiceCode, QuotaCode)` pairs published WITHOUT a `Description`.
 ///
-/// SOURCE: the recorded `ListAWSDefaultServiceQuotas` response of `events` carries a
-/// sentence for the `PutEvents` rate row that is not the one its rate class carries, and no
-/// source available to this emulator states that text — so that row carries none rather
-/// than a sentence this catalog would be wording itself, which is what the rule forbids.
+/// SOURCE: the recorded `ListAWSDefaultServiceQuotas` response of `events` states which
+/// quota four of its codes publish without stating every member of those rows: the
+/// resource-policy size of a version 2 event bus carries a sentence that response words and
+/// no source available to this emulator states, so that row carries none rather than a
+/// sentence this catalog would be wording itself, which is what the rule forbids. The same
+/// holds for the stateful rule group capacity of a Network Firewall policy (`fms`), the
+/// Windows family's total SSD IOPS (`fsx`) and the `NewGameSessionsPerCreator` ceiling of a
+/// fleet configuration (`gamelift`), whose names and limits that service's recorded listing
+/// states while stating no sentence for them.
 /// The same holds for the two `glue` rows whose name, value and adjustability that
 /// service's recorded listing states while stating no sentence for them: the account's
 /// security configurations and the Data Catalog's connection types. It holds too for the
@@ -63,7 +68,10 @@ const SERVICE_CODES: &[&str] = &[
 /// `pub(crate)` so the suites that assert "every row carries its published sentence"
 /// read the one list rather than each keeping a copy of it.
 pub(crate) const PUBLISHED_WITHOUT_A_DESCRIPTION: &[(&str, &str)] = &[
-    ("events", "L-9B653E91"),
+    ("events", "L-5D1D13E3"),
+    ("fms", "L-5AB0AC42"),
+    ("fsx", "L-901C77F5"),
+    ("gamelift", "L-3A43EF3C"),
     ("glue", "L-337244C9"),
     ("glue", "L-83192DBF"),
     ("glue", "L-F545C262"),

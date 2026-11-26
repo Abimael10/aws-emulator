@@ -1052,6 +1052,11 @@ async fn a_description_belongs_to_the_row_that_carries_it() {
             ),
         ]
     };
+    // EventBridge's event-INGEST rate is the one row of the class its recorded listing
+    // words WITHOUT the leading article, so the form is admitted for that row alone rather
+    // than for every service's rate rows.
+    let ingest_rate_wording = "Maximum number of requests per second for PutEvents API. \
+                               Additional requests are throttled.";
 
     // The one series a covered catalog meters with a call count that is NOT one API's
     // rate: EventBridge's invocations, which its recorded listing describes by what an
@@ -1092,6 +1097,8 @@ async fn a_description_belongs_to_the_row_that_carries_it() {
                     assert!(
                         if *service_code == "events" && api == "Invocations" {
                             description == invocation_wording
+                        } else if *service_code == "events" && api == "PutEvents" {
+                            description == ingest_rate_wording
                         } else {
                             rate_wordings(&api).contains(&description)
                         },

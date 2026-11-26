@@ -64,7 +64,7 @@ const SERVICES: &[CatalogService] = &[
         service_code: "events",
         service_name: "Amazon EventBridge (CloudWatch Events)",
         quota_count: 21,
-        gap_codes: &["L-D082A4F6"],
+        gap_codes: &[],
     },
     CatalogService {
         service_code: "firehose",
@@ -82,7 +82,7 @@ const SERVICES: &[CatalogService] = &[
         service_code: "fsx",
         service_name: "Amazon FSx",
         quota_count: 30,
-        gap_codes: &["L-4EDE4065", "L-7D5FDD38", "L-8F1B9C74"],
+        gap_codes: &[],
     },
     CatalogService {
         service_code: "gamelift",
@@ -118,7 +118,7 @@ const SERVICES: &[CatalogService] = &[
         service_code: "imagebuilder",
         service_name: "EC2 Image Builder",
         quota_count: 23,
-        gap_codes: &["L-10D22E0D"],
+        gap_codes: &[],
     },
 ];
 
@@ -126,8 +126,11 @@ const SERVICES: &[CatalogService] = &[
 /// at all — the whole of the `gap_codes` above.
 ///
 /// Pinned as ONE number so that leaving a further code to the default-quota-set gap is a
-/// deliberate, visible edit rather than one more entry in a list nothing counts.
-const GAP_CODE_COUNT: usize = 5;
+/// deliberate, visible edit rather than one more entry in a list nothing counts. It is ZERO
+/// now that every code these recorded listings carry a row for answers one here: the codes
+/// whose own quota no source states carry the plane a sourced binding displaced instead (see
+/// the row tables in `src/state/quota_rows.rs`).
+const GAP_CODE_COUNT: usize = 0;
 
 /// A code this catalog used to derive from a quota NAME for one of these services, which
 /// the service answers to nothing under.
@@ -232,8 +235,8 @@ const PROBES: &[Probe] = &[
     Probe {
         service_code: "fsx",
         quota_code: "L-901C77F5",
-        quota_name: "ONTAP storage virtual machines per file system",
-        value: 24.0,
+        quota_name: "Windows total SSD IOPS",
+        value: 500_000.0,
         unit: "None",
         adjustable: true,
         period: None,
@@ -252,8 +255,8 @@ const PROBES: &[Probe] = &[
     Probe {
         service_code: "gamelift",
         quota_code: "L-22451070",
-        quota_name: "Builds",
-        value: 1000.0,
+        quota_name: "Game session queues per region",
+        value: 25.0,
         unit: "None",
         adjustable: true,
         period: None,
@@ -322,8 +325,8 @@ const PROBES: &[Probe] = &[
     Probe {
         service_code: "imagebuilder",
         quota_code: "L-6105A4EE",
-        quota_name: "Workflows",
-        value: 1000.0,
+        quota_name: "Lifecycle policies",
+        value: 50.0,
         unit: "None",
         adjustable: true,
         period: None,
