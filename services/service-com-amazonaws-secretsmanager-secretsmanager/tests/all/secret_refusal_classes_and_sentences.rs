@@ -27,6 +27,11 @@
 //!    quoting the whole list the member held and nesting the element shape's WHOLE declared
 //!    constraint set — the expression of a `@pattern` inside such a set as the model writes
 //!    it — so two offending elements of one list are one validation error about one member.
+//! 5. A rule stated over a COMBINATION of request members, rather than over one member's own
+//!    value, states what change the request asks of the secret it addresses, so the secret is
+//!    resolved first: a `SecretId` the Region holds no secret for is `ResourceNotFoundException`
+//!    whatever those members say, and the combination rule decides only for a secret that
+//!    exists.
 //!
 //! The rows differ along what each rule generalises over: the operation and member that
 //! carried the value, the constraint class (`@length` on a string and on a blob, `@pattern`,
@@ -1310,4 +1315,171 @@ async fn a_limit_this_service_enforces_itself_states_that_operations_own_refusal
             MAX_RESULTS_MAX + 1
         )),
     );
+}
+
+/// The fixed sentence a `SecretId` the account holds no secret for is refused with, held in
+/// one place by the service so every operation that resolves an id answers the same words.
+const NOT_FOUND_MESSAGE: &str =
+    service_com_amazonaws_secretsmanager_secretsmanager::state::SECRET_NOT_FOUND_MESSAGE;
+
+/// The sentence `UpdateSecretVersionStage` refuses a call naming neither version member
+/// with: `MoveToVersionId` is "the ID of the version to add the staging label to" and
+/// `RemoveFromVersionId` "the ID of the version that the staging label is to be removed
+/// from" (this service's Smithy model), and both are optional, so a call naming neither
+/// asks for no change.
+const NO_VERSION_NAMED_MESSAGE: &str =
+    "You must specify either MoveToVersionId or RemoveFromVersionId.";
+
+/// One operation's rule over the COMBINATION of its members: the members whose combination
+/// the rule refuses, and the class and sentence that refusal carries for a secret the
+/// account HOLDS.
+struct CombinationRule {
+    operation: &'static str,
+    case: &'static str,
+    /// The request members besides `SecretId`.
+    members: Value,
+    code: &'static str,
+    message: &'static str,
+}
+
+/// Every rule of this service that is stated over a combination of request members rather
+/// than over one member's own value, one row per operation that carries one — the two
+/// version members of a staging-label move, and the two value members of each write that
+/// stores one (both named, and, where the operation's purpose is to store a value, neither).
+fn combination_rules() -> Vec<CombinationRule> {
+    vec![
+        CombinationRule {
+            operation: "UpdateSecretVersionStage",
+            case: "neither version member, moving the service's own label",
+            members: json!({"VersionStage": "AWSCURRENT"}),
+            code: PARAMETER,
+            message: NO_VERSION_NAMED_MESSAGE,
+        },
+        CombinationRule {
+            operation: "UpdateSecretVersionStage",
+            case: "neither version member, moving a caller's own label",
+            members: json!({"VersionStage": "blue"}),
+            code: PARAMETER,
+            message: NO_VERSION_NAMED_MESSAGE,
+        },
+        CombinationRule {
+            operation: "PutSecretValue",
+            case: "both value members",
+            members: json!({
+                "SecretString": "stored",
+                "SecretBinary": "AAECAwQ=",
+                "ClientRequestToken": token("put-both-values"),
+            }),
+            code: PARAMETER,
+            message: BOTH_SECRET_VALUES_MESSAGE,
+        },
+        CombinationRule {
+            operation: "PutSecretValue",
+            case: "neither value member",
+            members: json!({"ClientRequestToken": token("put-no-value")}),
+            code: STATE,
+            message: NO_SECRET_VALUE_MESSAGE,
+        },
+        CombinationRule {
+            operation: "UpdateSecret",
+            case: "both value members",
+            members: json!({
+                "SecretString": "stored",
+                "SecretBinary": "AAECAwQ=",
+                "ClientRequestToken": token("update-both-values"),
+            }),
+            code: PARAMETER,
+            message: BOTH_SECRET_VALUES_MESSAGE,
+        },
+    ]
+}
+
+/// The request `rule` sends against the secret `secret_id` addresses.
+fn addressed_request(rule: &CombinationRule, secret_id: &str) -> Value {
+    let mut body = rule.members.clone();
+    let members = body.as_object_mut().expect("a request body is an object");
+    members.insert("SecretId".to_string(), json!(secret_id));
+    body
+}
+
+/// THE RULE: an operation addressed to ONE secret resolves that secret before it applies a
+/// rule over the COMBINATION of its other members — such a rule states what change the
+/// request asks of the secret, and a secret the Region does not hold admits no change — so a
+/// `SecretId` naming no secret is `ResourceNotFoundException` with the service's one
+/// not-found sentence, and the combination rule decides only for a secret that exists.
+///
+/// The rows span what the rule generalises over: the operation and the combination its rule
+/// is stated over (the two version members of a staging-label move, the two value members of
+/// each write that stores one), the staging label named, and the form the `SecretId`
+/// addresses the absent secret by (a bare name, a full ARN, a partial ARN).
+#[tokio::test]
+async fn a_missing_secret_outranks_a_rule_over_combined_members() {
+    for rule in combination_rules() {
+        for (form, absent) in absent_secret_ids("absent-secret") {
+            let case = format!("{} with {} on {form}", rule.operation, rule.case);
+            let router = emulator();
+            let answered = err(
+                &router,
+                rule.operation,
+                addressed_request(&rule, &absent),
+                &case,
+            )
+            .await;
+            refused(&case, answered, NOT_FOUND, NOT_FOUND_MESSAGE);
+        }
+    }
+}
+
+/// THE RULE's other half: for a secret the account DOES hold, the combination rule is what
+/// refuses the same request — the secret resolving first takes nothing away from it.
+#[tokio::test]
+async fn a_rule_over_combined_members_still_refuses_a_secret_that_exists() {
+    for rule in combination_rules() {
+        let case = format!("{} with {} on a held secret", rule.operation, rule.case);
+        let router = emulator();
+        create(&router, "held-secret", &case).await;
+        let answered = err(
+            &router,
+            rule.operation,
+            addressed_request(&rule, "held-secret"),
+            &case,
+        )
+        .await;
+        refused(&case, answered, rule.code, rule.message);
+
+        // The refused call changed nothing: the secret is still there to be read.
+        let described = ok(
+            &router,
+            "DescribeSecret",
+            json!({"SecretId": "held-secret"}),
+            &case,
+        )
+        .await;
+        assert_eq!(
+            described.get("Name").and_then(Value::as_str),
+            Some("held-secret"),
+            "case {case:?}: expected the refused call to leave the secret as it was, got \
+             {described}"
+        );
+    }
+}
+
+/// The forms a `SecretId` addresses a secret the account holds nothing under by: "the ARN or
+/// name of the secret" (`SecretIdType`'s members, this service's Smithy model) plus the
+/// partial ARN that names a secret too — the full ARN without the six trailing characters a
+/// secret's ARN ends in. `(the form's name, the id)`.
+fn absent_secret_ids(name: &str) -> Vec<(String, String)> {
+    let arn = format!(
+        "arn:aws:secretsmanager:us-west-2:{}:secret:{name}-AbCdEf",
+        ::engine::emulator_account_id()
+    );
+    let partial = arn
+        .rsplit_once('-')
+        .map(|(prefix, _)| prefix.to_string())
+        .unwrap_or_else(|| arn.clone());
+    vec![
+        ("a bare name".to_string(), name.to_string()),
+        ("a full ARN".to_string(), arn),
+        ("a partial ARN".to_string(), partial),
+    ]
 }

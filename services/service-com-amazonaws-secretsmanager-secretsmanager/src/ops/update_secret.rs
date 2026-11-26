@@ -260,6 +260,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     input.kms_key_id.as_deref(),
                 ),
         )?;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        // The Region the caller signed for, which is the Region the secret this
+        // request names is looked for in — the namespace of a secret name is one
+        // Region's.
+        let region = crate::state::request_region(ctx.parts());
+        // The secret this update is addressed to, resolved BEFORE the rule over
+        // which value member it stores: this operation "modifies the details of a
+        // secret", so a `SecretId` this Region holds no secret for is answered
+        // `ResourceNotFoundException` whichever value members the request carries
+        // (see
+        // [`crate::state::ComAmazonawsSecretsmanagerSecretsmanagerState::holds_addressed`]).
+        if !state
+            .lock()
+            .holds_addressed(&region, &input.secret_id, ::std::time::SystemTime::now())
+        {
+            return Err(not_found());
+        }
         // "Either SecretBinary or SecretString must have a value, but not both."
         // (`UpdateSecretRequest$SecretString`, this service's Smithy model.) A
         // call naming NEITHER is valid here and changes only metadata — this
@@ -277,8 +294,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.secret_string.as_ref(),
             input.secret_binary.as_ref(),
         );
-
-        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
         // "If you include SecretString or SecretBinary, then Secrets Manager
         // creates a new version for the secret, and this parameter specifies the
         // unique identifier for the new version."
@@ -307,7 +322,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What this update is refused for, and the key the new value is to be
         // stored under, decided under the store's guard; sealing that value is a
         // call to KMS, which cannot be made while the guard is held.
-        let region = crate::state::request_region(ctx.parts());
+        //
         // Which service, if any, is making this update as its OWN service principal: a
         // secret another service manages is that service's to change
         // ([`crate::state::service_owned`]).
@@ -417,12 +432,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // applies the metadata it names.
         let sealed = sealed.filter(|_| !target.replay);
         let Some(secret) = store.get_mut(&region, &input.secret_id) else {
-            return Err(UpdateSecretErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
-                },
-            )
-            .into());
+            return Err(not_found());
         };
 
         // The metadata this call names is applied; a member it does not name
@@ -528,12 +538,7 @@ fn admit(
     requesting_owner: Option<&crate::state::service_owned::OwningService>,
 ) -> Result<Target, UpdateSecretError> {
     let Some(secret) = secret else {
-        return Err(UpdateSecretErrorModeled::ResourceNotFoundException(
-            ResourceNotFoundException {
-                message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
-            },
-        )
-        .into());
+        return Err(not_found());
     };
     // A secret inside its recovery window still exists, so it is refused by
     // its state: "The secret is scheduled for deletion."
@@ -627,6 +632,16 @@ fn admit(
 fn missing_client_request_token() -> UpdateSecretError {
     UpdateSecretErrorModeled::InvalidRequestException(InvalidRequestException {
         message: Some(crate::state::MISSING_CLIENT_REQUEST_TOKEN_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// `ResourceNotFoundException` for a `SecretId` that names no stored secret: the
+/// constant sentence Secrets Manager answers with, which carries no part of the
+/// request (see [`crate::state::SECRET_NOT_FOUND_MESSAGE`]).
+fn not_found() -> UpdateSecretError {
+    UpdateSecretErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

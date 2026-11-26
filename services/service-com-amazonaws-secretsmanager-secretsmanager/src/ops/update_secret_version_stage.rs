@@ -195,18 +195,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let move_to = input.move_to_version_id.clone();
         let remove_from = input.remove_from_version_id.clone();
 
-        // One of the two version parameters has to be there: `MoveToVersionId`
-        // is "the ID of the version to add the staging label to. To remove a
-        // label from a version, then do not specify this parameter", and
-        // `RemoveFromVersionId` "the ID of the version that the staging label is
-        // to be removed from" (this service's Smithy model) — a call naming
-        // neither asks for no change at all.
-        if move_to.is_none() && remove_from.is_none() {
-            return Err(invalid_parameter(
-                "You must specify either MoveToVersionId or RemoveFromVersionId.",
-            ));
-        }
-
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
         let region = crate::state::request_region(ctx.parts());
         // Which service, if any, is making this change as its OWN service principal,
@@ -231,6 +219,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // One of the two version parameters has to be there: `MoveToVersionId`
+        // is "the ID of the version to add the staging label to. To remove a
+        // label from a version, then do not specify this parameter", and
+        // `RemoveFromVersionId` "the ID of the version that the staging label is
+        // to be removed from" (this service's Smithy model) — a call naming
+        // neither asks for no change at all.
+        //
+        // The rule is over the COMBINATION of the two members, so it states what
+        // change this call asks of the secret it addresses and is applied only
+        // once that secret has resolved: a `SecretId` this Region holds no secret
+        // for is answered `ResourceNotFoundException` above, whichever version
+        // members the request carries (see
+        // [`crate::state::ComAmazonawsSecretsmanagerSecretsmanagerState::holds_addressed`]).
+        if move_to.is_none() && remove_from.is_none() {
+            return Err(invalid_parameter(
+                "You must specify either MoveToVersionId or RemoveFromVersionId.",
+            ));
+        }
+
         // A secret inside its recovery window still exists, so a staging-label
         // change is refused by its state: "The secret is scheduled for
         // deletion." (`InvalidRequestException`, this service's Smithy model.)

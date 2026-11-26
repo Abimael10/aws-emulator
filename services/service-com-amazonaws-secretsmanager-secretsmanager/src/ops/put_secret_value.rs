@@ -254,6 +254,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.version_stages.as_deref().unwrap_or_default(),
             ),
         )?;
+        // This operation "creates a new version of your secret", so it always
+        // stakes a version — and the version's id is the token the CALLER
+        // generates: "If you generate a raw HTTP request to the Secrets Manager
+        // service endpoint, then you must generate a ClientRequestToken and
+        // include it in the request."
+        // (`PutSecretValueRequest$ClientRequestToken`, this service's Smithy
+        // model.) A request that carries none is refused before anything is
+        // encrypted or stored, rather than staking a version under an id the
+        // caller never chose, cannot retry with, and which would take AWSCURRENT
+        // off the version the caller does know. The member is missing on its own
+        // terms, which the request alone decides, so this precedes the store.
+        let Some(version_id) = input.client_request_token.clone() else {
+            return Err(missing_client_request_token());
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let region = crate::state::request_region(ctx.parts());
+        // The secret this write is addressed to, resolved BEFORE the rule over
+        // which value member it stores: this operation writes a version OF the
+        // secret `SecretId` names, so a `SecretId` this Region holds no secret
+        // for is answered `ResourceNotFoundException` whichever value members the
+        // request carries (see
+        // [`crate::state::ComAmazonawsSecretsmanagerSecretsmanagerState::holds_addressed`]).
+        if !state
+            .lock()
+            .holds_addressed(&region, &input.secret_id, ::std::time::SystemTime::now())
+        {
+            return Err(no_such_secret());
+        }
         // "Either SecretString or SecretBinary must have a value, but not both."
         if input.secret_string.is_some() && input.secret_binary.is_some() {
             return Err(invalid_parameter(
@@ -273,22 +302,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_request(crate::state::NO_SECRET_VALUE_MESSAGE));
         };
 
-        // This operation "creates a new version of your secret", so it always
-        // stakes a version — and the version's id is the token the CALLER
-        // generates: "If you generate a raw HTTP request to the Secrets Manager
-        // service endpoint, then you must generate a ClientRequestToken and
-        // include it in the request."
-        // (`PutSecretValueRequest$ClientRequestToken`, this service's Smithy
-        // model.) A request that carries none is refused before anything is
-        // encrypted or stored, rather than staking a version under an id the
-        // caller never chose, cannot retry with, and which would take AWSCURRENT
-        // off the version the caller does know.
-        let Some(version_id) = input.client_request_token.clone() else {
-            return Err(missing_client_request_token());
-        };
-
-        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
-        let region = crate::state::request_region(ctx.parts());
         // Which service, if any, is making this write as its OWN service principal: a
         // secret another service manages is that service's to write
         // ([`crate::state::service_owned`]).

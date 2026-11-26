@@ -3288,6 +3288,27 @@ impl ComAmazonawsSecretsmanagerSecretsmanagerState {
             secret.settle_replicas(now);
         }
     }
+
+    /// Whether `region` holds the secret a request's `SecretId` addresses, with the
+    /// changes the clock has already made due materialised first.
+    ///
+    /// An operation addressed to ONE secret resolves that secret before it applies a
+    /// rule over the COMBINATION of its other members: such a rule states what change
+    /// the request asks of the secret, and a secret this Region does not hold admits
+    /// no change at all. So a `SecretId` the Region holds no secret for is answered
+    /// `ResourceNotFoundException` ([`SECRET_NOT_FOUND_MESSAGE`]) whatever those
+    /// members say — which is the error CLASS a caller branches on, since a client
+    /// reconciling against a secret that may be gone catches the not-found class and
+    /// would read a parameter refusal as its own request being malformed.
+    ///
+    /// Only such a combination rule waits for this: the validation of ONE member's own
+    /// value — a length, a range, a count, a key's syntax, a document's grammar — is
+    /// decidable from the request alone and still precedes it.
+    pub fn holds_addressed(&mut self, region: &str, secret_id: &str, now: SystemTime) -> bool {
+        self.expire_due(now);
+        self.settle_replicas_due(now);
+        self.resolve(region, secret_id).is_some()
+    }
 }
 
 /// An ARN with the trailing hyphen and six random characters removed; the ARN
