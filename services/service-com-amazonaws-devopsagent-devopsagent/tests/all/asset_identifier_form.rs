@@ -7,12 +7,20 @@
 //! names one asset carries nothing about the other resources the store holds and the
 //! same call sequence against two stores does not name one asset twice.
 //!
+//! The INVARIANTS of that identifier are asserted over drawn creates at the end of
+//! this file: whatever a create carries, the identifier it answers stays inside the
+//! bounds its member publishes, is the handle the asset is read back by, repeats for
+//! an idempotent replay of the same create and for nothing else, and is never the
+//! same for two assets.
+//!
 //! Every case drives the service through the same router the emulator serves, so
 //! the routes, status codes, protocol envelope and state are all exercised.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -252,6 +260,13 @@ fn assert_asset_identifier(case: &str, asset_id: &str) {
         "case {case:?}: expected an opaque asset identifier of {ASSET_ID_LEN} characters in \
          the canonical UUID form, got {asset_id:?}"
     );
+    assert_within_resource_id(case, asset_id);
+}
+
+/// Assert `asset_id` satisfies what the MODEL publishes for the member that reports it:
+/// `ResourceId`'s length bound and charset, and nothing about the form the service
+/// happens to draw inside them.
+fn assert_within_resource_id(case: &str, asset_id: &str) {
     let length = asset_id.chars().count();
     assert!(
         (RESOURCE_ID_MIN_LEN..=RESOURCE_ID_MAX_LEN).contains(&length)
@@ -579,4 +594,164 @@ async fn asset_identifier_is_stable_and_resolves_only_its_own_asset() {
         "case absent identifier: refusal reported {:?}",
         error_message(&body)
     );
+}
+
+// ---------------------------------------------------------------------------
+// The identifier's invariants, over DRAWN creates
+// ---------------------------------------------------------------------------
+
+/// The seeds the drawn suite below runs from: a fixed set this suite owns, so the case
+/// count is bounded and every run draws the same creates, or the single seed
+/// [`DRAW_SEED_OVERRIDE`] names for an exploratory run. Every assertion carries its
+/// seed and its draw index, so a failure names the create that produced it and the
+/// override replays exactly that one.
+const DRAW_SEEDS: [u64; 4] = [0xa55e_7001, 0xa55e_7002, 0xa55e_7003, 0xa55e_7004];
+
+/// The environment variable that replaces [`DRAW_SEEDS`] with one named seed.
+const DRAW_SEED_OVERRIDE: &str = "DEVOPSAGENT_ASSET_IDENTIFIER_SEED";
+
+/// How many assets one seed creates. Bounded, and more than one per seed so the draws
+/// of a seed share their store.
+const DRAWS_PER_SEED: usize = 5;
+
+/// The `assetType` values a draw picks from.
+///
+/// Source: the three types this service enforces a metadata rule for
+/// (`crate::state::ASSET_TYPE_RULES` — skill, artifact, attachment) plus types it
+/// enforces none for, because `AssetType` is an open string the model documents only
+/// by example — "The type of asset (e.g. skill, artifact)",
+/// `smithy_query(query="shape", shape="AssetType")`.
+const DRAWN_ASSET_TYPES: [&str; 6] = [
+    "skill",
+    "artifact",
+    "attachment",
+    "runbook",
+    "playbook",
+    "evaluation.suite",
+];
+
+/// The content paths a draw picks from: a bare file name, nested paths, a path with a
+/// space and a one-character one, all inside the modelled `AssetFilePath`
+/// (`^[a-zA-Z0-9_./ ()-]+$`, `smithy_query(query="shape", shape="AssetFilePath")`).
+const DRAWN_PATHS: [&str; 5] = [
+    "SKILL.md",
+    "data.json",
+    "docs/notes.md",
+    "deep/nested/dir/run (1).yaml",
+    "a",
+];
+
+/// How many resources of OTHER kinds a draw may create before its asset, so the
+/// identifier is minted behind a varying number of unrelated creates.
+const MOST_UNRELATED_PER_DRAW: usize = 3;
+
+/// RULE: whatever a create carries, the identifier `CreateAsset` answers is the
+/// asset's own — inside the bounds its member publishes, the handle the asset is read
+/// back by, repeated for an idempotent replay of that create and for no other asset.
+#[tokio::test]
+async fn a_drawn_create_mints_an_identifier_only_its_own_asset_answers_to() {
+    let seeds = match std::env::var(DRAW_SEED_OVERRIDE) {
+        Ok(named) => vec![named.trim().parse::<u64>().unwrap_or_else(|error| {
+            panic!("{DRAW_SEED_OVERRIDE}={named:?} is not a u64 seed: {error}")
+        })],
+        Err(_) => DRAW_SEEDS.to_vec(),
+    };
+
+    // Every identifier any seed's store minted, so no two assets of any store in this
+    // suite share one.
+    let mut minted_everywhere: Vec<(String, String)> = Vec::new();
+
+    for seed in seeds {
+        let mut generator = StdRng::seed_from_u64(seed);
+        let seed_case = format!("seed {seed}");
+        let router = new_router();
+        // Two spaces, so a draw's asset is created in one of them and an identifier is
+        // asserted across the spaces of one store as well as within one.
+        let spaces = [
+            create_space(&router, &seed_case, "drawn-identifiers-a").await,
+            create_space(&router, &seed_case, "drawn-identifiers-b").await,
+        ];
+
+        for draw in 0..DRAWS_PER_SEED {
+            let asset_type = DRAWN_ASSET_TYPES[generator.random_range(0..DRAWN_ASSET_TYPES.len())];
+            let path = DRAWN_PATHS[generator.random_range(0..DRAWN_PATHS.len())];
+            let space = &spaces[generator.random_range(0..spaces.len())];
+            let body = format!("drawn body {}", generator.random_range(0..1_000_000_u32));
+            let case = format!("{seed_case}, draw {draw}: a {asset_type:?} at {path:?}");
+
+            // Unrelated resources of two other kinds first: what names this asset must
+            // not depend on how many of them the store holds.
+            for n in 0..generator.random_range(0..=MOST_UNRELATED_PER_DRAW) {
+                create_task(&router, &case, space, &format!("unrelated task {draw}-{n}")).await;
+            }
+            for n in 0..generator.random_range(0..=MOST_UNRELATED_PER_DRAW) {
+                create_trigger(&router, &case, space, &format!("rate({} hours)", n + 1)).await;
+            }
+
+            let mut request = asset_request(asset_type, path);
+            request["content"]["file"]["body"] = json!({ "text": body });
+            let token = format!("drawn-{seed}-{draw}");
+            request["clientToken"] = json!(token);
+
+            let asset_id = create_asset(&router, &case, space, request.clone()).await;
+            // What the MODEL publishes for the member that reports it; the form the
+            // service draws inside those bounds is the table rows' subject, not this
+            // suite's.
+            assert_within_resource_id(&case, &asset_id);
+
+            // No other asset of any store answers to it.
+            if let Some((other_case, repeated)) = minted_everywhere
+                .iter()
+                .find(|(_, seen)| *seen == asset_id)
+            {
+                panic!(
+                    "case {case:?}: identifier {repeated:?} was already minted by case \
+                     {other_case:?}"
+                );
+            }
+            minted_everywhere.push((case.clone(), asset_id.clone()));
+
+            // READ BACK: the identifier the create answered resolves the asset it
+            // persisted, in the space the create was addressed to.
+            let uri = get_asset_uri(space, &asset_id);
+            let (status, fetched) = call(&router, "GET", &uri, None).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected 200 from GetAsset on {asset_id:?}, got {status}: {fetched}"
+            );
+            assert_eq!(
+                fetched["asset"]["assetId"],
+                json!(asset_id),
+                "case {case:?}: GetAsset reported {:?} for the asset created as {asset_id:?}",
+                fetched["asset"]["assetId"]
+            );
+            assert_eq!(
+                fetched["asset"]["assetType"],
+                json!(asset_type),
+                "case {case:?}: GetAsset reported {:?} as the asset type",
+                fetched["asset"]["assetType"]
+            );
+
+            // IDEMPOTENCE: the same create replayed with the same `clientToken` is the
+            // same asset, so it answers the same identifier...
+            let replayed = create_asset(&router, &case, space, request.clone()).await;
+            assert_eq!(
+                replayed, asset_id,
+                "case {case:?}: the create replayed with clientToken {token:?} answered \
+                 {replayed:?}, not the identifier {asset_id:?} the first one minted"
+            );
+            // ... while the SAME content under a fresh token is another asset, so the
+            // identifier is the asset's and not a function of what the request carried.
+            let mut twin = request;
+            twin["clientToken"] = json!(format!("{token}-twin"));
+            let twin_id = create_asset(&router, &case, space, twin).await;
+            assert_within_resource_id(&case, &twin_id);
+            assert_ne!(
+                twin_id, asset_id,
+                "case {case:?}: a second create of the same content answered the identifier \
+                 {twin_id:?} the first asset already carries"
+            );
+            minted_everywhere.push((format!("{case} (twin)"), twin_id));
+        }
+    }
 }
