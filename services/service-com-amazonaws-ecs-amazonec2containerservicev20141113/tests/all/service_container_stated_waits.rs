@@ -21,8 +21,9 @@
 //! exactly that. What a SERVICE does with such a container — the count it then holds — is the
 //! premise every rollout of this crate rests on, and the one an Application Auto Scaling
 //! movement of the `ecs:service:DesiredCount` dimension is fulfilled by. A wait inside a
-//! program that does something ELSE keeps the stated reading either way, which
-//! [`crate::container_stated_waits`] pins.
+//! program that does something ELSE keeps the stated reading for a task run on its own
+//! ([`crate::container_stated_waits`]) and is spent for a container whose task a service
+//! maintains, which [`crate::zz_tmp_diag`] pins.
 //!
 //! Sources: `smithy_query(query="operation",operation="DescribeServices")` for
 //! `Service$runningCount` ("the number of tasks in the cluster that are in the RUNNING state")

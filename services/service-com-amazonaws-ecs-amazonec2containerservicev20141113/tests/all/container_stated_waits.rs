@@ -2,7 +2,8 @@
 
 //! What a duration a container's PROGRAM states costs this emulator, and what it does not.
 //!
-//! RULE under test: **the seconds in a container's `sleep` are its program's own account of
+//! RULE under test, for a task run on its OWN — something IS waiting to see that program end:
+//! **the seconds in a container's `sleep` are its program's own account of
 //! how long that program took, so a wait a program STATES among steps of its own is taken as
 //! stated and what the program does next — its next step, or its own end — follows at once:
 //! the task stops on the status its program exited with, however many seconds that program
@@ -17,11 +18,13 @@
 //!
 //! Why the bound has to be this emulator's: a container's program is request-supplied, and
 //! everything that waits on its task waits with it — the AWS Batch job whose dependents are
-//! held until it ends (`core/router/tests/all/batch_job_dependency_gate.rs`), the deployment
-//! whose stabilisation is watched, the client polling `DescribeTasks`. A program's own words
+//! held until it ends (`core/router/tests/all/batch_job_dependency_gate.rs`), the client
+//! polling `DescribeTasks` for the terminal status of the task it ran. A program's own words
 //! must not decide how long any of them takes to reach a verdict, exactly as they must not
 //! decide how many steps it may take (`MAX_COMMANDS_PER_RUN`) or how long the run may live
-//! (the run's deadline).
+//! (the run's deadline). Every row below therefore runs its task on its own; a container whose
+//! task a SERVICE maintains has no such verdict behind it and is up for every wait it names,
+//! which `crate::zz_tmp_diag` pins.
 //!
 //! Sources: `smithy_query(query="operation",operation="DescribeTasks")` for `Task$lastStatus`,
 //! `Task$stopCode`/`stoppedReason` and `Container$exitCode` ("the exit code returned from the

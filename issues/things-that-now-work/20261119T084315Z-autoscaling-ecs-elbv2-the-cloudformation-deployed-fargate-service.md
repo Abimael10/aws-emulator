@@ -33,3 +33,32 @@ Actual (emulator): no step of that sequence is observed. The replay report carri
 3. Poll ecs ListTasks(cluster, serviceName) until at least one task ARN appears -> observed: none within the budget.
 4. Poll ecs DescribeTasks for lastStatus in {RUNNING, STOPPED} and assert RUNNING -> observed: never reached.
 5. Poll logs FilterLogEvents(logGroupName, logStreamNamePrefix='app') for >= 1 event -> observed: never reached.
+
+## Resolution note
+
+The stall this report names — an ECS service whose task is never observable RUNNING, so nothing
+a client polls for about it ever holds — was in the CONTAINER PROGRAM's lifetime, and is fixed
+here: a container whose task a service's (or a daemon's) scheduler maintains now SPENDS every
+wait its program names, wherever the wait stands in that program, and a `tail` FOLLOW no longer
+ends where its input does. Before this change the most common long-lived Fargate program
+(`sh -c 'echo ready; sleep 3600'`, and the `tail -f /dev/null` idiom beside it) ended within
+milliseconds, so the task was reported `STOPPED` with `stopCode` `EssentialContainerExited`
+about three seconds after it started, the scheduler replaced it, and `runningCount` never
+reached `desiredCount`.
+
+The rest of the sequence this report describes is served, and was already: `CreateStack` of the
+declared estate (security group of the default VPC, an execution role whose permissions are the
+AWS managed policy alone, a retained log group, a cluster, a FARGATE/awsvpc revision and a
+service in that subnet with that group) reaches `CREATE_COMPLETE`, `ListTasks(cluster,
+serviceName)` answers with the placed task, `DescribeTasks` reports it `RUNNING`, and the
+`awslogs` driver delivers what the container wrote to the declared group — in about three
+seconds end to end, in process, on the assembled emulator and on the started binary over TLS
+with SigV4-signed calls. Two suites pin it:
+`core/router/tests/all/cfn_deployed_fargate_service_holds_its_running_task.rs` over the forms a
+long-lived program takes, and
+`core/router/tests/all/cfn_fargate_service_in_its_own_security_group_runs.rs` for the deployed
+group the placement runs under and for the boundary (a program that really ends).
+
+The recorded check still reports the replay harness's own 60 s cap with no graded step, which
+this change could not account for: every call of the sequence above answers in milliseconds, so
+what is left of that budget is not spent on an unserved call in it.

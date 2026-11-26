@@ -220,6 +220,15 @@
 //! maintains your desired number of tasks from a specified task definition"
 //! (`CreateService`), so the end of such a container is not a verdict a caller polls for: it
 //! is the task leaving the set the service holds, which the scheduler replaces.
+//!
+//! That is why such a container spends EVERY wait its program names, wherever the wait stands
+//! in it: the reason to take a wait as stated is the verdict something is waiting for the
+//! program's end to reach, and a service's task has no such verdict behind it. A program of
+//! the shape a long-running workload is written in (`sh -c 'echo ready; sleep 3600'`) is a
+//! container that is up for the hour it names, so the service reaches the `desiredCount` its
+//! caller asked for and HOLDS it; taking that wait as stated would end the container at once,
+//! report its essential container as having exited, and leave the scheduler replacing a task
+//! for ever behind a `runningCount` the service never reaches.
 
 use std::collections::BTreeMap;
 use std::pin::Pin;
@@ -670,6 +679,48 @@ fn script_is_only_a_wait(text: &str) -> bool {
         .is_some_and(|word| word.value == SLEEP_COMMAND)
 }
 
+/// The utility whose FOLLOW option asks for a program that does not end
+/// ([`follow_free_arguments`]).
+const TAIL_COMMAND: &str = "tail";
+
+/// How `tail`'s follow option is written: the flag, the long name, and the long name carrying
+/// the descriptor form it may be given (`--follow=name`, `--follow=descriptor`).
+const FOLLOW_FLAG: &str = "-f";
+const FOLLOW_LONG: &str = "--follow";
+const FOLLOW_LONG_VALUE_PREFIX: &str = "--follow=";
+
+/// `arguments` with `tail`'s FOLLOW option taken out, for an invocation that carries one, and
+/// `None` for every other invocation — including one of another utility, since no other
+/// utility these containers perform reads `-f` as a follow
+/// ([`::service_common::posix_shell_text_filters::TEXT_FILTER_COMMANDS`]: `cut -f` names its
+/// field list and `grep -f` is not performed at all).
+///
+/// What is left is the invocation the text filters compute over, so a follow writes exactly what
+/// the same invocation without it writes — the last lines of its input, as many as its own count
+/// asks for — and the FOLLOW itself is the one thing this session performs rather than that
+/// module: the utility "shall not terminate after the last line of the input file has been
+/// copied" (POSIX, `tail`), which is a program that goes on rather than text to compute.
+fn follow_free_arguments(name: &str, arguments: &[String]) -> Option<Vec<String>> {
+    if name != TAIL_COMMAND {
+        return None;
+    }
+    let follows = |argument: &String| {
+        argument == FOLLOW_FLAG
+            || argument == FOLLOW_LONG
+            || argument.starts_with(FOLLOW_LONG_VALUE_PREFIX)
+    };
+    if !arguments.iter().any(follows) {
+        return None;
+    }
+    Some(
+        arguments
+            .iter()
+            .filter(|argument| !follows(argument))
+            .cloned()
+            .collect(),
+    )
+}
+
 /// What a container's run ended as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerOutcome {
@@ -993,10 +1044,11 @@ impl ContainerShell {
         }
     }
 
-    /// This session performing the program of a container whose task a SERVICE maintains:
-    /// nothing is waiting for that program to end, which is what lets a program that is
-    /// nothing but a wait be the span the container runs for FOR THE SECONDS IT NAMES, with no
-    /// ceiling of this emulator's on it (see the module docs).
+    /// This session performing the program of a container whose task a SERVICE's or a DAEMON's
+    /// scheduler maintains: nothing is waiting for that program to end, which is what makes
+    /// every wait it names one the container is up for — with no ceiling of this emulator's on
+    /// a program that is nothing but a wait, and nothing stated rather than spent anywhere else
+    /// in it (see the module docs).
     #[must_use]
     pub fn maintained_by_a_service(mut self) -> Self {
         self.maintained_by_a_service = true;
@@ -1729,13 +1781,18 @@ impl ContainerShell {
     /// Whether a wait the program states in seconds is a duration this session only STATES,
     /// rather than one it spends out of this emulator's own wall clock.
     ///
-    /// It is, wherever that wait stands in a program that does something ELSE: the seconds in
-    /// a `sleep` are then that program's own account of how long it took, and spending them
-    /// would let it decide how long this emulator takes to answer whatever is waiting for that
-    /// program to END — the standalone task whose terminal status a client polls for, the
-    /// dependents held until this container ends. So the wait is taken as stated and what the
-    /// program does next — its next command, or its own end carrying the status that wait
-    /// answered — follows at once, which is what the container then reports.
+    /// It is, wherever that wait stands in a program that does something ELSE and something is
+    /// waiting to see that program END: the seconds in a `sleep` are then that program's own
+    /// account of how long it took, and spending them would let it decide how long this
+    /// emulator takes to answer whatever is waiting — the standalone task whose terminal status
+    /// a client polls for, the dependents held until this container ends. So the wait is taken
+    /// as stated and what the program does next — its next command, or its own end carrying the
+    /// status that wait answered — follows at once, which is what the container then reports.
+    ///
+    /// It is NOT, in a container whose task a SERVICE maintains
+    /// ([`Self::maintained_by_a_service`]): nothing is waiting to see that program end, so no
+    /// verdict is held by spending the seconds it names, and the container is up for them —
+    /// which is what lets the service hold the count it was asked for (see the module docs).
     ///
     /// It is NOT, where the wait is the WHOLE PROGRAM ([`Self::program_is_a_wait`]): the
     /// container was given nothing to do but wait, so there is no work for those seconds to be
@@ -1753,7 +1810,7 @@ impl ContainerShell {
     /// up. So it is spent until the run's own deadline, exactly as a wait that names no end at
     /// all is ([`Self::run_sleep`]).
     fn states_a_wait_rather_than_spending_it(&self) -> bool {
-        self.loop_depth == 0 && !self.program_is_a_wait
+        self.loop_depth == 0 && !self.program_is_a_wait && !self.maintained_by_a_service
     }
 
     /// The action this session has recorded for the termination signal, under any of the
@@ -2866,10 +2923,10 @@ impl ContainerShell {
     /// its next command, or its own end — follows at once, so what the container reports is
     /// still its own program's outcome while nothing waiting on the task is held by that
     /// program's account of itself. A wait that names no end of its own, one the program goes
-    /// round a loop on, and one the container was given as its WHOLE program are spent: those
-    /// are the container waiting rather than reporting how long it worked. The SHELL spelling of
-    /// that last one is spent up to this emulator's ceiling on it
-    /// ([`WHOLE_PROGRAM_SHELL_WAIT_CEILING`]).
+    /// round a loop on, one the container was given as its WHOLE program, and every wait of a
+    /// container whose task a SERVICE maintains are spent: those are the container waiting
+    /// rather than reporting how long it worked. The SHELL spelling of the whole-program one is
+    /// spent up to this emulator's ceiling on it ([`WHOLE_PROGRAM_SHELL_WAIT_CEILING`]).
     async fn run_sleep(&mut self, arguments: &[String]) -> i32 {
         let Some(argument) = arguments.first() else {
             return EXIT_FAILURE;
@@ -3122,6 +3179,10 @@ impl ContainerShell {
     /// this container could not run, a file this filesystem will not read is reported the way
     /// the file commands report one, and a filter with no input at all could not run either:
     /// there is no terminal behind standard input here.
+    ///
+    /// The one option read HERE is `tail`'s FOLLOW ([`follow_free_arguments`]): what it asks for
+    /// is not a computation over text but a program that does not END, which only a session with
+    /// a clock can perform.
     async fn run_text_filter(
         &mut self,
         name: &str,
@@ -3129,7 +3190,10 @@ impl ContainerShell {
         redirections: &Redirections,
     ) -> i32 {
         use ::service_common::posix_shell_text_filters::{Filter, STANDARD_INPUT_LABEL};
-        let Some(filter) = Filter::read(name, arguments) else {
+        // "tail -f": the lines it has are written, and then the utility goes on waiting.
+        let followed = follow_free_arguments(name, arguments);
+        let read_as = followed.as_deref().unwrap_or(arguments);
+        let Some(filter) = Filter::read(name, read_as) else {
             return self.declined();
         };
         let (label, input) = match filter.file() {
@@ -3160,6 +3224,16 @@ impl ContainerShell {
         };
         if !self.write_stdout(&written.written, redirections).await {
             return EXIT_FAILURE;
+        }
+        // A FOLLOW does not end where the input does: "tail shall not terminate after the last
+        // line of the input file has been copied, but shall read and copy further bytes from the
+        // input file when they become available" — so what the program does next is nothing, and
+        // the container is up until it is stopped or this run's own bound ends it, exactly as a
+        // wait with no end of its own leaves it ([`Self::run_sleep`]).
+        if followed.is_some() && self.wait_for(None).await {
+            // "If sleep receives a signal, it shall exit with a status greater than zero" —
+            // the status a signal gives a command, which is what ends this one too.
+            return EXIT_SIGNAL_BASE + SIGTERM_NUMBER;
         }
         // The status of a utility that reports a SELECTION is that selection
         // (`posix_shell_text_filters::Selection`): a `grep` of this container's filesystem

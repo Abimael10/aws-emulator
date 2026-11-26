@@ -275,8 +275,9 @@ pub struct ContainerLaunch {
     /// Where the session records what this container's run CONSUMES, the one the store holds
     /// for it ([`ContainerRun::consumption`]).
     consumption: Arc<ContainerConsumption>,
-    /// Whether the task this container belongs to is one a SERVICE maintains, so nothing is
-    /// waiting for its program to END ([`ContainerShell::maintained_by_a_service`]).
+    /// Whether the task this container belongs to is one a SERVICE's or a DAEMON's scheduler
+    /// maintains, so nothing is waiting for its program to END
+    /// ([`ContainerShell::maintained_by_a_service`]).
     maintained_by_a_service: bool,
 }
 
@@ -547,10 +548,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     process: ContainerProcess::of(Some(stored), task),
                     layer,
                     consumption,
-                    // The service the scheduler placed this task for, read off the task
-                    // itself: a task of a service is one that service maintains RUNNING, so
-                    // nothing is waiting for its containers' programs to end.
-                    maintained_by_a_service: task.service_name.is_some(),
+                    // The scheduler that placed this task, read off the task itself: a task a
+                    // service's or a daemon's scheduler maintains is one that scheduler keeps
+                    // RUNNING, so nothing is waiting for its containers' programs to end.
+                    maintained_by_a_service: task.service_name.is_some()
+                        || task.daemon_arn.is_some(),
                 });
             }
             for started in started {
