@@ -58,6 +58,18 @@ impl Waf {
         (Self { router }, engine)
     }
 
+    /// [`Self::new`] with the base address this emulator answers on set to `base` rather
+    /// than the unserved default, for a suite that asserts a URL a handler composes from
+    /// the address the request arrived on.
+    pub(crate) fn served_at(base: &str) -> Self {
+        let mut waf = Self::new();
+        waf.router.set_url_base(
+            ::smithy_server_runtime::EndpointUrl::parse(base)
+                .expect("a bare https base URL"),
+        );
+        waf
+    }
+
     /// [`Self::new`] with the service that OWNS a protected resource mounted beside
     /// WAFv2 on the same engine, as the assembled emulator mounts them.
     ///

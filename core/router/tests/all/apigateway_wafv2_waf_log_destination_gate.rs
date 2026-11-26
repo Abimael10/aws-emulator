@@ -872,6 +872,10 @@ async fn each_inspected_request_leaves_one_redacted_record_in_the_named_group() 
 
     for row in &rows {
         let group = format!("{WAF_LOGS_PREFIX}{}", row.name);
+        // The destination group as the client of a logging destination creates it: WAF
+        // resolves the destination it is pointed at before it stores the configuration, so
+        // the group is there before any put names it.
+        emulator.create_group(&group).await;
         let arn = web_acl_in_front(
             &emulator,
             &format!("acl-{}", row.name),

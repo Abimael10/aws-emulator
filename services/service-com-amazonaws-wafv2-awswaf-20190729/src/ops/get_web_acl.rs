@@ -2,7 +2,9 @@
 
 //! @op GetWebACL
 //! Answers the stored WebACL, resolved either by `(Scope, Name, Id)` or by `ARN`,
-//! together with its current `LockToken`. A resource that is not stored is
+//! together with its current `LockToken`, and with the account's
+//! `ApplicationIntegrationURL` for a web ACL that integrates with the application it
+//! protects. A resource that is not stored is
 //! `WAFNonexistentItemException`; an ARN this request cannot use — malformed, of
 //! another region, or disagreeing with the `Scope` named — is
 //! `WAFInvalidParameterException`; an ARN naming another KIND of resource, and a
@@ -273,10 +275,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetWebACLOutput {
             web_acl: Some(entry.web_acl.clone()),
             lock_token: Some(entry.lock_token.clone()),
-            // WAF returns an application integration URL only for a web ACL that uses
-            // the CAPTCHA or challenge JavaScript integrations, which this emulator
-            // does not host.
-            application_integration_url: None,
+            // "The URL to use in SDK integrations … This is only populated if you are
+            // using a rule group in your web ACL that integrates with your
+            // applications in this way": the URL is the account's own integration
+            // address, the same one `ListAPIKeys` reports and published at the address
+            // this emulator answers on
+            // (`crate::state::application_integration_url`), and it is reported for a
+            // web ACL that integrates with the application it protects and left out for
+            // one that does not (`crate::state::uses_application_integration`).
+            application_integration_url: crate::state::uses_application_integration(&entry.web_acl)
+                .then(|| crate::state::application_integration_url(ctx.endpoint().as_str())),
         })
     }
 }

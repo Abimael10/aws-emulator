@@ -212,6 +212,19 @@ impl Emulator {
         (status, parsed)
     }
 
+    /// Create the log group `name` through CloudWatch Logs' own wire, as the client of a
+    /// logging destination creates it before any configuration names it: WAF resolves the
+    /// destination it is pointed at before it stores the configuration.
+    async fn given_log_group(&self, name: &str) {
+        let (status, body) = self
+            .logs("CreateLogGroup", json!({ "logGroupName": name }))
+            .await;
+        assert_eq!(
+            status, 200,
+            "setup CreateLogGroup({name}): expected HTTP 200, got {status} with {body}"
+        );
+    }
+
     /// One unsigned request to a deployed stage's invoke URL: the api's own host, no
     /// credential, the headers every case sends.
     async fn invoke(&self, api: &str, stage: &str) -> (u16, String) {
@@ -596,6 +609,7 @@ async fn the_named_group_receives_one_record_for_each_inspected_request() {
             row.name,
         )
         .await;
+        emulator.given_log_group(&group).await;
         emulator
             .waf_ok(
                 "PutLoggingConfiguration",
@@ -735,6 +749,7 @@ async fn a_destination_without_the_prefix_is_refused_and_changes_nothing() {
         stage,
     )
     .await;
+    emulator.given_log_group(&group).await;
     emulator
         .waf_ok(
             "PutLoggingConfiguration",

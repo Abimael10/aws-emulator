@@ -234,6 +234,26 @@ impl Emulator {
                 .unwrap_or_default(),
         )
     }
+    /// Create the log group `name` through CloudWatch Logs' own wire, as the client of a
+    /// logging destination creates it before any configuration names it: WAF resolves the
+    /// destination it is pointed at before it stores the configuration.
+    async fn given_log_group(&self, name: &str) {
+        let (status, body) = self
+            .logs("CreateLogGroup", json!({ "logGroupName": name }))
+            .await;
+        assert_eq!(
+            status, 200,
+            "setup CreateLogGroup({name}): expected HTTP 200, got {status} with {body}"
+        );
+    }
+}
+
+/// The log group a destination ARN names, or `None` for a destination of another kind.
+fn log_group_named(destination: &str) -> Option<&str> {
+    destination
+        .rsplit_once(":log-group:")
+        .map(|(_, name)| name)
+        .filter(|name| !name.is_empty())
 }
 
 /// The ARN `AssociateWebACL` binds a web ACL to a REST API stage by, the one form
@@ -408,6 +428,11 @@ async fn configure_logging(
     }
     if let Some(filter) = filter {
         configuration["LoggingFilter"] = filter;
+    }
+    // The destination has to be there before the put names it, so a log group named as one
+    // is created first ([`Emulator::given_log_group`]).
+    if let Some(group) = log_group_named(destination) {
+        emulator.given_log_group(group).await;
     }
     emulator
         .waf_ok(

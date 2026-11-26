@@ -973,8 +973,16 @@ async fn the_log_record_of_an_intercepted_request_reports_the_status_waf_sent() 
     let web_acl = create_web_acl(&front, "intercepted-action-logged-acl", rules()).await;
     associate(&front, &web_acl, &api).await;
     // A destination a `LoggingConfiguration` may name: a log group whose name carries the
-    // prefix WAF requires of one.
+    // prefix WAF requires of one, created before the put names it — WAF resolves the
+    // destination it is pointed at before it stores the configuration.
     let group = "aws-waf-logs-intercepted-action";
+    let (created, created_body) = front
+        .logs("CreateLogGroup", json!({ "logGroupName": group }))
+        .await;
+    assert_eq!(
+        created, 200,
+        "setup CreateLogGroup({group}): expected HTTP 200, got {created} with {created_body}"
+    );
     front
         .waf_ok(
             "PutLoggingConfiguration",

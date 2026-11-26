@@ -7,7 +7,11 @@
 //! well-formed ARN, or whose destination name does not carry the `aws-waf-logs-`
 //! prefix, is `WAFInvalidParameterException`. An `ResourceArn` naming no web ACL of this
 //! account is `WAFNonexistentItemException` and one that is not a wafv2 ARN at all
-//! `WAFInvalidParameterException` (both HTTP 400). The configuration's own members
+//! `WAFInvalidParameterException` (both HTTP 400). A destination the service that owns
+//! it reports no such resource for, and one addressed in another Region than the one WAF
+//! resolves this web ACL's destinations in, are `WAFNonexistentItemException` too — the
+//! configuration exists to deliver there, so the destination is resolved before anything
+//! is stored (`crate::service::logs::destinations`). The configuration's own members
 //! are judged BEFORE the web ACL is resolved — the ARN's syntax first, then the
 //! destinations — so a request that is wrong in two ways reports the parameter it
 //! carries rather than the resource it addresses. This is the ONLY file to touch
@@ -215,9 +219,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata, which this operation does not need:
-        // the web ACL is addressed by the configuration's own `ResourceArn`.
-        let _ = ctx;
+        // `ctx` is what the destinations this configuration names are resolved over:
+        // the in-process callback into the services that own them
+        // (`crate::service::logs::destinations`). The web ACL itself is addressed by
+        // the configuration's own `ResourceArn`.
         let mut configuration = input.logging_configuration;
 
         // The malformed-ARN parameter failure, as every operation here that takes an
@@ -295,14 +300,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let mut state = state.lock();
 
         // `LoggingConfiguration$ResourceArn` is "the ARN of the web ACL that you want
         // to associate with LogDestinationConfigs", so a configuration can only be
         // put in front of a web ACL this account holds: an ARN of another resource
         // kind, and one naming a web ACL that was never created, both reference a
         // resource that doesn't exist.
-        let Some(entry) = state.web_acl_by_arn(&configuration.resource_arn) else {
+        let Some((scope, name, id, web_acl_region)) = ({
+            let state = state.lock();
+            state.web_acl_by_arn(&configuration.resource_arn).map(|entry| {
+                (
+                    entry.scope.clone(),
+                    entry.web_acl.name.clone(),
+                    entry.web_acl.id.clone(),
+                    // The Region WAF resolves this web ACL's destinations in is the one
+                    // the web ACL lives in, which its own ARN carries
+                    // (`crate::state::resource_arn` mints that segment from the scope
+                    // and the endpoint the create arrived at, so a CLOUDFRONT-scoped
+                    // web ACL carries the single Region that scope is served at).
+                    crate::state::arn_resource_region(&entry.web_acl.arn)
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+        }) else {
             crate::state::audit(
                 "PutLoggingConfiguration",
                 "",
@@ -317,9 +338,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let scope = entry.scope.clone();
-        let name = entry.web_acl.name.clone();
-        let id = entry.web_acl.id.clone();
+
+        // The destination is what the configuration EXISTS to deliver into, so WAF
+        // resolves every one it names — in the Region it resolves this web ACL's
+        // destinations in, and with the service that owns the destination
+        // (`crate::service::logs::destinations`) — before the configuration is
+        // stored: a destination established not to be there is a resource that
+        // doesn't exist, and nothing is written for it. Asked with no state guard
+        // held, because each resolution awaits an in-process hop, and asked of each
+        // DISTINCT destination once and of at most
+        // `destinations::MAX_RESOLVED_DESTINATIONS` of them — the bound the list's own
+        // `@length` puts on it — so the work one request asks for is bounded here,
+        // ahead of the first hop.
+        for destination in
+            crate::service::logs::destinations::resolvable(&configuration.log_destination_configs)
+        {
+            if crate::service::logs::destinations::is_absent(ctx, destination, &web_acl_region)
+                .await
+            {
+                crate::state::audit(
+                    "PutLoggingConfiguration",
+                    &scope,
+                    &name,
+                    &id,
+                    "WAFNonexistentItemException",
+                );
+                return Err(
+                    PutLoggingConfigurationErrorModeled::WAFNonexistentItemException(
+                        crate::state::nonexistent_item_exception(),
+                    )
+                    .into(),
+                );
+            }
+        }
 
         // The members WAF fills server-side on a save, materialised here so a
         // configuration reads back the same way whatever the request left out:
@@ -346,8 +397,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "This operation completely replaces any mutable specifications that you
         // already have for a logging configuration with the ones that you provide to
         // this call", and "you can define one logging destination per web ACL": the
-        // put REPLACES what the web ACL carried under this log scope.
-        state.insert_logging_configuration(configuration.clone());
+        // put REPLACES what the web ACL carried under this log scope. The guard is
+        // taken again here, the destination resolutions above having awaited without
+        // it, and the web ACL resolved once more: one deleted while they were in
+        // flight is a resource that no longer exists.
+        {
+            let mut state = state.lock();
+            if state.web_acl_by_arn(&configuration.resource_arn).is_none() {
+                crate::state::audit(
+                    "PutLoggingConfiguration",
+                    &scope,
+                    &name,
+                    &id,
+                    "WAFNonexistentItemException",
+                );
+                return Err(
+                    PutLoggingConfigurationErrorModeled::WAFNonexistentItemException(
+                        crate::state::nonexistent_item_exception(),
+                    )
+                    .into(),
+                );
+            }
+            state.insert_logging_configuration(configuration.clone());
+        }
         crate::state::audit(
             "PutLoggingConfiguration",
             &scope,

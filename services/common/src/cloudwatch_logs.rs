@@ -175,7 +175,9 @@ pub fn log_group_of_arn(arn: &str) -> Option<&str> {
 /// cross-service pre-condition in this tree follows.
 ///
 /// The hop is the in-process callback into this same emulator ([`logs_client`]), so nothing
-/// here opens a socket or leaves the process. Call it with NO state guard held — it awaits.
+/// here opens a socket or leaves the process. A group CloudWatch Logs answers with is also
+/// read for WHERE it lives ([`answered_in`]), because the question is about one Region.
+/// Call it with NO state guard held — it awaits.
 pub async fn log_group_is_absent(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -190,7 +192,7 @@ pub async fn log_group_is_absent(
         Ok(answer) => !answer
             .log_groups()
             .iter()
-            .any(|group| group.log_group_name() == Some(name)),
+            .any(|group| group.log_group_name() == Some(name) && answered_in(group, region)),
         Err(error) => {
             // Not CloudWatch Logs reporting what it holds, so this establishes nothing about
             // the group — and it is worth a warning, because an emulator with no CloudWatch
@@ -206,6 +208,26 @@ pub async fn log_group_is_absent(
             false
         }
     }
+}
+
+/// Whether the log group CloudWatch Logs answered with is one `region` holds.
+///
+/// `DescribeLogGroups` reports each group's own ARN — `LogGroup$logGroupArn`, and the form
+/// carrying everything under the group under `LogGroup$arn` — whose Region field is the
+/// Region the group was created in. A group of the same name in ANOTHER Region is not one
+/// the asked Region holds: a service pointed at a destination delivers into the Region it
+/// resolved the destination in, so a group somewhere else is no destination for it.
+///
+/// `true` — establish nothing — where the answer carries no ARN to read a Region off, or one
+/// whose Region field is empty: a refusal has to be grounded in what the owning service
+/// said, so an answer that does not say where the group lives is not read as saying it lives
+/// elsewhere.
+fn answered_in(group: &::aws_sdk_cloudwatchlogs::types::LogGroup, region: &str) -> bool {
+    let Some(arn) = group.log_group_arn().or_else(|| group.arn()) else {
+        return true;
+    };
+    crate::arn::parse(arn)
+        .is_none_or(|parsed| parsed.region.is_empty() || parsed.region == region)
 }
 
 /// Write one log event per entry of `records` into `log_group`, in the stream `log_stream`.

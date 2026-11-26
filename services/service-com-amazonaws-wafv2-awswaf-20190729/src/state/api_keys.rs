@@ -302,22 +302,24 @@ pub fn decrypt_api_key(value: &str) -> Option<DecryptedApiKey> {
     })
 }
 
-/// The domain WAF serves the CAPTCHA and challenge JavaScript integration from.
+/// The domain AWS itself serves the CAPTCHA and challenge JavaScript integration from.
 ///
 /// `ListAPIKeysResponse$ApplicationIntegrationURL` is "the CAPTCHA application
 /// integration URL, for use in your JavaScript implementation", and the recorded
 /// WAF responses answer an `https` URL under this domain, hosted per region and per
-/// account.
+/// account. It is the NAME of the integration, which the account's own integration id
+/// is derived from ([`captcha_integration_id`]); the URL this emulator publishes names
+/// the address this emulator answers on instead ([`application_integration_url`]).
 const CAPTCHA_SDK_DOMAIN: &str = "captcha-sdk.awswaf.com";
 
 /// How many lowercase hex characters the integration id in
 /// [`application_integration_url`] carries.
 ///
-/// The label WAF publishes the CAPTCHA integration under is a SIX-byte id rendered
-/// as hex, so the label and the path segment are twelve characters wide. A client
-/// that splits the label out of the URL — to build a script tag, a host allow-list
-/// entry or a CSP entry — or that recovers the integration id from it, reads an id
-/// of that width, so that is the width the URL is composed from.
+/// The id WAF publishes the CAPTCHA integration under is a SIX-byte id rendered as
+/// hex, so the path segment is twelve characters wide. A client that splits the id
+/// out of the URL — to build a script tag, a host allow-list entry or a CSP entry —
+/// or that recovers the integration id from it, reads an id of that width, so that is
+/// the width the URL is composed from.
 const CAPTCHA_INTEGRATION_ID_LENGTH: usize = 12;
 
 /// How many bytes of the account digest the id is rendered from: two lowercase hex
@@ -338,8 +340,8 @@ const _: () = assert!(
         && CAPTCHA_INTEGRATION_ID_LENGTH.is_multiple_of(2)
 );
 
-/// The id of this account's CAPTCHA integration: the host label, and the path
-/// segment, of [`application_integration_url`].
+/// The id of this account's CAPTCHA integration: the path segment of
+/// [`application_integration_url`].
 ///
 /// An account's integration is not a resource a caller creates — nothing in this
 /// model mints or names one — so the id is a PROPERTY of the account: the same
@@ -356,21 +358,108 @@ fn captcha_integration_id() -> String {
     ::hex::encode(&digest[..CAPTCHA_INTEGRATION_ID_BYTES])
 }
 
-/// The `ApplicationIntegrationURL` this account's clients load the CAPTCHA
-/// JavaScript integration from, at the endpoint region `region`.
+/// The `ApplicationIntegrationURL` this account's clients load the JavaScript
+/// integration from, published at `endpoint` — the base address this emulator answers
+/// on ([`smithy_server_runtime::OperationContext::endpoint`]).
 ///
 /// "The CAPTCHA application integration URL, for use in your JavaScript
-/// implementation" (`ListAPIKeysResponse$ApplicationIntegrationURL`): WAF hosts the
-/// integration per account and per region and answers its URL whatever keys the
-/// account holds — a client reads the URL from this listing BEFORE it mints its
-/// first key — so it is reported from the account and the region alone, and is the
-/// same URL on every call.
+/// implementation" (`ListAPIKeysResponse$ApplicationIntegrationURL`) and "the URL to
+/// use in SDK integrations" (`GetWebACLResponse$ApplicationIntegrationURL`): WAF hosts
+/// the integration per account and answers its URL whatever keys the account holds — a
+/// client reads the URL from a listing BEFORE it mints its first key — so it is composed
+/// from the account and the address alone, and is the same URL on every call.
 ///
-/// The URL is `https://<id>.<region>.captcha-sdk.awswaf.com/<id>/`: the scheme, the
-/// domain, the trailing `/` and the repetition of the SAME
-/// [`CAPTCHA_INTEGRATION_ID_LENGTH`]-character id in the leading host label and the
-/// single path segment are fixed; the region and the id are the variable parts.
-pub fn application_integration_url(region: &str) -> String {
-    let integration = captcha_integration_id();
-    format!("https://{integration}.{region}.{CAPTCHA_SDK_DOMAIN}/{integration}/")
+/// AWS composes it as `https://<id>.<region>.captcha-sdk.awswaf.com/<id>/`, at a host
+/// AWS itself serves that integration from. A URL this emulator hands a caller has to
+/// name the address the emulator is reached on instead — a public AWS host is not one it
+/// answers on, and a client that followed it would leave the emulator altogether — so
+/// what is kept of that form is the part that is the emulator's to keep: the account's
+/// [`CAPTCHA_INTEGRATION_ID_LENGTH`]-character integration id as the single path segment,
+/// and the trailing `/`.
+pub fn application_integration_url(endpoint: &str) -> String {
+    format!(
+        "{}/{}/",
+        endpoint.trim_end_matches('/'),
+        captcha_integration_id()
+    )
+}
+
+/// Whether `web_acl` uses the client-application JavaScript integration, which is what
+/// decides whether a read of it reports [`application_integration_url`].
+///
+/// `GetWebACLResponse$ApplicationIntegrationURL` is "the URL to use in SDK integrations
+/// with Amazon Web Services managed rule groups … This is only populated if you are
+/// using a rule group in your web ACL that integrates with your applications in this
+/// way" — so the URL is reported for a web ACL that integrates with the application it
+/// protects, and left out for one that does not. Two things make a web ACL one of those:
+///
+/// * it asks WAF to INJECT the JavaScript SDK into the responses of a protected resource
+///   type (`AssociationConfig$ChallengeJavascriptSdkInjection`), which is the integration
+///   carried out for the application rather than by it; or
+/// * one of its rules runs a managed rule group that integrates with the application —
+///   the intelligent-threat-mitigation groups, which acquire their tokens through that
+///   SDK ([`ManagedRuleGroupDescriptor::is_advanced_managed_rule_set`]), the group kind
+///   the member's own doc names (`AWSManagedRulesATPRuleSet`,
+///   `AWSManagedRulesACFPRuleSet`).
+///
+/// The rule list is walked whole, nestings included ([`nested_statements`]), because a
+/// managed rule group reference may sit inside one.
+pub fn uses_application_integration(web_acl: &WebACL) -> bool {
+    let injects_the_sdk = web_acl.association_config.as_ref().is_some_and(|config| {
+        config
+            .challenge_javascript_sdk_injection
+            .as_ref()
+            .is_some_and(|injection| !injection.is_empty())
+    });
+    if injects_the_sdk {
+        return true;
+    }
+    // A rule group a Firewall Manager policy put in front of or behind this web ACL's
+    // own rules runs here too, so a group of that kind integrates with the application
+    // just as one of the account's own rules does.
+    let managed_for_the_account = web_acl
+        .pre_process_firewall_manager_rule_groups
+        .iter()
+        .chain(web_acl.post_process_firewall_manager_rule_groups.iter())
+        .flatten()
+        .filter_map(|group| {
+            group
+                .firewall_manager_statement
+                .managed_rule_group_statement
+                .as_ref()
+        })
+        .any(|managed| integrates_with_the_application(&managed.vendor_name, &managed.name));
+    if managed_for_the_account {
+        return true;
+    }
+    let mut pending: Vec<&Statement> = web_acl
+        .rules
+        .iter()
+        .flatten()
+        .map(|rule| &rule.statement)
+        .collect();
+    while let Some(statement) = pending.pop() {
+        if statement
+            .managed_rule_group_statement
+            .as_deref()
+            .is_some_and(|managed| {
+                integrates_with_the_application(&managed.vendor_name, &managed.name)
+            })
+        {
+            return true;
+        }
+        pending.extend(nested_statements(statement));
+    }
+    false
+}
+
+/// Whether the managed rule group a `(VendorName, Name)` pair names is one that
+/// integrates with the protected application: a catalogued group that provides "an
+/// advanced set of protections, such as the … rule groups that are used for WAF
+/// intelligent threat mitigation"
+/// ([`ManagedRuleGroupDescriptor::is_advanced_managed_rule_set`]), which are the groups
+/// that acquire their tokens through the client application's SDK. A pair the catalogue
+/// holds no group for names nothing that could integrate.
+fn integrates_with_the_application(vendor_name: &str, name: &str) -> bool {
+    managed_rule_group(vendor_name, name).is_some_and(|group| group.is_advanced_managed_rule_set)
 }

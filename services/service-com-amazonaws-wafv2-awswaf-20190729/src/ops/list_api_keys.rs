@@ -200,7 +200,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let region = crate::service::requests::request_region(ctx.parts());
         let state = state.lock();
 
         // Only this scope's keys, in creation order — the order a marker names a
@@ -242,13 +241,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_marker,
             api_key_summaries: Some(api_key_summaries),
             // "The CAPTCHA application integration URL, for use in your JavaScript
-            // implementation": WAF hosts that integration per account and per
-            // region and answers its URL on every listing — a client reads it here
-            // to learn where to load the script from, before it has a key to use
-            // with it — so it is reported whatever keys this scope holds, from the
-            // account and the endpoint region alone
+            // implementation": WAF hosts that integration per account and answers its
+            // URL on every listing — a client reads it here to learn where to load the
+            // script from, before it has a key to use with it — so it is reported
+            // whatever keys this scope holds, from the account and the address this
+            // emulator is reached on
             // (`crate::state::application_integration_url`).
-            application_integration_url: Some(crate::state::application_integration_url(&region)),
+            application_integration_url: Some(crate::state::application_integration_url(
+                ctx.endpoint().as_str(),
+            )),
         })
     }
 }

@@ -314,9 +314,18 @@ async fn list_logging_configurations_enumerates_one_scope_a_page_at_a_time() {
     regional.sort();
     let (_global_id, global_arn, _global_lock) =
         create_web_acl(&waf, "CLOUDFRONT", "acl-global", json!([])).await;
+    // A destination is resolved in the Region the web ACL lives in, which for a
+    // CLOUDFRONT-scoped one is the Region that scope is served at — so the global web ACL
+    // logs to the row written for that scope (see `crate::logging_destination_resolution`
+    // for that rule), selected by what it IS rather than by its position in the table.
+    let cases = configuration_cases();
+    let global_row = cases
+        .iter()
+        .find(|row| row.scope == "CLOUDFRONT")
+        .expect("a CLOUDFRONT row among the configuration cases");
     waf.ok(
         "PutLoggingConfiguration",
-        json!({ "LoggingConfiguration": configuration(row, &global_arn) }),
+        json!({ "LoggingConfiguration": configuration(global_row, &global_arn) }),
     )
     .await;
     create_web_acl(&waf, "REGIONAL", "acl-unlogged", json!([])).await;

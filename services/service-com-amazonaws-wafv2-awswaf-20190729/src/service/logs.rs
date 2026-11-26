@@ -48,6 +48,9 @@
 
 mod delivered_objects;
 mod delivered_streams;
+/// Whether the destination a configuration NAMES is one WAF can resolve at all, which is
+/// what `PutLoggingConfiguration` judges before it stores the configuration.
+pub mod destinations;
 
 use super::edge::{EdgeDecision, GroupActivity, InspectedRequest};
 use crate::ops::types::{FieldToMatch, LoggingConfiguration, LoggingFilter, Rule};
@@ -301,48 +304,40 @@ const CLOUDFRONT_KEY_SEGMENT: &str = "cloudfront";
 /// Where `configured` delivers, or `None` when it names none of the destination kinds
 /// `PutLoggingConfiguration` publishes.
 ///
-/// A log group is named by its ARN, in either of the two forms a client reads one in —
-/// the group on its own and the group with everything under it — which is the ONE reading
-/// of such an ARN this tree holds
-/// ([`::service_common::cloudwatch_logs::log_group_of_arn`]).
+/// WHICH destination a value addresses is read by the one reading this crate holds
+/// ([`destinations::addressed`], which `PutLoggingConfiguration` resolves a destination
+/// through), so a destination WAF accepted is one this path knows how to write to. What is
+/// left here is where each kind's records GO.
 ///
-/// A delivery stream is named by the `deliverystream/<name>` resource of a `firehose` ARN,
-/// whose own Region field is where that stream lives.
+/// A log group takes them in the Region its own ARN names, in the stream
+/// [`log_stream_name`] composes. A delivery stream likewise lives in the Region its own ARN
+/// names.
 ///
-/// A bucket is named by an ARN whose resource field is the bucket's own name and nothing
-/// else (`arn:<partition>:s3:::<bucket>`, the form `PutLoggingConfiguration` takes an S3
-/// destination in). Such an ARN carries no Region — a bucket's name is global — so the
-/// object store is addressed in the Region the DELIVERING web ACL lives in, which is where
-/// WAF requires the destination to live and which the web ACL's own ARN carries (a
-/// CLOUDFRONT-scoped web ACL is created and served at the one endpoint that serves that
-/// scope, so that is the Region its ARN names); the account whose logs they are is the one
-/// that ARN names too. The key's own Region SEGMENT is [`CLOUDFRONT_KEY_SEGMENT`] for a
-/// CLOUDFRONT-scoped web ACL, whose files land under the distribution segment rather than
-/// under a Region. `at_millis` is the instant the record was produced at, which is the
-/// minute its object is keyed under.
+/// A bucket's ARN carries no Region — a bucket's name is global — so the object store is
+/// addressed in the Region the DELIVERING web ACL lives in, which is where WAF requires the
+/// destination to live and which the web ACL's own ARN carries (a CLOUDFRONT-scoped web ACL
+/// is created and served at the one endpoint that serves that scope, so that is the Region
+/// its ARN names); the account whose logs they are is the one that ARN names too. The key's
+/// own Region SEGMENT is [`CLOUDFRONT_KEY_SEGMENT`] for a CLOUDFRONT-scoped web ACL, whose
+/// files land under the distribution segment rather than under a Region. `at_millis` is the
+/// instant the record was produced at, which is the minute its object is keyed under.
 fn destination(configured: &str, entry: &WebAclEntry, at_millis: i64) -> Option<Destination> {
-    if let Some(log_group) = ::service_common::cloudwatch_logs::log_group_of_arn(configured) {
-        return Some(Destination::LogGroup {
-            region: arn_region(configured),
-            log_group: log_group.to_string(),
-            log_stream: log_stream_name(entry),
-        });
-    }
-    if ::service_common::arn::vendor(configured) == Some(delivered_streams::FIREHOSE_VENDOR) {
-        let stream = ::service_common::arn::resource_id_of_type(
-            configured,
-            delivered_streams::DELIVERY_STREAM_RESOURCE_TYPE,
-        )?;
-        return Some(Destination::DeliveryStream {
-            region: arn_region(configured),
-            stream: stream.to_string(),
-        });
-    }
-    let arn = ::service_common::arn::parse_of(configured, S3_VENDOR)?;
-    let bucket = arn.resource;
-    if bucket.contains(['/', ':']) {
-        return None;
-    }
+    let bucket = match destinations::addressed(configured)? {
+        destinations::Addressed::LogGroup(log_group) => {
+            return Some(Destination::LogGroup {
+                region: arn_region(configured),
+                log_group: log_group.to_string(),
+                log_stream: log_stream_name(entry),
+            })
+        }
+        destinations::Addressed::DeliveryStream(stream) => {
+            return Some(Destination::DeliveryStream {
+                region: arn_region(configured),
+                stream: stream.to_string(),
+            })
+        }
+        destinations::Addressed::Bucket(bucket) => bucket,
+    };
     let region = {
         let named = arn_region(&entry.web_acl.arn);
         if named.is_empty() {

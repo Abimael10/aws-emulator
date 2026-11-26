@@ -908,8 +908,21 @@ pub struct FieldToProtect {
 #[smithy_macros::smithy(shape = "com.amazonaws.wafv2#AssociationConfig")]
 #[derive(Debug, Clone, Default)]
 pub struct AssociationConfig {
+    /// The resource types WAF injects the challenge JavaScript SDK into the responses
+    /// of, keyed by `AssociatedResourceType`; added to the on-disk model from the
+    /// recorded AWS responses, which accept the member on a save and answer it back
+    /// under `WebACL$AssociationConfig` with the keys the save carried.
+    pub challenge_javascript_sdk_injection:
+        Option<std::collections::HashMap<String, JavascriptSdkInjectionConfig>>,
     pub request_body: Option<std::collections::HashMap<String, RequestBodyAssociatedResourceTypeConfig>>,
 }
+
+/// One associated resource type's JavaScript-SDK injection settings, the value of an
+/// [`AssociationConfig::challenge_javascript_sdk_injection`] entry; added to the on-disk
+/// model from the recorded AWS responses, which carry it as an empty object.
+#[smithy_macros::smithy(shape = "com.amazonaws.wafv2#JavascriptSdkInjectionConfig")]
+#[derive(Debug, Clone, Default)]
+pub struct JavascriptSdkInjectionConfig {}
 
 #[smithy_macros::smithy(shape = "com.amazonaws.wafv2#RequestBodyAssociatedResourceTypeConfig")]
 #[derive(Debug, Clone, Default)]
