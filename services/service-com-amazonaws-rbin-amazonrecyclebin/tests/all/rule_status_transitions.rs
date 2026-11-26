@@ -11,12 +11,13 @@
 //!    never runs backwards.
 //!    Source: smithy_query(query="shape", shape="RuleStatus,CreateRuleResponse,
 //!    UpdateRuleResponse,GetRuleResponse").
-//! 2. TAGS. `CreateRuleResponse$Tags` is the member reporting "the tags
-//!    assigned to the retention rule" and targets a `TagList` bounded `0..200`, so a
-//!    rule carrying no tags reports the member PRESENT as an empty list rather than
-//!    omitting it — exactly like the resource-selection members (`ResourceTags`,
+//! 2. TAGS. `CreateRuleResponse$Tags` is the member a create ASSIGNS the rule's tags
+//!    with, answered back as "the tags assigned to the retention rule": the create
+//!    echoes the assignments it made, so a create that assigned none reports no `Tags`
+//!    member at all — unlike the resource-selection members (`ResourceTags`,
 //!    `ExcludeResourceTags`), which are part of a rule's record either way and are
-//!    reported empty.
+//!    reported empty, and unlike the tag READER (`ListTagsForResource`), whose whole
+//!    payload is that collection and reports it empty.
 //!
 //! Every case drives the service through the real router, exactly as a signed SDK
 //! request would, and each row states its own case so a failure names the input.
@@ -315,7 +316,8 @@ async fn update_rule_returns_the_rule_to_pending_until_the_clock_settles_it_agai
 }
 
 /// `(case, the request's Tags member, the tags the rule must end up carrying)`. A row
-/// whose expected map is empty must come back with the `Tags` member present and empty.
+/// whose expected map is empty assigned no tag, so the create reports no `Tags` member at
+/// all; `ListTagsForResource` reports that rule's tag collection as the empty list it is.
 fn tag_rows() -> Vec<(&'static str, Option<Value>, BTreeMap<String, String>)> {
     let pair = |key: &str, value: &str| (key.to_string(), value.to_string());
     // The quota the store holds one rule to, so the top of the count range is covered.
@@ -367,7 +369,7 @@ fn tag_rows() -> Vec<(&'static str, Option<Value>, BTreeMap<String, String>)> {
 }
 
 #[tokio::test]
-async fn create_rule_reports_the_tags_member_as_a_present_list() {
+async fn create_rule_reports_the_tags_it_assigned() {
     let router = router();
     for (case, requested, expected) in tag_rows() {
         let mut body = json!({
@@ -383,17 +385,27 @@ async fn create_rule_reports_the_tags_member_as_a_present_list() {
             "case {case:?}: expected HTTP 201 from CreateRule, got {status} / {created:?}"
         );
 
-        assert!(
-            created.get("Tags").is_some_and(Value::is_array),
-            "case {case:?}: expected CreateRule to report Tags as a present list, got {:?}",
-            created.get("Tags")
-        );
-        assert_eq!(
-            tags_of(&created).as_ref(),
-            Some(&expected),
-            "case {case:?}: expected CreateRule to report Tags {expected:?}, got {:?}",
-            created["Tags"]
-        );
+        if expected.is_empty() {
+            // A create that assigned no tag echoes no `Tags` member at all.
+            assert_eq!(
+                created.get("Tags"),
+                None,
+                "case {case:?}: expected CreateRule to report no Tags member, got {:?}",
+                created.get("Tags")
+            );
+        } else {
+            assert!(
+                created.get("Tags").is_some_and(Value::is_array),
+                "case {case:?}: expected CreateRule to report Tags as a present list, got {:?}",
+                created.get("Tags")
+            );
+            assert_eq!(
+                tags_of(&created).as_ref(),
+                Some(&expected),
+                "case {case:?}: expected CreateRule to report Tags {expected:?}, got {:?}",
+                created["Tags"]
+            );
+        }
 
         // The resource-selection members are part of a rule's record either way, so
         // they stay present even when the rule names none of them.

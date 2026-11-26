@@ -384,24 +384,32 @@ impl Rule {
         }
     }
 
-    /// The `Tags` member every response that reports this rule's own tags carries: the
-    /// stored tag assignments, as a list that is PRESENT whether or not the rule carries
-    /// any.
+    /// The `Tags` member the tag READER reports for this rule: the stored tag assignments,
+    /// as a list that is PRESENT whether or not the rule carries any.
     ///
-    /// `Tags` is the same member, documented the same way — "Information about the tags
-    /// assigned to the retention rule" — on every shape that reports it, read off the one
-    /// [`Self::tags`] field, and its target `TagList` is bounded `0..200`
+    /// `ListTagsForResource` "lists the tags assigned to a retention rule" and its whole
+    /// payload IS that collection, whose target `TagList` is bounded `0..200`
     /// (smithy_query(query="operation", operation="CreateRule,ListTagsForResource")), so a
     /// rule carrying no tags is a tag collection of length zero: the member is serialized
     /// as `[]` rather than left unset. A reader of the collection then always finds it,
     /// exactly as the other list members of a rule's record are always found — the
     /// resource SELECTION (`ResourceTags` / `ExcludeResourceTags`) and `ListRules`' own
-    /// `Rules` page are reported empty rather than omitted too. The normalisation lives
-    /// here, in one place, so no two renderers of this one field can answer differently
-    /// for the same rule, and the return type states that the member is never absent:
-    /// each renderer wraps the list in the `Some` its output field is declared with.
+    /// `Rules` page are reported empty rather than omitted too.
     pub fn reported_tags(&self) -> Vec<Tag> {
         self.tags.clone()
+    }
+
+    /// The `Tags` member a CREATE reports for the rule it just made: the tag assignments
+    /// the create carried, or ABSENT where it assigned none.
+    ///
+    /// `CreateRule`'s own `Tags` is the member the request assigns tags with, answered back
+    /// as "the tags assigned to the retention rule" — the create ECHOES what it was given,
+    /// and a create that assigned no tag reports no such member at all, where a reader of
+    /// the tag collection ([`Self::reported_tags`]) reports the empty collection it read.
+    /// Recorded behaviour: the 201 of a create carrying no `Tags` has no `Tags` member in
+    /// its body.
+    pub fn assigned_tags(&self) -> Option<Vec<Tag>> {
+        (!self.tags.is_empty()).then(|| self.tags.clone())
     }
 
     /// Whether the rule's lock still forbids modifying or deleting it.

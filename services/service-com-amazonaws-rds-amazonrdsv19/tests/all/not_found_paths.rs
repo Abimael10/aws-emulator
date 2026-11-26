@@ -810,21 +810,21 @@ async fn global_clusters_are_reported_out_of_state_and_filtered_by_member_region
         );
     }
 
-    // A filter name this operation does not support is ACCEPTED and narrows nothing: this
-    // report honours only the names it publishes, so a name outside them is a parameter it
-    // does not apply (see `global_cluster_member_filters.rs`).
+    // A filter name this report RECOGNISES without narrowing by it is served and applies
+    // nothing, while a name it does not recognise at all is refused (see
+    // `global_cluster_member_filters.rs`, which owns both halves of that rule).
     let (status, body) = call(
         &router,
         "DescribeGlobalClusters",
         &[
-            ("Filters.Filter.1.Name", "engine"),
-            ("Filters.Filter.1.Values.Value.1", "aurora-postgresql"),
+            ("Filters.Filter.1.Name", "global-cluster-id"),
+            ("Filters.Filter.1.Values.Value.1", "emu-global-a"),
         ],
     )
     .await;
     assert_eq!(
         status, 200,
-        "expected an unsupported filter name to be accepted, got {status} with {body}"
+        "expected the recognised filter name to be served, got {status} with {body}"
     );
     assert_eq!(
         texts(&body, "GlobalClusterIdentifier"),

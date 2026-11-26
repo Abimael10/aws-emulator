@@ -8,9 +8,12 @@
 //! target `TagList` is bounded `0..200`.
 //! Source: smithy_query(query="operation", operation="CreateRule,ListTagsForResource")
 //! and smithy_query(query="doc", shape="ListTagsForResourceResponse", member="Tags").
-//! So a rule carrying tags reports them, and a rule carrying NONE reports a collection of
-//! length zero: the member is PRESENT as an empty list rather than omitted, because a
-//! reader of the collection must find it whatever the rule holds.
+//! So a rule carrying tags reports them, and a rule carrying NONE is a tag collection of
+//! length zero: the READER (`ListTagsForResource`), whose whole payload is that collection,
+//! reports it as `[]` rather than omitting it, so a reader of the collection must find it
+//! whatever the rule holds. The CREATE's own member is its echo of the assignments it made,
+//! and is absent for a create that assigned none
+//! (`tests/all/rule_status_transitions.rs` owns that rule).
 //!
 //! What this suite pins, which no other suite does (`tests/all/rule_status_transitions.rs`
 //! owns the `CreateRule` side of the same member, and this suite reads the member through
@@ -20,8 +23,8 @@
 //!   `ListTagsForResource` — the tagging suite reads the member through a helper that
 //!   collapses an absent member and `[]` into the same empty map, so it cannot see the
 //!   difference;
-//! * that both renderers of the member agree for the same rule, whatever tag set it
-//!   holds, so the two cannot drift apart again;
+//! * that both renderers of the member report the same tag SET for the same rule, whatever
+//!   tag set it holds, so the two cannot drift apart again;
 //! * that the rendering follows the rule's CURRENT tag set however the rule reached it —
 //!   created untagged, created tagged, tagged afterwards by `TagResource`, or emptied
 //!   again by `UntagResource` — and not the shape of the request that created it;
@@ -198,8 +201,10 @@ async fn the_tags_member_is_reported_as_a_present_list_for_every_tag_set() {
             .unwrap_or_else(|| panic!("case {case:?}: CreateRule reported no RuleArn"))
             .to_string();
 
-        // The two renderers of the member answer the same for the rule as created: one
-        // stored tag set, one rendering of it.
+        // The two renderers of the member report the same tag SET for the rule as created:
+        // one stored tag set, one set of assignments. The create's member is absent where it
+        // assigned nothing, which the reader reports as the empty collection it is, so the
+        // sets are compared and not the member's presence.
         let (status, listed) = list_tags(&router, &rule_arn).await;
         assert_eq!(
             status, 200,
@@ -207,7 +212,7 @@ async fn the_tags_member_is_reported_as_a_present_list_for_every_tag_set() {
         );
         assert_eq!(
             tags_of(&listed),
-            tags_of(&created),
+            Some(tags_of(&created).unwrap_or_default()),
             "case {case:?}: CreateRule reported Tags {:?} while ListTagsForResource \
              reported {:?} for the same rule",
             created.get("Tags"),

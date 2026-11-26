@@ -1757,17 +1757,28 @@ impl ScriptRecord {
 /// request is served.
 pub const NODE_JS_VERSIONS: [&str; 2] = ["10.x", "24.x"];
 
-/// What the service answers a `CreateScript` that names NO runtime version: the member is
-/// REQUIRED, so there is no script to record without it.
+/// The `NodeJsVersion` a Realtime script uploaded as a LOCAL ZIP FILE runs on when its
+/// create names none: "By default, `NodeJsVersion` is `10.x`" (that member's own doc).
 ///
-/// The member's own doc still states a default ("By default, `NodeJsVersion` is `10.x`")
-/// beside the note that "Node.js 10 will reach end of support on September 30, 2026", and
-/// the service applies none: a create that omits the member is refused with this sentence.
-/// Recorded behaviour, read from the reason of the failed resource of a CloudFormation
-/// stack whose `AWS::GameLift::Script` declares no runtime version (in the behavioral
-/// corpus `simparity-behavioral-aws-v1`, check `cloudformation__gamelift__iam__\
+/// The default applies to the create that hands the service the script file itself: recorded
+/// behaviour, a `CreateScript` carrying a `ZipFile` and no `NodeJsVersion` is served and the
+/// script it records reports `10.x`. A create that leaves the file in the CALLER's own S3
+/// bucket and names no version is refused instead
+/// ([`NODE_JS_VERSION_REQUIRED_MESSAGE`]).
+pub const DEFAULT_NODE_JS_VERSION: &str = NODE_JS_VERSIONS[0];
+
+/// What the service answers a `CreateScript` that names no runtime version for a script it
+/// reads from the CALLER's own S3 location.
+///
+/// Recorded behaviour, read from the reason of the failed resource of a CloudFormation stack
+/// whose `AWS::GameLift::Script` declares a `StorageLocation` and no runtime version (in the
+/// behavioral corpus `simparity-behavioral-aws-v1`, check `cloudformation__gamelift__iam__\
 /// s3.deploy-gamelift-script-missing-nodejs-version-rejected-and-rolled-back`, whose reason
-/// quotes this sentence verbatim before its SDK's own diagnostic).
+/// quotes this sentence verbatim before its SDK's own diagnostic of the refused `CreateScript`
+/// call): that create is refused with this sentence, where the create that uploads the file
+/// itself takes the documented default ([`DEFAULT_NODE_JS_VERSION`]). The two forms of the
+/// one create are the two the operation documents, and the recordings answer them
+/// differently, so which file source the request names is what decides it.
 pub const NODE_JS_VERSION_REQUIRED_MESSAGE: &str =
     "The NodeJsVersion parameter is required. See the GameLift API Reference for \
      CreateScript() for a list of supported runtime versions.";

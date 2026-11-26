@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end HTTP tests for ONE rendering rule, over every response of this service
-//! that reports a collection: a modelled LIST member a successful response reports is
-//! PRESENT on the wire, as `[]` when the resource holds nothing, never omitted.
+//! that reports a collection it READS off a rule's record: a modelled LIST member such a
+//! response reports is PRESENT on the wire, as `[]` when the resource holds nothing, never
+//! omitted.
 //!
 //! Every list member this service reports is bounded with a minimum of ZERO — `TagList`
 //! `0..200`, `ResourceTags` `0..50`, `ExcludeResourceTags` `0..5`, and `ListRules`'
@@ -11,14 +12,20 @@
 //! Source: smithy_query(query="operation", operation="CreateRule,GetRule,UpdateRule,
 //! LockRule,UnlockRule,ListRules,ListTagsForResource").
 //!
+//! `CreateRule`'s own `Tags` is NOT such a member: it is the member the create assigns the
+//! rule's tags with and echoes back, so a create that assigned none reports no `Tags` at
+//! all (`tests/all/rule_status_transitions.rs` owns that rule). Every other collection a
+//! create reports is read off the stored record and is present either way, which this
+//! suite pins here.
+//!
 //! The table spans the class the rule generalises over: which operation renders the
 //! member (the create, the two single-rule readers, the two lock transitions, the list
 //! operation and the tag reader), which member it is (a rule's own tags, both resource
 //! selections, a page of rules), and whether the collection is empty or not — a rule
 //! created with nothing, a rule whose collection was emptied again, and one carrying
 //! entries. `tests/all/reported_tags_member.rs` owns the tag sets of the `Tags` member
-//! itself; this suite owns the presence of EVERY collection member, so no reader can
-//! start omitting one.
+//! itself; this suite owns the presence of every collection member a response reads off a
+//! record, so no reader can start omitting one.
 
 use serde_json::{json, Value};
 
@@ -29,8 +36,10 @@ use crate::retention_rule_lifecycle::{
 };
 use crate::rule_lock_transitions::{lock_rule, unlock_rule};
 
-/// The list members `CreateRule` reports for one rule.
-const CREATE_LIST_MEMBERS: [&str; 3] = ["Tags", "ResourceTags", "ExcludeResourceTags"];
+/// The list members `CreateRule` READS off the stored rule, which it reports present
+/// whether or not they hold anything. Its `Tags` member is the create's own echo of the
+/// assignments it made and is not one of them.
+const CREATE_LIST_MEMBERS: [&str; 2] = ["ResourceTags", "ExcludeResourceTags"];
 
 /// The list members the single-rule readers and the lock transitions report.
 const RULE_RECORD_LIST_MEMBERS: [&str; 2] = ["ResourceTags", "ExcludeResourceTags"];
@@ -120,7 +129,6 @@ async fn every_reported_list_member_is_present_whether_or_not_it_holds_anything(
         let case = row.case;
         let resource_type = row.body["ResourceType"].as_str().expect("a resource type");
         let expected = |member: &str| match member {
-            "Tags" => row.tags.clone(),
             "ResourceTags" => row.resource_tags.clone(),
             _ => row.exclude_resource_tags.clone(),
         };

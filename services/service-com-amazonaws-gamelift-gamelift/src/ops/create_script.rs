@@ -199,7 +199,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            MAX_SCRIPTS_PER_ACCOUNT, NODE_JS_VERSIONS, NODE_JS_VERSION_REQUIRED_MESSAGE,
+            DEFAULT_NODE_JS_VERSION, MAX_SCRIPTS_PER_ACCOUNT, NODE_JS_VERSIONS,
+            NODE_JS_VERSION_REQUIRED_MESSAGE,
         };
 
         let invalid = |message: String| -> Self::Error {
@@ -257,14 +258,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // `NodeJsVersion` is REQUIRED: the member's doc still states a default ("By default,
-        // `NodeJsVersion` is `10.x`") beside the note that Node.js 10 reaches end of support
-        // on September 30, 2026, and the service applies none — a create that names no
-        // runtime version is refused ([`crate::state::NODE_JS_VERSION_REQUIRED_MESSAGE`]
-        // records where that is read from). Refused before any state is locked, so a request
-        // without it stores nothing.
-        let Some(node_js_version) = input.node_js_version.clone() else {
-            return Err(invalid(NODE_JS_VERSION_REQUIRED_MESSAGE.to_string()));
+        // The runtime version a script runs on, where the create names none, depends on WHICH
+        // of the two file sources it names — the two alternatives this operation documents.
+        // A create that hands the service the file itself takes the documented default, "by
+        // default, `NodeJsVersion` is `10.x`" ([`crate::state::DEFAULT_NODE_JS_VERSION`]); a
+        // create that leaves the file in the caller's own S3 bucket is refused
+        // ([`crate::state::NODE_JS_VERSION_REQUIRED_MESSAGE`] records where both halves are
+        // read from). Refused before any state is locked, so such a request stores nothing,
+        // and every later read of a recorded script reports the version it was recorded with.
+        let node_js_version = match (input.node_js_version.clone(), zip_file) {
+            (Some(version), _) => version,
+            (None, Some(_)) => DEFAULT_NODE_JS_VERSION.to_string(),
+            (None, None) => return Err(invalid(NODE_JS_VERSION_REQUIRED_MESSAGE.to_string())),
         };
         // "The valid values are 10.x | 24.x." The modelled pattern
         // (`^[0-9]+\.(?:x|[0-9]+)$`) accepts any version string, so the documented catalog is

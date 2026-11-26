@@ -10,7 +10,8 @@
 
 use serde_json::{json, Value};
 
-use super::hosting_loop::{gamelift_arn, GameLift};
+use super::hosting_loop::{error_code, error_message, gamelift_arn, GameLift};
+use service_com_amazonaws_gamelift_gamelift::state::DEFAULT_NODE_JS_VERSION;
 
 /// Every `NodeJsVersion` a Realtime script may declare, from the member's own doc — "The
 /// valid values are `10.x | 24.x`" (`smithy_query shape=Script` member `NodeJsVersion`) —
@@ -18,8 +19,8 @@ use super::hosting_loop::{gamelift_arn, GameLift};
 const NODE_JS_VERSIONS: [&str; 2] = ["10.x", "24.x"];
 
 /// The `NodeJsVersion` the rows below that are not ABOUT the runtime version declare: the
-/// member is required (`state::NODE_JS_VERSION_REQUIRED_MESSAGE`), so every accepted create
-/// names one.
+/// one the service's own default is NOT, so a row that states it says which version it meant
+/// (the runtime-version default has its own test at the end of this suite).
 const SOME_NODE_JS_VERSION: &str = NODE_JS_VERSIONS[1];
 
 /// The modelled bounds of `CreateScriptInput$Name` and `$Version`
@@ -455,11 +456,6 @@ async fn a_create_outside_the_documented_contract_is_refused() {
             code: "InvalidRequestException",
         },
         Case {
-            label: "no Node.js version at all, the member being required",
-            request: json!({"Name": "no-runtime", "ZipFile": zip.clone()}),
-            code: "InvalidRequestException",
-        },
-        Case {
             label: "a Node.js version the service does not run, in the modelled form",
             request: json!({"Name": "node-twelve", "ZipFile": zip.clone(), "NodeJsVersion": "12.x"}),
             code: "InvalidRequestException",
@@ -513,35 +509,6 @@ async fn a_create_outside_the_documented_contract_is_refused() {
             case.code
         );
     }
-
-    // The refusal of the one REQUIRED member carries the service's own SENTENCE, not just its
-    // code: the message is part of what a client is answered. Its fixed text, as Amazon
-    // GameLift Servers words that class.
-    let (status, refused) = gamelift
-        .call(
-            "CreateScript",
-            &json!({
-                "Name": "no-runtime-message",
-                "ZipFile": zip_file_member(&zip_bytes(64)),
-            }),
-        )
-        .await;
-    assert_eq!(
-        status, 400,
-        "a create that names no NodeJsVersion must be refused, got {status} with {refused}"
-    );
-    assert_eq!(
-        refused
-            .get("Message")
-            .or_else(|| refused.get("message"))
-            .and_then(Value::as_str),
-        Some(
-            "The NodeJsVersion parameter is required. See the GameLift API Reference for \
-             CreateScript() for a list of supported runtime versions."
-        ),
-        "the refusal must carry the service's sentence for a missing runtime version, got \
-         {refused}"
-    );
 
     // Every refused create stored nothing: the next accepted create mints the FIRST script
     // of the store, and it is the only one a describe can find.
@@ -668,5 +635,243 @@ async fn describing_a_script_that_is_not_stored_is_refused() {
         described["Script"], script,
         "the stored script must still read back as created, got {}",
         described["Script"]
+    );
+}
+
+/// One row of the runtime-version table: the case, the `NodeJsVersion` the create states
+/// (`None` = no member at all), the rest of the create body, and the version the stored
+/// script must report — `""` where the create is refused instead.
+struct RuntimeRow {
+    case: &'static str,
+    stated: Option<&'static str>,
+    source: Value,
+    tags: Option<Value>,
+    expected: &'static str,
+}
+
+fn runtime_rows() -> Vec<RuntimeRow> {
+    let zip = zip_file_member(&zip_bytes(146));
+    vec![
+        RuntimeRow {
+            case: "a local zip file and no runtime version at all",
+            stated: None,
+            source: json!({ "ZipFile": zip.clone() }),
+            tags: None,
+            expected: DEFAULT_NODE_JS_VERSION,
+        },
+        RuntimeRow {
+            case: "a tagged create of a local zip file naming no runtime version",
+            stated: None,
+            source: json!({ "ZipFile": zip.clone() }),
+            tags: Some(json!([{ "Key": "owner", "Value": "liveops" }])),
+            expected: DEFAULT_NODE_JS_VERSION,
+        },
+        RuntimeRow {
+            case: "an empty local zip file naming no runtime version",
+            stated: None,
+            source: json!({ "ZipFile": zip_file_member(&zip_bytes(0)) }),
+            tags: None,
+            expected: DEFAULT_NODE_JS_VERSION,
+        },
+        RuntimeRow {
+            case: "a caller-owned storage location and no runtime version at all",
+            stated: None,
+            source: json!({ "StorageLocation": caller_location("scripts/realtime.zip") }),
+            tags: None,
+            expected: "",
+        },
+        RuntimeRow {
+            case: "a tagged create from a caller-owned location naming no runtime version",
+            stated: None,
+            source: json!({ "StorageLocation": caller_location("scripts/tagged.zip") }),
+            tags: Some(json!([{ "Key": "owner", "Value": "liveops" }])),
+            expected: "",
+        },
+        RuntimeRow {
+            case: "the default version stated explicitly, from a local zip file",
+            stated: Some(NODE_JS_VERSIONS[0]),
+            source: json!({ "ZipFile": zip.clone() }),
+            tags: None,
+            expected: NODE_JS_VERSIONS[0],
+        },
+        RuntimeRow {
+            case: "the default version stated explicitly, from a caller-owned location",
+            stated: Some(NODE_JS_VERSIONS[0]),
+            source: json!({ "StorageLocation": caller_location("scripts/stated.zip") }),
+            tags: None,
+            expected: NODE_JS_VERSIONS[0],
+        },
+        RuntimeRow {
+            case: "the other documented version, which no default overrides",
+            stated: Some(NODE_JS_VERSIONS[1]),
+            source: json!({ "StorageLocation": caller_location("scripts/other.zip") }),
+            tags: None,
+            expected: NODE_JS_VERSIONS[1],
+        },
+    ]
+}
+
+/// The create body one runtime-version row asks for.
+fn runtime_create_body(row: &RuntimeRow, name: &str) -> Value {
+    let mut body = json!({ "Name": name, "Version": "1.0.0" });
+    if let Value::Object(members) = row.source.clone() {
+        for (member, value) in members {
+            body[member] = value;
+        }
+    }
+    if let Some(stated) = row.stated {
+        body["NodeJsVersion"] = json!(stated);
+    }
+    if let Some(tags) = &row.tags {
+        body["Tags"] = tags.clone();
+    }
+    body
+}
+
+/// Where a create NAMES no runtime version, which of the two documented file sources it names
+/// is what decides the outcome: the create that hands the service the file itself records the
+/// script on the documented default, and the create that leaves the file in the caller's own
+/// S3 bucket is refused with the service's own sentence, recording nothing.
+///
+/// Recorded behaviour on both halves: a `CreateScript` carrying a `ZipFile` and no
+/// `NodeJsVersion` is served and the script reports `10.x` ("the Node.js version used for
+/// execution of your Realtime script. The valid values are `10.x | 24.x`. By default,
+/// `NodeJsVersion` is `10.x`", `smithy_query(query="doc", shape="CreateScriptInput",
+/// member="NodeJsVersion")`), while a create naming a `StorageLocation` and no
+/// `NodeJsVersion` is refused `InvalidRequestException` with the sentence
+/// `state::NODE_JS_VERSION_REQUIRED_MESSAGE` records the source of.
+///
+/// The rows span what the rule generalises over: which file source the create names (a local
+/// zip file, including an empty one, and a caller-owned S3 location), whether the create states
+/// the member at all (absent, each documented value), and whether the script carries tags —
+/// every served row read back through `DescribeScript`, so the version the create applied is
+/// the one the record holds, and every refused row leaving no script behind.
+#[tokio::test]
+async fn a_create_naming_no_runtime_version_is_decided_by_the_file_source_it_names() {
+    let gamelift = GameLift::new();
+    for (index, row) in runtime_rows().iter().enumerate() {
+        let case = row.case;
+        let name = format!("runtime-default-{index}");
+        if row.expected.is_empty() {
+            let (status, payload) = gamelift
+                .call("CreateScript", &runtime_create_body(row, &name))
+                .await;
+            assert_eq!(
+                (status, error_code(&payload).as_str()),
+                (400, "InvalidRequestException"),
+                "case {case:?}: expected the create to be refused, got {status} with {payload}"
+            );
+            assert_eq!(
+                error_message(&payload),
+                "The NodeJsVersion parameter is required. See the GameLift API Reference for \
+                 CreateScript() for a list of supported runtime versions.",
+                "case {case:?}: expected the service's own sentence, got {payload}"
+            );
+            // A refused create records nothing: no script answers to the name it asked for.
+            let (status, listed) = gamelift
+                .call("DescribeScript", &json!({ "ScriptId": format!("script-{name}") }))
+                .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: a refused create records no script, got {status} with {listed}"
+            );
+            continue;
+        }
+        let created = gamelift
+            .ok("CreateScript", runtime_create_body(row, &name))
+            .await;
+        let script = &created["Script"];
+        assert_eq!(
+            script["NodeJsVersion"].as_str(),
+            Some(row.expected),
+            "case {case:?}: expected the create to report NodeJsVersion {:?}, got {created}",
+            row.expected
+        );
+        let script_id = script["ScriptId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: CreateScript minted no ScriptId"))
+            .to_string();
+
+        // ROUND TRIP: the record the create left behind reports the same version.
+        let described = gamelift
+            .ok("DescribeScript", json!({ "ScriptId": script_id }))
+            .await;
+        assert_eq!(
+            described["Script"]["NodeJsVersion"].as_str(),
+            Some(row.expected),
+            "case {case:?}: expected DescribeScript to report NodeJsVersion {:?}, got \
+             {described}",
+            row.expected
+        );
+        assert_eq!(
+            described["Script"]["Name"].as_str(),
+            Some(name.as_str()),
+            "case {case:?}: DescribeScript must report the created script, got {described}"
+        );
+    }
+}
+
+/// The source rule decides only the create that NAMES no version: a version outside the
+/// documented catalog is still refused from either source, and records nothing.
+///
+/// The rows span the class: a major the service does not run, a minor past a documented
+/// value, and a documented major with another minor — each from both file sources.
+#[tokio::test]
+async fn a_runtime_version_outside_the_documented_catalog_is_still_refused() {
+    let gamelift = GameLift::new();
+    let zip = zip_file_member(&zip_bytes(64));
+    for (case, version) in [
+        ("a major the service does not run", "12.x"),
+        ("a minor past a documented version", "10.1"),
+        ("a documented major with another minor", "24.1"),
+    ] {
+        for (source_case, source) in [
+            ("a local zip file", json!({ "ZipFile": zip.clone() })),
+            (
+                "a caller-owned location",
+                json!({ "StorageLocation": caller_location("scripts/refused.zip") }),
+            ),
+        ] {
+            let mut body = json!({ "Name": "refused-runtime", "NodeJsVersion": version });
+            if let Value::Object(members) = source {
+                for (member, value) in members {
+                    body[member] = value;
+                }
+            }
+            let (status, code) = gamelift.err("CreateScript", body).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "InvalidRequestException"),
+                "case {case:?} from {source_case:?}: expected the runtime version {version:?} \
+                 to be refused, got {status} {code}"
+            );
+        }
+    }
+
+    // And a create naming NO version at all, from the source that takes the default, is
+    // served — so the refusals above are about the VERSION and not about the member being
+    // absent.
+    let created = gamelift
+        .ok(
+            "CreateScript",
+            json!({ "Name": "served-without-a-runtime", "ZipFile": zip }),
+        )
+        .await;
+    assert_eq!(
+        created["Script"]["NodeJsVersion"].as_str(),
+        Some(DEFAULT_NODE_JS_VERSION),
+        "a create naming no runtime version is served on the default, got {created}"
+    );
+    let script_id = created["Script"]["ScriptId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreateScript minted no ScriptId, got {created}"))
+        .to_string();
+    let described = gamelift
+        .ok("DescribeScript", json!({ "ScriptId": script_id }))
+        .await;
+    assert_eq!(
+        described["Script"]["NodeJsVersion"].as_str(),
+        Some(DEFAULT_NODE_JS_VERSION),
+        "the stored script reports the default runtime version, got {described}"
     );
 }

@@ -1401,7 +1401,8 @@ impl UserPool {
     }
 
     /// Where a password-reset message for `user` goes, as this pool's
-    /// `AccountRecoverySetting` decides.
+    /// `AccountRecoverySetting` decides, for an ADMINISTRATIVE reset — one whose
+    /// answer reports no delivery of its own.
     ///
     /// "If `verified_email` has a priority of 1 and `verified_phone_number` has
     /// a priority of 2, your user pool sends account-recovery messages to a
@@ -1411,6 +1412,35 @@ impl UserPool {
     /// mechanisms are tried in ascending priority and only a VERIFIED value is a
     /// destination.
     pub fn recovery_destination(&self, user: &User) -> RecoveryDestination {
+        self.ranked_recovery_destination(user, false)
+    }
+
+    /// Where a SELF-SERVICE password reset's message goes: the same ranking, held
+    /// to the mechanisms this pool can actually deliver over.
+    ///
+    /// `ForgotPassword` REPORTS the destination it chose (`CodeDeliveryDetails`),
+    /// and a mechanism whose medium the pool has no delivery path for sends
+    /// nothing: a text message leaves a pool only through the caller its
+    /// `SmsConfiguration` names or the function its `CustomSMSSender` names
+    /// ([`Self::delivers_sms`]), so on a pool that configures neither the
+    /// `verified_phone_number` mechanism does not qualify and the pool falls
+    /// through to the next mechanism by priority \u2014 leaving a user with no other
+    /// qualifying mechanism with no destination at all. Recorded behaviour: a pool
+    /// ranking the phone mechanism first and storing no `SmsConfiguration` answers
+    /// a reset for a user holding a verified number of its verified EMAIL, and
+    /// refuses the reset of a user holding only that number.
+    pub fn self_service_recovery_destination(&self, user: &User) -> RecoveryDestination {
+        self.ranked_recovery_destination(user, true)
+    }
+
+    /// The ranked walk both doors share. `needs_a_delivery_path` is whether a
+    /// mechanism has to be one this pool can deliver over to qualify, which is the
+    /// ONE difference between them.
+    fn ranked_recovery_destination(
+        &self,
+        user: &User,
+        needs_a_delivery_path: bool,
+    ) -> RecoveryDestination {
         let mut mechanisms: Vec<(i32, String)> = self
             .account_recovery_setting
             .as_ref()
@@ -1451,20 +1481,21 @@ impl UserPool {
             .mfa_setting_list
             .iter()
             .any(|setting| setting == SMS_MFA_SETTING);
-        // That activated second factor is the ONE thing documented to
-        // disqualify a mechanism the pool ranks: everything else about this
-        // decision is the values the USER holds verified, taken in the pool's
-        // own order. What the pool has configured for SENDING over a medium is
-        // no part of it — `SmsConfiguration` is "user pool configuration for
-        // delivery of SMS messages with Amazon Simple Notification Service"
-        // (`SmsConfigurationType` in this service's model), which is how a
-        // message leaves the pool and not whether the user has a verified
-        // number to send one to — so a pool that stores none still recovers
-        // through the mechanism its `AccountRecoverySetting` ranks.
+        // That activated second factor is one thing documented to disqualify a
+        // mechanism the pool ranks. The other is the pool having no path for the
+        // medium at all, which only the door that REPORTS the destination it chose
+        // is held to (`needs_a_delivery_path`): `SmsConfiguration` is "user pool
+        // configuration for delivery of SMS messages with Amazon Simple
+        // Notification Service" (`SmsConfigurationType` in this service's model),
+        // so a pool that names neither it nor a `CustomSMSSender` has nobody to
+        // send a text message through and the mechanism that delivers over one
+        // does not qualify. Everything else about this decision is the values the
+        // USER holds verified, taken in the pool's own order.
+        let sms_qualifies = !sms_mfa_activated && (!needs_a_delivery_path || self.delivers_sms());
         mechanisms
             .iter()
             .filter_map(|(_, name)| recovered_attribute(name))
-            .filter(|attribute| *attribute != SMS_RECOVERED_ATTRIBUTE || !sms_mfa_activated)
+            .filter(|attribute| *attribute != SMS_RECOVERED_ATTRIBUTE || sms_qualifies)
             .find_map(|attribute| {
                 user.verified_destination_of(attribute)
                     .map(|destination| RecoveryDestination::Delivered {

@@ -1412,10 +1412,11 @@ async fn confirming_a_sign_up_migrates_an_alias_only_when_the_request_asks() {
     }
 }
 
-/// RULE: a password-reset message goes to the VERIFIED attribute the pool's
-/// `AccountRecoverySetting` prioritises, and a pool that reserves resets to
-/// administrators sends none — over a table whose rows differ along the pool's
-/// configuration and which of the user's values are verified.
+/// RULE: a self-service password-reset message goes to the VERIFIED attribute the
+/// pool's `AccountRecoverySetting` prioritises AMONG the mechanisms the pool can
+/// deliver over, and a pool that reserves resets to administrators sends none — over
+/// a table whose rows differ along the pool's configuration, the delivery path it
+/// stores and which of the user's values are verified.
 #[tokio::test]
 async fn forgot_password_follows_the_pools_account_recovery_setting() {
     let engine = engine();
@@ -1439,9 +1440,10 @@ async fn forgot_password_follows_the_pools_account_recovery_setting() {
         }
     });
     // The same ranking on a pool that stores the Amazon SNS caller a text
-    // message leaves through. Whether the pool stores one is no part of the
-    // recovery decision, so the rows below pair the same ranking with and
-    // without it and expect the same destination.
+    // message leaves through. A self-service reset REPORTS the destination it
+    // chose, so the phone mechanism qualifies only where the pool can send a text
+    // message at all: the rows below pair the same ranking with and without that
+    // caller and expect different destinations.
     let verified_phone_first_over_sms = merged(
         verified_phone_first.clone(),
         &json!({
@@ -1496,9 +1498,8 @@ async fn forgot_password_follows_the_pools_account_recovery_setting() {
         ),
         (
             // The same ranking and the same verified number, on a pool with no
-            // SMS delivery path at all: what the pool configured for SENDING is
-            // no part of the decision, so the ranked mechanism the user holds
-            // verified is still the destination.
+            // SMS delivery path at all: the phone mechanism cannot deliver, so the
+            // pool falls through to the next mechanism it ranks.
             "verified_phone_number first and verified, on a pool that sends no SMS",
             verified_phone_first.clone(),
             vec![
@@ -1508,19 +1509,19 @@ async fn forgot_password_follows_the_pools_account_recovery_setting() {
                 ("phone_number_verified", "true"),
             ],
             200,
-            "phone_number",
+            "email",
         ),
         (
-            // And with the verified number as the user's ONLY address, that is
-            // still what the ranked mechanism recovers over.
+            // And with the verified number as the user's ONLY address, no ranked
+            // mechanism qualifies at all, so the reset is refused.
             "a verified number alone, on a pool that sends no SMS",
             verified_phone_first.clone(),
             vec![
                 ("phone_number", "+15550100009"),
                 ("phone_number_verified", "true"),
             ],
-            200,
-            "phone_number",
+            400,
+            "InvalidParameterException",
         ),
         (
             "verified_phone_number first, but only the email is verified",

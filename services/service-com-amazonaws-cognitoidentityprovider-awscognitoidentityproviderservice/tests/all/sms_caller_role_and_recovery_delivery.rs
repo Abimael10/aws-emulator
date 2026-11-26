@@ -21,13 +21,13 @@
 //! * RULE B — an SMS MFA factor needs a caller to send through: a
 //!   `SmsMfaConfiguration` that names none, while the pool's MFA is on or
 //!   optional, is `InvalidParameterException` (HTTP 400).
-//! * RULE C — where a reset code goes is decided by the values the USER holds
-//!   verified and the order the pool's `AccountRecoverySetting` ranks its
-//!   mechanisms in: what the pool configured for SENDING over a medium is no part
-//!   of that decision, so the `verified_phone_number` mechanism qualifies on a
-//!   pool that stores no SMS configuration exactly as it does on one that stores
-//!   one, and only a user holding no verified value a ranked mechanism recovers
-//!   over is refused.
+//! * RULE C — where a SELF-SERVICE reset code goes is decided by the values the
+//!   USER holds verified, the order the pool's `AccountRecoverySetting` ranks its
+//!   mechanisms in, and whether the pool can deliver over the medium a mechanism
+//!   uses: `ForgotPassword` REPORTS the destination it chose, so on a pool that
+//!   configures no SMS path the `verified_phone_number` mechanism does not qualify
+//!   and the pool falls through to the next mechanism by priority, and a user left
+//!   with no qualifying mechanism is refused.
 //!
 //! The roles and their trust documents are IAM's OWN records, written through
 //! IAM's own `CreateRole` over the same engine, so the documents this service
@@ -682,10 +682,10 @@ async fn an_sms_mfa_factor_needs_a_caller_to_send_through() {
 }
 
 /// RULE C: which recovery mechanism `ForgotPassword` delivers over is decided by the
-/// values the USER holds verified and the order the pool's `AccountRecoverySetting`
-/// ranks its mechanisms in — what the pool configured for SENDING over a medium is no
-/// part of that decision, so the `verified_phone_number` mechanism qualifies on a pool
-/// that stores no `SmsConfiguration` exactly as it does on one that stores one.
+/// values the USER holds verified, the order the pool's `AccountRecoverySetting`
+/// ranks its mechanisms in, and whether the pool configures a path for the medium a
+/// mechanism delivers over — a phone mechanism does not qualify on a pool that can
+/// send no text message, so the pool falls through to the next mechanism it ranks.
 #[tokio::test]
 async fn a_reset_code_goes_over_the_ranked_mechanism_the_user_holds_verified() {
     let router = router_without_iam();
@@ -721,6 +721,9 @@ async fn a_reset_code_goes_over_the_ranked_mechanism_the_user_holds_verified() {
             "phone_number",
         ),
         (
+            // The same user and ranking on a pool that can send no text message:
+            // the phone mechanism does not qualify, so the pool falls through to
+            // the email mechanism it ranks next.
             "the same user and ranking, on a pool that sends no SMS",
             phone_first.clone(),
             Value::Null,
@@ -730,7 +733,7 @@ async fn a_reset_code_goes_over_the_ranked_mechanism_the_user_holds_verified() {
                 ("phone_number", "+15550100002"),
                 ("phone_number_verified", "true"),
             ],
-            "phone_number",
+            "email",
         ),
         (
             "a verified number as the only contact, on a pool that sends SMS",
@@ -743,6 +746,8 @@ async fn a_reset_code_goes_over_the_ranked_mechanism_the_user_holds_verified() {
             "phone_number",
         ),
         (
+            // Nothing qualifies: the one mechanism the pool ranks delivers over a
+            // medium it has no path for, so there is no destination at all.
             "a verified number as the only contact, on a pool that sends no SMS",
             phone_only.clone(),
             Value::Null,
@@ -750,12 +755,12 @@ async fn a_reset_code_goes_over_the_ranked_mechanism_the_user_holds_verified() {
                 ("phone_number", "+15550100004"),
                 ("phone_number_verified", "true"),
             ],
-            "phone_number",
+            "",
         ),
         (
             // A stored configuration that names NOBODY to send through is a pool
             // with no SMS delivery path, exactly as a pool with no configuration
-            // at all — and neither reading decides where a reset code goes.
+            // at all.
             "a verified number alone, on a pool whose SMS configuration names no caller",
             phone_only.clone(),
             json!({ "SnsCallerArn": "" }),
@@ -763,11 +768,12 @@ async fn a_reset_code_goes_over_the_ranked_mechanism_the_user_holds_verified() {
                 ("phone_number", "+15550100007"),
                 ("phone_number_verified", "true"),
             ],
-            "phone_number",
+            "",
         ),
         (
             // The pool ranks the phone mechanism ALONE, so the user's verified
-            // email is not a mechanism this pool recovers through at all.
+            // email is not a mechanism this pool recovers through at all — and the
+            // phone mechanism has no path on this pool.
             "the phone mechanism alone and a verified email the pool may not use",
             phone_only.clone(),
             Value::Null,
@@ -777,7 +783,7 @@ async fn a_reset_code_goes_over_the_ranked_mechanism_the_user_holds_verified() {
                 ("phone_number", "+15550100005"),
                 ("phone_number_verified", "true"),
             ],
-            "phone_number",
+            "",
         ),
         (
             "an unverified number on a pool that sends SMS",
@@ -785,6 +791,23 @@ async fn a_reset_code_goes_over_the_ranked_mechanism_the_user_holds_verified() {
             sends_sms.clone(),
             vec![("phone_number", "+15550100006")],
             "",
+        ),
+        (
+            // The EMAIL medium has a path of its own, so a verified email ranked
+            // first qualifies on a pool that configures no SMS caller.
+            "a verified email ranked first, on a pool that sends no SMS",
+            json!([
+                { "Name": "verified_email", "Priority": 1 },
+                { "Name": "verified_phone_number", "Priority": 2 },
+            ]),
+            Value::Null,
+            vec![
+                ("email", "f@example.com"),
+                ("email_verified", "true"),
+                ("phone_number", "+15550100008"),
+                ("phone_number_verified", "true"),
+            ],
+            "email",
         ),
     ];
 
@@ -852,7 +875,7 @@ async fn a_reset_code_goes_over_the_ranked_mechanism_the_user_holds_verified() {
         if expected.is_empty() {
             assert_eq!(
                 status, 400,
-                "case {case:?}: a user holding no verified value a ranked mechanism \
+                "case {case:?}: a user holding no verified value a QUALIFYING mechanism \
                  recovers over is refused, got {status} with {payload}"
             );
             assert_eq!(

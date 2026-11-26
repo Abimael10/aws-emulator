@@ -495,8 +495,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ForgotPassword<En
 
         // "The message delivery method is determined by the user's available attributes
         // and the AccountRecoverySetting configuration of the user pool" (this
-        // operation's own doc), which is what `UserPool::recovery_destination` decides.
-        let (attribute, destination) = match pool.recovery_destination(user) {
+        // operation's own doc), which is what `UserPool::self_service_recovery_destination`
+        // decides — the self-service door, which REPORTS the destination it chose, so a
+        // mechanism this pool has no delivery path for sends nothing and does not qualify.
+        let (attribute, destination) = match pool.self_service_recovery_destination(user) {
             crate::state::RecoveryDestination::Delivered {
                 attribute,
                 destination,
