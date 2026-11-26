@@ -347,7 +347,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused whole, as it is when the cluster or the task resolves to nothing.
         //
         // A container entry that names no container names the task's only container, the
-        // same way every other container-scoped member of this service resolves one.
+        // same way every other container-scoped member of this service resolves one. A name
+        // the task does not hold is refused naming that name and the task it was looked for
+        // in ([`crate::state::unresolved_container_message`]).
         let mut container_targets = Vec::new();
         for change in input.containers.iter().flatten() {
             let position = match change.container_name.as_deref() {
@@ -356,7 +358,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             let Some(position) = position else {
                 return Err(invalid_parameter(
-                    crate::state::CONTAINER_NOT_FOUND_MESSAGE.to_string(),
+                    crate::state::unresolved_container_message(
+                        change.container_name.as_deref().unwrap_or_default(),
+                        &task_reference,
+                    ),
                 ));
             };
             container_targets.push((position, change.clone()));
@@ -367,7 +372,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for change in input.managed_agents.iter().flatten() {
             let Some(position) = container_position(task, &change.container_name) else {
                 return Err(invalid_parameter(
-                    crate::state::CONTAINER_NOT_FOUND_MESSAGE.to_string(),
+                    crate::state::unresolved_container_message(
+                        &change.container_name,
+                        &task_reference,
+                    ),
                 ));
             };
             agent_targets.push((position, change.clone()));

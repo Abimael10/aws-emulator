@@ -140,6 +140,40 @@ pub fn unverified_task_report_violation(task: &TaskRecord) -> Option<&'static st
         .then_some(UNVERIFIED_TASK_REPORT_MESSAGE)
 }
 
+/// The task id a `task` reference names: the last segment of the value when it is an ARN
+/// (`arn:aws:ecs:<region>:<account>:task/<cluster>/<id>`), and the value itself otherwise —
+/// both forms of the member ("The task ID or full ARN of the task") name the same task, and
+/// the agent plane names a task by its ID.
+///
+/// The `task` member's counterpart of the readings the other identifier-or-ARN members of
+/// this service have ([`super::container_instance_id_from_reference`],
+/// [`super::attachment_id_from_reference`]): one member, one reading.
+pub fn task_id_from_reference(reference: &str) -> &str {
+    if reference.starts_with("arn:") {
+        reference.rsplit('/').next().unwrap_or(reference)
+    } else {
+        reference
+    }
+}
+
+/// `InvalidParameterException$message` for a report entry naming a container the task it was
+/// weighed against does not hold, BUILT FROM THE REQUEST: Amazon ECS names the container the
+/// report referred to and the task it looked for it in, so an agent acknowledging a batch can
+/// tell which entry was rejected and against what. The fixed words are the frame; the
+/// container name is the request's own value and the task is named by its ID, which is why
+/// the reference is reduced to one by [`task_id_from_reference`] rather than echoed whole.
+///
+/// The ONE place this service words that refusal, whichever container-scoped member of the
+/// agent plane carried the name — `SubmitTaskStateChange$containers`,
+/// `SubmitTaskStateChange$managedAgents` and `SubmitContainerStateChange$containerName` all
+/// resolve a container of the task the report named, so one unresolved name is one sentence.
+pub fn unresolved_container_message(container_name: &str, task_reference: &str) -> String {
+    format!(
+        "Unable to find container {container_name} for task {}",
+        task_id_from_reference(task_reference)
+    )
+}
+
 /// The refusal the attachment states a report NAMES earn, or `None` when every entry names
 /// one of [`AGENT_REPORT_ATTACHMENT_STATUSES`].
 pub fn agent_report_attachment_status_violation<'a>(

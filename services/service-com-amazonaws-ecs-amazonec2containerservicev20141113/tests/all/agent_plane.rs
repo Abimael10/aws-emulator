@@ -926,7 +926,11 @@ async fn a_container_state_change_is_recorded_once_and_never_runs_backwards() {
         (code.as_str(), message.as_str()),
         (
             "InvalidParameterException",
-            "The referenced container was not found"
+            format!(
+                "Unable to find container ghost for task {}",
+                task_arn.rsplit('/').next().unwrap_or_default()
+            )
+            .as_str()
         ),
         "case {case:?}: expected the container-not-found refusal, got {code} with {message:?}"
     );

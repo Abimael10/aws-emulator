@@ -276,7 +276,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .expect("the task was just found in this cluster");
         // "The name of the container": a report that names none names the task's only
         // container, the same way every other container-scoped member of this service
-        // resolves one.
+        // resolves one. A name the task does not hold is refused naming that name and the
+        // task it was looked for in ([`crate::state::unresolved_container_message`]).
         let container = match input.container_name.as_deref() {
             Some(requested) => task
                 .containers
@@ -288,7 +289,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 SubmitContainerStateChangeErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(crate::state::CONTAINER_NOT_FOUND_MESSAGE.to_string()),
+                        message: Some(crate::state::unresolved_container_message(
+                            input.container_name.as_deref().unwrap_or_default(),
+                            &task_reference,
+                        )),
                     },
                 )
                 .into(),

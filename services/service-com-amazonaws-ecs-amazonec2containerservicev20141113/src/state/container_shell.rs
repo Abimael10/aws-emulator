@@ -205,16 +205,21 @@
 //! the span the container runs for, and spending them holds nothing up — the container is
 //! simply still there while every call about its task is answered.
 //!
-//! Which leaves the SHELL spelling of that same program (`["sh", "-c", "sleep 3600"]`). A
-//! shell program states how long it took, because that program did something: so the seconds
-//! are stated wherever something is waiting for it to END, and spent where nothing is — which
-//! is a container whose task a SERVICE maintains ([`ContainerShell::maintained_by_a_service`]).
-//! A service "runs and maintains your desired number of tasks from a specified task
-//! definition" (`CreateService`), so the end of such a container is not a verdict a caller
-//! polls for: it is the task leaving the set the service holds, which the scheduler replaces.
-//! Stating the wait there would turn a container whose program says it runs for an hour into a
-//! container that exits at once, and so a service that can never hold its count into one
-//! replacing a task that keeps exiting.
+//! Which leaves the SHELL spelling of that same program (`["sh", "-c", "sleep 3600"]`). That
+//! container was given nothing to do either, so the seconds are the span it RUNS FOR there too
+//! — a task whose container is nothing but a wait reports `RUNNING` while it waits, which is
+//! what a client polling that task observes. What differs from the argument-vector spelling is
+//! the CEILING on them: a shell program is one something may be waiting to see END — a
+//! standalone task's terminal status, the dependents held until this container ends — so the
+//! span is bounded by [`WHOLE_PROGRAM_SHELL_WAIT_CEILING`] rather than taken as the program
+//! wrote it, and what the container then reports is the status that wait answered.
+//!
+//! A container whose task a SERVICE maintains has nothing waiting for that end at all
+//! ([`ContainerShell::maintained_by_a_service`]), so there is no ceiling to put on it: the
+//! seconds it names are the span it runs for, however many they are. A service "runs and
+//! maintains your desired number of tasks from a specified task definition"
+//! (`CreateService`), so the end of such a container is not a verdict a caller polls for: it
+//! is the task leaving the set the service holds, which the scheduler replaces.
 
 use std::collections::BTreeMap;
 use std::pin::Pin;
@@ -229,6 +234,25 @@ use super::*;
 
 /// The exit status of a command that ran to success.
 const EXIT_SUCCESS: i32 = 0;
+
+/// How long a container whose SHELL program is nothing but a WAIT is there for, whatever
+/// number of seconds that wait names.
+///
+/// EMULATOR-CHOSEN — the seconds are the caller's own and AWS spends every one of them — and
+/// what it is chosen against is the pair of things such a container is read by. A client that
+/// polls the task it belongs to must OBSERVE it running: a task whose container is nothing but
+/// a wait is `RUNNING` while it waits, and a window narrower than the interval such a client
+/// looks again at would let it miss that status altogether. And whatever is waiting to see that
+/// program END — the standalone task's terminal status, the dependents held until this
+/// container ends — must reach its verdict without the request's own words deciding when: the
+/// bound on that is this emulator's, like every other bound in this module. Thirty seconds is
+/// wide enough for several looks of an ordinary poll and short enough that every verdict behind
+/// the container is reached inside one.
+///
+/// The ARGUMENT-VECTOR spelling of the same program keeps the seconds it names
+/// ([`ContainerProgram::is_only_a_wait`]), and so does a container whose task a service
+/// maintains: see the module docs for which reading applies where.
+pub const WHOLE_PROGRAM_SHELL_WAIT_CEILING: Duration = Duration::from_secs(30);
 
 /// The exit status of a command that ran and answered failure, which is what the `false`
 /// utility is specified to do ("exit with a status code indicating failure").
@@ -896,6 +920,11 @@ pub struct ContainerShell {
     /// Whether the container whose program this session performs belongs to a task a SERVICE
     /// maintains, so nothing is waiting for that program to END ([`Self::run`]).
     maintained_by_a_service: bool,
+    /// The ceiling on the wait a container's SHELL program is nothing but
+    /// ([`WHOLE_PROGRAM_SHELL_WAIT_CEILING`]), and `None` for every other program — the
+    /// argument-vector spelling of such a wait and a container a service maintains keep the
+    /// seconds they name (see the module docs).
+    whole_program_wait_ceiling: Option<Duration>,
 }
 
 impl ContainerShell {
@@ -960,13 +989,14 @@ impl ContainerShell {
             executing_since: Instant::now(),
             terminal: None,
             maintained_by_a_service: false,
+            whole_program_wait_ceiling: None,
         }
     }
 
     /// This session performing the program of a container whose task a SERVICE maintains:
     /// nothing is waiting for that program to end, which is what lets a program that is
-    /// nothing but a wait be the span the container runs for however it is written (see the
-    /// module docs).
+    /// nothing but a wait be the span the container runs for FOR THE SECONDS IT NAMES, with no
+    /// ceiling of this emulator's on it (see the module docs).
     #[must_use]
     pub fn maintained_by_a_service(mut self) -> Self {
         self.maintained_by_a_service = true;
@@ -1078,17 +1108,21 @@ impl ContainerShell {
     pub async fn run(&mut self, program: &ContainerProgram) -> ContainerOutcome {
         // Whether the container was given nothing to do but WAIT, which is what decides
         // whether the seconds its wait names are spent or merely stated
-        // ([`Self::states_a_wait_rather_than_spending_it`]). For the vector an image exec's,
-        // that is the whole of it: such a container holds no program that did anything for
-        // those seconds to be the account of. A SHELL program did something, so its seconds
-        // are its own account of how long it took — except where nothing is waiting for that
-        // program to end at all, which is a container whose task a service maintains
-        // ([`Self::maintained_by_a_service`]).
-        self.program_is_a_wait = match program {
-            ContainerProgram::Argv(_) => program.is_only_a_wait(),
-            ContainerProgram::Script(_) => {
-                self.maintained_by_a_service && program.is_only_a_wait()
+        // ([`Self::states_a_wait_rather_than_spending_it`]). A container given nothing but a
+        // wait holds no program that did anything for those seconds to be the account of, so
+        // they are the span it RUNS FOR — in either spelling of such a program. What the SHELL
+        // spelling takes is a ceiling on them
+        // ([`WHOLE_PROGRAM_SHELL_WAIT_CEILING`]), because something may be waiting to see that
+        // program end; a container whose task a service maintains has nothing waiting for it
+        // ([`Self::maintained_by_a_service`]), so it keeps the seconds it names.
+        self.program_is_a_wait = program.is_only_a_wait();
+        self.whole_program_wait_ceiling = match program {
+            ContainerProgram::Script(_)
+                if self.program_is_a_wait && !self.maintained_by_a_service =>
+            {
+                Some(WHOLE_PROGRAM_SHELL_WAIT_CEILING)
             }
+            _ => None,
         };
         let mut status = match program {
             ContainerProgram::Script(text) => self.run_text(text).await,
@@ -1708,9 +1742,10 @@ impl ContainerShell {
     /// the account of — they are the span the container RUNS FOR, which is what
     /// `Task$lastStatus` reports of a task while its containers are up. Spending them holds
     /// nothing up that this emulator owes anyone: the container is simply still there, as it is
-    /// for a wait with no end at all, and every call about its task is answered throughout. For
-    /// the SHELL spelling of such a program that is so where nothing is waiting for the program
-    /// to end at all ([`Self::maintained_by_a_service`]); [`Self::run`] holds that reading.
+    /// for a wait with no end at all, and every call about its task is answered throughout.
+    /// Either spelling of such a program is read that way; what the SHELL spelling takes is a
+    /// ceiling on the seconds ([`WHOLE_PROGRAM_SHELL_WAIT_CEILING`], applied by
+    /// [`Self::run_sleep`]), because something may be waiting to see that program END.
     ///
     /// It is NOT either, inside a LOOP the program is going round: a wait there states no
     /// duration of the program's own work, because what ends the loop is something else — the
@@ -2832,7 +2867,9 @@ impl ContainerShell {
     /// still its own program's outcome while nothing waiting on the task is held by that
     /// program's account of itself. A wait that names no end of its own, one the program goes
     /// round a loop on, and one the container was given as its WHOLE program are spent: those
-    /// are the container waiting rather than reporting how long it worked.
+    /// are the container waiting rather than reporting how long it worked. The SHELL spelling of
+    /// that last one is spent up to this emulator's ceiling on it
+    /// ([`WHOLE_PROGRAM_SHELL_WAIT_CEILING`]).
     async fn run_sleep(&mut self, arguments: &[String]) -> i32 {
         let Some(argument) = arguments.first() else {
             return EXIT_FAILURE;
@@ -2849,7 +2886,12 @@ impl ContainerShell {
                 .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
             {
                 Some(_) if self.states_a_wait_rather_than_spending_it() => Some(Duration::ZERO),
-                Some(waiting) => Some(waiting),
+                // The span the container is there for, bounded where this emulator bounds it
+                // ([`WHOLE_PROGRAM_SHELL_WAIT_CEILING`]).
+                Some(waiting) => Some(match self.whole_program_wait_ceiling {
+                    Some(ceiling) => waiting.min(ceiling),
+                    None => waiting,
+                }),
                 None => return EXIT_FAILURE,
             }
         };

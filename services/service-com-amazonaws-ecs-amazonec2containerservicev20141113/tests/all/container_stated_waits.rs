@@ -8,9 +8,11 @@
 //! the task stops on the status its program exited with, however many seconds that program
 //! said it waited. The wait a container has nothing but something OUTSIDE its program to end
 //! it is another thing: a wait with no end of its own (`sleep infinity`), one the program goes
-//! round a LOOP on and one a container is given as its WHOLE program are the container waiting
-//! for something else to end it, which is how a container stays up, so those are spent — the
-//! last of them for the seconds it names ([`crate::container_whole_program_wait`]), the others
+//! round a LOOP on and one a container is given as its WHOLE program — in either spelling of
+//! such a program — are the container waiting for something else to end it, which is how a
+//! container stays up, so those are spent: the argument-vector spelling for the seconds it
+//! names ([`crate::container_whole_program_wait`]), the shell spelling up to this emulator's
+//! own ceiling on it (past which the task stops on the status that wait answered), the others
 //! up to the run's own deadline.**
 //!
 //! Why the bound has to be this emulator's: a container's program is request-supplied, and
@@ -123,6 +125,15 @@ const ROWS: &[Row] = &[
         // the seconds this row names ([`crate::container_whole_program_wait`]).
         case: "a wait the program states as its whole argument vector",
         command: &["sleep", "30"],
+        ends: Ends::Exits(0),
+    },
+    Row {
+        // The container's WHOLE program, in the SHELL spelling of it: the container was given
+        // nothing to do but wait there either, so the seconds are the span it runs for — up to
+        // this emulator's own ceiling on them, which is what the task then stops on the status
+        // of, well inside this suite's budget and far short of the hour the program named.
+        case: "a wait the program states as its whole shell program",
+        command: &["/bin/sh", "-c", "sleep 3600"],
         ends: Ends::Exits(0),
     },
     Row {

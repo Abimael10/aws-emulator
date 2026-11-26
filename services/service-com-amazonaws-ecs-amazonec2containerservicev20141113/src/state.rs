@@ -1024,12 +1024,6 @@ pub fn task_stage_rank(status: &str) -> Option<usize> {
 /// doc calls it ("Sent to acknowledge that a container changed states").
 pub const STATE_CHANGE_ACKNOWLEDGMENT: &str = "ACK";
 
-/// `InvalidParameterException$message` for a `containerName` that names no container of
-/// the task the state change names. The sentence the agent plane answers for a reference
-/// that resolves to nothing, one resource along from
-/// [`TASK_NOT_FOUND_MESSAGE`]: the request's own value is not echoed.
-pub const CONTAINER_NOT_FOUND_MESSAGE: &str = "The referenced container was not found";
-
 /// `InvalidParameterException$message` for an `ExecuteCommand` whose `task` names no task
 /// of the cluster: a fixed sentence stating what the caller has to change.
 pub const EXECUTE_COMMAND_TASK_NOT_FOUND_MESSAGE: &str =

@@ -79,8 +79,15 @@ const CLUSTER_NOT_FOUND: &str = "Cluster not found.";
 /// The sentence a report naming a task that resolves to nothing is refused with.
 const TASK_NOT_FOUND: &str = "The referenced task was not found";
 
-/// The sentence a report naming a container the task does not hold is refused with.
-const CONTAINER_NOT_FOUND: &str = "The referenced container was not found";
+/// The sentence a report naming a container the task does not hold is refused with: fixed
+/// text around the container name the request carried and the ID of the task it was weighed
+/// against.
+fn container_not_found(container_name: &str, task_arn: &str) -> String {
+    format!(
+        "Unable to find container {container_name} for task {}",
+        task_arn.rsplit('/').next().unwrap_or_default()
+    )
+}
 
 /// The one managed agent `ManagedAgentName` names (`smithy_query(query="shape",
 /// shape="ManagedAgentName")` -> ExecuteCommandAgent).
@@ -287,7 +294,7 @@ async fn a_report_resolves_every_nested_reference_before_it_records_any_of_them(
                 ],
             }),
             "InvalidParameterException",
-            CONTAINER_NOT_FOUND.to_string(),
+            container_not_found("ghost", &task_arn),
         ),
         (
             "a managed-agent entry naming no container of the task",
@@ -300,7 +307,7 @@ async fn a_report_resolves_every_nested_reference_before_it_records_any_of_them(
                 }],
             }),
             "InvalidParameterException",
-            CONTAINER_NOT_FOUND.to_string(),
+            container_not_found("ghost", &task_arn),
         ),
         (
             "an attachment entry whose ARN names no interface of the task",
