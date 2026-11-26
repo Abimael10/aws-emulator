@@ -29,6 +29,11 @@
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
+/// The workspace's one way of telling a continuation token a store ISSUED from one a
+/// caller assembled; re-exported so the listing that mints and verifies tokens names
+/// this module's key rather than reaching across the crate boundary itself.
+pub use ::service_common::page_tokens::PageTokenKey;
+
 /// Per-service state for com-amazonaws-pinpointsmsvoice-pinpointsmsvoice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsPinpointsmsvoicePinpointsmsvoiceState {
@@ -57,6 +62,24 @@ pub struct ComAmazonawsPinpointsmsvoicePinpointsmsvoiceState {
     /// Monotonic sequence behind the `MessageId` `SendVoiceMessage` mints, so two
     /// calls can never be handed the same id.
     pub next_message_seq: u64,
+    /// The secret every `NextToken` this store's listing hands out is authenticated
+    /// under — one key per store, drawn from the system's randomness when the store is
+    /// created, never derived from a request and never reported.
+    ///
+    /// Private, reached through [`page_token_key`](
+    /// ComAmazonawsPinpointsmsvoicePinpointsmsvoiceState::page_token_key): what a
+    /// listing needs is to mint and to verify, not to read the secret out.
+    page_token_key: PageTokenKey,
+}
+
+impl ComAmazonawsPinpointsmsvoicePinpointsmsvoiceState {
+    /// The key this store's page tokens are minted and verified under.
+    ///
+    /// `Copy`, so a listing takes the key off the store and goes on to borrow the
+    /// records it is about to report in the same call.
+    pub fn page_token_key(&self) -> PageTokenKey {
+        self.page_token_key
+    }
 }
 
 /// One configuration set and the event destinations attached to it.

@@ -24,7 +24,8 @@ tracing = { workspace = true }
 # Encodes/decodes the opaque ListConfigurationSets `NextToken`.
 hex = { workspace = true }
 # The one claim rule for a service whose SigV4 signing name is shared with another
-# emulated service (here Pinpoint SMS Voice V2).
+# emulated service (here Pinpoint SMS Voice V2), and the workspace's page-token key,
+# which is what tells a `NextToken` this store issued from one a caller assembled.
 service-common = { path = "../common" }
 
 [build-dependencies]

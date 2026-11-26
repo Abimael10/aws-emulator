@@ -92,12 +92,15 @@ const DEFAULT_PAGE_SIZE: usize = 50;
 /// follows the token still walks the whole collection.
 const MAX_PAGE_SIZE: usize = 1_000;
 
-/// The marker every `NextToken` this operation mints carries, inside the encoding.
+/// The collection-and-version prefix every `NextToken` this operation mints carries,
+/// INSIDE the bytes the store's key authenticates.
 ///
-/// It is what distinguishes a token this service handed out from a string a caller made
-/// up that merely decodes cleanly; it also names the token's layout version, so a later
-/// change of cursor format can reject the old shape instead of misreading it.
-const TOKEN_MARKER: &str = "pinpointsmsvoice:configuration-sets:1:";
+/// It names which listing of this service the cursor belongs to and the cursor layout's
+/// version, so a later change of format rejects the old shape instead of misreading it.
+/// It is NOT what makes a token this service's: a prefix declared in the source is a
+/// shape any caller can reproduce. That distinction is the authenticator
+/// [`crate::state::PageTokenKey`] puts over these bytes — see [`decode_token`].
+const TOKEN_SCOPE: &str = "pinpointsmsvoice:configuration-sets:2:";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -171,6 +174,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
 
+        // The store comes first because validating `NextToken` needs this store's page
+        // token key: a cursor is only a position in THIS store's listing if this store
+        // minted it. The key is `Copy`, so it is taken off the store and the same guard
+        // goes on to borrow the names this call is about to report.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListConfigurationSetsErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the service state store is unavailable".into()),
+                },
+            )
+        })?;
+        let store = state.lock();
+        let token_key = store.page_token_key();
+
         // BOTH parameters this handler's own validation can reject are read before
         // anything is refused, and a finding is recorded in the order the input binds them
         // (`NextToken`, then `PageSize` —
@@ -179,10 +196,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whichever was looked at first. `refusal_wording` words it.
         let mut unusable: Vec<(&str, Unusable)> = Vec::new();
 
-        // `NextToken` is opaque to the caller but it is OURS: one this service did not
+        // `NextToken` is opaque to the caller but it is OURS: one this store did not
         // mint cannot name a position in the listing, so it is a parameter this
         // service's validation cannot use — and one it names in the refusal, because the
-        // caller can only have got a usable token from this service.
+        // caller can only have got a usable token from this service. What decides that
+        // is the authenticator the store's key puts over the cursor, never the token's
+        // shape ([`decode_token`]).
         //
         // A value that bound NOTHING (absent, or present and empty) names no position to
         // resume from, so the listing starts at the beginning; a value that is present but
@@ -196,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // forms resolve the same way: no position to resume from, and a finding
             // below.
             OptionalValue::Blank => None,
-            OptionalValue::Present(raw) => decode_token(raw),
+            OptionalValue::Present(raw) => decode_token(&token_key, raw),
         };
         if resume_after.is_none() && asked_token != OptionalValue::Nothing {
             unusable.push(("NextToken", Unusable::Unreadable));
@@ -231,15 +250,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            ListConfigurationSetsErrorModeled::InternalServiceErrorException(
-                InternalServiceErrorException {
-                    message: Some("the service state store is unavailable".into()),
-                },
-            )
-        })?;
-        let store = state.lock();
-
         // This listing is ACCOUNT-scoped — it names no configuration set — so it is not
         // one of the resource-scoped actions `types::authorization` gates: it answers what
         // is stored whether or not the account holds that entitlement.
@@ -259,7 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // must not hand back a token that resumes onto nothing.
         let more = remaining.next().is_some();
         let next_token = match (more, page.last()) {
-            (true, Some(last)) => Some(encode_token(last)),
+            (true, Some(last)) => Some(encode_token(&token_key, last)),
             _ => None,
         };
 
@@ -321,20 +331,29 @@ fn parse_page_size(raw: &str) -> Option<usize> {
 
 /// Mint the opaque `NextToken` for a page whose last entry was `after`.
 ///
-/// The token is the hex of [`TOKEN_MARKER`] followed by the exclusive-start name:
-/// opaque to the caller, and enough to resume the listing because the stored order is
-/// total. The marker is what makes the token THIS service's — see [`decode_token`].
-fn encode_token(after: &str) -> String {
-    hex::encode(format!("{TOKEN_MARKER}{after}").as_bytes())
+/// The cursor travels inside the token — [`TOKEN_SCOPE`] and then the exclusive-start
+/// name, which is enough to resume because the stored order is total — behind the
+/// authenticator this store's `key` puts over it. That authenticator is what makes the
+/// token THIS store's: the key is drawn from the system's randomness, stays in memory
+/// and is never reported, so no caller can produce the authenticator for a cursor of its
+/// own ([`decode_token`]).
+///
+/// Rendered hex rather than base64 because the token travels back in a query string
+/// (`?NextToken=...`), where hex needs no escaping while base64's `+` would arrive as a
+/// space.
+fn encode_token(key: &crate::state::PageTokenKey, after: &str) -> String {
+    hex::encode(key.mint(&format!("{TOKEN_SCOPE}{after}")))
 }
 
-/// The inverse of [`encode_token`]; `None` for anything this service did not mint.
+/// The inverse of [`encode_token`]; `None` for anything THIS store did not mint.
 ///
-/// The marker is checked, not just the encoding: without it any even-length hex string
-/// that happens to decode to UTF-8 would be honoured as a cursor, and a caller that
-/// invented one would silently get a listing starting from a position the service never
-/// handed out.
-fn decode_token(token: &str) -> Option<String> {
-    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
-    decoded.strip_prefix(TOKEN_MARKER).map(str::to_string)
+/// The authenticator is verified, not just the shape: a value that is not hex, one whose
+/// bytes this store's key does not authenticate (a cursor a caller assembled from the
+/// prefix above, one another store minted, one altered on the way back) and one carrying
+/// a cursor of another layout all name no position in this listing. Checking the shape
+/// alone would honour any value of that shape, and a caller that assembled one would
+/// silently get a listing resumed after a position this service never handed out.
+fn decode_token(key: &crate::state::PageTokenKey, token: &str) -> Option<String> {
+    let cursor = key.cursor_of(&hex::decode(token).ok()?)?;
+    cursor.strip_prefix(TOKEN_SCOPE).map(str::to_string)
 }
