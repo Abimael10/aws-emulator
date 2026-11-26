@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTrafficPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTrafficPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTrafficPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: mints a `TrafficPolicyId`, stores the traffic policy — its name, its policy
+//! statements in the order they were submitted, its default action, its message-size ceiling
+//! and its tags — in this service's state, and returns the stored id. `ClientToken`
+//! (`@idempotencyToken`) makes a retry return the id the first call minted; the same token
+//! presented with a different request is refused with the modelled `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +151,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTrafficPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTrafficPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTrafficPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the service is always mounted on the shared
+            // `InMemoryEngine`. Answered with the modelled `ValidationException` rather
+            // than a 501, which would claim the operation is unwritten; this operation
+            // models no retryable error, so the refusal says the request was not served.
+            return Err(CreateTrafficPolicyErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+
+        let fingerprint = crate::state::create_traffic_policy_fingerprint(
+            &input.traffic_policy_name,
+            &input.policy_statements,
+            &input.default_action,
+            input.max_message_size_bytes,
+            input.tags.as_deref(),
+        );
+
+        // `ClientToken` is `@idempotencyToken`: a retry must observe the first call's
+        // outcome rather than provision a second traffic policy, so the token is resolved
+        // before anything is written. A token presented with a DIFFERENT request is not a
+        // retry and is refused as the conflict it is, rather than being answered with the
+        // policy the first request created.
+        if let Some(recorded) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.traffic_policy_idempotency.get(token))
+        {
+            if recorded.fingerprint == fingerprint {
+                return Ok(CreateTrafficPolicyOutput {
+                    traffic_policy_id: recorded.resource_id.clone(),
+                });
+            }
+            return Err(CreateTrafficPolicyErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "ClientToken was already used to create traffic policy {} with different \
+                     parameters.",
+                    recorded.resource_id
+                )),
+            })
+            .into());
+        }
+
+        // The per-account traffic-policy quota. Checked AFTER the idempotency lookup, so a
+        // retry of a create that already succeeded is never refused by a quota it did not
+        // consume, and BEFORE any insert, so a refused create stores nothing.
+        if store.traffic_policies.len() >= crate::state::MAX_TRAFFIC_POLICIES {
+            return Err(CreateTrafficPolicyErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "The maximum number of traffic policies ({}) has been reached. Delete \
+                         a traffic policy before creating another.",
+                        crate::state::MAX_TRAFFIC_POLICIES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let traffic_policy_id = store.mint_traffic_policy_id(now);
+        let record = crate::state::TrafficPolicyRecord {
+            traffic_policy_arn: crate::state::traffic_policy_arn(&region, &traffic_policy_id),
+            traffic_policy_id: traffic_policy_id.clone(),
+            traffic_policy_name: input.traffic_policy_name,
+            // Stored in the order they were submitted: a statement's position is part of
+            // what was created, so a read reports them in that order.
+            policy_statements: input.policy_statements,
+            default_action: input.default_action,
+            max_message_size_bytes: input.max_message_size_bytes,
+            created_at_millis: now,
+            // A created traffic policy has never been updated, so its
+            // `LastUpdatedTimestamp` is its creation instant.
+            last_updated_at_millis: now,
+            tags: input.tags.unwrap_or_default(),
+        };
+
+        if let Some(token) = input.client_token {
+            store.traffic_policy_idempotency.insert(
+                token,
+                crate::state::IdempotentCreate {
+                    resource_id: traffic_policy_id.clone(),
+                    fingerprint,
+                },
+            );
+        }
+        store
+            .traffic_policies
+            .insert(traffic_policy_id.clone(), record);
+
+        Ok(CreateTrafficPolicyOutput { traffic_policy_id })
     }
 }

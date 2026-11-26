@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTrafficPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTrafficPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTrafficPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the stored traffic policy a `TrafficPolicyId` resolves to — its
+//! name, its ARN, its policy statements in the order they were created, its default action,
+//! its message-size ceiling and the instants it was created and last updated. An id that
+//! resolves to nothing is refused with the modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +148,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTrafficPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTrafficPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTrafficPolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the service is always mounted on the shared
+            // `InMemoryEngine`. Answered with the modelled `ValidationException` rather
+            // than a 501, which would claim the operation is unwritten.
+            return Err(GetTrafficPolicyErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+            })
+            .into());
+        };
+
+        // `@readonly`: this handler only reports what is stored, and a traffic policy has no
+        // state the clock owes a transition to.
+        let store = state.lock();
+
+        let Some(record) = store.traffic_policies.get(&input.traffic_policy_id) else {
+            return Err(GetTrafficPolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::traffic_policy_not_found_message(
+                        &input.traffic_policy_id,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetTrafficPolicyOutput {
+            traffic_policy_id: record.traffic_policy_id.clone(),
+            traffic_policy_name: record.traffic_policy_name.clone(),
+            traffic_policy_arn: Some(record.traffic_policy_arn.clone()),
+            policy_statements: Some(record.policy_statements.clone()),
+            default_action: Some(record.default_action.clone()),
+            // Absent when the policy was created without one: the model declares no
+            // `@default` for it, so there is no ceiling to report.
+            max_message_size_bytes: record.max_message_size_bytes,
+            created_timestamp: Some(crate::state::timestamp(record.created_at_millis)),
+            last_updated_timestamp: Some(crate::state::timestamp(record.last_updated_at_millis)),
+        })
     }
 }

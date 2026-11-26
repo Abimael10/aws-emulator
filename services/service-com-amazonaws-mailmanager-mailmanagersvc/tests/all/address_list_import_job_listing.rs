@@ -257,7 +257,7 @@ async fn every_page_size_walks_one_list_once() {
                     job["Name"].as_str().is_some_and(|name| !name.is_empty())
                         && job["PreSignedUrl"]
                             .as_str()
-                            .is_some_and(|url| url.contains(job["JobId"].as_str().unwrap_or("x")))
+                            .is_some_and(|url| url.contains("/_aws/"))
                         && job["CreatedTimestamp"].as_f64().is_some_and(|t| t > 0.0),
                     "case {case:?}: every reported job carries its stored name, upload target \
                      and creation instant, got {job:?}"

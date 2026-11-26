@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     ArchiveBooleanToEvaluate, ArchiveFilterCondition, ArchiveFilters, ArchiveRetention,
-    ArchiveStringToEvaluate, ExportStatus, Row, Rule, SearchStatus, Tag,
+    ArchiveStringToEvaluate, ExportStatus, PolicyStatement, Row, Rule, SearchStatus, Tag,
 };
 
 /// The two `ArchiveState` values this service's model declares; see
@@ -716,6 +716,64 @@ pub fn rule_set_not_found_message(rule_set_id: &str) -> String {
     format!("Could not find RuleSet with id {rule_set_id}")
 }
 
+/// The most traffic policies this emulator keeps, i.e. its per-account traffic-policy quota.
+///
+/// `CreateTrafficPolicy` models `ServiceQuotaExceededException` ("Occurs when an operation
+/// exceeds a predefined service quota or limit") precisely because the real service caps the
+/// resource. The model does not state the number, so this value is CHOSEN on the same
+/// reasoning as [`MAX_ARCHIVES`]: large enough that ordinary use never reaches it, small
+/// enough that a caller cannot grow the process's memory without limit. It bounds the whole
+/// traffic-policy side of the store: `traffic_policies` holds one entry per live traffic
+/// policy, and `traffic_policy_idempotency` is only written on a create that succeeded.
+pub const MAX_TRAFFIC_POLICIES: usize = 100;
+
+/// One stored traffic policy: "a container for policy statements" (the model's
+/// `TrafficPolicy` doc), each statement filtering the email traffic that reaches an ingress
+/// point.
+///
+/// The single source of truth for every traffic-policy operation: `CreateTrafficPolicy`
+/// writes it and `GetTrafficPolicy` reads it back. The model declares no status member for a
+/// traffic policy, so a created one is immediately usable — there is no transition for the
+/// clock to owe.
+///
+/// [`Self::policy_statements`] holds the modelled `PolicyStatement` values exactly as they
+/// were submitted, in the submitted ORDER: a statement matches or it does not, and the
+/// order the statements are evaluated in is part of what was created, so a read reporting
+/// them in another order would describe a different policy.
+#[derive(Debug, Clone)]
+pub struct TrafficPolicyRecord {
+    pub traffic_policy_id: String,
+    pub traffic_policy_name: String,
+    pub traffic_policy_arn: String,
+    pub policy_statements: Vec<PolicyStatement>,
+    /// `DefaultAction`, one of `AcceptAction`'s values (`ALLOW` | `DENY`): what the policy
+    /// does with a message no statement addresses. The model makes it **required** on the
+    /// create, so a record always carries one.
+    pub default_action: String,
+    /// `MaxMessageSizeBytes`, which the model leaves optional and declares no `@default`
+    /// for: a policy created without one has no size ceiling of its own, and the read
+    /// reports the member as absent rather than inventing a limit.
+    pub max_message_size_bytes: Option<i32>,
+    pub created_at_millis: i64,
+    /// The instant the traffic policy was last written, which is its creation instant until
+    /// an update rewrites it — what a traffic-policy read reports as
+    /// `LastUpdatedTimestamp`.
+    pub last_updated_at_millis: i64,
+    pub tags: Vec<Tag>,
+}
+
+/// How a traffic-policy operation words the refusal of a `TrafficPolicyId` that resolves to
+/// no stored traffic policy.
+///
+/// The fixed text is "Could not find TrafficPolicy with id " and the one variable part is
+/// the id the request named, copied verbatim — the shape this service's resource lookups
+/// state a miss in (see [`address_list_not_found_message`] and
+/// [`rule_set_not_found_message`]), carried by the modelled `ResourceNotFoundException`
+/// ("Occurs when a requested resource is not found").
+pub fn traffic_policy_not_found_message(traffic_policy_id: &str) -> String {
+    format!("Could not find TrafficPolicy with id {traffic_policy_id}")
+}
+
 /// Per-service state for com-amazonaws-mailmanager-mailmanagersvc. A handler reaches it through [`service_state`].
 ///
 /// Every map is a `BTreeMap`, so `ListArchives` walks the archives in one stable,
@@ -763,6 +821,12 @@ pub struct ComAmazonawsMailmanagerMailmanagersvcState {
     /// [`ComAmazonawsMailmanagerMailmanagersvcState::mint_import_job_id`]; see
     /// [`Self::archive_sequence`].
     pub import_job_sequence: u64,
+    /// The secret the upload token of an import job's published locator is authenticated
+    /// under; see [`import_job_upload_token`].
+    ///
+    /// Its own key, separate from [`Self::page_token_key`], so a value minted for one
+    /// purpose is never read as the other.
+    pub import_job_upload_key: PageTokenKey,
     /// Archive search jobs by `SearchId`, across every archive.
     ///
     /// A `BTreeMap`, so `ListArchiveSearches` walks one archive's jobs in one stable order
@@ -804,6 +868,20 @@ pub struct ComAmazonawsMailmanagerMailmanagersvcState {
     /// [`ComAmazonawsMailmanagerMailmanagersvcState::mint_rule_set_id`]; see
     /// [`Self::archive_sequence`].
     pub rule_set_sequence: u64,
+    /// Traffic policies by `TrafficPolicyId`.
+    ///
+    /// A `BTreeMap`, so `ListTrafficPolicies` walks them in one stable, deterministic order
+    /// and a continuation token can name the next key to resume from. Bounded by
+    /// [`MAX_TRAFFIC_POLICIES`].
+    pub traffic_policies: BTreeMap<String, TrafficPolicyRecord>,
+    /// `ClientToken` -> the `CreateTrafficPolicy` it completed. Separate from the other token
+    /// maps so a token recorded for one resource is never read as a retry of a create of
+    /// another.
+    pub traffic_policy_idempotency: BTreeMap<String, IdempotentCreate>,
+    /// Monotonic counter feeding
+    /// [`ComAmazonawsMailmanagerMailmanagersvcState::mint_traffic_policy_id`]; see
+    /// [`Self::archive_sequence`].
+    pub traffic_policy_sequence: u64,
 }
 
 impl ComAmazonawsMailmanagerMailmanagersvcState {
@@ -965,6 +1043,14 @@ impl ComAmazonawsMailmanagerMailmanagersvcState {
         self.rule_set_sequence = self.rule_set_sequence.wrapping_add(1);
         mint_id(self.rule_set_sequence, now_millis)
     }
+
+    /// Mint a fresh `TrafficPolicyId`, the same way [`Self::mint_archive_id`] mints an
+    /// archive id: 32 lowercase hex characters, well inside `TrafficPolicyId`'s modelled
+    /// 1..100 length (the shape declares no pattern).
+    pub fn mint_traffic_policy_id(&mut self, now_millis: i64) -> String {
+        self.traffic_policy_sequence = self.traffic_policy_sequence.wrapping_add(1);
+        mint_id(self.traffic_policy_sequence, now_millis)
+    }
 }
 
 /// The identifier minted for the `sequence`-th resource of its kind: 32 lowercase hex
@@ -1083,6 +1169,29 @@ pub fn create_rule_set_fingerprint(
     )
 }
 
+/// A stable description of the members a traffic policy is created from; see
+/// [`create_archive_fingerprint`] for what it is compared against and why.
+///
+/// The policy statements are part of it, rendered with the derived `Debug` formatting of the
+/// modelled shapes for the same reason [`create_rule_set_fingerprint`] renders rules that
+/// way, and so are the default action and the message-size ceiling, because the record
+/// stores them all.
+pub fn create_traffic_policy_fingerprint(
+    traffic_policy_name: &str,
+    policy_statements: &[PolicyStatement],
+    default_action: &str,
+    max_message_size_bytes: Option<i32>,
+    tags: Option<&[Tag]>,
+) -> String {
+    format!(
+        "{traffic_policy_name}\u{1e}{policy_statements:?}\u{1e}{default_action}\u{1e}{}\u{1e}{}",
+        max_message_size_bytes
+            .map(|bytes| bytes.to_string())
+            .unwrap_or_default(),
+        render_tags(tags)
+    )
+}
+
 /// A stable description of the members an address-list import job is created from; see
 /// [`create_archive_fingerprint`] for what it is compared against and why.
 pub fn create_import_job_fingerprint(
@@ -1194,6 +1303,19 @@ pub fn rule_set_arn(region: &str, rule_set_id: &str) -> String {
     )
 }
 
+/// The ARN of a traffic policy, in this service's ARN namespace.
+///
+/// `TrafficPolicyArn` carries `@arnReference`
+/// (`smithy_query(query="shape",shape="TrafficPolicyArn")`), and SES names the Mail Manager
+/// traffic-policy resource type `mailmanager-traffic-policy` in an ARN.
+pub fn traffic_policy_arn(region: &str, traffic_policy_id: &str) -> String {
+    ::engine::emulator_arn(
+        "ses",
+        region,
+        &format!("mailmanager-traffic-policy/{traffic_policy_id}"),
+    )
+}
+
 /// The segment that names THIS service's upload plane behind the reserved data-plane path
 /// namespace (`::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE`), so the
 /// locator [`import_job_upload_url`] hands out and the route that accepts the upload
@@ -1201,21 +1323,46 @@ pub fn rule_set_arn(region: &str, rule_set_id: &str) -> String {
 /// service.
 pub const IMPORT_JOB_UPLOAD_PLANE: &str = "address-list-import-jobs";
 
-/// The path the input file of `job_id` is uploaded at:
+/// The capability the published locator of the import job `job_id` carries in its last path
+/// segment: the `JobId` AUTHENTICATED under this store's upload key, in this service's
+/// opaque spelling ([`encode_page_token`]).
+///
+/// What makes holding the locator — and not merely knowing a `JobId`, which every job read
+/// and listing hands out — the thing that admits a write: no caller can produce the
+/// authenticator for a job id of its own, and the token this store minted is reported
+/// nowhere but in the locator itself. [`import_job_of_upload_token`] reads it back.
+pub fn import_job_upload_token(key: &PageTokenKey, job_id: &str) -> String {
+    encode_page_token(key, job_id)
+}
+
+/// The `JobId` the upload token `upload_token` carries, or `None` for any value THIS store's
+/// upload key did not mint — a token a caller assembled, one whose authenticator does not
+/// match the id it travels with, and one minted by another store (another emulator process,
+/// a restarted one).
+///
+/// The comparison is the authenticator's own constant-time one, so a refusal tells a caller
+/// nothing about how close its value was.
+pub fn import_job_of_upload_token(key: &PageTokenKey, upload_token: &str) -> Option<String> {
+    decode_page_token(key, upload_token)
+}
+
+/// The path the input file behind the locator `upload_token` is uploaded at:
 /// `/_aws/{plane}/{resource}`, the reserved shape for a data plane this emulator serves on
 /// its one endpoint.
-pub fn import_job_upload_path(job_id: &str) -> String {
+pub fn import_job_upload_path(upload_token: &str) -> String {
     format!(
-        "/{}/{IMPORT_JOB_UPLOAD_PLANE}/{job_id}",
+        "/{}/{IMPORT_JOB_UPLOAD_PLANE}/{upload_token}",
         ::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE
     )
 }
 
-/// The job whose upload target `path` addresses, or `None` for every other path.
+/// The upload token `path` presents, or `None` for every other path.
 ///
-/// Reads the same namespace and plane segments the locator is built from. The id has to
-/// have the FORM this service mints one in, so a path of the same shape addressed to
-/// another mounted service is not mistaken for a locator this service published.
+/// Reads the same namespace and plane segments the locator is built from. The token has to
+/// have the FORM this store mints one in, so neither a path of the same shape addressed to
+/// another mounted service nor one built from a job's own `JobId` is mistaken for a locator
+/// this service published. WHICH job the token addresses is a question only the store's key
+/// answers ([`import_job_of_upload_token`]).
 pub fn parse_import_job_upload_path(path: &str) -> Option<&str> {
     use ::service_common::data_plane_addressing::{first_segment, EMULATOR_PATH_NAMESPACE};
 
@@ -1227,32 +1374,44 @@ pub fn parse_import_job_upload_path(path: &str) -> Option<&str> {
     if plane != IMPORT_JOB_UPLOAD_PLANE {
         return None;
     }
-    let job_id = rest.strip_prefix('/')?;
-    is_job_id_shaped(job_id).then_some(job_id)
+    let upload_token = rest.strip_prefix('/')?;
+    is_upload_token_shaped(upload_token).then_some(upload_token)
 }
 
-/// Whether `candidate` could be a `JobId` at all: the modelled length 1..255 and pattern
-/// `^[a-zA-Z0-9-]+$` (`smithy_query(query="shape",shape="JobId")`).
-fn is_job_id_shaped(candidate: &str) -> bool {
-    (1..=255).contains(&candidate.len())
+/// Whether `candidate` has the FORM of an upload token this store mints: the hexadecimal of
+/// at least an authenticator and a one-character cursor, and no longer than a token over the
+/// longest `JobId` the model admits (length 1..255).
+///
+/// A shape test only, so the plane answers a well-formed locator rather than appearing
+/// absent; whether the token is one this store minted is
+/// [`import_job_of_upload_token`]'s answer, and only it admits a write.
+fn is_upload_token_shaped(candidate: &str) -> bool {
+    let authenticated = 2 * ::service_common::page_tokens::AUTHENTICATOR_BYTES;
+    (authenticated + 2..=authenticated + 2 * 255).contains(&candidate.len())
+        && candidate.len().is_multiple_of(2)
         && candidate
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-/// Where a client uploads the input file of the import job `job_id`:
-/// `CreateAddressListImportJobResponse$PreSignedUrl`, "The pre-signed URL target for
-/// uploading the input file".
+/// Where a client uploads the input file of the import job the locator `upload_token`
+/// addresses: `CreateAddressListImportJobResponse$PreSignedUrl`, "The pre-signed URL target
+/// for uploading the input file".
 ///
 /// AWS answers an Amazon S3 pre-signed URL here. This emulator provisions no object store,
 /// so the URL names THIS job's input file on the endpoint THIS REQUEST ARRIVED AT, and
 /// this service accepts the upload on that path itself (see `crate::service`) — a URL a
-/// client can really write the file to, rather than one pointing at the real service. NO
-/// signature is attached: this emulator signs no URLs, and a fabricated signature would
-/// claim a computation nothing performed; the minted, unguessable `JobId` is what names
-/// the target.
-pub fn import_job_upload_url(host: &str, job_id: &str) -> String {
-    format!("https://{host}{}", import_job_upload_path(job_id))
+/// client can really write the file to, rather than one pointing at the real service.
+///
+/// What AUTHORISES that write is the locator itself, as it is for a pre-signed URL: its last
+/// segment is the `JobId` authenticated under this store's upload key
+/// ([`import_job_upload_token`]), the upload plane admits a write only for a token that key
+/// minted, and no modelled operation reports it — so a caller holding only the `JobId` every
+/// job read and listing hands out addresses no upload target at all. No SigV4 signature is
+/// attached, because this service's locator carries its own authenticated capability instead
+/// and a fabricated signature would claim a computation nothing performed.
+pub fn import_job_upload_url(host: &str, upload_token: &str) -> String {
+    format!("https://{host}{}", import_job_upload_path(upload_token))
 }
 
 /// The endpoint host this request reached the emulator on, so a URL this service hands out

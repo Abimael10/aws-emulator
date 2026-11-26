@@ -233,8 +233,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let job_id = store.mint_import_job_id(now);
+        // The locator's own capability: the job's id authenticated under this store's upload
+        // key, which no modelled operation reports.
+        let upload_token =
+            crate::state::import_job_upload_token(&store.import_job_upload_key, &job_id);
         let record = crate::state::ImportJobRecord {
-            pre_signed_url: crate::state::import_job_upload_url(&host, &job_id),
+            pre_signed_url: crate::state::import_job_upload_url(&host, &upload_token),
             job_id: job_id.clone(),
             address_list_id: input.address_list_id,
             name: input.name,

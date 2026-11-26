@@ -214,11 +214,17 @@ async fn create_then_get_round_trips_every_job_shape() {
         assert_well_formed_job_id(&case, &job_id);
         minted.push(job_id.clone());
 
-        // The upload target is a locator for THIS job on the endpoint the caller reached.
-        assert_eq!(
-            url,
-            format!("https://{HOST}/_aws/{IMPORT_JOB_UPLOAD_PLANE}/{job_id}"),
-            "case {case:?}: unexpected PreSignedUrl, got {url:?}"
+        // The upload target is a locator on the endpoint the caller reached, under this
+        // service's upload plane, and its last segment is the job's own capability — not the
+        // `JobId`, which every job read hands out.
+        let prefix = format!("https://{HOST}/_aws/{IMPORT_JOB_UPLOAD_PLANE}/");
+        let token = url.strip_prefix(&prefix).unwrap_or_else(|| {
+            panic!("case {case:?}: the PreSignedUrl must name {prefix:?}, got {url:?}")
+        });
+        assert!(
+            token.len() > 2 && token != job_id && !token.contains(&job_id),
+            "case {case:?}: the upload locator must carry its own token rather than the \
+             JobId {job_id:?}, got {url:?}"
         );
 
         let (status, out) = harness
@@ -651,7 +657,7 @@ async fn the_published_upload_url_serves_the_input_file() {
 
     // A body past the bound this emulator retains is refused by the upload plane rather
     // than stored.
-    let (_, url) = harness
+    let (oversized_job_id, url) = harness
         .create_job(
             "an oversized upload",
             json!({
@@ -670,15 +676,37 @@ async fn the_published_upload_url_serves_the_input_file() {
          {status} {out:?}"
     );
 
-    // Rows: the methods a published upload target does NOT serve, and a target naming no
-    // stored job.
-    let refused: [(&str, &str, String); 3] = [
+    // Rows: the methods a published upload target does NOT serve, and the targets that
+    // address no import job of this emulator — one shaped like a locator but minted for no
+    // job, one built from the `JobId` every job read hands out (which is NOT the locator's
+    // capability, so it authorises nothing), and one built from the live locator with its
+    // last character changed.
+    let live_token = url.rsplit('/').next().unwrap_or_default().to_string();
+    let tampered = format!(
+        "{}{}",
+        &live_token[..live_token.len() - 1],
+        if live_token.ends_with('0') { "1" } else { "0" }
+    );
+    let refused: [(&str, &str, String); 5] = [
         ("a GET of the upload target", "GET", url.clone()),
         ("a DELETE of the upload target", "DELETE", url.clone()),
         (
-            "a PUT to a job that does not exist",
+            "a PUT to a locator whose authenticator nothing minted",
             "PUT",
-            format!("https://{HOST}/_aws/{IMPORT_JOB_UPLOAD_PLANE}/no-such-import-job"),
+            format!(
+                "https://{HOST}/_aws/{IMPORT_JOB_UPLOAD_PLANE}/{}",
+                "0".repeat(live_token.len())
+            ),
+        ),
+        (
+            "a PUT addressed by the JobId instead of the locator",
+            "PUT",
+            format!("https://{HOST}/_aws/{IMPORT_JOB_UPLOAD_PLANE}/{oversized_job_id}"),
+        ),
+        (
+            "a PUT to the live locator with one character changed",
+            "PUT",
+            format!("https://{HOST}/_aws/{IMPORT_JOB_UPLOAD_PLANE}/{tampered}"),
         ),
     ];
     for (case, method, target) in refused {

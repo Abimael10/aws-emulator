@@ -178,10 +178,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // A request to an import job's upload URL is exactly that case by construction —
         // its path is in neither of this service's protocol path spaces — so this is where
         // such a URL is served. Anything else keeps the framework's default.
-        let job_id =
+        let upload_token =
             crate::state::parse_import_job_upload_path(service_common::request_path(req.uri()))?
                 .to_string();
-        self.serve_import_upload(req, &job_id)
+        self.serve_import_upload(req, &upload_token)
     }
 
     fn override_framework_error(
@@ -200,18 +200,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
-    /// Serve one request to the upload URL of the import job `job_id`.
+    /// Serve one request to the upload URL an import job's locator addresses.
     ///
     /// An upload is a WRITE — that is what the URL was handed out for — so it records the
     /// input file as the one that job imports, and a second upload to the same URL replaces
     /// the first: a `PUT` is idempotent. The upload is judged in this order: the method, so
     /// a path this service publishes states which methods it serves rather than appearing
-    /// absent; the size this emulator retains; and then the store, because a URL naming a
-    /// job that is gone — or one whose address list is gone — is no longer a target.
+    /// absent; the size this emulator retains; and then the store, because the token is what
+    /// AUTHORISES the write — one this store minted for no job is no target, and neither is
+    /// one whose job, or whose job's address list, is gone.
     /// `None` only if a status this file names is not a status at all, which it is: it is
     /// what keeps this plane free of a conversion that could panic on a request path, and
     /// leaves the framework's own refusal to answer instead.
-    fn serve_import_upload(&self, req: &RtRequest, job_id: &str) -> Option<RtResponse> {
+    fn serve_import_upload(&self, req: &RtRequest, upload_token: &str) -> Option<RtResponse> {
         if req.method() != UPLOAD_METHOD {
             return method_not_allowed();
         }
@@ -237,16 +238,29 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         let uploaded_at_millis = crate::state::now_millis();
         {
             let mut store = state.lock();
-            // Borrowed once as the state it is, so the job and the lists are reached as two
-            // disjoint fields.
-            let store = &mut *store;
-            // A path naming no stored job is not a target this service published: it is
-            // refused rather than accepting a file nothing will import.
-            let Some(job) = store.import_jobs.get_mut(job_id) else {
+            // The token the request presented is resolved FIRST: only one this store's
+            // upload key minted names a job at all, and the refusal repeats neither the
+            // token nor what it failed to name.
+            let Some(job_id) = crate::state::import_job_of_upload_token(
+                &store.import_job_upload_key,
+                upload_token,
+            ) else {
                 return upload_error(
                     404,
                     "ResourceNotFoundException",
-                    format!("Import job {job_id} not found."),
+                    UPLOAD_TARGET_NOT_FOUND.to_string(),
+                );
+            };
+            // Borrowed once as the state it is, so the job and the lists are reached as two
+            // disjoint fields.
+            let store = &mut *store;
+            let Some(job) = store.import_jobs.get_mut(&job_id) else {
+                // A token this key minted for a job that is no longer held: authenticated,
+                // but no longer a target.
+                return upload_error(
+                    404,
+                    "ResourceNotFoundException",
+                    UPLOAD_TARGET_NOT_FOUND.to_string(),
                 );
             };
             // Nor is the target one this service still serves once the address list the job
@@ -276,6 +290,13 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// bytes by `PUT`, which is how a client writes a file to the URL
 /// `CreateAddressListImportJob` hands it.
 const UPLOAD_METHOD: &str = "PUT";
+
+/// How the upload plane refuses a locator it holds no import job for.
+///
+/// It states neither the token the request presented nor whether such a token was ever
+/// minted: a refusal that distinguished the two would let a caller search the token space.
+const UPLOAD_TARGET_NOT_FOUND: &str =
+    "The upload target does not address an import job of this emulator.";
 
 /// The refusal the upload plane answers a method it does not serve with. RFC 9110 requires
 /// a `405` to state which methods the target supports, so the refusal names it in the
