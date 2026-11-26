@@ -65,6 +65,15 @@ const EC2_INSTANCE: Option<&str> = Some("/AWS::EC2::Instance");
 /// The `TargetType` of a document that acts on an Amazon S3 bucket.
 const S3_BUCKET: Option<&str> = Some("/AWS::S3::Bucket");
 
+/// The `TargetType` of a document that acts on an Amazon EBS volume: `TargetType` names
+/// "the kinds of resources the document can run on" by their CloudFormation resource type,
+/// and an EBS volume's is `AWS::EC2::Volume`.
+const EBS_VOLUME: Option<&str> = Some("/AWS::EC2::Volume");
+
+/// The `TargetType` of a document that acts on a SNAPSHOT of an Amazon EBS volume, which is
+/// a resource of its own rather than the volume it was taken of.
+const EBS_SNAPSHOT: Option<&str> = Some("/AWS::EC2::Snapshot");
+
 /// The ONE publication date a catalogue entry carries when this crate does not hold that
 /// document's own date, in milliseconds since the Unix epoch: 2016-01-01T00:00:00Z, the
 /// turn of the year Systems Manager began publishing documents in.
@@ -509,14 +518,14 @@ pub const PUBLISHED_DOCUMENTS: &[PublishedDocument] = &[
         AUTOMATION,
         published_automation_runbooks::CREATE_SNAPSHOT,
         1_514_908_841_805,
-        None
+        EBS_VOLUME
     ),
     authored!(
         "AWS-DeleteSnapshot",
         AUTOMATION,
         published_automation_runbooks::DELETE_SNAPSHOT,
         1_514_908_849_923,
-        None
+        EBS_SNAPSHOT
     ),
     authored!(
         "AWS-UpdateLinuxAmi",

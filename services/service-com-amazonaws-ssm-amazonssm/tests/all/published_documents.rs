@@ -222,14 +222,18 @@ fn catalogue_rows() -> Vec<Published<'static>> {
             platforms: &["Windows"],
         },
         Published {
+            // Published at schema 1.2, the agent's legacy plugin model, whose steps are the
+            // `runtimeConfig` plugins.
             case: "the command document that only reports Windows updates",
             name: "AWS-FindWindowsUpdates",
             document_type: "Command",
-            schema_version: "2.2",
+            schema_version: "1.2",
             parameters: &["UpdateLevel", "KbArticleIds"],
             platforms: &["Windows"],
         },
         Published {
+            // Its steps are the download plugin and the run-another-document one, which the
+            // plugin reference documents for the Windows Server and Linux platforms.
             case: "a command document that downloads what it runs",
             name: "AWS-RunRemoteScript",
             document_type: "Command",
@@ -241,7 +245,7 @@ fn catalogue_rows() -> Vec<Published<'static>> {
                 "workingDirectory",
                 "executionTimeout",
             ],
-            platforms: PLATFORM_TYPES,
+            platforms: &["Windows", "Linux"],
         },
         Published {
             case: "the command document that runs another document",
@@ -255,28 +259,31 @@ fn catalogue_rows() -> Vec<Published<'static>> {
                 "workingDirectory",
                 "executionTimeout",
             ],
-            platforms: PLATFORM_TYPES,
+            platforms: &["Windows", "Linux"],
         },
         Published {
+            // A schema 1.2 document whose one `runtimeConfig` plugin restricts no platform.
             case: "a command document with one parameter",
             name: "AWS-RefreshAssociation",
             document_type: "Command",
-            schema_version: "2.2",
+            schema_version: "1.2",
             parameters: &["associationIds"],
             platforms: PLATFORM_TYPES,
         },
         Published {
+            // A schema 1.2 document whose plugin joins a domain, which the plugin reference
+            // documents for the Windows Server and Linux platforms only.
             case: "the command document that joins a directory domain",
             name: "AWS-JoinDirectoryServiceDomain",
             document_type: "Command",
-            schema_version: "2.2",
+            schema_version: "1.2",
             parameters: &[
                 "directoryId",
                 "directoryName",
                 "directoryOU",
                 "dnsIpAddresses",
             ],
-            platforms: PLATFORM_TYPES,
+            platforms: &["Windows", "Linux"],
         },
         Published {
             // Its step's precondition restricts it to one platform, which is not the

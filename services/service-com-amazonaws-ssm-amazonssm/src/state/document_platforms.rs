@@ -30,14 +30,20 @@ use super::{mapping_get, scalar_string, DOCUMENT_PLATFORM_TYPES};
 ///
 /// The entries are the plugins the "command document plugin reference" of the Amazon Web
 /// Services Systems Manager User Guide documents a platform restriction for; a plugin it
-/// documents for every platform (`aws:updateSsmAgent`, `aws:downloadContent`,
-/// `aws:runDocument`, `aws:softwareInventory`) and every Automation action restrict
-/// nothing and so are absent here. The `aws:cloudWatch` spelling is the schema 1.2 name of
-/// the same Windows-only plugin `aws:configureCloudWatch` is in later schemas.
+/// documents for every platform (`aws:updateSsmAgent`, `aws:configurePackage`,
+/// `aws:softwareInventory`) and every Automation action restrict nothing and so are absent
+/// here. The `aws:cloudWatch` spelling is the schema 1.2 name of the same Windows-only
+/// plugin `aws:configureCloudWatch` is in later schemas.
 pub fn plugin_platform_types(action: &str) -> Option<&'static [&'static str]> {
     match action {
         // Runs the commands through a Unix-like shell.
         "aws:runShellScript" => Some(&["Linux", "MacOS"]),
+        // The plugins the reference documents for the Windows Server and Linux node
+        // platforms, and for no other: joining a directory domain, downloading content a
+        // document names, and running another document on the node.
+        "aws:domainJoin" | "aws:downloadContent" | "aws:runDocument" => {
+            Some(&["Windows", "Linux"])
+        }
         // Windows-only: PowerShell, a PowerShell module, an MSI application, and the
         // CloudWatch agent configuration.
         "aws:runPowerShellScript" | "aws:psModule" | "aws:applications" | "aws:cloudWatch"

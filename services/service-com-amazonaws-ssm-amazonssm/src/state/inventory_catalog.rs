@@ -22,13 +22,13 @@
 //! node record and a `Custom:` type is what a put wrote ([`super::custom_inventory`]), and
 //! every other published type has collected nothing here.
 //!
-//! PROVISIONAL ENTRIES: the attribute lists of `AWS:AWSComponent`, `AWS:Application` and
-//! `AWS:InstanceInformation` are the published ones, confirmed against a recorded schema read.
-//! The lists of `AWS:ComplianceItem`, `AWS:ComplianceSummary`, `AWS:File`,
-//! `AWS:InstanceDetailedInformation`, `AWS:Network`, `AWS:PatchSummary` and `AWS:WindowsRole` are
-//! reconstructed from the same published documentation and are NOT confirmed against a recorded
-//! read, so each of their consts says so: a later correction is a one-line change to the list it
-//! names, and nothing else here depends on their contents.
+//! PROVISIONAL ENTRIES: the attribute lists of `AWS:AWSComponent`, `AWS:Application`,
+//! `AWS:ComplianceItem`, `AWS:InstanceDetailedInformation` and `AWS:InstanceInformation` are the
+//! published ones, confirmed against a recorded schema read. The lists of
+//! `AWS:ComplianceSummary`, `AWS:File`, `AWS:Network`, `AWS:PatchSummary` and `AWS:WindowsRole`
+//! are reconstructed from the same published documentation and are NOT confirmed against a
+//! recorded read, so each of their consts says so: a later correction is a one-line change to the
+//! list it names, and nothing else here depends on their contents.
 //!
 //! The NAMING rule is this module's other half, because the catalog is what makes it decidable:
 //! a type name is either one of the published names, spelled exactly — "Type name is case
@@ -51,6 +51,11 @@ pub struct PublishedInventoryType {
     pub version: &'static str,
     /// "The schema attributes for inventory", in the order the published schema lists them.
     pub attributes: &'static [&'static str],
+    /// The attributes of this type whose VALUES are numbers — a count, a core or socket
+    /// count, a size — so the published schema reports them with the number data type
+    /// ([`PublishedInventoryType::to_schema`]). Every other attribute of the type carries
+    /// the text one.
+    pub numeric_attributes: &'static [&'static str],
 }
 
 impl PublishedInventoryType {
@@ -58,13 +63,11 @@ impl PublishedInventoryType {
     /// rather than all of its own — which is how an aggregation read reports only the
     /// attributes it may count over ([`super::inventory::reported_schemas`]).
     ///
-    /// Every attribute of a published type carries the TEXT data type. That is RECORDED
-    /// BEHAVIOUR rather than an assumption about the values: a schema read of the published
-    /// catalog answers `"DataType": "STRING"` for every attribute of every type, the ones
-    /// whose values read as numbers (a count, a version, a size) included. A custom type is
-    /// the other case — its attributes are whatever its items say, so
-    /// [`super::custom_inventory::custom_type_schema`] reports the number type where every
-    /// value under an attribute is one.
+    /// Each attribute carries the data type of the VALUES reported under it: the number one
+    /// where the attribute counts or measures something
+    /// ([`PublishedInventoryType::numeric_attributes`]) and the text one otherwise — the
+    /// same rule a custom type's schema follows, where the attributes are whatever its items
+    /// say ([`super::custom_inventory::custom_type_schema`]).
     ///
     /// No `DisplayName`: "the alias name of the inventory type … used for display purposes",
     /// and Systems Manager publishes these types under their own names, so none is invented.
@@ -76,7 +79,11 @@ impl PublishedInventoryType {
                 .iter()
                 .map(|name| InventoryItemAttribute {
                     name: (*name).to_string(),
-                    data_type: super::custom_inventory::ATTRIBUTE_DATA_TYPE_STRING.to_string(),
+                    data_type: if self.numeric_attributes.contains(name) {
+                        super::custom_inventory::ATTRIBUTE_DATA_TYPE_NUMBER.to_string()
+                    } else {
+                        super::custom_inventory::ATTRIBUTE_DATA_TYPE_STRING.to_string()
+                    },
                 })
                 .collect(),
             display_name: None,
@@ -115,8 +122,13 @@ const APPLICATION_ATTRIBUTES: &[&str] = &[
 
 /// The attributes of `AWS:ComplianceItem`: one compliance finding about a node — which
 /// compliance type reported it, the execution that produced it, and the finding's own
-/// identity, status and severity, with the detail a patch or association finding carries.
-/// PROVISIONAL past the first eight (see the module docs).
+/// identity, status and severity, with the detail a patch or association finding carries:
+/// the override list the patch run honoured, the long-form text and link of the finding,
+/// the CVEs it covers and when the document that produced it ran.
+///
+/// The whole published list, in the order the published schema states it (AWS Systems
+/// Manager User Guide, "Metadata collected by Systems Manager Inventory", the
+/// `AWS:ComplianceItem` table), confirmed against a recorded schema read.
 const COMPLIANCE_ITEM_ATTRIBUTES: &[&str] = &[
     "ComplianceType",
     "ExecutionId",
@@ -134,7 +146,11 @@ const COMPLIANCE_ITEM_ATTRIBUTES: &[&str] = &[
     "PatchState",
     "PatchGroup",
     "InstalledTime",
+    "InstallOverrideList",
+    "DetailedText",
+    "DetailedLink",
     "CVEIds",
+    "DocumentExecutionTime",
 ];
 
 /// The attributes of `AWS:ComplianceSummary`: the roll-up of a node's compliance findings —
@@ -179,7 +195,8 @@ const FILE_ATTRIBUTES: &[&str] = &[
 ];
 
 /// The attributes of `AWS:InstanceDetailedInformation`: the node's CPU and kernel detail,
-/// beside the identity `AWS:InstanceInformation` carries. PROVISIONAL (see the module docs).
+/// beside the identity `AWS:InstanceInformation` carries. The counts and the clock speed are
+/// the type's numeric attributes ([`INSTANCE_DETAILED_INFORMATION_NUMBERS`]).
 const INSTANCE_DETAILED_INFORMATION_ATTRIBUTES: &[&str] = &[
     "CPUModel",
     "CPUCores",
@@ -299,6 +316,51 @@ const WINDOWS_UPDATE_ATTRIBUTES: &[&str] = &[
     "InstalledBy",
 ];
 
+/// The attributes of `AWS:ComplianceSummary` whose values are numbers: the roll-up's own
+/// counts, one per severity on each side of the compliant/non-compliant split.
+const COMPLIANCE_SUMMARY_COUNTS: &[&str] = &[
+    "CompliantCriticalCount",
+    "CompliantHighCount",
+    "CompliantMediumCount",
+    "CompliantLowCount",
+    "CompliantInformationalCount",
+    "CompliantUnspecifiedCount",
+    "NonCompliantCriticalCount",
+    "NonCompliantHighCount",
+    "NonCompliantMediumCount",
+    "NonCompliantLowCount",
+    "NonCompliantInformationalCount",
+    "NonCompliantUnspecifiedCount",
+];
+
+/// The attributes of `AWS:PatchSummary` whose values are numbers: how many patches the last
+/// patch operation left in each state.
+const PATCH_SUMMARY_COUNTS: &[&str] = &[
+    "InstalledCount",
+    "InstalledOtherCount",
+    "InstalledPendingRebootCount",
+    "InstalledRejectedCount",
+    "MissingCount",
+    "FailedCount",
+    "UnreportedNotApplicableCount",
+    "NotApplicableCount",
+    "CriticalNonCompliantCount",
+    "SecurityNonCompliantCount",
+    "OtherNonCompliantCount",
+];
+
+/// The attribute of `AWS:File` whose value is a number: the file's size in bytes.
+const FILE_NUMBERS: &[&str] = &["Size"];
+
+/// The attributes of `AWS:InstanceDetailedInformation` whose values are numbers: how many
+/// cores, processors, sockets the node has and how fast they run.
+const INSTANCE_DETAILED_INFORMATION_NUMBERS: &[&str] =
+    &["CPUCores", "CPUs", "CPUSpeedMHz", "CPUSockets"];
+
+/// No attribute of the type carries a number, so every one of its attributes is reported
+/// with the text data type.
+const NO_NUMBERS: &[&str] = &[];
+
 /// The inventory types Systems Manager publishes, in ascending type-name order — the order a
 /// schema read walks the catalog in, which is what lets a page resume from the type name it
 /// stopped at (see the module docs for where the set comes from).
@@ -307,76 +369,93 @@ pub const PUBLISHED_INVENTORY_TYPES: &[PublishedInventoryType] = &[
         type_name: "AWS:AWSComponent",
         version: "1.0",
         attributes: AWS_COMPONENT_ATTRIBUTES,
+        numeric_attributes: NO_NUMBERS,
     },
     PublishedInventoryType {
         type_name: "AWS:Application",
         version: "1.1",
         attributes: APPLICATION_ATTRIBUTES,
+        numeric_attributes: NO_NUMBERS,
     },
     PublishedInventoryType {
         type_name: "AWS:ComplianceItem",
-        version: "1.0",
+        // Systems Manager publishes the compliance-item schema at its second revision, the
+        // one that carries the detail attributes above.
+        version: "1.1",
         attributes: COMPLIANCE_ITEM_ATTRIBUTES,
+        numeric_attributes: NO_NUMBERS,
     },
     PublishedInventoryType {
         type_name: "AWS:ComplianceSummary",
         version: "1.0",
         attributes: COMPLIANCE_SUMMARY_ATTRIBUTES,
+        numeric_attributes: COMPLIANCE_SUMMARY_COUNTS,
     },
     PublishedInventoryType {
         type_name: "AWS:File",
         version: "1.0",
         attributes: FILE_ATTRIBUTES,
+        numeric_attributes: FILE_NUMBERS,
     },
     PublishedInventoryType {
         type_name: "AWS:InstanceDetailedInformation",
         version: "1.0",
         attributes: INSTANCE_DETAILED_INFORMATION_ATTRIBUTES,
+        numeric_attributes: INSTANCE_DETAILED_INFORMATION_NUMBERS,
     },
     PublishedInventoryType {
         type_name: super::inventory::INVENTORY_TYPE_INSTANCE_INFORMATION,
         version: "1.1",
         attributes: INSTANCE_INFORMATION_ATTRIBUTES,
+        numeric_attributes: NO_NUMBERS,
     },
     PublishedInventoryType {
         type_name: "AWS:Network",
         version: "1.0",
         attributes: NETWORK_ATTRIBUTES,
+        numeric_attributes: NO_NUMBERS,
     },
     PublishedInventoryType {
         type_name: "AWS:PatchSummary",
         version: "1.0",
         attributes: PATCH_SUMMARY_ATTRIBUTES,
+        numeric_attributes: PATCH_SUMMARY_COUNTS,
     },
     PublishedInventoryType {
         type_name: "AWS:ResourceGroup",
         version: "1.0",
         attributes: RESOURCE_GROUP_ATTRIBUTES,
+        numeric_attributes: NO_NUMBERS,
     },
     PublishedInventoryType {
         type_name: "AWS:Service",
         version: "1.0",
         attributes: SERVICE_ATTRIBUTES,
+        numeric_attributes: NO_NUMBERS,
     },
     PublishedInventoryType {
         type_name: "AWS:Tag",
         version: "1.0",
         attributes: TAG_ATTRIBUTES,
+        numeric_attributes: NO_NUMBERS,
     },
     PublishedInventoryType {
         type_name: "AWS:WindowsRegistry",
         version: "1.0",
         attributes: WINDOWS_REGISTRY_ATTRIBUTES,
+        numeric_attributes: NO_NUMBERS,
     },
     PublishedInventoryType {
         type_name: "AWS:WindowsRole",
         version: "1.0",
         attributes: WINDOWS_ROLE_ATTRIBUTES,
+        numeric_attributes: NO_NUMBERS,
     },
     PublishedInventoryType {
         type_name: "AWS:WindowsUpdate",
         version: "1.0",
         attributes: WINDOWS_UPDATE_ATTRIBUTES,
+        numeric_attributes: NO_NUMBERS,
     },
 ];
 

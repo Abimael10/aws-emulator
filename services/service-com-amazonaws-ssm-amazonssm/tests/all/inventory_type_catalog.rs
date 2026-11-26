@@ -250,12 +250,14 @@ async fn a_schema_read_reports_every_published_inventory_type() {
             attributes.len()
         );
         for (name, data_type) in &attributes {
-            // The recorded catalog answers the text data type for every attribute of every
-            // published type, the count-bearing and version-bearing ones included.
+            // The data type is the one the attribute's VALUES carry: the number one where the
+            // attribute counts or measures something and the text one otherwise, both in the
+            // uppercase wire form the modelled enum spells.
             assert!(
-                !name.is_empty() && data_type == DATA_TYPE_STRING,
+                !name.is_empty()
+                    && (data_type == DATA_TYPE_STRING || data_type == DATA_TYPE_NUMBER),
                 "case {case:?}: every published attribute is a named one of the uppercase wire \
-                 data type, got ({name:?}, {data_type:?})"
+                 data types, got ({name:?}, {data_type:?})"
             );
         }
     }

@@ -198,8 +198,13 @@ mainSteps:
 "#;
 
 /// Reports the Windows updates a node is missing, without installing any of them.
+///
+/// One of the command documents Systems Manager published for the agent's LEGACY plugin
+/// model: it is published at schema 1.2, which declares its one plugin under
+/// `runtimeConfig` rather than as a `mainSteps` step (the same shape
+/// [`CONFIGURE_CLOUD_WATCH`] carries).
 pub const FIND_WINDOWS_UPDATES: &str = r#"{
-  "schemaVersion": "2.2",
+  "schemaVersion": "1.2",
   "description": "List the Windows updates a managed node is missing.",
   "parameters": {
     "UpdateLevel": {
@@ -214,16 +219,17 @@ pub const FIND_WINDOWS_UPDATES: &str = r#"{
       "default": ""
     }
   },
-  "mainSteps": [
-    {
-      "name": "findWindowsUpdates",
-      "action": "aws:runPowerShellScript",
-      "inputs": {
-        "commands": ["Get-MissingWindowsUpdates"],
-        "timeoutSeconds": "3600"
-      }
+  "runtimeConfig": {
+    "aws:psModule": {
+      "properties": [
+        {
+          "id": "0.aws:psModule",
+          "runCommand": "Get-MissingWindowsUpdates -UpdateLevel {{ UpdateLevel }} -KbArticleIds {{ KbArticleIds }}",
+          "timeoutSeconds": "3600"
+        }
+      ]
     }
-  ]
+  }
 }"#;
 
 /// Downloads a script from a remote location (an S3 object or a Git repository) and runs
@@ -327,8 +333,11 @@ pub const RUN_DOCUMENT: &str = r#"{
 }"#;
 
 /// Makes the agent apply its associations again, immediately.
+///
+/// Published at schema 1.2, the agent's legacy plugin model: its one plugin is declared
+/// under `runtimeConfig`, and nothing about that plugin restricts the node platform.
 pub const REFRESH_ASSOCIATION: &str = r#"{
-  "schemaVersion": "2.2",
+  "schemaVersion": "1.2",
   "description": "Apply the State Manager associations of a managed node immediately.",
   "parameters": {
     "associationIds": {
@@ -337,20 +346,26 @@ pub const REFRESH_ASSOCIATION: &str = r#"{
       "default": []
     }
   },
-  "mainSteps": [
-    {
-      "name": "refreshAssociation",
-      "action": "aws:refreshAssociation",
-      "inputs": {
-        "associationIds": "{{ associationIds }}"
-      }
+  "runtimeConfig": {
+    "aws:refreshAssociation": {
+      "properties": [
+        {
+          "id": "0.aws:refreshAssociation",
+          "associationIds": "{{ associationIds }}"
+        }
+      ]
     }
-  ]
+  }
 }"#;
 
 /// Joins a node to an AWS Directory Service domain.
+///
+/// Published at schema 1.2, the agent's legacy plugin model. Its plugin is the domain-join
+/// one, which the plugin reference documents for the Windows Server and Linux platforms
+/// ([`super::document_platforms::plugin_platform_types`]), so the document is compatible
+/// with those two rather than with every platform the model lists.
 pub const JOIN_DIRECTORY_SERVICE_DOMAIN: &str = r#"{
-  "schemaVersion": "2.2",
+  "schemaVersion": "1.2",
   "description": "Join a managed node to an AWS Directory Service domain.",
   "parameters": {
     "directoryId": {
@@ -372,18 +387,16 @@ pub const JOIN_DIRECTORY_SERVICE_DOMAIN: &str = r#"{
       "default": []
     }
   },
-  "mainSteps": [
-    {
-      "name": "joinDomain",
-      "action": "aws:domainJoin",
-      "inputs": {
+  "runtimeConfig": {
+    "aws:domainJoin": {
+      "properties": {
         "directoryId": "{{ directoryId }}",
         "directoryName": "{{ directoryName }}",
         "directoryOU": "{{ directoryOU }}",
         "dnsIpAddresses": "{{ dnsIpAddresses }}"
       }
     }
-  ]
+  }
 }"#;
 
 /// Runs Ansible playbooks on a node: its step precondition restricts it to Linux.

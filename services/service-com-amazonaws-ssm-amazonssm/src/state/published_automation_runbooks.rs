@@ -178,68 +178,56 @@ pub const CREATE_IMAGE: &str = r#"{
 }"#;
 
 /// Creates a snapshot of an EBS volume.
-pub const CREATE_SNAPSHOT: &str = r#"{
-  "schemaVersion": "0.3",
-  "description": "Create a snapshot of one Amazon EBS volume.",
-  "assumeRole": "{{ AutomationAssumeRole }}",
-  "parameters": {
-    "AutomationAssumeRole": {
-      "type": "String",
-      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
-      "default": ""
-    },
-    "VolumeId": {
-      "type": "String",
-      "description": "(Required) The id of the EBS volume the snapshot is taken of."
-    },
-    "Description": {
-      "type": "String",
-      "description": "(Optional) The description of the snapshot to create.",
-      "default": ""
-    }
-  },
-  "mainSteps": [
-    {
-      "name": "createSnapshot",
-      "action": "aws:executeAwsApi",
-      "inputs": {
-        "Service": "ec2",
-        "Api": "CreateSnapshot",
-        "VolumeId": "{{ VolumeId }}",
-        "Description": "{{ Description }}"
-      }
-    }
-  ]
-}"#;
+///
+/// Authored in YAML, which is the format Amazon publishes this runbook in: the format a
+/// read reports is the format of the body ([`super::PublishedDocument::document_format`]),
+/// so the body carried here is the one Amazon publishes the document in.
+pub const CREATE_SNAPSHOT: &str = r#"schemaVersion: "0.3"
+description: Create a snapshot of one Amazon EBS volume.
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf."
+    default: ""
+  VolumeId:
+    type: String
+    description: "(Required) The id of the EBS volume the snapshot is taken of."
+  Description:
+    type: String
+    description: "(Optional) The description of the snapshot to create."
+    default: ""
+mainSteps:
+  - name: createSnapshot
+    action: "aws:executeAwsApi"
+    inputs:
+      Service: ec2
+      Api: CreateSnapshot
+      VolumeId: "{{ VolumeId }}"
+      Description: "{{ Description }}"
+"#;
 
-/// Deletes a snapshot of an EBS volume.
-pub const DELETE_SNAPSHOT: &str = r#"{
-  "schemaVersion": "0.3",
-  "description": "Delete one snapshot of an Amazon EBS volume.",
-  "assumeRole": "{{ AutomationAssumeRole }}",
-  "parameters": {
-    "AutomationAssumeRole": {
-      "type": "String",
-      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
-      "default": ""
-    },
-    "SnapshotId": {
-      "type": "String",
-      "description": "(Required) The id of the snapshot to delete."
-    }
-  },
-  "mainSteps": [
-    {
-      "name": "deleteSnapshot",
-      "action": "aws:executeAwsApi",
-      "inputs": {
-        "Service": "ec2",
-        "Api": "DeleteSnapshot",
-        "SnapshotId": "{{ SnapshotId }}"
-      }
-    }
-  ]
-}"#;
+/// Deletes a snapshot of an EBS volume. Authored in YAML, the format Amazon publishes this
+/// runbook in.
+pub const DELETE_SNAPSHOT: &str = r#"schemaVersion: "0.3"
+description: Delete one snapshot of an Amazon EBS volume.
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf."
+    default: ""
+  SnapshotId:
+    type: String
+    description: "(Required) The id of the snapshot to delete."
+mainSteps:
+  - name: deleteSnapshot
+    action: "aws:executeAwsApi"
+    inputs:
+      Service: ec2
+      Api: DeleteSnapshot
+      SnapshotId: "{{ SnapshotId }}"
+"#;
 
 /// Patches a Linux AMI and registers the updated image.
 pub const UPDATE_LINUX_AMI: &str = r#"{
@@ -379,52 +367,41 @@ pub const PATCH_INSTANCE_WITH_ROLLBACK: &str = r#"{
   ]
 }"#;
 
-/// Changes the instance type of a stopped EC2 instance.
-pub const RESIZE_INSTANCE: &str = r#"{
-  "schemaVersion": "0.3",
-  "description": "Change the instance type of one Amazon EC2 instance.",
-  "assumeRole": "{{ AutomationAssumeRole }}",
-  "parameters": {
-    "AutomationAssumeRole": {
-      "type": "String",
-      "description": "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.",
-      "default": ""
-    },
-    "InstanceId": {
-      "type": "String",
-      "description": "(Required) The id of the EC2 instance to resize."
-    },
-    "InstanceType": {
-      "type": "String",
-      "description": "(Required) The instance type the instance is changed to."
-    }
-  },
-  "mainSteps": [
-    {
-      "name": "stopInstance",
-      "action": "aws:changeInstanceState",
-      "inputs": {
-        "InstanceIds": ["{{ InstanceId }}"],
-        "DesiredState": "stopped"
-      }
-    },
-    {
-      "name": "modifyInstanceAttribute",
-      "action": "aws:executeAwsApi",
-      "inputs": {
-        "Service": "ec2",
-        "Api": "ModifyInstanceAttribute",
-        "InstanceId": "{{ InstanceId }}",
-        "InstanceType": { "Value": "{{ InstanceType }}" }
-      }
-    },
-    {
-      "name": "startInstance",
-      "action": "aws:changeInstanceState",
-      "inputs": {
-        "InstanceIds": ["{{ InstanceId }}"],
-        "DesiredState": "running"
-      }
-    }
-  ]
-}"#;
+/// Changes the instance type of a stopped EC2 instance. Authored in YAML, the format Amazon
+/// publishes this runbook in.
+pub const RESIZE_INSTANCE: &str = r#"schemaVersion: "0.3"
+description: Change the instance type of one Amazon EC2 instance.
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: "(Optional) The ARN of the role that allows Automation to perform the actions on your behalf."
+    default: ""
+  InstanceId:
+    type: String
+    description: "(Required) The id of the EC2 instance to resize."
+  InstanceType:
+    type: String
+    description: "(Required) The instance type the instance is changed to."
+mainSteps:
+  - name: stopInstance
+    action: "aws:changeInstanceState"
+    inputs:
+      InstanceIds:
+        - "{{ InstanceId }}"
+      DesiredState: stopped
+  - name: modifyInstanceAttribute
+    action: "aws:executeAwsApi"
+    inputs:
+      Service: ec2
+      Api: ModifyInstanceAttribute
+      InstanceId: "{{ InstanceId }}"
+      InstanceType:
+        Value: "{{ InstanceType }}"
+  - name: startInstance
+    action: "aws:changeInstanceState"
+    inputs:
+      InstanceIds:
+        - "{{ InstanceId }}"
+      DesiredState: running
+"#;
