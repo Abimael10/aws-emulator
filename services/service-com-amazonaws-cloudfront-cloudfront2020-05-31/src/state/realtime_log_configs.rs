@@ -276,6 +276,41 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         found.ok_or(RealtimeLogConfigAddress::NotFound)
     }
 
+    /// Whether `name` and `arn` address two DIFFERENT configurations, which is what makes a
+    /// pair of identifiers address none at all.
+    ///
+    /// A MUTATION addresses exactly one configuration, so a request carrying both
+    /// identifiers has to carry two that address the same record; a request carrying one, or
+    /// neither, cannot disagree with itself. The comparison is over the records the two
+    /// identifiers RESOLVE to, so an identifier the store holds nothing under disagrees with
+    /// one it does, while a pair that resolves to nothing at all agrees — that pair is the
+    /// NOT-FOUND condition, which the resolution below reports.
+    ///
+    /// The READS need no such agreement: nothing is written, and the documentation states the
+    /// precedence for them ("if you provide both, CloudFront uses the name to identify the
+    /// real-time log configuration to get"), which is what
+    /// [`Self::addressed_realtime_log_config`] applies. An identifier submitted as an empty
+    /// element names nothing there and here alike.
+    ///
+    /// ONE rule for every operation that MUTATES a configuration by either identifier, so the
+    /// update and the delete cannot drift apart; which SENTENCE each refuses with is its own.
+    pub fn realtime_log_config_identifiers_conflict(
+        &self,
+        name: Option<&str>,
+        arn: Option<&str>,
+    ) -> bool {
+        let name = name.filter(|name| !name.is_empty());
+        let arn = arn.filter(|arn| !arn.is_empty());
+        let (Some(name), Some(arn)) = (name, arn) else {
+            return false;
+        };
+        let by_name = self.realtime_log_config(name).map(|stored| &stored.name);
+        let by_arn = self
+            .realtime_log_config_by_arn(arn)
+            .map(|stored| &stored.name);
+        by_name != by_arn
+    }
+
     /// The real-time log configuration `arn` names, to be MUTATED: the record is the one
     /// [`Self::realtime_log_config_by_arn`] answers, reached the same way, for the edge's own
     /// sampling cursor ([`StoredRealtimeLogConfig::represents_next_request`]), which is the
@@ -319,14 +354,17 @@ pub enum RealtimeLogConfigAddress {
     NotFound,
 }
 
-/// The modelled `InvalidArgument` (HTTP 400) for a request that names neither identifier,
-/// so it addresses no real-time log configuration at all: "To get a real-time log
+/// The modelled `InvalidArgument` (HTTP 400) for a READ or a DELETE that names neither
+/// identifier, so it addresses no real-time log configuration at all: "To get a real-time log
 /// configuration, you can provide the configuration's name or its Amazon Resource Name
 /// (ARN). You must provide at least one."
 ///
 /// ONE CONSTANT for the condition rather than a sentence built from the request: what the
 /// refusal states is the CONSTRAINT on the parameters, which is a property of the
-/// operation and not of the call.
+/// operation and not of the call. The UPDATE words the same condition in its own sentence
+/// ([`realtime_log_config_identifier_invalid`]), and the distribution listing in a third
+/// ([`realtime_log_config_listing_identifier_required`]): each surface answers as the service
+/// answers it rather than one being reworded to match another.
 pub fn realtime_log_config_identifier_required() -> InvalidArgument {
     InvalidArgument {
         message: Some(REALTIME_LOG_CONFIG_IDENTIFIER_REQUIRED_MESSAGE.to_string()),
@@ -341,6 +379,49 @@ pub fn realtime_log_config_identifier_required() -> InvalidArgument {
 /// refusal of this condition reads the same.
 pub const REALTIME_LOG_CONFIG_IDENTIFIER_REQUIRED_MESSAGE: &str =
     "The parameter Name/ARN must be provided.";
+
+/// The modelled `InvalidArgument` (HTTP 400) for a DELETE whose `Name` and `ARN` each
+/// address a different stored configuration, so the pair addresses neither.
+///
+/// ONE constant for the condition, as [`realtime_log_config_identifier_required`] is for its
+/// own: what the refusal states is the CONSTRAINT on the two parameters — they have to refer
+/// to one configuration — which is a property of the operation rather than of the call, so
+/// neither identifier reaches the sentence.
+pub fn realtime_log_config_identifiers_disagree() -> InvalidArgument {
+    InvalidArgument {
+        message: Some(REALTIME_LOG_CONFIG_IDENTIFIERS_DISAGREE_MESSAGE.to_string()),
+    }
+}
+
+/// The message a delete whose two identifiers address different configurations is refused
+/// with, on the wire.
+///
+/// The WIRE text, as [`REALTIME_LOG_CONFIG_IDENTIFIER_REQUIRED_MESSAGE`] is for the delete's
+/// other identifier refusal: the service words this surface's two preconditions in two
+/// sentences, so a caller keying on the message can tell which one failed.
+pub const REALTIME_LOG_CONFIG_IDENTIFIERS_DISAGREE_MESSAGE: &str =
+    "The parameter Name/ARN must refer to the same realtime log config.";
+
+/// The modelled `InvalidArgument` (HTTP 400) for an UPDATE the pair of identifiers addresses
+/// no single configuration through — one that names neither, and one whose `Name` and `ARN`
+/// address different records.
+///
+/// The update words BOTH of its identifier preconditions in this one sentence, which is the
+/// service's own for this surface and not the delete's
+/// ([`REALTIME_LOG_CONFIG_IDENTIFIER_REQUIRED_MESSAGE`],
+/// [`REALTIME_LOG_CONFIG_IDENTIFIERS_DISAGREE_MESSAGE`]): each operation's refusal reads as
+/// the service's own rather than one being reworded to match the other. It names the two
+/// parameters and nothing of the request, so every refusal of it reads the same.
+pub fn realtime_log_config_identifier_invalid() -> InvalidArgument {
+    InvalidArgument {
+        message: Some(REALTIME_LOG_CONFIG_IDENTIFIER_INVALID_MESSAGE.to_string()),
+    }
+}
+
+/// The message an update the pair of identifiers addresses no configuration through is
+/// refused with, on the wire.
+pub const REALTIME_LOG_CONFIG_IDENTIFIER_INVALID_MESSAGE: &str =
+    "Invalid parameter received. Name/ARN";
 
 /// The modelled `InvalidArgument` (HTTP 400) for a DISTRIBUTION LISTING that names neither
 /// identifier, so it addresses no real-time log configuration at all: "You can specify the

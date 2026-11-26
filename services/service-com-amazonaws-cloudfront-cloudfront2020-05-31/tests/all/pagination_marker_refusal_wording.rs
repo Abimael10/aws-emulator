@@ -14,8 +14,7 @@
 //! The rows differ along what the rule generalises over:
 //!
 //! * the RESOURCE the listing enumerates, which is what the stated constraint names — a
-//!   distribution, an invalidation, an origin access control, an origin request policy, a
-//!   continuous deployment policy, a distribution tenant;
+//!   distribution, an invalidation, an origin access control, a distribution tenant;
 //! * whether the listing is SCOPED to a parent resource the request names (the invalidations
 //!   of one distribution, the distributions attached to one web ACL) or enumerates a whole
 //!   collection — a scoped listing holds an identifier the refusal could have leaked;
@@ -23,6 +22,11 @@
 //!   parameter beside a path label, and a member of a request document;
 //! * the FORM of the unusable marker (another word, a hyphenated name, a bare number, a long
 //!   run of one character), which the rule never reports back.
+//!
+//! A listing whose model binds a not-found error named for the resource kind its marker
+//! identifies states no constraint on the parameter at all — it reports the resource as not
+//! existing instead — so the policy listings are not rows here; each of those suites asserts
+//! that answer.
 
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -58,10 +62,6 @@ enum Listing {
     Invalidations(String),
     /// `ListOriginAccessControls`: a query parameter of a collection route.
     OriginAccessControls,
-    /// `ListOriginRequestPolicies`: a query parameter of a collection route.
-    OriginRequestPolicies,
-    /// `ListContinuousDeploymentPolicies`: a query parameter of a collection route.
-    ContinuousDeploymentPolicies,
     /// `ListDistributionTenants`: a member of the request DOCUMENT.
     DistributionTenants,
 }
@@ -93,20 +93,6 @@ impl Listing {
                 get(
                     router,
                     &format!("/{API_VERSION}/origin-access-control?Marker={marker}"),
-                )
-                .await
-            }
-            Self::OriginRequestPolicies => {
-                get(
-                    router,
-                    &format!("/{API_VERSION}/origin-request-policy?Marker={marker}"),
-                )
-                .await
-            }
-            Self::ContinuousDeploymentPolicies => {
-                get(
-                    router,
-                    &format!("/{API_VERSION}/continuous-deployment-policy?Marker={marker}"),
                 )
                 .await
             }
@@ -173,16 +159,6 @@ fn rows(distribution_id: String) -> Vec<(&'static str, Listing, &'static str)> {
             "an origin access control listing",
             Listing::OriginAccessControls,
             "Marker must be a valid CF origin access control Id",
-        ),
-        (
-            "an origin request policy listing",
-            Listing::OriginRequestPolicies,
-            "Marker must be a valid CF origin request policy Id",
-        ),
-        (
-            "a continuous deployment policy listing",
-            Listing::ContinuousDeploymentPolicies,
-            "Marker must be a valid CF continuous deployment policy Id",
         ),
         (
             "a distribution tenant listing, the marker in a document",

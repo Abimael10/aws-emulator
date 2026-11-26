@@ -18,8 +18,9 @@
 //! * `Status` narrows the answer to the stores whose own stored status is the one asked
 //!   for, so the statuses partition the unfiltered answer and a status no store carries
 //!   selects nothing;
-//! * a page size that names no page, and a `Marker` that is no key value store name, are
-//!   refused with `InvalidArgument` (400), and a refusal changes nothing;
+//! * a page size that names no page is refused with `InvalidArgument` (400), and a `Marker`
+//!   outside the pattern the API publishes for a pagination token with `MalformedXML` (400); a
+//!   refusal changes nothing;
 //! * a listing is a READ: it answers the same records again, mints nothing and moves no
 //!   store's status or version token.
 //!
@@ -36,8 +37,8 @@
 use std::time::Duration;
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    INVALID_KEY_VALUE_STORE_MARKER_MESSAGE, KVS_PROVISIONING_DELAY, KVS_STATUS_PROVISIONING,
-    KVS_STATUS_READY, MAX_ITEMS, MAX_ITEMS_INVALID_MESSAGE, MAX_KEY_VALUE_STORE_NAME,
+    KVS_PROVISIONING_DELAY, KVS_STATUS_PROVISIONING, KVS_STATUS_READY, MAX_ITEMS,
+    MAX_ITEMS_INVALID_MESSAGE, MAX_KEY_VALUE_STORE_NAME, PAGINATION_TOKEN_PATTERN,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -550,8 +551,9 @@ async fn assert_status_split(
     );
 }
 
-/// A page size that names no page, and a `Marker` that is no key value store name, are
-/// refused with `InvalidArgument` (400) — and a refusal leaves the listing answering
+/// A page size that names no page is refused with `InvalidArgument` (400), and a `Marker`
+/// outside the pattern the API publishes for a pagination token with `MalformedXML` (400)
+/// — and a refusal leaves the listing answering
 /// exactly what it answered before.
 #[tokio::test]
 async fn an_unusable_page_size_or_marker_is_refused() {
@@ -582,16 +584,21 @@ async fn an_unusable_page_size_or_marker_is_refused() {
         );
     }
 
-    // Rows: a marker one character past the name length bound, one drawing from a
-    // character the name pattern excludes, and one carrying a character class the pattern
-    // excludes entirely — none of them a resume point this listing ever handed out.
-    let markers = [
-        "x".repeat(MAX_KEY_VALUE_STORE_NAME + 1),
-        "orders.by.region".to_string(),
-        "store:1".to_string(),
+    // Rows: a marker carrying a character the published token pattern excludes — an
+    // exclamation mark, a hash, a comma — and one carrying a letter outside the ASCII word
+    // alphabet. Each is a value this API cannot read: `MalformedXML`, as every value outside a
+    // published constraint is answered (`crate::service::envelope`), stated in the frame every
+    // constraint violation of this API is stated in.
+    //
+    // The values travel percent-encoded, since `#` opens a URI fragment and `,` is reserved.
+    let markers: [(&str, &str); 4] = [
+        ("a!b", "a%21b"),
+        ("a#b", "a%23b"),
+        ("a,b", "a%2Cb"),
+        ("héllo", "h%C3%A9llo"),
     ];
-    for marker in markers {
-        let answer = list_stores(&router, &format!("?Marker={marker}")).await;
+    for (marker, encoded) in markers {
+        let answer = list_stores(&router, &format!("?Marker={encoded}")).await;
         assert_eq!(
             answer.status, 400,
             "case Marker={marker:?}: expected HTTP 400, got {} with {}",
@@ -599,15 +606,32 @@ async fn an_unusable_page_size_or_marker_is_refused() {
         );
         assert_eq!(
             answer.error_code(),
-            "InvalidArgument",
-            "case Marker={marker:?}: expected InvalidArgument, got {}",
+            "MalformedXML",
+            "case Marker={marker:?}: expected MalformedXML, got {}",
             answer.raw
+        );
+        let expected = format!(
+            "1 validation error detected: Value '{marker}' at 'nextToken' failed to satisfy \
+             constraint: Member must satisfy regular expression pattern: {PAGINATION_TOKEN_PATTERN}"
         );
         assert_eq!(
             answer.root().find_text("Message"),
-            Some(INVALID_KEY_VALUE_STORE_MARKER_MESSAGE),
-            "case Marker={marker:?}: expected the parameter's constraint, got {}",
+            Some(expected.as_str()),
+            "case Marker={marker:?}: expected the constraint the token broke, got {}",
             answer.raw
+        );
+    }
+
+    // A value the token pattern DOES admit is a position in the one name order, whether or not
+    // a store is held under it: this listing's model binds no not-found error at all, so a
+    // page resumes after it.
+    let past_length = "x".repeat(MAX_KEY_VALUE_STORE_NAME + 1);
+    for marker in ["orders.by.region", "store:1", past_length.as_str()] {
+        let answer = list_stores(&router, &format!("?Marker={marker}")).await;
+        assert_eq!(
+            answer.status, 200,
+            "case Marker={marker:?}: expected the listing to resume, got {} with {}",
+            answer.status, answer.raw
         );
     }
 

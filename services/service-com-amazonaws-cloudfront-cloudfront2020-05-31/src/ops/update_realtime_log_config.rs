@@ -175,6 +175,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let mut store = state.lock();
 
+        // A request carrying BOTH identifiers has to carry two that address the same
+        // record: a `Name` and an `ARN` addressing different configurations address none,
+        // which this operation words in its own one sentence for both of its identifier
+        // preconditions — not the delete's wording for the same conditions.
+        if store
+            .realtime_log_config_identifiers_conflict(input.name.as_deref(), input.arn.as_deref())
+        {
+            return Err(UpdateRealtimeLogConfigErrorModeled::InvalidArgument(
+                crate::state::realtime_log_config_identifier_invalid(),
+            )
+            .into());
+        }
+
         // Which configuration the request addresses, by the one rule every operation that
         // addresses one either way goes through. The record's own name is what keys it:
         // "You cannot update a real-time log configuration's Name or ARN."
@@ -184,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Ok(stored) => stored.name.clone(),
             Err(crate::state::RealtimeLogConfigAddress::NoIdentifier) => {
                 return Err(UpdateRealtimeLogConfigErrorModeled::InvalidArgument(
-                    crate::state::realtime_log_config_identifier_required(),
+                    crate::state::realtime_log_config_identifier_invalid(),
                 )
                 .into())
             }

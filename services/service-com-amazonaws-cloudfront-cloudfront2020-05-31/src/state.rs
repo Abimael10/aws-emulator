@@ -570,8 +570,10 @@ pub const MAX_TRUSTED_SIGNERS: usize = 5;
 /// groups its cache behaviours name.
 ///
 /// CloudFront's published quota is 4 key groups associated with a single distribution, and
-/// the modelled refusal names the same scope: "The number of key groups referenced by this
-/// distribution is more than the maximum allowed." A group several behaviours trust — the
+/// the model's own documentation of the refusal names the same scope: "The number of key
+/// groups referenced by this distribution is more than the maximum allowed." (what the
+/// service ANSWERS for it is [`TOO_MANY_KEY_GROUPS_ASSOCIATED_MESSAGE`]). A group several
+/// behaviours trust — the
 /// ordinary signed-URL configuration, where one key group is trusted by every behaviour — is
 /// ONE key group associated with the distribution, which is also the set the distribution
 /// reports as active, so the count is over the distinct ids ([`config_limit_exceeded`]).
@@ -4501,10 +4503,11 @@ pub use origin_access_control_pairing::*;
 mod config_members;
 pub use config_members::*;
 
-/// The ONE sentence every listing of this service refuses a `Marker` that is no resume point
-/// with: the constraint on the parameter, carrying nothing from the request and nothing from
-/// the store. A SUBMODULE for the same reason [`functions`] is one; `pub use` keeps every name
-/// reachable as `crate::state::<name>`.
+/// How every listing of this service refuses a `Marker` that is no resume point: the resource
+/// the marker names not existing, a pagination token the API cannot read, or the constraint on
+/// the parameter — each carrying nothing from the store, and nothing from the request but the
+/// value a constraint frame states. A SUBMODULE for the same reason [`functions`] is one;
+/// `pub use` keeps every name reachable as `crate::state::<name>`.
 mod pagination_markers;
 pub use pagination_markers::*;
 

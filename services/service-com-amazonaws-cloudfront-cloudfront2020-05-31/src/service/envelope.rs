@@ -68,13 +68,24 @@
 //! * every OTHER constraint the boundary reports on a member nested inside the payload — a
 //!   member that is absent, too short or long, outside its range or outside its pattern — is
 //!   a request document this API cannot read just as surely, so it too is `MalformedXML`
-//!   (400) under the sentence the boundary wrote. The one part of that sentence this service
-//!   states itself is a PATTERN, which it reports as the pattern it enforces rather than as
-//!   the one the model spells ([`stated_pattern`]).
+//!   (400) under the sentence the boundary wrote. Two parts of that sentence this service
+//!   states itself: a PATTERN, which it reports as the pattern it enforces rather than as the
+//!   one the model spells ([`stated_pattern`]), and the two numbers a `@range` clause states —
+//!   the value submitted and the bound declared — which are rendered in the member's own
+//!   numeric type, so a floating-point member's carry a decimal fraction
+//!   ([`with_fractional_bounds`]).
 //!
 //! All of them leave every other refusal exactly as the layer that made it rendered it: a
 //! request the boundary read, and an operation's refusal that reports another rule, are
 //! never second-guessed here.
+//!
+//! One restatement is about an OPERATION's own refusal rather than the boundary's: a value
+//! outside a constraint the model publishes for the SHAPE that value has to be, where the
+//! member it travelled in declares none, is a value this API cannot read exactly as one the
+//! boundary caught is — an operation states it in the same whole frame, the count of violations
+//! followed by the constraint one of them broke — so it is answered under the same
+//! `MalformedXML` (400) and keeps the sentence the operation wrote
+//! ([`refused_over_a_published_constraint`]).
 //!
 //! One refusal is made HERE rather than reworded: a request whose DOCUMENT is larger than
 //! this API reads is answered with the transport's `413` and no document at all
@@ -230,6 +241,37 @@ const VALUE_SET_MARKERS: [&str; 2] = [ENUM_VALUE_SET_MARKER, VALUE_SET_MARKER];
 /// pattern itself.
 const PATTERN_MARKER: &str = "Member must satisfy regular expression pattern: ";
 
+/// The markers a constraint refusal names the VALUE it is about with (`Value '<value>' at
+/// ...`), with the apostrophes as they stand raw and as the XML envelope escapes them.
+const VIOLATED_VALUE_MARKERS: [(&str, &str); 2] =
+    [("Value &apos;", "&apos;"), ("Value '", "'")];
+
+/// The two ways the request boundary states a `@range` bound (`Member must have value
+/// {greater,less} than or equal to <bound>`), up to the bound itself, which runs to the end of
+/// the clause.
+const RANGE_MARKERS: [&str; 2] = [
+    "Member must have value greater than or equal to ",
+    "Member must have value less than or equal to ",
+];
+
+/// The member paths whose leaf targets a FLOATING-POINT shape of this model, each as the tail
+/// of the path a refusal about it states.
+///
+/// A numeric constraint refusal reports the value submitted and the bound the model declares,
+/// and both are rendered in the member's OWN numeric type — a floating-point member's with a
+/// decimal fraction, an integral member's without one. The layer that writes the refusal
+/// renders an f64 that happens to be integral without its fraction, so the paths whose leaf is
+/// floating-point are restated ([`with_fractional_bounds`]) and no other refusal is touched.
+///
+/// The list is the model's: `ResponseHeadersPolicyServerTimingHeadersConfig$SamplingRate` is
+/// the one `@range`-constrained floating-point member this service has
+/// (`smithy_query(query="shape",shape="ResponseHeadersPolicyServerTimingHeadersConfig")` — a
+/// `double` with `@range` min 0.0 max 100.0), reached through whichever operation submits a
+/// `ResponseHeadersPolicyConfig`. The model's other floating-point member,
+/// `ContinuousDeploymentSingleWeightConfig$Weight` (a `float`), carries no `@range`, so no
+/// bound is ever reported for it.
+const FRACTIONAL_MEMBER_PATHS: [&str; 1] = [".serverTimingHeadersConfig.samplingRate"];
+
 /// The partition segment an ARN pattern the MODEL carries names, and the one the service
 /// reports for it.
 ///
@@ -259,12 +301,25 @@ const CONSTRAINED_MEMBER_MARKERS: [(&str, &str); 2] = [
 /// (`N validation errors detected: <clause>; <clause>`).
 const CLAUSE_SEPARATOR: &str = "; ";
 
+/// How any layer of this service states that a value is outside a constraint: the frame the
+/// request boundary states every one of them in (`... failed to satisfy constraint: <the
+/// constraint>`). What it identifies is the DEFECT — a value the API cannot read because it is
+/// outside a constraint the API publishes — whichever layer read the constraint, which is why
+/// an operation's own refusal in this frame is answered as the boundary's is.
+const CONSTRAINT_MARKER: &str = "failed to satisfy constraint:";
+
 /// How the request boundary counts ONE violation, and how the validator that reads a
 /// distribution configuration counts it: that validator writes the plural noun whatever the
 /// count is, which is the wording recorded for every refusal of that document
 /// (`crate::state::function_association_event_refusal` states the same count).
 const SINGULAR_COUNT: &str = "1 validation error detected:";
 const PLURAL_COUNT: &str = "1 validation errors detected:";
+
+/// How every clause of a refusal message OPENS: it states the value it is about first
+/// (`Value '<value>' at '<member>' failed to satisfy constraint: ...`), the one exception being
+/// the first clause, which the count prefix opens. It is what tells a clause BOUNDARY from the
+/// `; ` an escaped apostrophe inside a clause ends with ([`stated_clauses`]).
+const CLAUSE_OPENING: &str = "Value ";
 
 /// The step a member path takes from a structure into one of its members, which is what makes
 /// a path NESTED: a member reached through another member travelled inside the request's
@@ -506,11 +561,7 @@ fn refused_over_value_set(refusal: &str) -> bool {
 /// The member path a constraint refusal is about, as the layer that wrote it rendered it, or
 /// `None` when the refusal states no member at all.
 fn constrained_member_path(refusal: &str) -> Option<&str> {
-    let message = element_text(refusal, "Message")?;
-    CONSTRAINED_MEMBER_MARKERS.iter().find_map(|(open, close)| {
-        let after = message.split_once(open)?.1;
-        Some(after.split_once(close)?.0)
-    })
+    member_path(element_text(refusal, "Message")?)
 }
 
 /// Whether `refusal` is about a member NESTED inside the request's payload — a member reached
@@ -518,6 +569,25 @@ fn constrained_member_path(refusal: &str) -> Option<&str> {
 /// ([`MEMBER_PATH_STEP`]).
 fn refused_over_a_document_member(refusal: &str) -> bool {
     constrained_member_path(refusal).is_some_and(|path| path.contains(MEMBER_PATH_STEP))
+}
+
+/// Whether `refusal` is an OPERATION refusing a value outside a constraint the MODEL publishes
+/// for the shape that value has to be, rather than for the member it travelled in — which it
+/// states in the frame every constraint violation of this API is stated in, because that is
+/// what the defect is.
+///
+/// The WHOLE frame is what identifies it: the message OPENS with the count of violations
+/// ([`SINGULAR_COUNT`], [`PLURAL_COUNT`]) and goes on to state the constraint one of them broke
+/// ([`CONSTRAINT_MARKER`]). A refusal that merely CARRIES that text is not one — several of this
+/// service's refusals echo a value the caller submitted, and a caller who writes the marker into
+/// such a value must not thereby choose the code its refusal is answered under.
+fn refused_over_a_published_constraint(refusal: &str) -> bool {
+    element_text(refusal, "Message").is_some_and(|message| {
+        [SINGULAR_COUNT, PLURAL_COUNT]
+            .iter()
+            .any(|count| message.starts_with(count))
+            && message.contains(CONSTRAINT_MARKER)
+    })
 }
 
 /// The value sets this service publishes in an order of its own, each listed in that order.
@@ -670,12 +740,15 @@ fn is_same_value_set(stated: &[&str], values: &[&str]) -> bool {
 /// that reports the model's spelling tells the caller its value is wrong for a reason that is
 /// not the rule \u2014 that no other partition is allowed, and that the value has to match end to
 /// end \u2014 so the pattern is restated ([`stated_pattern`]) and nothing else of the refusal is.
+///
+/// The clauses it walks are the ones [`stated_clauses`] reads, so a pattern that carries the
+/// text a clause boundary is written with is restated whole rather than cut at it.
 fn with_stated_pattern(refusal: &str) -> String {
     let Some(message) = element_text(refusal, "Message") else {
         return refusal.to_string();
     };
-    let stated: Vec<String> = message
-        .split(CLAUSE_SEPARATOR)
+    let stated: Vec<String> = stated_clauses(message)
+        .iter()
         .map(|clause| match clause.split_once(PATTERN_MARKER) {
             Some((head, pattern)) => {
                 format!("{head}{PATTERN_MARKER}{}", stated_pattern(pattern))
@@ -704,6 +777,117 @@ fn with_stated_pattern(refusal: &str) -> String {
 fn stated_pattern(pattern: &str) -> String {
     service_common::validation::unanchored(pattern)
         .replace(MODELLED_ARN_PARTITION, STATED_ARN_PARTITION)
+}
+
+/// `refusal` with the value and the bound of every clause about a FLOATING-POINT member
+/// rendered as that member's own type renders a number: with a decimal fraction.
+///
+/// A numeric constraint refusal reports two numbers — the value submitted and the bound the
+/// model declares — and both belong to the MEMBER, whose type decides how a number of it is
+/// written. The layer that wrote the refusal renders an integral floating-point value and an
+/// integral bound without their fraction, which states the constraint of an integral member;
+/// the members this holds for are the model's own ([`FRACTIONAL_MEMBER_PATHS`]), and every
+/// other clause is handed back exactly as it stands.
+fn with_fractional_bounds(refusal: &str) -> String {
+    let Some(message) = element_text(refusal, "Message") else {
+        return refusal.to_string();
+    };
+    let clauses: Vec<String> = stated_clauses(message)
+        .iter()
+        .map(|clause| as_fractional(clause))
+        .collect();
+    let restated = clauses.join(CLAUSE_SEPARATOR);
+    if restated == message {
+        return refusal.to_string();
+    }
+    refusal.replacen(
+        &format!("<Message>{message}</Message>"),
+        &format!("<Message>{restated}</Message>"),
+        1,
+    )
+}
+
+/// The CLAUSES of `message`, each a whole constraint the request broke.
+///
+/// The layer that writes a refusal joins its clauses with [`CLAUSE_SEPARATOR`], and an
+/// XML-escaped apostrophe (`&apos;`) ENDS in the semicolon that separator opens with — so a
+/// split on the separator alone cuts one clause into pieces wherever the message names a
+/// member or echoes a value. Every clause opens by stating the value it is about
+/// ([`CLAUSE_OPENING`]), so a piece that does not open one belongs to the clause before it.
+fn stated_clauses(message: &str) -> Vec<String> {
+    let mut clauses: Vec<String> = Vec::new();
+    for piece in message.split(CLAUSE_SEPARATOR) {
+        match clauses.last_mut() {
+            Some(last) if !piece.starts_with(CLAUSE_OPENING) => {
+                last.push_str(CLAUSE_SEPARATOR);
+                last.push_str(piece);
+            }
+            _ => clauses.push(piece.to_string()),
+        }
+    }
+    clauses
+}
+
+/// Whether `clause` is about a member whose shape is floating-point
+/// ([`FRACTIONAL_MEMBER_PATHS`]).
+fn names_a_fractional_member(clause: &str) -> bool {
+    member_path(clause).is_some_and(|path| {
+        FRACTIONAL_MEMBER_PATHS
+            .iter()
+            .any(|member| path.ends_with(member))
+    })
+}
+
+/// `clause` with the value it echoes and the bound it reports written as decimal fractions —
+/// or exactly as it stands when it is about a member of any other type.
+fn as_fractional(clause: &str) -> String {
+    if !names_a_fractional_member(clause) {
+        return clause.to_string();
+    }
+    let stated = with_fractional_value(clause).unwrap_or_else(|| clause.to_string());
+    with_fractional_bound(&stated).unwrap_or(stated)
+}
+
+/// `clause` with the VALUE it echoes written as a decimal fraction, or `None` when it echoes
+/// none or when that value already carries one.
+fn with_fractional_value(clause: &str) -> Option<String> {
+    for (open, close) in VIOLATED_VALUE_MARKERS {
+        let Some((head, rest)) = clause.split_once(open) else {
+            continue;
+        };
+        let (value, tail) = rest.split_once(close)?;
+        return fractional(value).map(|stated| format!("{head}{open}{stated}{close}{tail}"));
+    }
+    None
+}
+
+/// `clause` with the BOUND it reports written as a decimal fraction, or `None` when it reports
+/// none or when that bound already carries one. One clause states one constraint, so the bound
+/// runs to the end of it.
+fn with_fractional_bound(clause: &str) -> Option<String> {
+    for marker in RANGE_MARKERS {
+        let Some((head, bound)) = clause.split_once(marker) else {
+            continue;
+        };
+        return fractional(bound).map(|stated| format!("{head}{marker}{stated}"));
+    }
+    None
+}
+
+/// `number` with a decimal fraction, or `None` when it is already written with one — or is no
+/// plain decimal integer, which is the only form a fraction can be added to.
+fn fractional(number: &str) -> Option<String> {
+    let digits = number.strip_prefix('-').unwrap_or(number);
+    (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| format!("{number}.0"))
+}
+
+/// The member path a constraint CLAUSE is about, or `None` when it states no member.
+fn member_path(clause: &str) -> Option<&str> {
+    CONSTRAINED_MEMBER_MARKERS.iter().find_map(|(open, close)| {
+        let after = clause.split_once(open)?.1;
+        Some(after.split_once(close)?.0)
+    })
 }
 
 /// `refusal` answered under `code`, with everything else the boundary rendered — its
@@ -788,6 +972,17 @@ fn restated(req: &RtRequest, resp: &RtResponse) -> Option<RtResponse> {
         if refused_over_value_set(refusal) {
             return Some(recoded(&with_stated_enum_values(refusal), code, MALFORMED_XML));
         }
+        // A value outside a constraint the MODEL publishes for the shape that value has to be
+        // is a value this API cannot read, whichever layer read the constraint: the boundary
+        // refuses one against a constraint the schema carries and this service answers
+        // `MalformedXML` for it below, so an operation that reads such a constraint itself —
+        // a listing whose `Marker` is a pagination token the API publishes a pattern for,
+        // which the member it travels in does not declare — reaches the same answer rather
+        // than a second one. The sentence states the member, the value and the constraint it
+        // broke, so the code alone is restated.
+        if refused_over_a_published_constraint(refusal) {
+            return Some(recoded(refusal, code, MALFORMED_XML));
+        }
         return None;
     }
 
@@ -851,7 +1046,7 @@ fn restated(req: &RtRequest, resp: &RtResponse) -> Option<RtResponse> {
     // another member, so it is not a defect of the document and keeps the boundary's wording.
     if refused_over_a_document_member(refusal) {
         return Some(recoded(
-            &with_stated_pattern(refusal),
+            &with_stated_pattern(&with_fractional_bounds(refusal)),
             FRAMEWORK_REFUSAL_CODE,
             MALFORMED_XML,
         ));
@@ -1118,6 +1313,233 @@ mod tests {
         assert_eq!(
             actual, other,
             "case \"another constraint\": expected the refusal left alone, got {actual:?}"
+        );
+    }
+
+    /// Which refusals the published-constraint restatement claims: the WHOLE frame — the count
+    /// of violations, then the constraint one of them broke — and not a message that merely
+    /// carries that text inside a value the caller submitted.
+    #[test]
+    fn only_a_whole_constraint_frame_is_answered_as_an_unreadable_value() {
+        // (case, the message an operation wrote, whether its code is restated)
+        let rows: [(&str, String, bool); 4] = [
+            (
+                "an operation stating a constraint the model publishes",
+                format!(
+                    "{SINGULAR_COUNT} Value &apos;a!b&apos; at &apos;nextToken&apos; failed to \
+                     satisfy constraint: Member must satisfy regular expression pattern: [a-z]*"
+                ),
+                true,
+            ),
+            (
+                "the same frame with the plural count a document walk writes",
+                format!(
+                    "{PLURAL_COUNT} Value &apos;x&apos; at &apos;a.b&apos; failed to satisfy \
+                     constraint: Member must satisfy value set: [one, two]"
+                ),
+                true,
+            ),
+            (
+                "a refusal echoing the marker inside a submitted value",
+                "Marker failed to satisfy constraint: is not a marker this listing handed out"
+                    .to_string(),
+                false,
+            ),
+            (
+                "a refusal stating a rule of its own",
+                "The parameter Name/ARN must be provided.".to_string(),
+                false,
+            ),
+        ];
+
+        for (case, message, restated) in rows {
+            let refusal = format!(
+                "<ErrorResponse xmlns=\"{XML_NAMESPACE}\"><Error><Type>Sender</Type>\
+                 <Code>{INVALID_ARGUMENT}</Code><Message>{message}</Message></Error>\
+                 </ErrorResponse>"
+            );
+            assert_eq!(
+                refused_over_a_published_constraint(&refusal),
+                restated,
+                "case {case:?}: expected the refusal to be read as a published-constraint \
+                 violation: {restated}"
+            );
+        }
+    }
+
+    /// Which members [`FRACTIONAL_MEMBER_PATHS`] has to cover is the MODEL's answer, not this
+    /// catalogue's: a member whose `@range` is read against a floating-point shape. Reading it
+    /// back off the model is what fails this suite when the model gains another one, so the
+    /// catalogue cannot fall silently out of step with the types it is derived from.
+    #[test]
+    fn every_range_constrained_floating_point_member_of_the_model_is_restated() {
+        const MODEL: &str =
+            include_str!("../../smithy-model/com-amazonaws-cloudfront-cloudfront2020-05-31.json");
+        const RANGE_TRAIT: &str = "smithy.api#range";
+
+        let model: serde_json::Value =
+            serde_json::from_str(MODEL).expect("this service's model is readable JSON");
+        let shapes = model["shapes"]
+            .as_object()
+            .expect("a Smithy model declares its shapes");
+
+        // The floating-point shapes of the model, by shape id.
+        let floating: Vec<&str> = shapes
+            .iter()
+            .filter(|(_, shape)| matches!(shape["type"].as_str(), Some("double" | "float")))
+            .map(|(id, _)| id.as_str())
+            .collect();
+
+        // Every member targeting one of them whose range is declared — on the member itself or
+        // on the shape it targets — named as a refusal names a member: in lowerCamel.
+        let mut constrained: Vec<String> = Vec::new();
+        for shape in shapes.values() {
+            let Some(members) = shape["members"].as_object() else {
+                continue;
+            };
+            for (member, declaration) in members {
+                let Some(target) = declaration["target"].as_str() else {
+                    continue;
+                };
+                if !floating.contains(&target) {
+                    continue;
+                }
+                if declaration["traits"][RANGE_TRAIT].is_object()
+                    || shapes[target]["traits"][RANGE_TRAIT].is_object()
+                {
+                    let mut characters = member.chars();
+                    let stated = match characters.next() {
+                        Some(first) => {
+                            first.to_lowercase().collect::<String>() + characters.as_str()
+                        }
+                        None => continue,
+                    };
+                    constrained.push(stated);
+                }
+            }
+        }
+        assert!(
+            !constrained.is_empty(),
+            "the model must declare at least one range-constrained floating-point member for \
+             this rule to be about anything"
+        );
+
+        for member in &constrained {
+            assert!(
+                FRACTIONAL_MEMBER_PATHS
+                    .iter()
+                    .any(|path| path.ends_with(&format!(".{member}"))),
+                "case {member:?}: the model declares a range-constrained floating-point member \
+                 no entry of {FRACTIONAL_MEMBER_PATHS:?} covers, so its refusal would state an \
+                 integral value and bound"
+            );
+        }
+    }
+
+    /// The two numbers a `@range` clause states are written as the member's own type writes a
+    /// number: a floating-point member's with a decimal fraction, every other member's exactly
+    /// as the layer that wrote the refusal rendered it.
+    #[test]
+    fn a_range_clause_about_a_double_states_both_numbers_as_doubles() {
+        // (case, the member path the clause is about, the value, the requirement, the bound,
+        // the sentence this service states)
+        let rows: [(&str, &str, &str, &str, &str, &str); 4] = [
+            (
+                "an integral value past a double member's maximum",
+                "responseHeadersPolicyConfig.serverTimingHeadersConfig.samplingRate",
+                "150",
+                "less",
+                "100",
+                "1 validation error detected: Value &apos;150.0&apos; at \
+                 &apos;responseHeadersPolicyConfig.serverTimingHeadersConfig.samplingRate&apos; \
+                 failed to satisfy constraint: Member must have value less than or equal to 100.0",
+            ),
+            (
+                "an integral value below a double member's minimum",
+                "responseHeadersPolicyConfig.serverTimingHeadersConfig.samplingRate",
+                "-2",
+                "greater",
+                "0",
+                "1 validation error detected: Value &apos;-2.0&apos; at \
+                 &apos;responseHeadersPolicyConfig.serverTimingHeadersConfig.samplingRate&apos; \
+                 failed to satisfy constraint: Member must have value greater than or equal to \
+                 0.0",
+            ),
+            (
+                "a value already written with a fraction",
+                "responseHeadersPolicyConfig.serverTimingHeadersConfig.samplingRate",
+                "100.5",
+                "less",
+                "100.0",
+                "1 validation error detected: Value &apos;100.5&apos; at \
+                 &apos;responseHeadersPolicyConfig.serverTimingHeadersConfig.samplingRate&apos; \
+                 failed to satisfy constraint: Member must have value less than or equal to 100.0",
+            ),
+            (
+                "a range clause about a member of an integral type",
+                "distributionConfig.cacheBehaviors.items.1.member.minTTL",
+                "7",
+                "less",
+                "3",
+                "1 validation error detected: Value &apos;7&apos; at \
+                 &apos;distributionConfig.cacheBehaviors.items.1.member.minTTL&apos; failed to \
+                 satisfy constraint: Member must have value less than or equal to 3",
+            ),
+        ];
+
+        for (case, path, value, requirement, bound, expected) in rows {
+            let clause = format!(
+                "1 validation error detected: Value &apos;{value}&apos; at &apos;{path}&apos; \
+                 failed to satisfy constraint: Member must have value {requirement} than or \
+                 equal to {bound}"
+            );
+            assert_eq!(
+                member_path(&clause),
+                Some(path),
+                "case {case:?}: expected the clause to name the member {path:?}"
+            );
+            let refusal = format!(
+                "<ErrorResponse xmlns=\"{XML_NAMESPACE}\"><Error><Type>Sender</Type>\
+                 <Code>{FRAMEWORK_REFUSAL_CODE}</Code><Message>{clause}</Message>\
+                 </Error></ErrorResponse>"
+            );
+            let stated = with_fractional_bounds(&refusal);
+            let actual = element_text(&stated, "Message").unwrap_or_default();
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected the sentence {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// A message that states SEVERAL constraints is read clause by clause — the escaped
+    /// apostrophes inside a clause end in the semicolon the clause separator opens with, so a
+    /// clause boundary is where the next clause opens — and only the clauses about a
+    /// floating-point member are restated.
+    #[test]
+    fn a_message_of_several_clauses_restates_only_the_double_members_clauses() {
+        let message = "1 validation errors detected: Value &apos;200&apos; at \
+                       &apos;responseHeadersPolicyConfig.serverTimingHeadersConfig.samplingRate\
+                       &apos; failed to satisfy constraint: Member must have value less than or \
+                       equal to 100; Value &apos;k&apos; at &apos;tags.items.1.member.key&apos; \
+                       failed to satisfy constraint: Member must have length greater than or \
+                       equal to 2";
+        let refusal = format!(
+            "<ErrorResponse xmlns=\"{XML_NAMESPACE}\"><Error><Type>Sender</Type>\
+             <Code>{FRAMEWORK_REFUSAL_CODE}</Code><Message>{message}</Message>\
+             </Error></ErrorResponse>"
+        );
+        let expected = "1 validation errors detected: Value &apos;200.0&apos; at \
+                        &apos;responseHeadersPolicyConfig.serverTimingHeadersConfig.samplingRate\
+                        &apos; failed to satisfy constraint: Member must have value less than or \
+                        equal to 100.0; Value &apos;k&apos; at &apos;tags.items.1.member.key\
+                        &apos; failed to satisfy constraint: Member must have length greater \
+                        than or equal to 2";
+        let stated = with_fractional_bounds(&refusal);
+        let actual = element_text(&stated, "Message").unwrap_or_default();
+        assert_eq!(
+            actual, expected,
+            "case \"two clauses\": expected the sentence {expected:?}, got {actual:?}"
         );
     }
 

@@ -190,20 +190,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(SystemTime::now());
 
         // "set this field's value to the value of NextMarker from the current page's
-        // response": the marker is a cache policy id this service handed out. A value that
-        // is not one was never a resume point (`InvalidArgument`), and one that is but names
-        // no policy — neither a stored one nor a published managed one — is a policy that
-        // does not exist, which is the reason this listing models `NoSuchCachePolicy`.
+        // response": the marker is the CACHE POLICY the previous page ended at, named by its
+        // id. A marker that resolves to no policy — neither a stored one nor a published
+        // managed one — is a policy that does not exist, which is the reason this listing
+        // models `NoSuchCachePolicy`. The FORM of the value is no separate condition: this
+        // service publishes no form for the ids it mints, so a value that could never have
+        // been one resolves to no policy just as surely as one that could. What the sentence
+        // states is that the request's MARKER is no policy of this account, which is what the
+        // caller has to fix — not that some policy it named is absent.
         if let Some(marker) = crate::state::resume_marker(input.marker.as_deref()) {
-            if !crate::state::is_minted_uuid(marker) {
-                return Err(ListCachePoliciesErrorModeled::InvalidArgument(
-                    crate::state::invalid_cache_policy_marker(),
-                )
-                .into());
-            }
             if store.readable_cache_policy(marker).is_none() {
                 return Err(ListCachePoliciesErrorModeled::NoSuchCachePolicy(
-                    crate::state::no_such_cache_policy(),
+                    NoSuchCachePolicy {
+                        message: Some(crate::state::invalid_resource_marker_message(
+                            crate::state::CACHE_POLICY_MARKER_RESOURCE,
+                        )),
+                    },
                 )
                 .into());
             }

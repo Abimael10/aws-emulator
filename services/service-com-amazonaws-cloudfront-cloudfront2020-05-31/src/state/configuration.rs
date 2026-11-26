@@ -834,14 +834,19 @@ pub const TOO_MANY_TRUSTED_SIGNERS_MESSAGE: &str =
 
 /// The sentence CloudFront refuses a configuration associating more key groups with the
 /// distribution than the quota admits with — the modelled
-/// `TooManyKeyGroupsAssociatedToDistribution`, worded as the model documents that error shape
-/// ("The number of key groups referenced by this distribution is more than the maximum
-/// allowed.") and fixed for the reason [`TOO_MANY_CACHE_BEHAVIORS_MESSAGE`] is.
+/// `TooManyKeyGroupsAssociatedToDistribution`.
+///
+/// The WIRE text, which differs from the sentence the MODEL's documentation of the error
+/// shape uses ("The number of key groups referenced by this distribution is more than the
+/// maximum allowed."): that one documents the condition, this one is what the service
+/// answers. It states what the request would do to the account's quota rather than any count,
+/// and is fixed for the reason [`TOO_MANY_CACHE_BEHAVIORS_MESSAGE`] is. Do not "correct" this
+/// constant to the documentation sentence.
 ///
 /// NOT [`TOO_MANY_KEY_GROUPS_MESSAGE`], which is the ACCOUNT's own key-group quota.
 pub const TOO_MANY_KEY_GROUPS_ASSOCIATED_MESSAGE: &str =
-    "The number of key groups referenced by this distribution is more than the maximum \
-     allowed.";
+    "Processing your request will cause you to exceed the maximum number of key groups that \
+     can be associated to a distribution.";
 
 /// Every cache behaviour of `config` as the view that names the list wrappers they share:
 /// the default cache behaviour first, then the ordered ones.
@@ -2503,25 +2508,6 @@ pub fn key_value_store_in_use(name: &str) -> crate::ops::types::CannotDeleteEnti
     }
 }
 
-/// The modelled `InvalidArgument` (HTTP 400) for a `ListKeyValueStores` `Marker` that is
-/// no resume point this service handed out.
-///
-/// ONE CONSTANT for the condition, for the same reason [`invalid_public_key_marker`] is
-/// one: what the refusal states is the CONSTRAINT on the parameter — a marker is a key
-/// value store name — which is a property of the parameter rather than of the value
-/// submitted, so nothing from the request belongs in the text.
-pub fn invalid_key_value_store_marker() -> crate::ops::types::InvalidArgument {
-    crate::ops::types::InvalidArgument {
-        message: Some(INVALID_KEY_VALUE_STORE_MARKER_MESSAGE.to_string()),
-    }
-}
-
-/// The message `ListKeyValueStores` refuses an unusable `Marker` with: the constraint on
-/// the parameter, worded as [`INVALID_PUBLIC_KEY_MARKER_MESSAGE`] words the same
-/// constraint on the other listing's marker.
-pub const INVALID_KEY_VALUE_STORE_MARKER_MESSAGE: &str =
-    "Marker must be a valid CF key value store Name";
-
 /// The modelled `EntityNotFound` (HTTP 404) for a distribution id no stored distribution
 /// carries, for the operations whose model names `EntityNotFound` rather than
 /// `NoSuchDistribution` for that condition.
@@ -3065,25 +3051,6 @@ pub fn unresolved_response_headers_policy_id(id: &str) -> NoSuchResponseHeadersP
 /// the two together so neither can drift.
 pub const RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE: &str = "Id format is invalid";
 
-/// The modelled `InvalidArgument` (HTTP 400) for a `ListResponseHeadersPolicies` `Marker`
-/// that is no resume point this service handed out.
-///
-/// ONE CONSTANT for the condition, for the same reason [`invalid_cache_policy_marker`] is
-/// one: what the refusal states is the CONSTRAINT on the parameter — a marker is a response
-/// headers policy id — which is a property of the parameter rather than of the value
-/// submitted, so nothing from the request belongs in the text.
-pub fn invalid_response_headers_policy_marker() -> crate::ops::types::InvalidArgument {
-    crate::ops::types::InvalidArgument {
-        message: Some(INVALID_RESPONSE_HEADERS_POLICY_MARKER_MESSAGE.to_string()),
-    }
-}
-
-/// The message `ListResponseHeadersPolicies` refuses an unusable `Marker` with, in the form
-/// this service states the constraint in ([`INVALID_CACHE_POLICY_MARKER_MESSAGE`] states the
-/// same one for the cache policy family).
-pub const INVALID_RESPONSE_HEADERS_POLICY_MARKER_MESSAGE: &str =
-    "Marker must be a valid CF response headers policy Id";
-
 /// The modelled `IllegalUpdate` (HTTP 400) for an update that would move a resource's
 /// `CallerReference` onto another value.
 ///
@@ -3449,24 +3416,6 @@ pub fn no_such_cache_policy() -> NoSuchCachePolicy {
 /// the cache policy surface holds it to — and the shape's own documentation states it in its
 /// shorter form.
 pub const NO_SUCH_CACHE_POLICY_MESSAGE: &str = "The specified cache policy does not exist.";
-
-/// The modelled `InvalidArgument` (HTTP 400) for a `ListCachePolicies` `Marker` that is no
-/// resume point this service handed out.
-///
-/// ONE CONSTANT for the condition, for the same reason [`invalid_public_key_marker`] is one:
-/// what the refusal states is the CONSTRAINT on the parameter — a marker is a cache policy
-/// id — which is a property of the parameter rather than of the value submitted, so nothing
-/// from the request belongs in the text.
-pub fn invalid_cache_policy_marker() -> crate::ops::types::InvalidArgument {
-    crate::ops::types::InvalidArgument {
-        message: Some(INVALID_CACHE_POLICY_MARKER_MESSAGE.to_string()),
-    }
-}
-
-/// The message `ListCachePolicies` refuses an unusable `Marker` with: the constraint on the
-/// parameter, worded as [`INVALID_PUBLIC_KEY_MARKER_MESSAGE`] words the same constraint on
-/// the other listing's marker.
-pub const INVALID_CACHE_POLICY_MARKER_MESSAGE: &str = "Marker must be a valid CF cache policy Id";
 
 /// The modelled `CachePolicyInUse` (HTTP 409) for a delete of a policy a cache behaviour
 /// still attaches.

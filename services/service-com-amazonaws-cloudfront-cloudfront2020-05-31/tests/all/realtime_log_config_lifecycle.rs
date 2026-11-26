@@ -45,7 +45,8 @@
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     KINESIS_STREAM_TYPE, MAX_REALTIME_LOG_CONFIG_END_POINTS, MAX_REALTIME_LOG_CONFIG_FIELDS,
     MAX_SAMPLING_RATE, MIN_SAMPLING_RATE, NO_SUCH_REALTIME_LOG_CONFIG_MESSAGE,
-    REALTIME_LOG_CONFIG_ALREADY_EXISTS_MESSAGE, REALTIME_LOG_CONFIG_IDENTIFIER_REQUIRED_MESSAGE,
+    REALTIME_LOG_CONFIG_ALREADY_EXISTS_MESSAGE, REALTIME_LOG_CONFIG_IDENTIFIER_INVALID_MESSAGE,
+    REALTIME_LOG_CONFIG_IDENTIFIER_REQUIRED_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -1311,8 +1312,8 @@ async fn an_update_is_refused_by_the_same_rules_as_a_create() {
     );
     let message = unaddressed.root().find_text("Message").unwrap_or_default();
     assert_eq!(
-        message, REALTIME_LOG_CONFIG_IDENTIFIER_REQUIRED_MESSAGE,
-        "case no identifier: expected the served missing-identifier message, got \
+        message, REALTIME_LOG_CONFIG_IDENTIFIER_INVALID_MESSAGE,
+        "case no identifier: expected the update's own missing-identifier message, got \
          {message:?} in {}",
         unaddressed.raw
     );

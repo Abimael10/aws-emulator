@@ -816,27 +816,23 @@ async fn walking_the_pages_enumerates_every_policy_once() {
     }
 }
 
-/// The refusals the listing models: a page size that names no page, and a `Marker` that
-/// is no resume point this service handed out.
+/// The refusals the listing models: a page size that names no page is `InvalidArgument`
+/// (400), and a `Marker` that resolves to no policy is `NoSuchContinuousDeploymentPolicy`
+/// (404) whatever form the value takes — the marker is the policy the previous page ended at,
+/// and the service publishes no form for the ids it mints.
 #[tokio::test]
 async fn unusable_list_arguments_are_refused() {
     let router = emulator();
     let table = staged(&router, "listargs", policy_table()).await;
     create_all(&router, &table[..2]).await;
 
-    // Rows: a page size that is no page, one that is no integer, and markers of every
-    // shape that is not a policy id this listing issued.
+    // Rows: a page size that is no page, and one that is no integer.
     for (case, query) in [
         ("a negative page size", "?MaxItems=-3"),
         ("a page size that is no integer", "?MaxItems=not-a-number"),
-        ("a marker that is no policy id", "?Marker=not-an-id"),
         (
-            "a marker of another resource's id shape",
-            "?Marker=E1111111111111",
-        ),
-        (
-            "an unusable marker beside a usable page size",
-            "?MaxItems=2&Marker=not-an-id",
+            "an unusable page size beside a usable marker",
+            "?MaxItems=-3&Marker=00000000-0000-0000-0000-000000000000",
         ),
     ] {
         let answer = list_policies(&router, query).await;
@@ -853,11 +849,13 @@ async fn unusable_list_arguments_are_refused() {
         );
     }
 
-    // A marker shaped like a policy id that no policy holds names a policy that does not
-    // exist — the one resource this listing can be about.
+    // A marker that resolves to no policy names a policy that does not exist — the one
+    // resource this listing can be about — of whatever shape the value takes.
     for (case, marker) in [
         ("a UUID never minted", "00000000-0000-0000-0000-000000000000"),
         ("another UUID never minted", "ffffffff-ffff-ffff-ffff-ffffffffffff"),
+        ("a marker that is no policy id", "not-an-id"),
+        ("a marker of another resource's id shape", "E1111111111111"),
     ] {
         let answer = list_policies(&router, &format!("?Marker={marker}")).await;
         assert_eq!(

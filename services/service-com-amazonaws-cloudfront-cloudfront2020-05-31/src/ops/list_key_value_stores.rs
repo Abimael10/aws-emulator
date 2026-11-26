@@ -171,20 +171,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // constrains this parameter to no value set at all.
         let wanted_status = input.status.as_deref();
 
-        // "The marker associated with the key value stores list": the resume point this
-        // listing hands out is the NAME the previous page ended at, and the name of a key
-        // value store is a `KeyValueStoreName`, so a value outside that constraint was
-        // never a resume point this service issued (`InvalidArgument`). A well-formed name
-        // the store does not hold is still a position in the one name order, so a page
-        // resumes after it: this listing models no not-found refusal. Refused BEFORE the
-        // store is reached, as the sibling listings refuse their own markers.
-        if crate::state::resume_marker(input.marker.as_deref())
-            .is_some_and(|marker| !crate::state::is_key_value_store_name(marker))
-        {
-            return Err(ListKeyValueStoresErrorModeled::InvalidArgument(
-                crate::state::invalid_key_value_store_marker(),
-            )
-            .into());
+        // "The marker associated with the key value stores list": this listing's resume point
+        // is a pagination TOKEN rather than an identifier of one of the stores, and the API
+        // publishes the characters a token may be written in — a constraint the member it
+        // travels in does not declare, so this is where it is read. A value outside it is a
+        // value this API cannot read, which it answers under the code every such value is
+        // answered with (`crate::service::envelope`). Read BEFORE the store is reached, as the
+        // sibling listings read their own markers.
+        if let Some(marker) = crate::state::resume_marker(input.marker.as_deref()) {
+            if !crate::state::is_pagination_token(marker) {
+                return Err(ListKeyValueStoresErrorModeled::InvalidArgument(InvalidArgument {
+                    message: Some(crate::state::unreadable_pagination_token_message(marker)),
+                })
+                .into());
+            }
         }
 
         let mut store = state.lock();

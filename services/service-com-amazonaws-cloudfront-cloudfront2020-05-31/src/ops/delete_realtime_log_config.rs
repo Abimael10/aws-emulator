@@ -183,6 +183,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let mut store = state.lock();
 
+        // A request carrying BOTH identifiers has to carry two that address the same
+        // record: a `Name` and an `ARN` addressing different configurations address none.
+        // This operation words that precondition and the missing-identifier one in two
+        // sentences, so a caller keying on the message can tell which one failed.
+        if store
+            .realtime_log_config_identifiers_conflict(input.name.as_deref(), input.arn.as_deref())
+        {
+            return Err(DeleteRealtimeLogConfigErrorModeled::InvalidArgument(
+                crate::state::realtime_log_config_identifiers_disagree(),
+            )
+            .into());
+        }
+
         // Which configuration the request addresses, by the one rule every operation that
         // addresses one either way goes through.
         let (name, arn) = match store

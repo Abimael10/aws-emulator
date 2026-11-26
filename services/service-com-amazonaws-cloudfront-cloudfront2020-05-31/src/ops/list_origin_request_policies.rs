@@ -200,27 +200,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(SystemTime::now());
 
         // "To get the next page of the list, set this field's value to the value of
-        // NextMarker from the current page's response": the marker is a resume point this
-        // service handed out — an origin request policy id — so a value outside that shape
-        // was never one (`InvalidArgument`), and one that is but names no policy, in neither
-        // the account's records nor the catalog AWS published, is a policy that does not
-        // exist, which is the resource this listing is about and the reason it models
-        // `NoSuchOriginRequestPolicy`.
+        // NextMarker from the current page's response": the marker is the ORIGIN REQUEST
+        // POLICY the previous page ended at, named by its id. A marker that resolves to no
+        // policy — in neither the account's records nor the catalog AWS published — is a
+        // policy that does not exist, which is the resource this listing is about and the
+        // reason it models `NoSuchOriginRequestPolicy`. The FORM of the value is no separate
+        // condition: this service publishes no form for the ids it mints, so a value that
+        // could never have been one resolves to no policy just as surely as one that could.
+        // What the sentence states is that the request's MARKER is no policy of this account,
+        // which is what the caller has to fix — not that some policy it named is absent.
         if let Some(marker) = crate::state::resume_marker(input.marker.as_deref()) {
-            if !crate::state::is_minted_uuid(marker) {
-                return Err(ListOriginRequestPoliciesErrorModeled::InvalidArgument(
-                    InvalidArgument {
-                        message: Some(crate::state::invalid_marker_message(
-                            crate::state::ORIGIN_REQUEST_POLICY_MARKER_KIND,
-                        )),
-                    },
-                )
-                .into());
-            }
             if store.readable_origin_request_policy(marker).is_none() {
                 return Err(
                     ListOriginRequestPoliciesErrorModeled::NoSuchOriginRequestPolicy(
-                        crate::state::no_such_origin_request_policy(),
+                        NoSuchOriginRequestPolicy {
+                            message: Some(crate::state::invalid_resource_marker_message(
+                                crate::state::ORIGIN_REQUEST_POLICY_MARKER_RESOURCE,
+                            )),
+                        },
                     )
                     .into(),
                 );

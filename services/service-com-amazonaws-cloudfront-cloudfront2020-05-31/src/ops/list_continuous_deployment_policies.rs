@@ -172,25 +172,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(SystemTime::now());
 
         // "set this field's value to the value of NextMarker from the current page's
-        // response": the marker is a policy id this service handed out. A value that is
-        // not one was never a resume point (`InvalidArgument`), and one that is but names
-        // no stored policy is a policy that does not exist — the only resource this
-        // listing can be about, and the reason it models `NoSuchContinuousDeploymentPolicy`.
+        // response": the marker is the POLICY the previous page ended at, named by its id. A
+        // marker that resolves to no stored policy is a policy that does not exist — the only
+        // resource this listing can be about, and the reason it models
+        // `NoSuchContinuousDeploymentPolicy`. The FORM of the value is no separate condition:
+        // this service publishes no form for the ids it mints, so a value that could never
+        // have been one resolves to no policy just as surely as one that could. What the
+        // sentence states is that the request's MARKER is no policy of this account, which is
+        // what the caller has to fix — not that some policy it named is absent.
         if let Some(marker) = crate::state::resume_marker(input.marker.as_deref()) {
-            if !crate::state::is_minted_uuid(marker) {
-                return Err(ListContinuousDeploymentPoliciesErrorModeled::InvalidArgument(
-                    InvalidArgument {
-                        message: Some(crate::state::invalid_marker_message(
-                            crate::state::CONTINUOUS_DEPLOYMENT_POLICY_MARKER_KIND,
-                        )),
-                    },
-                )
-                .into());
-            }
             if store.continuous_deployment_policy(marker).is_none() {
                 return Err(
                     ListContinuousDeploymentPoliciesErrorModeled::NoSuchContinuousDeploymentPolicy(
-                        crate::state::no_such_continuous_deployment_policy(),
+                        NoSuchContinuousDeploymentPolicy {
+                            message: Some(crate::state::invalid_resource_marker_message(
+                                crate::state::CONTINUOUS_DEPLOYMENT_POLICY_MARKER_RESOURCE,
+                            )),
+                        },
                     )
                     .into(),
                 );

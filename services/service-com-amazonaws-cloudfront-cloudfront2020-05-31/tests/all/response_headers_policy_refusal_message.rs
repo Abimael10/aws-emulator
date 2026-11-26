@@ -16,10 +16,10 @@
 //! policy, whatever shape the id takes. Both sentences are fixed text: neither interpolates
 //! anything, and in particular neither echoes the submitted value back.
 //!
-//! The listing whose resume point is an identifier of this family carries the same rule for
-//! its `Marker`: a value that is no policy id at all was never a resume point this service
-//! handed out (`InvalidArgument`, 400, under the constraint on the parameter), while a
-//! well-formed one naming no policy is the same absent-policy 404.
+//! The listing whose resume point is an identifier of this family prechecks nothing either:
+//! its `Marker` is the policy the previous page ended at, so a value that resolves to no
+//! policy — of any shape — is refused under the same 404, in the sentence that states the
+//! request's MARKER is no policy of this account ([`INVALID_MARKER_MESSAGE`]).
 //!
 //! The rows span the shape classes an identifier falls into rather than one recorded value,
 //! and the perturbed rows are DERIVED from a live id — one this service minted in the test
@@ -28,10 +28,15 @@
 //! refusals are shown to change nothing a later caller sees.
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    INVALID_RESPONSE_HEADERS_POLICY_MARKER_MESSAGE, MANAGED_RESPONSE_HEADERS_POLICIES,
-    NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE, RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE,
+    MANAGED_RESPONSE_HEADERS_POLICIES, NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE,
+    RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
+
+/// The sentence the LISTING refuses a `Marker` that resolves to no policy with, as a literal
+/// rather than read back from the crate: the WORDING is what these rows are held to.
+const INVALID_MARKER_MESSAGE: &str =
+    "The request contains an invalid response headers policy marker.";
 
 use crate::distribution_lifecycle::{call, emulator, is_minted_uuid, Answer, API_VERSION};
 use crate::distributions_by_response_headers_policy_id::list_by_policy;
@@ -299,37 +304,40 @@ async fn a_well_formed_identifier_that_names_no_policy_is_refused_as_absent() {
             (
                 "GetResponseHeadersPolicyConfig",
                 get_policy_config(&router, &candidate.id).await,
+                NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE,
             ),
             (
                 "GetResponseHeadersPolicy",
                 get_policy(&router, &candidate.id).await,
+                NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE,
             ),
             (
                 "ListDistributionsByResponseHeadersPolicyId",
                 list_by_policy(&router, &candidate.id, "").await,
+                NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE,
             ),
+            // The LISTING resolves the value as its resume point rather than as the policy
+            // the request is about, so what it reports is that the MARKER is no policy of
+            // this account.
             (
                 "ListResponseHeadersPolicies",
                 list_policies(&router, &format!("?Marker={}", candidate.id)).await,
+                INVALID_MARKER_MESSAGE,
             ),
         ];
-        for (reader, answer) in &answers {
-            assert_refusal(
-                reader,
-                &candidate,
-                answer,
-                NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE,
-            );
+        for (reader, answer, expected) in &answers {
+            assert_refusal(reader, &candidate, answer, expected);
         }
     }
 }
 
-/// A `Marker` that is no identifier of this family was never a resume point the service
-/// handed out, so the listing refuses it under the constraint on the parameter (400) rather
-/// than as a policy that does not exist — and a `Marker` that names a policy either source
-/// holds is served.
+/// A `Marker` that resolves to no policy is refused under the code the model binds for that
+/// resource (404), whatever form the value takes — the marker is the policy the previous page
+/// ended at, and the service publishes no form for the ids it mints — in the sentence that
+/// states the request's MARKER is no policy of this account; and a `Marker` that names a policy
+/// either source holds is served.
 #[tokio::test]
-async fn a_marker_that_is_no_policy_id_is_refused_as_an_unusable_resume_point() {
+async fn a_marker_that_is_no_policy_id_is_refused_as_an_invalid_marker() {
     let router = emulator();
     let (minted, _) = create_one(&router, "the-policy-that-exists").await;
     let published = MANAGED_RESPONSE_HEADERS_POLICIES
@@ -342,22 +350,21 @@ async fn a_marker_that_is_no_policy_id_is_refused_as_an_unusable_resume_point() 
         let marker = &candidate.id;
         let answer = list_policies(&router, &format!("?Marker={marker}")).await;
         assert_eq!(
-            answer.status, 400,
-            "case {case} ({marker:?}): expected HTTP 400 for a marker that is no policy id, \
-             got {} with {}",
+            answer.status, 404,
+            "case {case} ({marker:?}): expected HTTP 404 for a marker that resolves to no \
+             policy, got {} with {}",
             answer.status, answer.raw
         );
         assert_eq!(
             answer.error_code(),
-            "InvalidArgument",
-            "case {case} ({marker:?}): expected InvalidArgument, got {}",
+            "NoSuchResponseHeadersPolicy",
+            "case {case} ({marker:?}): expected NoSuchResponseHeadersPolicy, got {}",
             answer.raw
         );
         let message = answer.root().find_text("Message").unwrap_or_default();
         assert_eq!(
-            message, INVALID_RESPONSE_HEADERS_POLICY_MARKER_MESSAGE,
-            "case {case} ({marker:?}): expected the constraint on the parameter, got \
-             {message:?}"
+            message, INVALID_MARKER_MESSAGE,
+            "case {case} ({marker:?}): expected the marker sentence, got {message:?}"
         );
     }
 

@@ -62,8 +62,8 @@ const TOO_MANY_CACHE_BEHAVIORS: &str =
 /// The sentence a configuration associating more key groups than the quota admits is refused
 /// with.
 const TOO_MANY_KEY_GROUPS: &str =
-    "The number of key groups referenced by this distribution is more than the maximum \
-     allowed.";
+    "Processing your request will cause you to exceed the maximum number of key groups that \
+     can be associated to a distribution.";
 
 /// The sentence a configuration associating more trusted signers than the quota admits is
 /// refused with.
@@ -381,6 +381,117 @@ fn rows() -> Vec<Row> {
             },
         },
     ]
+}
+
+/// The sentence a quota refusal states is FIXED text about the quota itself: it carries no
+/// count — neither the number the configuration named nor the quota — so two configurations
+/// that break the same quota by different amounts are refused in the very same words.
+#[tokio::test]
+async fn a_quota_refusal_states_the_quota_and_no_count_from_the_request() {
+    let router = emulator();
+    // Enough key groups to break the quota by one and by several.
+    let groups = create_groups(&router, "quota-wording", KEY_GROUP_QUOTA + 4).await;
+
+    // Rows: one past the quota in one behaviour, one past it spread over the behaviours, and
+    // several past it — the amount by which the quota is broken is what the rule generalises
+    // over, and it never reaches the sentence.
+    let one_past: Vec<usize> = (0..=KEY_GROUP_QUOTA).collect();
+    let several_past: Vec<usize> = (0..KEY_GROUP_QUOTA + 4).collect();
+    let rows: Vec<(&str, Behavior, Vec<Behavior>)> = vec![
+        (
+            "one key group past the quota in one behaviour",
+            Behavior::groups(&one_past),
+            Vec::new(),
+        ),
+        (
+            "one key group past the quota, spread over the behaviours",
+            Behavior::groups(&[0, 1]),
+            vec![Behavior::groups(&[2, 3]), Behavior::groups(&[4])],
+        ),
+        (
+            "several key groups past the quota",
+            Behavior::groups(&several_past),
+            Vec::new(),
+        ),
+        (
+            "several past the quota, every behaviour naming its own",
+            Behavior::groups(&[0, 0, 1]),
+            vec![
+                Behavior::groups(&[2]),
+                Behavior::groups(&[3, 4]),
+                Behavior::groups(&[5, 6, 7]),
+            ],
+        ),
+    ];
+
+    let mut said: Vec<String> = Vec::new();
+    for (index, (case, default, ordered)) in rows.iter().enumerate() {
+        let body = config_xml(
+            &format!("ref-quota-wording-{index}"),
+            default,
+            ordered,
+            &groups,
+        );
+        let answer = create_distribution(&router, &body).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case}: expected HTTP 400, got {} with {}",
+            answer.status, answer.raw
+        );
+        assert_eq!(
+            answer.error_code(),
+            "TooManyKeyGroupsAssociatedToDistribution",
+            "case {case}: expected TooManyKeyGroupsAssociatedToDistribution, got {:?} in {}",
+            answer.error_code(),
+            answer.raw
+        );
+        let message = answer
+            .root()
+            .find_text("Message")
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            message, TOO_MANY_KEY_GROUPS,
+            "case {case}: expected the sentence {TOO_MANY_KEY_GROUPS:?}, got {message:?}"
+        );
+        assert!(
+            !message.chars().any(char::is_numeric),
+            "case {case}: the sentence must carry no count at all, got {message:?}"
+        );
+        for id in &groups {
+            assert!(
+                !message.contains(id.as_str()),
+                "case {case}: the sentence must name no key group the request listed, got \
+                 {message:?}"
+            );
+        }
+        said.push(message);
+    }
+
+    let first = said.first().cloned().unwrap_or_default();
+    assert!(
+        said.iter().all(|message| *message == first),
+        "case the quota sentence: every refusal of this quota must read the same, got {said:?}"
+    );
+
+    // The quota's own worth of key groups is still admitted, so the rows above are about the
+    // quota being exceeded and not about trusting key groups at all.
+    let admitted: Vec<usize> = (0..KEY_GROUP_QUOTA).collect();
+    let answer = create_distribution(
+        &router,
+        &config_xml(
+            "ref-quota-wording-admitted",
+            &Behavior::groups(&admitted),
+            &[],
+            &groups,
+        ),
+    )
+    .await;
+    assert_eq!(
+        answer.status, 201,
+        "case the quota's own worth of key groups: expected HTTP 201, got {} with {}",
+        answer.status, answer.raw
+    );
 }
 
 /// A per-distribution association quota counts the DISTINCT key groups and signer accounts a

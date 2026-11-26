@@ -200,22 +200,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(SystemTime::now());
 
         // "set this field's value to the value of NextMarker from the current page's
-        // response": the marker is a response headers policy id this service handed out. A
-        // value that is not one was never a resume point (`InvalidArgument`), and one that
-        // is but names no policy — neither a stored one nor a published one — is a policy
-        // that does not exist, which is the reason this listing models
-        // `NoSuchResponseHeadersPolicy`.
+        // response": the marker is the RESPONSE HEADERS POLICY the previous page ended at,
+        // named by its id. A marker that resolves to no policy — neither a stored one nor a
+        // published one — is a policy that does not exist, which is the reason this listing
+        // models `NoSuchResponseHeadersPolicy`. The FORM of the value is no separate
+        // condition: this service publishes no form for the ids it mints, so a value that
+        // could never have been one resolves to no policy just as surely as one that could.
+        // What the sentence states is that the request's MARKER is no policy of this account,
+        // which is what the caller has to fix — not that some policy it named is absent.
         if let Some(marker) = crate::state::resume_marker(input.marker.as_deref()) {
-            if !crate::state::is_minted_uuid(marker) {
-                return Err(ListResponseHeadersPoliciesErrorModeled::InvalidArgument(
-                    crate::state::invalid_response_headers_policy_marker(),
-                )
-                .into());
-            }
             if store.readable_response_headers_policy(marker).is_none() {
                 return Err(
                     ListResponseHeadersPoliciesErrorModeled::NoSuchResponseHeadersPolicy(
-                        crate::state::no_such_response_headers_policy(),
+                        NoSuchResponseHeadersPolicy {
+                            message: Some(crate::state::invalid_resource_marker_message(
+                                crate::state::RESPONSE_HEADERS_POLICY_MARKER_RESOURCE,
+                            )),
+                        },
                     )
                     .into(),
                 );

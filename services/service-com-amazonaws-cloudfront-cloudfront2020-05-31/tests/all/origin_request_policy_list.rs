@@ -38,9 +38,14 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::ops::types::
     ORIGIN_REQUEST_POLICY_TYPE_VALUES;
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     MANAGED_ORIGIN_REQUEST_POLICIES, MAX_ITEMS, MAX_ITEMS_INVALID_MESSAGE,
-    NO_SUCH_ORIGIN_REQUEST_POLICY_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
+
+/// The sentence this listing refuses a `Marker` that resolves to no origin request policy
+/// with, as a literal rather than read back from the crate: the WORDING is what these rows are
+/// held to.
+const INVALID_MARKER_MESSAGE: &str =
+    "The request contains an invalid origin request policy marker.";
 
 use crate::distribution_lifecycle::{call, emulator, is_minted_uuid, Answer, Node, API_VERSION};
 use crate::origin_request_policy_lifecycle::{
@@ -467,6 +472,11 @@ async fn the_type_filter_selects_the_kind_of_policy_it_names() {
 
 /// A page size that names no page, and a `Marker` that is no resume point this service
 /// handed out, are refused with the errors the operation models and store nothing.
+///
+/// The marker is the POLICY the previous page ended at, so a value that resolves to no policy
+/// is that policy not existing — whatever form the value takes, since the service publishes no
+/// form for the ids it mints — which is the modelled `NoSuchOriginRequestPolicy` (404). A page
+/// size the parameter cannot take is the modelled `InvalidArgument` (400).
 #[tokio::test]
 async fn an_unusable_page_size_or_marker_is_refused() {
     let router = emulator();
@@ -474,8 +484,8 @@ async fn an_unusable_page_size_or_marker_is_refused() {
     let before = listed_ids(list_policies(&router, "").await.root());
 
     // Rows: every form a page size can be unusable in (negative, no integer at all,
-    // past what the member can hold), and every form a marker can fail the id shape in (no
-    // id at all, too short, too long, upper-case hex, another namespace's token,
+    // past what the member can hold), and every form a marker that resolves to no policy can
+    // take (no id at all, too short, too long, upper-case hex, another namespace's token,
     // characters outside hex) — plus an unusable size beside a usable marker, where the
     // size is what is refused.
     let last = before.last().cloned().expect("the fixture created policies");
@@ -525,6 +535,28 @@ async fn an_unusable_page_size_or_marker_is_refused() {
     ];
     for (case, query, over_marker) in rows {
         let answer = list_policies(&router, query).await;
+        if *over_marker {
+            // A marker that resolves to no policy is refused under the code the model binds
+            // for that resource, in the one sentence this listing states for its marker.
+            assert_eq!(
+                answer.status, 404,
+                "case {case}: expected HTTP 404 for {query}, got {} with {}",
+                answer.status, answer.raw
+            );
+            assert_eq!(
+                answer.error_code(),
+                "NoSuchOriginRequestPolicy",
+                "case {case}: expected NoSuchOriginRequestPolicy for {query}, got {}",
+                answer.raw
+            );
+            let message = answer.root().find_text("Message").unwrap_or_default();
+            assert_eq!(
+                message, INVALID_MARKER_MESSAGE,
+                "case {case}: expected the marker sentence for {query}, got {}",
+                answer.raw
+            );
+            continue;
+        }
         assert_eq!(
             answer.status, 400,
             "case {case}: expected HTTP 400 for {query}, got {} with {}",
@@ -536,20 +568,18 @@ async fn an_unusable_page_size_or_marker_is_refused() {
             "case {case}: expected InvalidArgument for {query}, got {}",
             answer.raw
         );
-        if !over_marker {
-            // What the refusal states is the CONSTRAINT on the parameter, so every
-            // unusable value is refused with that one sentence.
-            let message = answer.root().find_text("Message").unwrap_or_default();
-            assert_eq!(
-                message, MAX_ITEMS_INVALID_MESSAGE,
-                "case {case}: expected the page-size constraint stated for {query}, got {}",
-                answer.raw
-            );
-        }
+        // What the refusal states is the CONSTRAINT on the parameter, so every
+        // unusable value is refused with that one sentence.
+        let message = answer.root().find_text("Message").unwrap_or_default();
+        assert_eq!(
+            message, MAX_ITEMS_INVALID_MESSAGE,
+            "case {case}: expected the page-size constraint stated for {query}, got {}",
+            answer.raw
+        );
     }
 
-    // A marker with the shape of an id this service mints, naming no stored policy, is a
-    // policy that does not exist.
+    // A marker with the shape of an id this service mints, naming no stored policy, is the
+    // same refusal: the listing is being resumed at a policy this account holds none of.
     for marker in [
         "00000000-0000-0000-0000-000000000000",
         "ffffffff-ffff-ffff-ffff-ffffffffffff",
@@ -568,8 +598,8 @@ async fn an_unusable_page_size_or_marker_is_refused() {
         );
         assert_eq!(
             answer.root().find_text("Message").unwrap_or_default(),
-            NO_SUCH_ORIGIN_REQUEST_POLICY_MESSAGE,
-            "case unknown marker {marker}: expected the modelled sentence, got {}",
+            INVALID_MARKER_MESSAGE,
+            "case unknown marker {marker}: expected the marker sentence, got {}",
             answer.raw
         );
     }

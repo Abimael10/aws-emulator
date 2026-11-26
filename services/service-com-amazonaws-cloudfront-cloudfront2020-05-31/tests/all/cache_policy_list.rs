@@ -21,9 +21,8 @@
 //! * a cache policy id names ONE policy whoever created it, so `GetCachePolicy` and
 //!   `GetCachePolicyConfig` answer for a published id exactly as they do for one this
 //!   account minted;
-//! * a page size that names no page, and a `Marker` that is no cache policy id, are refused
-//!   with `InvalidArgument` (400); a well-shaped marker naming no policy at all is
-//!   `NoSuchCachePolicy` (404);
+//! * a page size that names no page is refused with `InvalidArgument` (400); a `Marker` that
+//!   resolves to no policy is `NoSuchCachePolicy` (404), whatever form the value takes;
 //! * a value a QUERY PARAMETER's enum does not admit describes a request this API cannot
 //!   read: `MalformedXML` (400), naming the parameter and the values it admits;
 //! * a listing is a READ: it answers the same records again and mints nothing.
@@ -43,10 +42,13 @@
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::ops::types::CACHE_POLICY_TYPE_VALUES;
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     ManagedCachePolicy, CACHE_POLICY_TYPE_CUSTOM, CACHE_POLICY_TYPE_MANAGED,
-    INVALID_CACHE_POLICY_MARKER_MESSAGE, MANAGED_CACHE_POLICIES, MAX_ITEMS,
-    MAX_ITEMS_INVALID_MESSAGE, NO_SUCH_CACHE_POLICY_MESSAGE,
+    MANAGED_CACHE_POLICIES, MAX_ITEMS, MAX_ITEMS_INVALID_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
+
+/// The sentence this listing refuses a `Marker` that resolves to no cache policy with, as a
+/// literal rather than read back from the crate: the WORDING is what these rows are held to.
+const INVALID_MARKER_MESSAGE: &str = "The request contains an invalid cache policy marker.";
 
 use crate::cache_policy_lifecycle::{create_policy, get_policy, get_policy_config, policy_table};
 use crate::distribution_lifecycle::{call, emulator, is_version_token, Answer, API_VERSION};
@@ -508,69 +510,86 @@ async fn a_listing_reports_every_policy_of_the_kind_asked_for_and_pages_through_
     }
 }
 
-/// A page size that names no page, and a `Marker` that is no cache policy id, are refused
-/// with the modelled `InvalidArgument` (400) and change nothing; a well-shaped marker that
-/// names no policy at all is the modelled `NoSuchCachePolicy` (404); a marker naming a
-/// policy EITHER source holds is a resume point.
+/// A page size that names no page is refused with the modelled `InvalidArgument` (400), a
+/// `Marker` that resolves to no cache policy is the modelled `NoSuchCachePolicy` (404)
+/// whatever form the value takes, and a marker naming a policy EITHER source holds is a
+/// resume point — and none of the refusals changes anything.
 #[tokio::test]
 async fn a_page_size_or_marker_that_names_no_resume_point_is_refused() {
     let router = emulator();
     let custom = create_custom_policies(&router).await;
     let before = page_ids(&list_policies(&router, "").await);
 
-    // Every form a page size can be unusable in, and every form a marker can fail the id
-    // shape in (no id at all, too short, too long, the wrong case, another namespace's
-    // token, characters outside the id alphabet).
-    let rows: [(&str, &str, &str); 10] = [
-        ("a negative page size", "?MaxItems=-1", MAX_ITEMS_INVALID_MESSAGE),
+    // Every form a page size can be unusable in, and every form a marker that resolves to no
+    // policy can take (no id at all, too short, too long, the wrong case, another namespace's
+    // token, characters outside the id alphabet). The page-size rows carry the sentence that
+    // states the constraint on the parameter; the marker rows are the policy not existing.
+    let rows: [(&str, &str, bool); 10] = [
+        ("a negative page size", "?MaxItems=-1", false),
         (
             "a page size that is no integer",
             "?MaxItems=not-a-number",
-            MAX_ITEMS_INVALID_MESSAGE,
+            false,
         ),
         (
             "a page size past what the member can hold",
             "?MaxItems=99999999999",
-            MAX_ITEMS_INVALID_MESSAGE,
+            false,
         ),
         (
             "an unusable page size beside a usable marker",
             "?MaxItems=-1&Marker=658327ea-f89d-4fab-a63d-7e88639e58f6",
-            MAX_ITEMS_INVALID_MESSAGE,
+            false,
         ),
-        (
-            "a marker that is no id at all",
-            "?Marker=nope",
-            INVALID_CACHE_POLICY_MARKER_MESSAGE,
-        ),
+        ("a marker that is no id at all", "?Marker=nope", true),
         (
             "a marker too short to be an id",
             "?Marker=658327ea-f89d-4fab-a63d",
-            INVALID_CACHE_POLICY_MARKER_MESSAGE,
+            true,
         ),
         (
             "a marker too long to be an id",
             "?Marker=658327ea-f89d-4fab-a63d-7e88639e58f6-7e88639e58f6",
-            INVALID_CACHE_POLICY_MARKER_MESSAGE,
+            true,
         ),
         (
             "a marker in the wrong case",
             "?Marker=658327EA-F89D-4FAB-A63D-7E88639E58F6",
-            INVALID_CACHE_POLICY_MARKER_MESSAGE,
+            true,
         ),
         (
             "a marker from another resource's namespace",
             "?Marker=E1AAAAAAAAAAAA",
-            INVALID_CACHE_POLICY_MARKER_MESSAGE,
+            true,
         ),
         (
             "a marker carrying characters outside the id alphabet",
             "?Marker=658327ea-f89d-4fab-a63d-7e88639e58%21",
-            INVALID_CACHE_POLICY_MARKER_MESSAGE,
+            true,
         ),
     ];
-    for (case, query, expected_message) in rows {
+    for (case, query, over_marker) in rows {
         let answer = list_policies(&router, query).await;
+        if over_marker {
+            assert_eq!(
+                answer.status, 404,
+                "case {case}: expected HTTP 404 for {query}, got {} with {}",
+                answer.status, answer.raw
+            );
+            assert_eq!(
+                answer.error_code(),
+                "NoSuchCachePolicy",
+                "case {case}: expected NoSuchCachePolicy for {query}, got {}",
+                answer.raw
+            );
+            assert_eq!(
+                answer.root().find_text("Message").unwrap_or_default(),
+                INVALID_MARKER_MESSAGE,
+                "case {case}: expected the marker sentence for {query}, got {}",
+                answer.raw
+            );
+            continue;
+        }
         assert_eq!(
             answer.status, 400,
             "case {case}: expected HTTP 400 for {query}, got {} with {}",
@@ -582,19 +601,18 @@ async fn a_page_size_or_marker_that_names_no_resume_point_is_refused() {
             "case {case}: expected InvalidArgument for {query}, got {}",
             answer.raw
         );
-        // What each refusal states is the CONSTRAINT on the parameter — a marker is a cache
-        // policy id, a page size is an integer that bounds a page — rather than text quoted
-        // out of the request.
+        // What the refusal states is the CONSTRAINT on the parameter — a page size is an
+        // integer that bounds a page — rather than text quoted out of the request.
         assert_eq!(
             answer.root().find_text("Message").unwrap_or_default(),
-            expected_message,
+            MAX_ITEMS_INVALID_MESSAGE,
             "case {case}: expected the constraint stated for {query}, got {}",
             answer.raw
         );
     }
 
-    // A well-shaped id no policy holds is the modelled 404: the listing is being resumed at
-    // a policy that does not exist.
+    // A well-shaped id no policy holds is the same 404: the listing is being resumed at a
+    // policy this account holds none of.
     let unheld = "00000000-0000-4000-8000-000000000000";
     let answer = list_policies(&router, &format!("?Marker={unheld}")).await;
     assert_eq!(
@@ -610,8 +628,8 @@ async fn a_page_size_or_marker_that_names_no_resume_point_is_refused() {
     );
     assert_eq!(
         answer.root().find_text("Message").unwrap_or_default(),
-        NO_SUCH_CACHE_POLICY_MESSAGE,
-        "case a marker naming no policy: expected the modelled sentence, got {}",
+        INVALID_MARKER_MESSAGE,
+        "case a marker naming no policy: expected the marker sentence, got {}",
         answer.raw
     );
 
