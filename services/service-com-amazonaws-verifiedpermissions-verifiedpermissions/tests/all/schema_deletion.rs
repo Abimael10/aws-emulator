@@ -28,9 +28,9 @@ use service_com_amazonaws_verifiedpermissions_verifiedpermissions::ops::INVALID_
 use crate::harness::{call, error_code, field_list, ok, router, store_with_mode};
 use crate::schema::photo_app_schema;
 use crate::store_validation_settings::{
-    no_schema_reason, policy_in, stored_policy_statement, stored_template_statement, template_in,
-    CONFORMANT_POLICY, CONFORMANT_REPLACEMENT, CONFORMANT_TEMPLATE,
-    CONFORMANT_TEMPLATE_REPLACEMENT,
+    policy_in, stored_policy_statement, stored_template_statement, template_in, CONFORMANT_POLICY,
+    CONFORMANT_REPLACEMENT, CONFORMANT_TEMPLATE, CONFORMANT_TEMPLATE_REPLACEMENT,
+    NO_SCHEMA_REASON, POLICY_DEFINITION_PATH, TEMPLATE_STATEMENT_PATH,
 };
 
 /// The document a store holds when it holds no schema: a schema that declares
@@ -113,14 +113,14 @@ async fn assert_holds_no_schema(
 }
 
 /// Assert `operation` is refused for a `STRICT` store that holds no schema: HTTP
-/// 400 `ValidationException`, one `fieldList` entry naming `/policyStoreId`, and
-/// the reason sentence for `content`.
+/// 400 `ValidationException`, and one `fieldList` entry naming `member` — the
+/// request member that submitted the Cedar document — with the fixed reason.
 async fn assert_refused_for_lack_of_schema(
     router: &smithy_server_runtime::MultiServiceRouter,
     case: &str,
     operation: &str,
     request: &Value,
-    content: &str,
+    member: &str,
 ) {
     let (status, body) = call(router, operation, request).await;
     assert_eq!(
@@ -139,8 +139,8 @@ async fn assert_refused_for_lack_of_schema(
     );
     assert_eq!(
         field_list(&body),
-        vec![("/policyStoreId".to_string(), no_schema_reason(content))],
-        "case {case:?}: {operation} must name the store as the member at fault, got {body}"
+        vec![(member.to_string(), NO_SCHEMA_REASON.to_string())],
+        "case {case:?}: {operation} must name the member that submitted the content, got {body}"
     );
 }
 
@@ -250,7 +250,7 @@ async fn putting_the_empty_document_deletes_the_schema_and_strict_writes_are_ref
                 "policyStoreId": &store_id,
                 "definition": { "static": { "statement": CONFORMANT_POLICY } },
             }),
-            "a policy",
+            POLICY_DEFINITION_PATH,
         )
         .await;
         assert_refused_for_lack_of_schema(
@@ -258,7 +258,7 @@ async fn putting_the_empty_document_deletes_the_schema_and_strict_writes_are_ref
             case,
             "CreatePolicyTemplate",
             &json!({ "policyStoreId": &store_id, "statement": CONFORMANT_TEMPLATE }),
-            "a policy template",
+            TEMPLATE_STATEMENT_PATH,
         )
         .await;
         if let Some((policy_id, template_id)) = &content {
@@ -271,7 +271,7 @@ async fn putting_the_empty_document_deletes_the_schema_and_strict_writes_are_ref
                     "policyId": policy_id,
                     "definition": { "static": { "statement": CONFORMANT_REPLACEMENT } },
                 }),
-                "a policy",
+                POLICY_DEFINITION_PATH,
             )
             .await;
             assert_refused_for_lack_of_schema(
@@ -283,7 +283,7 @@ async fn putting_the_empty_document_deletes_the_schema_and_strict_writes_are_ref
                     "policyTemplateId": template_id,
                     "statement": CONFORMANT_TEMPLATE_REPLACEMENT,
                 }),
-                "a policy template",
+                TEMPLATE_STATEMENT_PATH,
             )
             .await;
         }
@@ -387,7 +387,7 @@ async fn a_schema_put_after_a_deletion_is_created_again() {
                 "policyStoreId": &store_id,
                 "definition": { "static": { "statement": CONFORMANT_POLICY } },
             }),
-            "a policy",
+            POLICY_DEFINITION_PATH,
         )
         .await;
     }

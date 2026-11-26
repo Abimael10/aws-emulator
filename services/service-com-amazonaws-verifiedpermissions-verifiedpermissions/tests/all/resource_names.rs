@@ -13,6 +13,11 @@
 //! carried it: nothing is stored for it, no read reports it, it collides with no
 //! other resource's name, and it is reachable by no `name/<name>` reference.
 //!
+//! The REFERENCE side of the same member is pinned here too: both patterns admit
+//! `/`, so a stored name may itself begin with the `name/` reference prefix, and
+//! a reference of that form reaches the resource whose stored name it names
+//! ([`a_name_reference_reaches_a_name_that_carries_the_prefix`]).
+//!
 //! Every assertion goes over the wire through the shared [`super::harness`], so a
 //! member only round-trips if it really reached this service's state.
 
@@ -451,4 +456,268 @@ async fn a_client_token_replay_compares_the_name_a_request_assigns() {
             );
         }
     }
+}
+
+/// The reference prefix a `policyId` or `policyTemplateId` carries when it names
+/// its resource by name instead of by id, from `DeletePolicyInput$policyId`'s
+/// documentation ("You can use the policy name in place of the policy ID. When
+/// using a name, prefix it with `name/`").
+const NAME_PREFIX: &str = "name/";
+
+/// `PolicyName`'s and `PolicyTemplateName`'s published maximum length
+/// (`smithy_query(query="shape", shape="PolicyName")`: `length 0..150`).
+const MAX_NAME_LEN: usize = 150;
+
+/// One stored name and the `name/` reference a caller writes for it.
+struct NameReference {
+    case: &'static str,
+    /// The `name` member the resource is created with.
+    name: String,
+    /// The reference that must reach it.
+    reference: String,
+}
+
+/// Every stored-name shape a `name/` reference has to reach.
+///
+/// The rows differ along the SHAPE of the stored name — whether it carries the
+/// reference prefix itself, how many times, whether the `/` the pattern admits
+/// sits elsewhere in it, and its length — and along which of the two readings of
+/// the reference reaches it: the name the prefix introduces, or the whole
+/// reference. `suffix` keeps each row's name unique where several share a store.
+fn name_references(suffix: &str) -> Vec<NameReference> {
+    let reference = |name: &str| format!("{NAME_PREFIX}{name}");
+    let prefixed = format!("{NAME_PREFIX}carries-prefix-{suffix}");
+    let twice = format!("{NAME_PREFIX}{NAME_PREFIX}twice-{suffix}");
+    let inner_slash = format!("team/alpha-{suffix}");
+    // At the published length bound, and beginning with the prefix: the longest
+    // name of this shape a request may carry.
+    let at_bound = format!(
+        "{NAME_PREFIX}{}",
+        "n".repeat(MAX_NAME_LEN - NAME_PREFIX.len())
+    );
+    vec![
+        NameReference {
+            case: "a plain name, in the documented form",
+            name: format!("plain-{suffix}"),
+            reference: reference(&format!("plain-{suffix}")),
+        },
+        NameReference {
+            // The value the caller NAMED the resource with is itself a
+            // `name/`-prefixed reference.
+            case: "a name carrying the prefix, referenced by that very value",
+            name: prefixed.clone(),
+            reference: prefixed.clone(),
+        },
+        NameReference {
+            case: "a name carrying the prefix, referenced in the documented form",
+            name: format!("{NAME_PREFIX}documented-{suffix}"),
+            reference: reference(&format!("{NAME_PREFIX}documented-{suffix}")),
+        },
+        NameReference {
+            case: "a name carrying the prefix twice, referenced by that value",
+            name: twice.clone(),
+            reference: twice,
+        },
+        NameReference {
+            case: "a name whose slash sits elsewhere",
+            name: inner_slash.clone(),
+            reference: reference(&inner_slash),
+        },
+        NameReference {
+            case: "a prefix-carrying name at the published length bound",
+            name: at_bound.clone(),
+            reference: at_bound,
+        },
+    ]
+}
+
+/// A `name/` reference reaches the resource its name names — including a name
+/// that itself begins with that prefix — through every operation that takes the
+/// reference, and a delete by that reference really removes the resource.
+///
+/// RULE: `PolicyName` and `PolicyTemplateName` are modelled `^[a-zA-Z0-9-/_]*$`
+/// (`smithy_query(query="shape", shape="PolicyName")`), a pattern that admits
+/// `/`, so a `name/`-prefixed string is itself a legal name; a reference of that
+/// form therefore names the stored name the prefix introduces and, where no
+/// resource carries that name, the whole reference as a name — so a resource is
+/// always reachable by the value that named it.
+#[tokio::test]
+async fn a_name_reference_reaches_a_name_that_carries_the_prefix() {
+    let router = router();
+
+    for (index, row) in name_references("r").iter().enumerate() {
+        let NameReference {
+            case,
+            name,
+            reference,
+        } = row;
+        // A store per row: a name is unique within its store, and each row's
+        // delete must be observable on its own.
+        let store_id = store_with_validation_off(&router).await;
+        let policy_id = create_policy(&router, &store_id, index, Some(name)).await;
+
+        // The reference reads the policy the name names.
+        let fetched = get_policy(&router, &store_id, reference).await;
+        assert_eq!(
+            (
+                fetched["policyId"].as_str(),
+                reported_name(&fetched),
+            ),
+            (Some(policy_id.as_str()), Some(name.as_str())),
+            "case {case:?}: {reference:?} must read the policy named {name:?}, got {fetched}"
+        );
+
+        // And it updates it: the same reference carries an update to the policy
+        // the minted id names.
+        let updated = ok(
+            &router,
+            "UpdatePolicy",
+            &json!({
+                "policyStoreId": store_id,
+                "policyId": reference,
+                "definition": { "static": { "statement": statement(index) } },
+            }),
+        )
+        .await;
+        assert_eq!(
+            updated["policyId"].as_str(),
+            Some(policy_id.as_str()),
+            "case {case:?}: {reference:?} must update the policy named {name:?}, got {updated}"
+        );
+
+        // And the delete by that reference removes it: the minted id answers the
+        // modelled 404 afterwards, and the store lists nothing.
+        let (status, body) = call(
+            &router,
+            "DeletePolicy",
+            &json!({ "policyStoreId": store_id, "policyId": reference }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: deleting {reference:?} must answer 200, got {status} {body}"
+        );
+        let (status, body) = call(
+            &router,
+            "GetPolicy",
+            &json!({ "policyStoreId": store_id, "policyId": policy_id }),
+        )
+        .await;
+        assert_eq!(
+            (
+                status,
+                error_code(&body).as_str(),
+                body["resourceType"].as_str(),
+                body["resourceId"].as_str(),
+            ),
+            (
+                404,
+                "ResourceNotFoundException",
+                Some("POLICY"),
+                Some(policy_id.as_str()),
+            ),
+            "case {case:?}: the deleted policy must be gone, got {status} {body}"
+        );
+        let listed = ok(
+            &router,
+            "ListPolicies",
+            &json!({ "policyStoreId": store_id }),
+        )
+        .await;
+        assert_eq!(
+            listed["policies"].as_array().map(Vec::len),
+            Some(0),
+            "case {case:?}: the store must list no policy after the delete, got {listed}"
+        );
+
+        // The same rule, on the other named resource: a policy template.
+        let template_id = create_template(&router, &store_id, index, Some(name)).await;
+        let fetched = get_template(&router, &store_id, reference).await;
+        assert_eq!(
+            (
+                fetched["policyTemplateId"].as_str(),
+                reported_name(&fetched),
+            ),
+            (Some(template_id.as_str()), Some(name.as_str())),
+            "case {case:?}: {reference:?} must read the template named {name:?}, got {fetched}"
+        );
+        let (status, body) = call(
+            &router,
+            "DeletePolicyTemplate",
+            &json!({ "policyStoreId": store_id, "policyTemplateId": reference }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: deleting template {reference:?} must answer 200, got {status} {body}"
+        );
+        let (status, body) = call(
+            &router,
+            "GetPolicyTemplate",
+            &json!({ "policyStoreId": store_id, "policyTemplateId": template_id }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: the deleted template must be gone, got {status} {body}"
+        );
+    }
+}
+
+/// Where BOTH readings of one reference name a stored resource, the documented
+/// one decides: `name/<n>` reaches the resource named `<n>`, and the resource
+/// named `name/<n>` is reached by `name/name/<n>` — each value still naming
+/// exactly one resource.
+#[tokio::test]
+async fn the_documented_reading_of_a_reference_decides_when_both_names_exist() {
+    let router = router();
+    let store_id = store_with_validation_off(&router).await;
+
+    let bare = "shared".to_string();
+    let prefixed = format!("{NAME_PREFIX}{bare}");
+    let bare_policy = create_policy(&router, &store_id, 0, Some(&bare)).await;
+    let prefixed_policy = create_policy(&router, &store_id, 1, Some(&prefixed)).await;
+    assert_ne!(
+        bare_policy, prefixed_policy,
+        "the two names are distinct, so they must name distinct policies"
+    );
+
+    // (case, the reference, the policy it must reach)
+    let rows: &[(&str, String, &String)] = &[
+        (
+            "the documented form of the bare name",
+            format!("{NAME_PREFIX}{bare}"),
+            &bare_policy,
+        ),
+        (
+            "the documented form of the prefix-carrying name",
+            format!("{NAME_PREFIX}{prefixed}"),
+            &prefixed_policy,
+        ),
+    ];
+    for (case, reference, expected) in rows {
+        let fetched = get_policy(&router, &store_id, reference).await;
+        assert_eq!(
+            fetched["policyId"].as_str(),
+            Some(expected.as_str()),
+            "case {case:?}: {reference:?} must reach {expected}, got {fetched}"
+        );
+    }
+
+    // Deleting by the documented form of the bare name removes only that policy:
+    // the prefix-carrying one is then what the same reference reaches.
+    ok(
+        &router,
+        "DeletePolicy",
+        &json!({ "policyStoreId": store_id, "policyId": format!("{NAME_PREFIX}{bare}") }),
+    )
+    .await;
+    let fetched = get_policy(&router, &store_id, &format!("{NAME_PREFIX}{bare}")).await;
+    assert_eq!(
+        fetched["policyId"].as_str(),
+        Some(prefixed_policy.as_str()),
+        "case \"the bare name is gone\": the reference must then reach the policy named \
+         {prefixed:?}, got {fetched}"
+    );
 }

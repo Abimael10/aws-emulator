@@ -181,9 +181,10 @@ async fn a_refused_request_names_the_offending_member_in_field_list() {
                 "policyStoreId": strict_store,
                 "definition": { "static": { "statement": conformant } },
             }),
-            // Nothing is wrong with the statement here: the store named by
-            // `policyStoreId` is the one holding no schema.
-            "/policyStoreId",
+            // The statement itself parses: what fails is the VALIDATION of the
+            // submitted definition, which the store has no schema to run, so the
+            // member that submitted it is the one reported.
+            "/definition",
         ),
         (
             "a schema that is not JSON",

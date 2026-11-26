@@ -524,8 +524,9 @@ pub const VALIDATION_MODE_STRICT: &str = "STRICT";
 ///
 /// The rule a store's validation settings impose is ONE rule over both kinds
 /// ([`PolicyStore::schema_to_validate_against`]); the only thing that differs
-/// between a policy and a policy template is the noun the refusal's reason names,
-/// so that noun is carried here instead of being spelled at each call site.
+/// between a policy and a policy template is the request member the submitted
+/// content arrived in — the member a validation refusal names — so that member is
+/// carried here instead of being spelled at each call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidatedContent {
     /// A static policy's statement: `CreatePolicy` and `UpdatePolicy`.
@@ -536,14 +537,29 @@ pub enum ValidatedContent {
 }
 
 impl ValidatedContent {
-    /// How the refusal's reason sentence names this kind of document.
-    const fn noun(self) -> &'static str {
+    /// The `ValidationExceptionField$path` a validation refusal of this kind of
+    /// document names: the request member whose CONTENT was submitted for
+    /// validation, which is a policy writer's whole `definition` and a template
+    /// writer's template statement — the same two members the schema's own
+    /// refusals name ([`crate::state::cedar::validate_static_policy`] and
+    /// [`crate::state::cedar::validate_policy_template`]).
+    const fn path(self) -> &'static str {
         match self {
-            Self::Policy => "a policy",
-            Self::PolicyTemplate => "a policy template",
+            Self::Policy => crate::ops::paths::DEFINITION,
+            Self::PolicyTemplate => crate::ops::paths::TEMPLATE_STATEMENT,
         }
     }
 }
+
+/// Why a Cedar write is refused by a policy store that validates `STRICT` while
+/// holding no schema: the validator has no schema to check the submission
+/// against, so it fails that validation outright.
+///
+/// FIXED text: nothing of the request or of the store appears in it, and it is
+/// the same sentence for a static policy and for a policy template — the
+/// condition is the store's, not the submitted document's.
+pub const NO_SCHEMA_VALIDATION_REASON: &str =
+    "No schema present - automatically failing all validation.";
 
 /// The EMPTY Cedar schema document: a schema that declares no namespace, and the
 /// document a policy store holds until `PutSchema` writes one. It is also the
@@ -1291,10 +1307,12 @@ impl PolicyStore {
     /// * `Ok(None)` — the store validates nothing, and the content is stored as
     ///   submitted;
     /// * `Ok(Some(cedar_json))` — the schema document to validate it against;
-    /// * `Err` — the store is `STRICT` and holds no schema, so there is nothing to
-    ///   validate against. Nothing is wrong with the submitted content: the member
-    ///   at fault is `policyStoreId`, the one the caller can act on (put a schema
-    ///   in that store, or name a store that has one).
+    /// * `Err` — the store is `STRICT` and holds no schema, so the validation the
+    ///   store requires fails for want of one ([`NO_SCHEMA_VALIDATION_REASON`]).
+    ///   That is a failure of the submitted content's validation, so the member
+    ///   the refusal names is the one that SUBMITTED the content
+    ///   ([`ValidatedContent::path`]) — the same member a schema that refused the
+    ///   content would be reported at.
     ///
     /// The `Err` answer is what the enumeration decides: only a submission of
     /// the content [`ValidatedContent`] names is refused for it, and a request
@@ -1313,12 +1331,8 @@ impl PolicyStore {
         match self.validation_schema() {
             Some(schema) => Ok(Some(schema)),
             None => Err(crate::ops::InvalidInput::new(
-                crate::ops::paths::POLICY_STORE_ID,
-                format!(
-                    "its validation mode is STRICT and it contains no schema, so there is \
-                     nothing to validate {} against",
-                    content.noun()
-                ),
+                content.path(),
+                NO_SCHEMA_VALIDATION_REASON,
             )),
         }
     }
@@ -1344,17 +1358,20 @@ impl PolicyStore {
     /// template name in place of the policy template ID. When using a name,
     /// prefix it with name/").
     pub fn resolve_policy_template_id(&self, reference: &str) -> Option<String> {
-        match reference.strip_prefix("name/") {
-            Some(name) => self
-                .policy_templates
-                .values()
-                .find(|template| template.name.as_deref() == Some(name))
-                .map(|template| template.policy_template_id.clone()),
-            None => self
-                .policy_templates
-                .contains_key(reference)
-                .then(|| reference.to_string()),
-        }
+        resolve_named_reference(
+            reference,
+            |name| {
+                self.policy_templates
+                    .values()
+                    .find(|template| template.name.as_deref() == Some(name))
+                    .map(|template| template.policy_template_id.clone())
+            },
+            |id| {
+                self.policy_templates
+                    .contains_key(id)
+                    .then(|| id.to_string())
+            },
+        )
     }
 
     /// Mint the next `identitySourceId` for this store. `IS` + 22 base62
@@ -1371,17 +1388,16 @@ impl PolicyStore {
     /// `name/<policyName>` naming one, which the API documents as interchangeable
     /// with the id.
     pub fn resolve_policy_id(&self, reference: &str) -> Option<String> {
-        match reference.strip_prefix("name/") {
-            Some(name) => self
-                .policies
-                .values()
-                .find(|policy| policy.name.as_deref() == Some(name))
-                .map(|policy| policy.policy_id.clone()),
-            None => self
-                .policies
-                .contains_key(reference)
-                .then(|| reference.to_string()),
-        }
+        resolve_named_reference(
+            reference,
+            |name| {
+                self.policies
+                    .values()
+                    .find(|policy| policy.name.as_deref() == Some(name))
+                    .map(|policy| policy.policy_id.clone())
+            },
+            |id| self.policies.contains_key(id).then(|| id.to_string()),
+        )
     }
 
     /// The total bytes of Cedar text this store holds — its policies AND its
@@ -1467,6 +1483,36 @@ pub const RESOURCE_TYPE_IDENTITY_SOURCE: &str = "IDENTITY_SOURCE";
 /// The resource-path prefix a `policyId` member carries when it names a policy by
 /// name instead of by id, which `resolve_policy_id` already accepts.
 pub const POLICY_NAME_PREFIX: &str = "name/";
+
+/// Resolve one of this service's identifier members that takes either a resource
+/// id or the documented [`POLICY_NAME_PREFIX`] form naming the resource by its
+/// `name` — `by_name` answers for one stored name, `by_id` for one stored id.
+///
+/// A reference WITHOUT the prefix is an id and nothing else: the name form is
+/// documented as prefixed ("You can use the policy name in place of the policy
+/// ID. When using a name, prefix it with `name/`"), so a bare value never
+/// searches the names.
+///
+/// A reference WITH the prefix names a name — and `PolicyName` and
+/// `PolicyTemplateName` are modelled `^[a-zA-Z0-9-/_]*$`
+/// (`smithy_query(query="shape", shape="PolicyName")`), a pattern that admits
+/// `/`, so a stored name may itself begin with that prefix. Such a name is a
+/// name the caller can only have written WITH its prefix, so the reference is
+/// matched both ways: first against the name the prefix introduces (the
+/// documented reading), then — when the store holds no resource of that name —
+/// against the whole reference as a name. A resource therefore stays reachable
+/// by the very value that named it, and a reference matching neither resolves
+/// nothing, as before.
+fn resolve_named_reference(
+    reference: &str,
+    by_name: impl Fn(&str) -> Option<String>,
+    by_id: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    match reference.strip_prefix(POLICY_NAME_PREFIX) {
+        Some(name) => by_name(name).or_else(|| by_name(reference)),
+        None => by_id(reference),
+    }
+}
 
 /// What a caller-supplied identifier reference NAMES: the kind of resource, and
 /// that resource's own id.

@@ -37,8 +37,8 @@ use service_com_amazonaws_verifiedpermissions_verifiedpermissions::state::cedar:
 use crate::harness::{call, error_code, fault_message, field_list, ok, router, store_with_mode};
 use crate::schema::photo_app_schema;
 use crate::store_validation_settings::{
-    no_schema_reason, policy_in, stored_policy_statement, stored_template_statement, template_in,
-    CONFORMANT_TEMPLATE,
+    policy_in, stored_policy_statement, stored_template_statement, template_in,
+    CONFORMANT_TEMPLATE, NO_SCHEMA_REASON, POLICY_DEFINITION_PATH,
 };
 
 /// The classification a policy body that does not parse is refused with, as the
@@ -326,8 +326,10 @@ async fn an_unparseable_statement_is_refused_before_the_store_has_nothing_to_val
     .await;
 
     // Both stores now validate STRICT with no schema: a WELL-FORMED write is
-    // refused at the store, which is what makes the rows below a statement about
-    // ORDER rather than about a store that refuses nothing.
+    // refused for want of a schema, naming the member that submitted the whole
+    // definition rather than the statement's own text, which is what makes the
+    // rows below a statement about ORDER rather than about a store that refuses
+    // nothing.
     for (store, label) in [(&switched, "switched to STRICT"), (&emptied, "schema deleted")] {
         let (status, body) = call(
             &router,
@@ -347,11 +349,11 @@ async fn an_unparseable_statement_is_refused_before_the_store_has_nothing_to_val
         assert_eq!(
             fields.first().map(|(path, message)| (
                 path.as_str(),
-                message == &no_schema_reason("a policy")
+                message.as_str() == NO_SCHEMA_REASON
             )),
-            Some(("/policyStoreId", true)),
-            "case {label:?}: the store is the member at fault for well-formed content, got \
-             {fields:?}"
+            Some((POLICY_DEFINITION_PATH, true)),
+            "case {label:?}: the submitted definition is the member at fault for well-formed \
+             content, got {fields:?}"
         );
     }
 
@@ -441,8 +443,7 @@ async fn an_unparseable_statement_is_refused_before_the_store_has_nothing_to_val
                      got {fields:?}"
                 );
                 assert_ne!(
-                    fields[0].1,
-                    no_schema_reason("a policy template"),
+                    fields[0].1, NO_SCHEMA_REASON,
                     "case {label:?}: text the parser cannot read is not refused for the \
                      store's missing schema, got {fields:?}"
                 );

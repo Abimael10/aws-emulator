@@ -735,10 +735,11 @@ async fn an_update_refuses_what_the_model_says_it_refuses() {
     }
 
     // A STRICT store with no schema has nothing to validate a replacement
-    // against, which is a property of the STORE the request named. The policy
-    // is created while the store still validates nothing, and the store is then
-    // switched to STRICT — which is the only way such a store can hold a policy
-    // at all, since a STRICT store with no schema refuses every create too.
+    // against, so the replacement's validation fails and the refusal names the
+    // member that submitted it. The policy is created while the store still
+    // validates nothing, and the store is then switched to STRICT — which is the
+    // only way such a store can hold a policy at all, since a STRICT store with
+    // no schema refuses every create too.
     let (strict_policy, _) = policy_of(&router, &strict_store, ORIGINAL, None).await;
     ok(
         &router,
@@ -765,8 +766,9 @@ async fn an_update_refuses_what_the_model_says_it_refuses() {
     );
     assert_eq!(
         body["fieldList"][0]["path"].as_str(),
-        Some("/policyStoreId"),
-        "case \"a STRICT store with no schema\": the member at fault is the store, got {body}"
+        Some("/definition"),
+        "case \"a STRICT store with no schema\": the member at fault is the one that submitted \
+         the definition, got {body}"
     );
 
     // The policy the refused updates named is untouched.

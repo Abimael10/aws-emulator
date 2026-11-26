@@ -1066,7 +1066,8 @@ async fn a_strict_store_with_no_schema_still_instantiates_a_policy_template() {
         }
 
         // The other side of the boundary, in the very same state: the two
-        // submissions the rule enumerates are still refused, naming the store.
+        // submissions the rule enumerates are still refused, each naming the
+        // member that submitted its Cedar document.
         let refused: [(&str, &str, Value, &str); 2] = [
             (
                 "a static policy",
@@ -1079,7 +1080,7 @@ async fn a_strict_store_with_no_schema_still_instantiates_a_policy_template() {
                         },
                     },
                 }),
-                "a policy",
+                crate::store_validation_settings::POLICY_DEFINITION_PATH,
             ),
             (
                 "a policy template",
@@ -1088,10 +1089,10 @@ async fn a_strict_store_with_no_schema_still_instantiates_a_policy_template() {
                     "policyStoreId": store_id,
                     "statement": crate::store_validation_settings::CONFORMANT_TEMPLATE,
                 }),
-                "a policy template",
+                crate::store_validation_settings::TEMPLATE_STATEMENT_PATH,
             ),
         ];
-        for (submission, operation, request, noun) in &refused {
+        for (submission, operation, request, member) in &refused {
             let case = format!("{route}: {submission}");
             let (status, body) = call(&router, operation, request).await;
             assert_eq!(
@@ -1106,10 +1107,10 @@ async fn a_strict_store_with_no_schema_still_instantiates_a_policy_template() {
             assert_eq!(
                 crate::harness::field_list(&body),
                 vec![(
-                    "/policyStoreId".to_string(),
-                    crate::store_validation_settings::no_schema_reason(noun),
+                    (*member).to_string(),
+                    crate::store_validation_settings::NO_SCHEMA_REASON.to_string(),
                 )],
-                "case {case:?}: expected the store to be named at fault, got {body}"
+                "case {case:?}: expected the submitting member to be named at fault, got {body}"
             );
         }
 
