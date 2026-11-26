@@ -660,8 +660,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the rules that matched it. Delivery is what a rule is FOR ("for each
         // matching rule, EventBridge delivers the event to every target of that
         // rule"), so it happens here rather than being left as a recorded
-        // intention. ONE budget for the whole request caps the fan-out's
-        // (entries x rules x targets x bytes) product.
+        // intention. ONE budget serves the whole request: the bytes it delivers
+        // are spent across every entry, while the delivery COUNT is re-armed per
+        // event, so one event's fan-out is decided by the rules and targets that
+        // matched it rather than by what else the request carried.
         //
         // An event-bus target re-publishes the event onto the bus it names,
         // whose own rules match the copy and deliver it, so the queue this pass
@@ -698,6 +700,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut dispatched: ::std::collections::BTreeMap<DispatchKey, Dispatched> =
             ::std::collections::BTreeMap::new();
         while let Some(dispatch) = dispatches.pop_front() {
+            // This event's own fan-out begins: the deliveries it may make are the
+            // ones its matched rules and their targets ask for, counted afresh.
+            budget.begin_event();
             // The envelope this dispatch hands over, copied once the FIRST rule
             // that hands it over needs it and shared by every entry made for it:
             // a dispatch no rule delivers copies nothing.
@@ -1942,27 +1947,61 @@ fn api_destination(
     })
 }
 
-/// How many target deliveries ONE `PutEvents` request may make, across every
-/// entry and every rule that matched.
+/// How many target deliveries ONE routed event may make, across every rule that
+/// matched it and every target of those rules.
 ///
-/// This operation's OWN bound, not a limit AWS publishes. Each factor of the
-/// fan-out is bounded on its own — at most 10 entries per request (`Entries` is
-/// modelled `length 1..10`), [`crate::state::MAX_RULES_PER_BUS`] rules per bus and
-/// [`crate::state::MAX_TARGETS_PER_RULE`] targets per rule — but their PRODUCT is
-/// not, so one request could otherwise dispatch 15,000 in-process calls. It is set
-/// far above any realistic event-and-rules combination (a rule fan-out of a few
-/// targets across a handful of matching rules per entry), and a request that
-/// exhausts it stops delivering and says so in the log rather than silently
-/// dispatching more.
-const MAX_DELIVERIES_PER_REQUEST: usize = 100;
+/// This operation's OWN bound, not a limit AWS publishes, and it is counted PER
+/// EVENT because that is what the fan-out AWS makes depends on: "for each matching
+/// rule, EventBridge delivers the event to every target of that rule", so how many
+/// deliveries one event makes is decided by the rules and targets the client
+/// configured and never by what else the same request happened to carry. A count
+/// spent across a whole request would drop a delivery a busy bus admits — a batch
+/// of entries on a bus carrying many matching rules reaches any such figure — and
+/// what is dropped is whatever was charged LAST, which is silent both to the
+/// publisher and to the target that never receives it.
+///
+/// It is therefore the ceiling the bounds already in force put on one event's
+/// fan-out: [`crate::state::MAX_RULES_PER_BUS`] rules on the bus, each with at most
+/// [`crate::state::MAX_TARGETS_PER_RULE`] targets. Nothing a client can configure
+/// exceeds it, so it never cuts a fan-out this emulator admits, while the work one
+/// request can demand stays bounded — by this figure times the modelled ten
+/// entries, and by what those deliveries WEIGH
+/// ([`MAX_DELIVERED_BYTES_PER_REQUEST`], which is spent across the whole request).
+const MAX_DELIVERIES_PER_EVENT: usize =
+    crate::state::MAX_RULES_PER_BUS * crate::state::MAX_TARGETS_PER_RULE;
+
+/// How many entries one request may carry: `Entries` is modelled `length 1..10`
+/// ("you can batch multiple event entries into one request").
+const MODELLED_MAX_ENTRIES: usize = 10;
+
+/// How many target deliveries ONE call may make in total, across every event it
+/// routes and every copy a bus target re-published.
+///
+/// [`MAX_DELIVERIES_PER_EVENT`] times the number of events the call will route —
+/// the same shape the matching budget takes
+/// ([`crate::state::MAX_MATCH_BYTES_PER_ENTRY`] is per entry and caps the request at
+/// that value times the entry count), so the fan-out a client CONFIGURED is never
+/// cut while the product one call can demand stays bounded. A bus target
+/// re-publishes onto another bus, whose own rules match the copy, so without this
+/// total the per-event count alone would multiply by a hop; with it, a call that
+/// reaches this figure stops delivering and says so.
+///
+/// `events` is what the CALLER will route — the entries a `PutEvents` request
+/// carries ([`MODELLED_MAX_ENTRIES`]), the events a replay re-publishes, one for a
+/// scheduled firing — because a total written for one of them would cut the others
+/// short: that is the very defect this budget's per-event count exists to avoid.
+fn max_deliveries_in_all(events: usize) -> usize {
+    events.saturating_mul(MAX_DELIVERIES_PER_EVENT)
+}
 
 /// How many delivered bytes ONE `PutEvents` request may hand to its targets,
 /// across every entry and target.
 ///
-/// A second bound on the same fan-out, beside [`MAX_DELIVERIES_PER_REQUEST`],
-/// because a delivery count alone does not bound the work: one entry's `Detail`
-/// may be just under [`crate::state::MAX_ENTRY_SIZE_BYTES`], so a count-only cap
-/// would admit hundreds of megabytes of message bodies from one request.
+/// A second bound on the same fan-out, beside the delivery counts
+/// ([`max_deliveries_in_all`]), because a delivery count alone does not bound the
+/// work: one entry's `Detail` may be just under
+/// [`crate::state::MAX_ENTRY_SIZE_BYTES`], so a count-only cap would admit hundreds
+/// of megabytes of message bodies from one request.
 const MAX_DELIVERED_BYTES_PER_REQUEST: usize = 8 * 1024 * 1024;
 
 /// How long ONE `PutEvents` request may spend WAITING on API destination
@@ -1982,41 +2021,76 @@ const MAX_DELIVERED_BYTES_PER_REQUEST: usize = 8 * 1024 * 1024;
 const MAX_ENDPOINT_WAIT_PER_REQUEST: ::std::time::Duration =
     ::std::time::Duration::from_secs(20);
 
-/// What one `PutEvents` request has left to spend on delivering to targets.
+/// What one call has left to spend on delivering to targets.
 ///
-/// ONE budget for the whole request, spent across every entry, rule and target:
-/// that is what caps the (entries x rules x targets x envelope bytes) PRODUCT
-/// rather than each factor on its own — the same shape as the matching budget
+/// The WEIGHT of what it delivers is one allowance for the whole call, which is
+/// what caps the (events x rules x targets x envelope bytes) product rather than
+/// each factor on its own — the same shape as the matching budget
 /// ([`crate::state::MAX_MATCH_BYTES_PER_ENTRY`]), which bounds comparison work and
-/// says nothing about delivery.
+/// says nothing about delivery. The COUNT is per routed event
+/// ([`MAX_DELIVERIES_PER_EVENT`]), re-armed as each event's own fan-out begins
+/// ([`Self::begin_event`]), so what one event's matched rules deliver never depends
+/// on what the same call carried beside it; the total is that count times the
+/// number of events the caller declared it would route ([`Self::for_events`]).
 pub(crate) struct DeliveryBudget {
     deliveries: usize,
+    all_deliveries: usize,
+    max_deliveries_in_all: usize,
     bytes: usize,
     /// What is left of [`MAX_ENDPOINT_WAIT_PER_REQUEST`].
     endpoint_wait: ::std::time::Duration,
 }
 
 impl DeliveryBudget {
-    /// A fresh budget: [`MAX_DELIVERIES_PER_REQUEST`] deliveries,
+    /// A fresh budget for a `PutEvents` request: [`MAX_DELIVERIES_PER_EVENT`]
+    /// deliveries for the event about to be routed, that many times the modelled
+    /// entry count in all ([`MODELLED_MAX_ENTRIES`]),
     /// [`MAX_DELIVERED_BYTES_PER_REQUEST`] bytes and
     /// [`MAX_ENDPOINT_WAIT_PER_REQUEST`] of waiting on endpoints.
     pub(crate) fn new() -> Self {
+        Self::for_events(MODELLED_MAX_ENTRIES)
+    }
+
+    /// The same budget for a caller that routes `events` events rather than the
+    /// entries of one request — a replay re-publishing a window of archived events,
+    /// where a total written for a request's ten entries would cut the replay short
+    /// part way through and tell nobody.
+    pub(crate) fn for_events(events: usize) -> Self {
         Self {
             deliveries: 0,
+            all_deliveries: 0,
+            max_deliveries_in_all: max_deliveries_in_all(events),
             bytes: 0,
             endpoint_wait: MAX_ENDPOINT_WAIT_PER_REQUEST,
         }
     }
 
-    /// Charge one delivery of `bytes`: `false` when it would pass either bound, in
+    /// Re-arm the delivery COUNT for the next routed event, leaving what the call
+    /// has already spent in total, on bytes and on endpoints where it is.
+    ///
+    /// Called as each event's own fan-out begins — for a copy re-published onto
+    /// another bus and for an event a replay re-publishes as much as for an entry
+    /// the request carried — because the deliveries an event makes are its own
+    /// matched rules' and targets', and a count shared with the other events would
+    /// let one event's fan-out decide another's.
+    pub(crate) fn begin_event(&mut self) {
+        self.deliveries = 0;
+    }
+
+    /// Charge one delivery of `bytes`: `false` when it would pass any bound, in
     /// which case nothing is charged and nothing must be delivered.
     fn charge(&mut self, bytes: usize) -> bool {
         let deliveries = self.deliveries + 1;
+        let all_deliveries = self.all_deliveries + 1;
         let total = self.bytes.saturating_add(bytes);
-        if deliveries > MAX_DELIVERIES_PER_REQUEST || total > MAX_DELIVERED_BYTES_PER_REQUEST {
+        if deliveries > MAX_DELIVERIES_PER_EVENT
+            || all_deliveries > self.max_deliveries_in_all
+            || total > MAX_DELIVERED_BYTES_PER_REQUEST
+        {
             return false;
         }
         self.deliveries = deliveries;
+        self.all_deliveries = all_deliveries;
         self.bytes = total;
         true
     }
@@ -2146,7 +2220,8 @@ pub(crate) async fn deliver(
     if !budget.charge(body.len()) {
         ::tracing::warn!(
             target = %target.arn,
-            deliveries = MAX_DELIVERIES_PER_REQUEST,
+            deliveries = MAX_DELIVERIES_PER_EVENT,
+            deliveries_in_all = budget.max_deliveries_in_all,
             bytes = MAX_DELIVERED_BYTES_PER_REQUEST,
             "this request reached the emulator's delivery budget; the remaining targets \
              of the matched rules are not delivered to"
@@ -2754,9 +2829,11 @@ async fn republish(
     // that has reached its budget does neither and nothing further is attempted
     // for this target.
     if !budget.charge(handover.rendered.len()) {
+        let in_all = budget.max_deliveries_in_all;
         return crate::state::InvocationOutcome::NotAttempted(format!(
             "this request reached the emulator's delivery budget of \
-             {MAX_DELIVERIES_PER_REQUEST} deliveries and {MAX_DELIVERED_BYTES_PER_REQUEST} bytes"
+             {MAX_DELIVERIES_PER_EVENT} deliveries per event, {in_all} in all and \
+             {MAX_DELIVERED_BYTES_PER_REQUEST} bytes"
         ));
     }
     // EventBridge publishes onto the other bus ACTING AS the role the target
@@ -3151,503 +3228,6 @@ const WORKFLOW_RESOURCE_TYPE: &str = "workflow";
 /// The resource type an Amazon Data Firehose delivery stream ARN names
 /// (`arn:<partition>:firehose:<region>:<account>:deliverystream/<name>`).
 const DELIVERY_STREAM_RESOURCE_TYPE: &str = "deliverystream";
-
-impl TargetKind {
-    /// The kind `arn` names, or `None` when this emulator has no invocation for
-    /// the resource it names — in which case nothing is handed over and nothing
-    /// is invented in its place.
-    fn of(arn: &str) -> Option<Self> {
-        let parsed = ::service_common::arn::parse(arn)?;
-        match parsed.vendor {
-            // A queue's ARN names the queue directly: a resource field carrying
-            // a type separator is not one, so it addresses no queue.
-            SQS_ARN_NAMESPACE
-                if !parsed.resource.contains('/') && !parsed.resource.contains(':') =>
-            {
-                Some(Self::Queue)
-            }
-            LAMBDA_ARN_NAMESPACE if parsed.resource_type() == FUNCTION_RESOURCE_TYPE => {
-                Some(Self::Function)
-            }
-            // A topic's ARN, like a queue's, names the topic directly.
-            SNS_ARN_NAMESPACE
-                if !parsed.resource.contains('/') && !parsed.resource.contains(':') =>
-            {
-                Some(Self::Topic)
-            }
-            STATES_ARN_NAMESPACE if parsed.resource_type() == STATE_MACHINE_RESOURCE_TYPE => {
-                Some(Self::StateMachine)
-            }
-            // A data stream's ARN names the stream directly (`stream/<name>`): a
-            // resource carrying a further segment addresses something within a
-            // stream (a consumer) rather than the stream, so no record is written
-            // for it.
-            KINESIS_ARN_NAMESPACE
-                if ::service_common::arn::resource_id_of_type(arn, STREAM_RESOURCE_TYPE)
-                    .is_some_and(|name| !name.is_empty() && !name.contains(['/', ':'])) =>
-            {
-                Some(Self::Stream)
-            }
-            // This service's own resource: an API destination, whose ARN carries
-            // the destination's name and its unique id
-            // (`crate::state::api_destination_arn`).
-            crate::state::ARN_NAMESPACE
-                if parsed.resource_type() == API_DESTINATION_RESOURCE_TYPE =>
-            {
-                Some(Self::ApiDestination)
-            }
-            // A workflow's ARN names the workflow directly (`workflow/<name>`):
-            // a resource carrying a further segment addresses something within a
-            // workflow (one of its runs) rather than the workflow, so no event
-            // is handed to it.
-            GLUE_ARN_NAMESPACE
-                if ::service_common::arn::resource_id_of_type(arn, WORKFLOW_RESOURCE_TYPE)
-                    .is_some_and(|name| !name.is_empty() && !name.contains(['/', ':'])) =>
-            {
-                Some(Self::Workflow)
-            }
-            // A pipeline's ARN names the pipeline directly, the way a queue's and a
-            // topic's do (`arn:<partition>:codepipeline:<region>:<account>:<name>`): a
-            // resource field carrying a type separator addresses one of that service's
-            // compound resources (an action type, a webhook) rather than a pipeline, so
-            // no execution is started for it.
-            CODEPIPELINE_ARN_NAMESPACE
-                if !parsed.resource.is_empty()
-                    && !parsed.resource.contains('/')
-                    && !parsed.resource.contains(':') =>
-            {
-                Some(Self::Pipeline)
-            }
-            // A log group's ARN names the group, in either of the two forms that
-            // name it (`crate::state::log_group_target::log_group_name`): a
-            // resource addressing something WITHIN a group (one of its streams)
-            // is not a group, so no log event is written for it.
-            crate::state::log_group_target::LOGS_ARN_NAMESPACE
-                if crate::state::log_group_target::log_group_name(arn).is_some() =>
-            {
-                Some(Self::LogGroup)
-            }
-            // A delivery stream's ARN names the stream directly
-            // (`deliverystream/<name>`): a resource carrying a further segment
-            // addresses something within a stream rather than the stream, so no
-            // record is put into it.
-            FIREHOSE_ARN_NAMESPACE
-                if ::service_common::arn::resource_id_of_type(
-                    arn,
-                    DELIVERY_STREAM_RESOURCE_TYPE,
-                )
-                .is_some_and(|name| !name.is_empty() && !name.contains(['/', ':'])) =>
-            {
-                Some(Self::DeliveryStream)
-            }
-            // A cluster's ARN names the cluster directly (`cluster/<name>`): a
-            // resource addressing something WITHIN a cluster (one of its tasks,
-            // one of its services) is not a cluster, so no task is run for it.
-            ECS_ARN_NAMESPACE if ecs_task::cluster_in_arn(arn).is_some() => Some(Self::EcsTask),
-            // An invoke ARN names the api, the stage, the verb and the resource
-            // path ONE request is made to: an ARN stating fewer of those names no
-            // request at all ([`rest_api_stage::addressed_stage`]).
-            rest_api_stage::EXECUTE_API_ARN_NAMESPACE
-                if rest_api_stage::addressed_stage(arn).is_some() =>
-            {
-                Some(Self::RestApiStage)
-            }
-            // An AppSync target's ARN names the API's published GraphQL ENDPOINT, or the
-            // API (and optionally one field of it) by id: an ARN naming fewer of those
-            // names addresses no API, so no operation is executed for it
-            // ([`app_sync::addressed`]).
-            app_sync::APPSYNC_ARN_NAMESPACE if app_sync::addressed(arn).is_some() => {
-                Some(Self::GraphqlApiField)
-            }
-            _ => None,
-        }
-    }
-
-    /// The IAM action the invocation of this target kind performs, which is what
-    /// the target's role has to be allowed to do.
-    fn action(self) -> &'static str {
-        match self {
-            Self::Queue => "sqs:SendMessage",
-            Self::Function => "lambda:InvokeFunction",
-            Self::Topic => "sns:Publish",
-            Self::StateMachine => "states:StartExecution",
-            Self::Stream => "kinesis:PutRecord",
-            Self::ApiDestination => "events:InvokeApiDestination",
-            // The action AWS requires of the role a Glue workflow target names,
-            // and the one no operation of the Glue model serves: the ingress
-            // EventBridge notifies a workflow's EVENT trigger through.
-            Self::Workflow => "glue:notifyEvent",
-            Self::Pipeline => "codepipeline:StartPipelineExecution",
-            Self::LogGroup => crate::state::log_group_target::PUT_LOG_EVENTS_ACTION,
-            Self::DeliveryStream => "firehose:PutRecord",
-            Self::EcsTask => crate::state::ecs_target::RUN_TASK_ACTION,
-            Self::RestApiStage => rest_api_stage::INVOKE_ACTION,
-            Self::GraphqlApiField => app_sync::GRAPHQL_ACTION,
-        }
-    }
-
-    /// The RESOURCE the action [`Self::action`] names is performed ON, which is
-    /// what a grant in force on the target's role has to cover.
-    ///
-    /// The target's own ARN for every kind but one: an `ecs:RunTask` is performed
-    /// on the TASK DEFINITION the run names — the resource type Amazon ECS
-    /// publishes for that action — with the cluster the task is placed in carried
-    /// as a condition key instead ([`ecs_task::run_resource`]).
-    fn action_resource<'a>(self, handover: &Handover<'a>) -> &'a str {
-        match self {
-            Self::EcsTask => ecs_task::run_resource(handover),
-            _ => handover.target.arn.as_str(),
-        }
-    }
-
-    /// Why the policies in force on the target's role bar this invocation, or
-    /// `None` when nothing of the kind can be shown.
-    ///
-    /// The shared decision for every kind AWS invokes under that role
-    /// ([`role_refusal`]), which an ECS task run takes with the cluster it places
-    /// into published as a condition key
-    /// ([`ecs_task::run_authorization_refusal`]) and which an invoke of an API
-    /// Gateway stage REPORTS as the answer the endpoint gives an identity that may
-    /// not invoke it ([`rest_api_stage::invoke_authorization_refusal`]) — as an
-    /// AppSync field's execution reports it as the answer that API's endpoint gives
-    /// such an identity ([`app_sync::invoke_authorization_refusal`]).
-    fn role_bars(
-        self,
-        stores: &Stores<'_>,
-        role_arn: Option<&str>,
-        handover: &Handover<'_>,
-        attempt: &crate::state::DeliveryAttempt<'_>,
-    ) -> Option<(String, String)> {
-        let iam = stores.iam;
-        match self {
-            Self::EcsTask => ecs_task::run_authorization_refusal(iam, role_arn, handover, attempt),
-            Self::RestApiStage => rest_api_stage::invoke_authorization_refusal(
-                iam,
-                role_arn,
-                handover,
-                attempt,
-                stores.endpoint,
-            ),
-            Self::GraphqlApiField => {
-                app_sync::invoke_authorization_refusal(stores, role_arn, handover, attempt)
-            }
-            _ => role_refusal(iam, role_arn, handover.rule_arn, attempt),
-        }
-    }
-
-    /// Make the invocation, and answer what came of it.
-    ///
-    /// A target service that answers `NotImplemented` has not refused the
-    /// delivery — nobody has written that operation in this emulator yet — so it
-    /// is recorded as NOT ATTEMPTED rather than counted as a failed invocation:
-    /// dead-lettering an event for a gap in the emulator would report a failure
-    /// that AWS never produces.
-    ///
-    /// `role_grants` is what the ROLE the target names says about this call, for
-    /// the kinds whose call AWS otherwise governs by the target's own
-    /// resource-based policy ([`role_grants_call`]): a delivery made as a role
-    /// that may make the call is admitted by that role, so the target's own
-    /// document is not what decides it and is not read.
-    #[allow(clippy::too_many_arguments)]
-    async fn invoke(
-        self,
-        callback: &smithy_server_runtime::EmbeddedEmulator,
-        clients: &mut Clients,
-        stores: &Stores<'_>,
-        region: &str,
-        handover: &Handover<'_>,
-        body: &str,
-        spent: &mut Spent,
-        budget: &mut DeliveryBudget,
-        sends: &mut QueueSends,
-        role_grants: bool,
-    ) -> Option<crate::state::InvocationOutcome> {
-        let target = handover.target;
-        let arn = target.arn.as_str();
-        // The target's OWN Region — the ARN's — which is not necessarily the one
-        // this request was signed for, falling back to it when the ARN names no
-        // Region label.
-        let region = ::service_common::arn::region_of(arn, self.vendor()).unwrap_or(region);
-        Some(match self {
-            // A queue target's message is HELD for the batch its queue's messages
-            // of this request go out in ([`queue_sends`]), once the documents in
-            // force over that queue have admitted it: `None` out of this
-            // operation is a delivery that is going to be made and recorded from
-            // what that batch answered, not one that was skipped.
-            Self::Queue => {
-                match queue_sends::hand_over(
-                    callback,
-                    clients,
-                    stores,
-                    region,
-                    handover,
-                    body,
-                    sends,
-                    role_grants,
-                )
-                .await
-                {
-                    queue_sends::Handled::Held => return None,
-                    queue_sends::Handled::Outcome(outcome) => outcome,
-                }
-            }
-            Self::Function => {
-                // One client for both calls this delivery makes on the function,
-                // for the reason the queue branch above gives.
-                let client = clients.lambda(callback, region).clone();
-                // The FUNCTION's own resource-based policy decides this delivery
-                // before anything is invoked ([`function_delivery_refusal`]),
-                // together with the ROLE the target names where it grants the
-                // invocation too — and an explicit deny in that document still
-                // refuses whatever the role allows
-                // ([`admitted_by_target_or_role`]). It is read ONCE per request
-                // per function ([`Clients::function_policy`]), for the reason the
-                // queue branch above gives.
-                let policy = clients.function_policy(&client, arn).await;
-                if let Some(refusal) =
-                    function_delivery_refusal(policy, arn, self.action(), handover, role_grants)
-                {
-                    return Some(refusal);
-                }
-                outcome(
-                    client
-                        // "Event: invoke the function asynchronously" — which is
-                        // how EventBridge invokes a function target: the rule
-                        // does not wait for the function's answer.
-                        .invoke()
-                        .function_name(arn)
-                        .invocation_type(::aws_sdk_lambda::types::InvocationType::Event)
-                        .payload(::aws_sdk_lambda::primitives::Blob::new(body.as_bytes()))
-                        .send()
-                        .await,
-                )
-            }
-            Self::Topic => {
-                // One client for both calls this delivery makes on the topic,
-                // for the reason the queue branch above gives.
-                let client = clients.sns(callback, region).clone();
-                // The TOPIC's own configuration decides this delivery before
-                // anything is published: its access policy
-                // ([`topic_delivery_refusal`]) and, for an encrypted topic, the
-                // policy of the key its messages are encrypted under
-                // ([`topic_key_refusal`]). The attributes are read ONCE per
-                // request per topic ([`Clients::topic_attributes`]), for the
-                // reason the queue branch above gives.
-                let attributes = clients.topic_attributes(&client, arn).await;
-                if let Some(refusal) = topic_delivery_refusal(
-                    attributes.as_ref(),
-                    arn,
-                    self.action(),
-                    handover,
-                    role_grants,
-                ) {
-                    return Some(refusal);
-                }
-                if let Some(refusal) =
-                    topic_key_refusal(stores.kms, attributes.as_ref(), region, arn, handover)
-                {
-                    return Some(refusal);
-                }
-                outcome(client.publish().topic_arn(arn).message(body).send().await)
-            }
-            Self::StateMachine => outcome(
-                clients
-                    .sfn(callback, region)
-                    .start_execution()
-                    .state_machine_arn(arn)
-                    // The execution's input is the whole event envelope, and the
-                    // execution is NAMED after the event that started it: an
-                    // execution name "must be unique for your Amazon Web
-                    // Services account, Region, and state machine"
-                    // (`StartExecution$name`), and EventBridge mints one per
-                    // INVOCATION from the event id and a UUID of its own
-                    // ([`state_machine_execution_name`]) — so the event id is
-                    // the join key between the event and its execution while two
-                    // targets naming two machines, and one event delivered
-                    // twice, each get an execution of their own.
-                    .name(state_machine_execution_name(handover.event_id))
-                    .input(body)
-                    .send()
-                    .await,
-            ),
-            Self::Stream => {
-                // Resolving the key reads the delivered text back as a document
-                // and names a place in it, which is CPU work on this worker:
-                // yielding first gives a cancellation or shutdown signal
-                // somewhere to land before it starts.
-                ::tokio::task::yield_now().await;
-                let partition_key = kinesis_partition_key(
-                    target.partition_key_path.as_deref(),
-                    handover.event_id,
-                    body,
-                );
-                outcome(
-                    clients
-                        .kinesis(callback, region)
-                        .put_record()
-                        .stream_arn(arn)
-                        // The record's data is the whole event envelope, and its
-                        // partition key is what decides the shard the event goes
-                        // to.
-                        .data(::aws_sdk_kinesis::primitives::Blob::new(body.as_bytes()))
-                        .partition_key(partition_key)
-                        .send()
-                        .await,
-                )
-            }
-            Self::ApiDestination => {
-                // The stored `InvocationEndpoint` is a caller's text, and it is
-                // NOT a host this process connects to: the invocation is made
-                // over the in-process emulator transport
-                // (`OperationContext::callback().http_connector()`, see
-                // [`invoke_api_destination`]), which routes the request to a
-                // service this emulator serves itself. No socket is opened, no
-                // name is resolved and nothing outside this process can be
-                // reached, so the endpoint's host, scheme and address range
-                // decide nothing but which emulated service claims it.
-                invoke_api_destination(callback, handover, body, spent, budget).await
-            }
-            // A Glue workflow is reached through the store of the Glue service
-            // in this SAME engine rather than through a client: the ingress
-            // EventBridge uses, `glue:notifyEvent`, is served by no operation of
-            // the Glue model, so there is no API call to make — the event is
-            // counted against the workflow's EVENT trigger where Glue's own
-            // readers read it.
-            Self::Workflow => notify_workflow(stores.glue, region, arn),
-            Self::Pipeline => {
-                // The pipeline is named by the resource segment of its ARN, which is
-                // what `StartPipelineExecution$name` takes.
-                let name = ::service_common::arn::parse(arn).map(|parsed| parsed.resource);
-                let Some(name) = name.filter(|name| !name.is_empty()) else {
-                    return Some(crate::state::InvocationOutcome::NotAttempted(
-                        "the target ARN names no pipeline".to_string(),
-                    ));
-                };
-                outcome(
-                    clients
-                        .codepipeline(callback, region)
-                        .start_pipeline_execution()
-                        .name(name)
-                        // `clientRequestToken` is "the system-generated unique ID used to
-                        // identify a unique execution request" and is an idempotency
-                        // token, so the delivery carries the one identifier of this
-                        // handover that is unique already — the event's id. One event
-                        // delivered twice is then one execution rather than two, which is
-                        // what makes the delivery idempotent (the state-machine target's
-                        // rule, in the member that service takes it in).
-                        .client_request_token(handover.event_id)
-                        .send()
-                        .await,
-                )
-            }
-            Self::LogGroup => {
-                // Resolving the record reads the delivered text back as a
-                // document, which is CPU work on this worker: yielding first
-                // gives a cancellation or shutdown signal somewhere to land
-                // before it starts, as the stream branch above does.
-                ::tokio::task::yield_now().await;
-                deliver_log_event(
-                    callback,
-                    clients,
-                    stores,
-                    region,
-                    arn,
-                    self.action(),
-                    handover,
-                    body,
-                    spent,
-                )
-                .await
-            }
-            Self::DeliveryStream => {
-                // `PutRecord` addresses the stream by NAME
-                // (`PutRecordInput$DeliveryStreamName`), which is the resource
-                // segment of its ARN.
-                let name = ::service_common::arn::resource_id_of_type(
-                    arn,
-                    DELIVERY_STREAM_RESOURCE_TYPE,
-                );
-                let Some(name) = name.filter(|name| !name.is_empty()) else {
-                    return Some(crate::state::InvocationOutcome::NotAttempted(
-                        "the target ARN names no delivery stream".to_string(),
-                    ));
-                };
-                // The record's data is what the target receives, as the bytes
-                // the stream then delivers to its own destination: "the data
-                // blob … is the data that the producer sends to Firehose"
-                // (`Record$Data`).
-                let record = ::aws_sdk_firehose::types::Record::builder()
-                    .data(::aws_sdk_firehose::primitives::Blob::new(body.as_bytes()))
-                    .build();
-                match record {
-                    Ok(record) => outcome(
-                        clients
-                            .firehose(callback, region)
-                            .put_record()
-                            .delivery_stream_name(name)
-                            .record(record)
-                            .send()
-                            .await,
-                    ),
-                    Err(error) => crate::state::InvocationOutcome::NotAttempted(format!(
-                        "the record this event would be put as could not be built: {error}"
-                    )),
-                }
-            }
-            Self::EcsTask => {
-                // Reading the delivered text back as the run's overrides is CPU
-                // work on this worker: yielding first gives a cancellation or
-                // shutdown signal somewhere to land before it starts, as the
-                // stream branch above does.
-                ::tokio::task::yield_now().await;
-                ecs_task::run(callback, clients, stores, region, handover, body).await
-            }
-            Self::RestApiStage => {
-                // The stage is reached over the IN-PROCESS emulator transport, the
-                // way an api destination's endpoint is: the invoke url names the
-                // api this emulator holds rather than a name anything resolves, so
-                // no socket is opened and nothing outside this process is reached.
-                rest_api_stage::invoke_rest_api_stage(
-                    callback,
-                    stores.endpoint,
-                    region,
-                    handover,
-                    body,
-                    spent,
-                    budget,
-                )
-                .await
-            }
-            Self::GraphqlApiField => {
-                // The API's own `GRAPHQL` endpoint EXECUTES the operation, in this
-                // same process: that endpoint is a socket the AppSync service
-                // serves per API rather than a route of this emulator's front
-                // door, so the request is handed to the very code it serves and no
-                // socket is opened ([`app_sync`]).
-                app_sync::execute_graphql_operation(callback, stores, region, handover, body).await
-            }
-        })
-    }
-
-    /// The ARN namespace of the service this kind of target lives in.
-    fn vendor(self) -> &'static str {
-        match self {
-            Self::Queue => SQS_ARN_NAMESPACE,
-            Self::Function => LAMBDA_ARN_NAMESPACE,
-            Self::Topic => SNS_ARN_NAMESPACE,
-            Self::StateMachine => STATES_ARN_NAMESPACE,
-            Self::Stream => KINESIS_ARN_NAMESPACE,
-            Self::ApiDestination => crate::state::ARN_NAMESPACE,
-            Self::Workflow => GLUE_ARN_NAMESPACE,
-            Self::Pipeline => CODEPIPELINE_ARN_NAMESPACE,
-            Self::LogGroup => crate::state::log_group_target::LOGS_ARN_NAMESPACE,
-            Self::DeliveryStream => FIREHOSE_ARN_NAMESPACE,
-            Self::EcsTask => ECS_ARN_NAMESPACE,
-            Self::RestApiStage => rest_api_stage::EXECUTE_API_ARN_NAMESPACE,
-            Self::GraphqlApiField => app_sync::APPSYNC_ARN_NAMESPACE,
-        }
-    }
-}
 
 /// The name EventBridge starts ONE state-machine target's execution under: the
 /// id of the event that started it, an underscore, and a UUID minted for this
@@ -4817,9 +4397,9 @@ pub(crate) struct Clients {
     /// as such rather than asked again.
     ///
     /// It holds one entry per QUEUE this request reached, so it is bounded by the
-    /// request's own delivery budget ([`MAX_DELIVERIES_PER_REQUEST`]): a request
-    /// hands over no more deliveries than that, and a queue it never reached has
-    /// no entry here.
+    /// request's own delivery budget ([`max_deliveries_in_all`]): a request hands
+    /// over no more deliveries than that, and a queue it never reached has no entry
+    /// here.
     queue_attributes: ::std::collections::BTreeMap<String, Option<QueueAttributes>>,
     /// The same, for each TOPIC this request has published to: its access policy
     /// and the key its messages are encrypted under ([`topic_attributes`]).
@@ -4977,3 +4557,11 @@ impl Clients {
 #[cfg(test)]
 #[path = "put_events/tests.rs"]
 mod tests;
+
+/// How a target's ARN classifies — which service's API a delivery to it makes, and
+/// what that call needs — read off the ARN itself.
+///
+/// The `#[path]` is what points the child at `ops/put_events/`, for the reason the
+/// api-destination module above gives.
+#[path = "put_events/target_kind.rs"]
+mod target_kind;

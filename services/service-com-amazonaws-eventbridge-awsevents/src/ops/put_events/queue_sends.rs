@@ -93,7 +93,7 @@ impl Held {
 /// routing pass decided them.
 ///
 /// How many it holds is bounded by the request's own delivery budget
-/// ([`MAX_DELIVERIES_PER_REQUEST`] deliveries and
+/// ([`max_deliveries_in_all`] deliveries and
 /// [`MAX_DELIVERED_BYTES_PER_REQUEST`] bytes), which [`deliver`] charges BEFORE a
 /// message is held: a request holds no more messages than it may deliver, so this
 /// grows with the budget rather than with what a publisher asks for.

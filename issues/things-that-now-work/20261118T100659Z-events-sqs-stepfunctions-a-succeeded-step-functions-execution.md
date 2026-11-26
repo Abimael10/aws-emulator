@@ -9,6 +9,38 @@ Issue-Commit: 7f8f759d74cb6fc509a9ff7e87e7c97fb9625f4c
 
 > _Note: this issue was identified against the code base at commit `7f8f759d74cb6fc509a9ff7e87e7c97fb9625f4c`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution
+
+One real defect on the delivery path this report names is closed; the recorded check's TIMEOUT is
+not, and is not reproducible — both halves are stated here so the next reader is not misled.
+
+What is fixed: EventBridge counted the target deliveries one `PutEvents` request may make across the
+WHOLE request, so a matched envelope was silently dropped once the request's entries, the rules that
+matched them and those rules' targets multiplied past that count — the publisher is still answered
+`FailedEntryCount` 0 and the target is simply never written to, which is this report's symptom
+exactly. A bus carrying more than a hundred matching rule-targets, or a batch of execution status
+changes on a bus carrying a dozen, reached it; what was dropped was whatever was charged last, which
+for a status-change batch is the newest execution's. The count is now per routed event and set to
+the ceiling the bounds already in force put on one event's fan-out (`MAX_RULES_PER_BUS` x
+`MAX_TARGETS_PER_RULE`), with a total of that figure times the number of events the caller routes, so
+a fan-out a client configured is never cut while the work one call can demand stays bounded.
+
+What is NOT fixed: `step-functions-execution-status-change-reaches-the-default-bus` still ends
+`Check timed out after 60.0s`, and this change is not shown to be its cause. The report's stronger
+claim — that no `aws.states` status-change event is ever published — is contradicted by the suites
+added here: driven end to end on the emulator a client STARTS, the scenario under "Steps to
+Reproduce" (a role trusted by `states.amazonaws.com`, a STANDARD single-`Pass` machine, two queues,
+two default-bus rules filtered on `detail.stateMachineArn` and `detail.status`, `resources` naming
+the execution, `startDate`/`stopDate` as epoch milliseconds bracketing the run, and nothing on the
+wrong-status queue) is served in about two seconds, under each shape of queue grant a client writes
+(unconditional, scoped by `aws:SourceArn`, scoped by `aws:SourceAccount`). A fixer picking that
+check up again should start from a shape not already covered by
+`core/router/tests/all/sfn_status_change_scoped_queue_grant_on_a_started_emulator.rs`, the three
+suites named in the resolution of
+`issues/things-that-now-work/20261107T042814Z-events-sqs-stepfunctions-step-functions-publishes-no-step.md`,
+and `core/router/tests/all/sqs_long_poll_does_not_block_the_emulator.rs` (which rules out a long poll
+holding the emulator) rather than from "nothing is published".
+
 ## Operation
 PutEvents
 

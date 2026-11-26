@@ -399,7 +399,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             events: Some(&state),
             endpoint: endpoint.as_str(),
         };
-        let mut budget = crate::ops::put_events::DeliveryBudget::new();
+        // The budget's total is sized for the events THIS replay re-publishes, not
+        // for the entries of one `PutEvents` request: a total written for ten
+        // entries would cut a window of a thousand archived events short part way
+        // through and tell nobody.
+        let mut budget =
+            crate::ops::put_events::DeliveryBudget::for_events(selected.len().max(1));
         let mut clients = crate::ops::put_events::Clients::default();
         // The messages the QUEUE targets of this replay are handed, sent in
         // batches once the replayed events have been matched and decided
@@ -418,6 +423,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // CPU-bound, and without an await point in this loop a cancellation
             // or a shutdown signal would have nowhere to land.
             ::tokio::task::yield_now().await;
+            // This replayed event's own fan-out begins: what its matched rules
+            // deliver is counted afresh, so a replay of a whole window does not
+            // let an earlier event's fan-out decide a later one's.
+            budget.begin_event();
             let Some(envelope) = crate::state::replayed_envelope(&event.envelope, &replay.name)
             else {
                 ::tracing::warn!(
