@@ -50,3 +50,27 @@ Replay the behavioral suite and re-run exactly the checks in trace_ids.
 2. Cause B — set routing.http2.enabled=true, connect to the HTTPS listener offering ALPN ['h2','http/1.1']; the handshake selects 'h2' today, so find what the poll ahead of that assertion waits for.
 3. Cause C — read DNSName and request `http://{DNSName}:{listener port}/`; expect the listener's answer.
 4. Cause D — bring up the listener as each check does and send the client request; expect a response within the check budget.
+
+## Resolution
+
+* Cause A (FIXED) — `elbv2.target-health-check-state-transition-unhealthy-to-healthy` passes on the
+  current tree: a registration this service can observe nothing about no longer keeps the verdict it
+  started with, and the check's `unhealthy` is reported with its reason.
+* Cause D, the security-policy half (FIXED here) — a listener's security policy now bounds the
+  CIPHER a handshake negotiates as well as the TLS version, in the policy's own published priority
+  order: `negotiated_cipher_suites` reads the `Ciphers` the policy publishes
+  (`DescribeSSLPolicies`, one catalogue) and the handshake selects the first of them the client also
+  offered, so a suite the policy does not publish is one no connection of such a listener runs under.
+  Covered by `tests/all/alb_listener_ssl_policy_ciphers.rs`.
+* Cause C (BLOCKED, vendor) — unchanged from what this report states: `DNSName` can only become a
+  bare host once a load balancer answers on the port its LISTENER declares, and the core owns that
+  port. `vendor/server/src/listeners.rs` binds through `bind_tokio`/`bind_std` from
+  `bind_ip_from_env()` and `listener_port_range_from_env()`, and `Listeners::tcp_plaintext` takes no
+  requested port, so a service crate cannot ask for 80 or 443 on a host of its own. Needed in the
+  core: a listener opener that takes a REQUESTED port and reports whether it was granted.
+* Causes B and D's attribute half (STILL OPEN) — both subjects are implemented and pinned end to end
+  (`tests/all/alb_negotiated_application_protocol.rs`,
+  `tests/all/alb_listener_response_headers.rs`), and both checks still exhaust the 60 s harness cap
+  inside a poll that precedes their assertions (`_poll_until#13`, `_poll_until#27`), which records
+  neither its description nor its last result. The step sequences of those two fixtures are still
+  what is needed to say what they wait for.

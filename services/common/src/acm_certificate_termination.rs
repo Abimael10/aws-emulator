@@ -26,7 +26,10 @@
 //! is handed in by the caller that enforces it. Neither is the APPLICATION PROTOCOL the
 //! handshake negotiates: which protocols a resource offers is its own configuration too (a
 //! listener's ALPN policy, an attribute of the load balancer in front of it), so they are
-//! handed in by the caller that SERVES them ([`server_config_offering`]).
+//! handed in by the caller that SERVES them ([`server_config_offering`]). Nor are the
+//! PROTOCOL VERSIONS and CIPHER SUITES the handshake may complete under: a resource whose
+//! own policy bounds them hands both in, in the order that policy prefers them
+//! ([`server_config_negotiating`]).
 
 use std::sync::Arc;
 
@@ -83,8 +86,33 @@ pub fn server_config_offering(
     client_certificates: Option<Arc<dyn client_certificates::ClientCertVerifier>>,
     alpn_protocols: &[&str],
 ) -> Option<Arc<::rustls::ServerConfig>> {
+    server_config_negotiating(
+        certificates,
+        versions,
+        &[],
+        client_certificates,
+        alpn_protocols,
+    )
+}
+
+/// [`server_config_offering`] for a resource whose own policy also says WHICH CIPHER SUITES
+/// it negotiates, and in which order it prefers them.
+///
+/// `cipher_suites` are those suites, most preferred first: a suite outside the list is one
+/// the resource never negotiates, and the one negotiated is the first entry of the list the
+/// client also offered — the resource's own preference, not the client's, which is why the
+/// client's order is not followed when a list is given. An EMPTY list leaves the suites and
+/// the preference order the library's own, which is the resource whose policy says nothing
+/// about ciphers.
+pub fn server_config_negotiating(
+    certificates: &[Arc<CertificateKeyMaterial>],
+    versions: &[&'static ::rustls::SupportedProtocolVersion],
+    cipher_suites: &[::rustls::SupportedCipherSuite],
+    client_certificates: Option<Arc<dyn client_certificates::ClientCertVerifier>>,
+    alpn_protocols: &[&str],
+) -> Option<Arc<::rustls::ServerConfig>> {
     let resolver = Arc::new(SelectedByServerName::of(certificates)?);
-    let builder = ::rustls::ServerConfig::builder_with_provider(provider());
+    let builder = ::rustls::ServerConfig::builder_with_provider(provider_negotiating(cipher_suites));
     let builder = match versions.is_empty() {
         true => builder.with_safe_default_protocol_versions().ok()?,
         false => builder.with_protocol_versions(versions).ok()?,
@@ -99,7 +127,23 @@ pub fn server_config_offering(
         .iter()
         .map(|protocol| protocol.as_bytes().to_vec())
         .collect();
+    // The order of a stated suite list is the RESOURCE's preference, so the server's own
+    // order decides which of the suites a client offered is selected.
+    config.ignore_client_order = !cipher_suites.is_empty();
     Some(Arc::new(config))
+}
+
+/// [`provider`] offering only `cipher_suites`, in that order, or the provider itself for an
+/// empty list — the suites a resource whose policy names them negotiates, and nothing else.
+fn provider_negotiating(
+    cipher_suites: &[::rustls::SupportedCipherSuite],
+) -> Arc<::rustls::crypto::CryptoProvider> {
+    if cipher_suites.is_empty() {
+        return provider();
+    }
+    let mut provider = ::rustls::crypto::aws_lc_rs::default_provider();
+    provider.cipher_suites = cipher_suites.to_vec();
+    Arc::new(provider)
 }
 
 /// The certificates one resource presents, and the selection among them: the entry whose

@@ -391,6 +391,75 @@ pub(crate) fn client_config_presenting(presented: Option<&Minted>) -> Arc<rustls
 #[derive(Debug)]
 struct AssertedAfterwards(Arc<rustls::crypto::CryptoProvider>);
 
+/// [`client_config`] for a client that offers ONLY `versions` and only the cipher suites
+/// `suites` names — the client whose offer makes WHICH suite a listener selects, and whether
+/// it selects one at all, observable (`crate::alb_listener_ssl_policy_ciphers`).
+///
+/// The suites are named by the way the published cipher catalogue spells them
+/// (`Cipher$Name`, as `DescribeSSLPolicies` reports it), so a case reads the same spelling
+/// the security policy under test publishes; a name this client's own provider does not
+/// implement is left out of the offer.
+pub(crate) fn client_config_offering(
+    versions: &[&'static rustls::SupportedProtocolVersion],
+    suites: &[&str],
+) -> Arc<rustls::ClientConfig> {
+    let available = rustls::crypto::aws_lc_rs::default_provider().cipher_suites;
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.cipher_suites = suites
+        .iter()
+        .filter_map(|wanted| {
+            available
+                .iter()
+                .find(|suite| cipher_catalogue_name(suite.suite()) == Some(*wanted))
+                .copied()
+        })
+        .collect();
+    let provider = Arc::new(provider);
+    Arc::new(
+        rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_protocol_versions(versions)
+            .expect("the offered suites cover the offered versions")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AssertedAfterwards(provider)))
+            .with_no_client_auth(),
+    )
+}
+
+/// How the published cipher catalogue spells one negotiated suite: a TLS 1.3 suite by its
+/// registered name and a TLS 1.2 suite by its OpenSSL name, which is how `Cipher$Name`
+/// spells them.
+///
+/// Written out here rather than read out of the service: a case that named its suites by the
+/// service's own table could not catch that table disagreeing with the catalogue.
+pub(crate) fn cipher_catalogue_name(suite: rustls::CipherSuite) -> Option<&'static str> {
+    match suite {
+        rustls::CipherSuite::TLS13_AES_128_GCM_SHA256 => Some("TLS_AES_128_GCM_SHA256"),
+        rustls::CipherSuite::TLS13_AES_256_GCM_SHA384 => Some("TLS_AES_256_GCM_SHA384"),
+        rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => {
+            Some("TLS_CHACHA20_POLY1305_SHA256")
+        }
+        rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 => {
+            Some("ECDHE-ECDSA-AES128-GCM-SHA256")
+        }
+        rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 => {
+            Some("ECDHE-ECDSA-AES256-GCM-SHA384")
+        }
+        rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 => {
+            Some("ECDHE-RSA-AES128-GCM-SHA256")
+        }
+        rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 => {
+            Some("ECDHE-RSA-AES256-GCM-SHA384")
+        }
+        rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 => {
+            Some("ECDHE-ECDSA-CHACHA20-POLY1305")
+        }
+        rustls::CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => {
+            Some("ECDHE-RSA-CHACHA20-POLY1305")
+        }
+        _ => None,
+    }
+}
+
 impl rustls::client::danger::ServerCertVerifier for AssertedAfterwards {
     fn verify_server_cert(
         &self,

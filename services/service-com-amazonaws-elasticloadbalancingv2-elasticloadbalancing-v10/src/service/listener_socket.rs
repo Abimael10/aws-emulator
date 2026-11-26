@@ -786,8 +786,9 @@ struct ConnectionPlan {
 /// selection [`::service_common::acm_certificate_termination`] states), so one listener serves
 /// every name its certificate list
 /// covers. The protocol versions are the ones the listener's security policy negotiates
-/// ([`negotiated_versions`]), so a client reads the version that policy allows rather than
-/// whatever this library would prefer.
+/// ([`negotiated_versions`]) and the cipher suites the ones it publishes, in its own priority
+/// order ([`negotiated_cipher_suites`]), so a client reads the version and the cipher that
+/// policy allows rather than whatever this library would prefer.
 ///
 /// `asks_for_client_certificates` is the listener's own mutual-authentication mode: a listener
 /// that hands a client certificate to its target asks every client for one
@@ -802,13 +803,59 @@ fn tls_server_config(
     asks_for_client_certificates: bool,
     alpn_protocols: &[&'static str],
 ) -> Option<Arc<::rustls::ServerConfig>> {
-    ::service_common::acm_certificate_termination::server_config_offering(
+    ::service_common::acm_certificate_termination::server_config_negotiating(
         certificates,
         &negotiated_versions(ssl_policy),
+        &negotiated_cipher_suites(ssl_policy),
         asks_for_client_certificates
             .then(crate::service::client_certificates::PresentedWithoutValidation::asking),
         alpn_protocols,
     )
+}
+
+/// The cipher suites a listener on the security policy `ssl_policy` completes a handshake
+/// with, in that policy's OWN priority order: the `Ciphers` it publishes
+/// ([`crate::ops::describe_ssl_policies::policy_ciphers`]), each read as the suite this
+/// emulator's TLS implementation negotiates it as ([`NEGOTIATED_CIPHER_NAMES`]).
+///
+/// "[HTTPS and TLS listeners] The security policy that defines which protocols and ciphers
+/// are supported" (`CreateListenerInput$SslPolicy`) is what decides this, and the published
+/// list is ordered: `Cipher$Priority` is that cipher's position in it, so the suite a
+/// handshake selects is the FIRST of the policy's own list the client also offered — the
+/// listener's preference, not the client's — and a suite the policy does not publish is one
+/// such a listener never negotiates, whatever the client offers. A listener that names no
+/// policy negotiates under the default policy
+/// ([`crate::ops::describe_ssl_policies::DEFAULT_SSL_POLICY`]), and so does one naming a
+/// policy this service publishes no cipher list for.
+///
+/// A published cipher this emulator's TLS implementation cannot negotiate (every CBC suite,
+/// and the 3DES suite of the oldest policy) is left out: it is a suite no connection of this
+/// emulator ever ran under. Should that leave a policy with none at all, the list is empty
+/// and the handshake runs under the library's own suites, since a listener offering no cipher
+/// could complete no handshake.
+fn negotiated_cipher_suites(ssl_policy: Option<&str>) -> Vec<::rustls::SupportedCipherSuite> {
+    let policy = ssl_policy
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(crate::ops::describe_ssl_policies::DEFAULT_SSL_POLICY);
+    let published = crate::ops::describe_ssl_policies::policy_ciphers(policy)
+        .or_else(|| {
+            crate::ops::describe_ssl_policies::policy_ciphers(
+                crate::ops::describe_ssl_policies::DEFAULT_SSL_POLICY,
+            )
+        })
+        .unwrap_or_default();
+    let provider = ::service_common::acm_certificate_termination::provider();
+    let mut suites: Vec<::rustls::SupportedCipherSuite> = Vec::new();
+    for name in published {
+        if let Some(suite) = provider
+            .cipher_suites
+            .iter()
+            .find(|suite| cipher_name(suite.suite()) == Some(*name))
+        {
+            suites.push(*suite);
+        }
+    }
+    suites
 }
 
 /// The TLS protocol versions a listener on the security policy `ssl_policy` completes a
@@ -1203,6 +1250,94 @@ mod tests {
                 negotiated, expected_versions,
                 "case {policy:?}: expected {expected_versions:?}, got {negotiated:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_listener_negotiates_the_ciphers_its_security_policy_publishes() {
+        // The rows span what the reading generalises over: a listener that names no policy
+        // (the default one), a policy that prefers AES-128 over AES-256, one whose profile
+        // prefers AES-256 the other way round, a TLS-1.3-only policy, a FIPS policy that
+        // leaves the ChaCha20 suite out, a blank name and a name no published policy
+        // carries. Each expectation is that policy's own published `Ciphers`
+        // (`DescribeSSLPolicies`, `crate::ops::describe_ssl_policies`), in its published
+        // order, less the suites this emulator's TLS implementation cannot negotiate.
+        let cases: &[(Option<&str>, &[&str])] = &[
+            (
+                None,
+                &[
+                    "ECDHE-ECDSA-AES128-GCM-SHA256",
+                    "ECDHE-RSA-AES128-GCM-SHA256",
+                    "ECDHE-ECDSA-AES256-GCM-SHA384",
+                    "ECDHE-RSA-AES256-GCM-SHA384",
+                ],
+            ),
+            (
+                Some("ELBSecurityPolicy-FS-1-2-Res-2020-10"),
+                &[
+                    "ECDHE-ECDSA-AES128-GCM-SHA256",
+                    "ECDHE-RSA-AES128-GCM-SHA256",
+                    "ECDHE-ECDSA-AES256-GCM-SHA384",
+                    "ECDHE-RSA-AES256-GCM-SHA384",
+                ],
+            ),
+            (
+                Some("ELBSecurityPolicy-TLS13-1-2-RFC9151-FIPS-2023-07"),
+                &[
+                    "TLS_AES_256_GCM_SHA384",
+                    "ECDHE-ECDSA-AES256-GCM-SHA384",
+                    "ECDHE-RSA-AES256-GCM-SHA384",
+                ],
+            ),
+            (
+                Some("ELBSecurityPolicy-TLS13-1-3-2021-06"),
+                &[
+                    "TLS_AES_128_GCM_SHA256",
+                    "TLS_AES_256_GCM_SHA384",
+                    "TLS_CHACHA20_POLY1305_SHA256",
+                ],
+            ),
+            (
+                Some("ELBSecurityPolicy-TLS13-1-3-FIPS-2023-04"),
+                &["TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384"],
+            ),
+            (
+                Some("   "),
+                &[
+                    "ECDHE-ECDSA-AES128-GCM-SHA256",
+                    "ECDHE-RSA-AES128-GCM-SHA256",
+                    "ECDHE-ECDSA-AES256-GCM-SHA384",
+                    "ECDHE-RSA-AES256-GCM-SHA384",
+                ],
+            ),
+            (
+                Some("ELBSecurityPolicy-NoSuchPolicy"),
+                &[
+                    "ECDHE-ECDSA-AES128-GCM-SHA256",
+                    "ECDHE-RSA-AES128-GCM-SHA256",
+                    "ECDHE-ECDSA-AES256-GCM-SHA384",
+                    "ECDHE-RSA-AES256-GCM-SHA384",
+                ],
+            ),
+        ];
+        for (policy, expected) in cases {
+            let negotiated: Vec<&str> = negotiated_cipher_suites(*policy)
+                .iter()
+                .filter_map(|suite| cipher_name(suite.suite()))
+                .collect();
+            assert_eq!(
+                negotiated, *expected,
+                "case {policy:?}: expected {expected:?}, got {negotiated:?}"
+            );
+            // Every suite a listener negotiates is one the policy itself publishes, which
+            // is what the bound means.
+            for name in &negotiated {
+                assert!(
+                    crate::ops::describe_ssl_policies::publishes_cipher(name),
+                    "case {policy:?}: {name} is negotiated but the catalogue publishes no \
+                     cipher of that name"
+                );
+            }
         }
     }
 

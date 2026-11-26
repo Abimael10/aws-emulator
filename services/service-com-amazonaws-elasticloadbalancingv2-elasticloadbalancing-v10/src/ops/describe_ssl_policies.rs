@@ -254,6 +254,25 @@ pub fn policy_ssl_protocols(name: &str) -> Option<&'static [&'static str]> {
         .map(|entry| entry.ssl_protocols)
 }
 
+/// The `Cipher` names the predefined policy `name` offers, in the priority order the
+/// catalogue publishes them in — the ciphers a listener set to that policy may negotiate,
+/// most preferred first, which is what `Cipher$Priority` states.
+///
+/// `None` for a name no predefined policy carries, which is a policy this service publishes
+/// no cipher list for; the caller decides what to do with a listener configured that way
+/// rather than being handed a list that is not the policy's.
+///
+/// The catalogue is the ONE place the published policies live ([`POLICY_CATALOGUE`]), so the
+/// socket a listener terminates TLS on (`crate::service::listener_socket`) negotiates exactly
+/// the ciphers `DescribeSSLPolicies` reports for it, in the same order.
+#[must_use]
+pub fn policy_ciphers(name: &str) -> Option<&'static [&'static str]> {
+    POLICY_CATALOGUE
+        .iter()
+        .find(|entry| entry.name == name)
+        .map(|entry| entry.ciphers)
+}
+
 /// Whether the published catalogue carries a cipher of this name at all — the cross-check
 /// that what another reading of this service SPELLS for a cipher (the `ssl_cipher` a load
 /// balancer's access-log record carries for a connection,
