@@ -539,22 +539,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // "Each number in the Count array is the number of times the corresponding
                     // value in the Values array occurred during the period."
                     // (`MetricDatum$Counts`) — a count is HOW MANY times an observation
-                    // happened, so a number that is not greater than 0 counts no occurrence and
-                    // weights nothing: the whole batch is refused rather than folded into the
-                    // series, where such a weight would subtract samples from every later
-                    // aggregate of it and leave a window whose sum no sample count explains.
+                    // happened, so it cannot be NEGATIVE: there is no such number of
+                    // occurrences, and folding one into the series would subtract samples from
+                    // every later aggregate of it and leave a window whose sum no sample count
+                    // explains, so the whole batch is refused instead. Zero IS a number of
+                    // occurrences — none — and is accepted: it weights no sample and nothing of
+                    // its value into the period, while the value it counts still belongs to the
+                    // span the datum published (the ingest below).
                     // A special value (NaN, +Infinity, -Infinity) is no count either, and is
                     // refused as the unsupported value the operation documents it as
                     // ([`checked_value`] below) rather than here — which is why only the FINITE
                     // entries are judged against the bound: a magnitude the service cannot hold
-                    // is a different fault from a count that counts nothing, and a client acts
-                    // on which one it was told. So this states only the member's own rule. The
-                    // refusal names the `Counts` member of the datum the request put it on,
+                    // is a different fault from a number that is no count at all, and a client
+                    // acts on which one it was told. So this states only the member's own rule.
+                    // The refusal names the `Counts` member of the datum the request put it on,
                     // which is what locates the array that has to change.
-                    if counts
-                        .iter()
-                        .any(|count| count.is_finite() && *count <= 0.0)
-                    {
+                    if counts.iter().any(|count| count.is_finite() && *count < 0.0) {
                         return Err(invalid_parameter_value(format!(
                             "The parameter {path}.Counts must contain only values greater than 0."
                         )));
@@ -570,6 +570,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         }
                         None => 1.0,
                     };
+                    // A count of zero weights no sample and nothing of the value into the
+                    // period, which is what the fields below hold: the sample count is the
+                    // count itself and the sum is the value weighted by it. The datum still
+                    // SPANS the value it published — a `Values` datum's smallest and largest
+                    // observation are the smallest and largest of the values it carries — so
+                    // the span is stored for every entry whatever its count.
                     observations.push(crate::state::StoredDatum {
                         sample_count: count,
                         sum: value * count,

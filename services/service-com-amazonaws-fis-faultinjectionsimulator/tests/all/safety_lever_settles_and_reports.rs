@@ -320,8 +320,8 @@ async fn the_lever_writes_the_report_of_the_stop_it_caused_once_that_stop_has_la
     // with it the report that end makes due. The stop falls due on the CLOCK, so the case
     // looks again until the report is there instead of waiting a fixed time: the lever is
     // called in a loop, and the only other call it makes is the Amazon S3 read that looks
-    // for the object, which settles nothing. Each of those lever calls asks for the status
-    // the lever is already held at, so each is REFUSED
+    // for the object, which settles nothing. Each of those lever calls asks a lever that is
+    // already holding to engage, so each is REFUSED
     // (`tests/all/safety_lever_status_change.rs`): the generation it performs is the one the
     // clock already made due, which the call does whatever it answers the caller.
     let deadline = std::time::Instant::now() + REPORT_LANDS_WITHIN;

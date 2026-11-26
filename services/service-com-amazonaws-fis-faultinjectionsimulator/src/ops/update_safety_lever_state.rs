@@ -84,13 +84,15 @@
 //!   running, which is what FIS documents engaging the lever as doing;
 //! * `disengaged` lands immediately: the model declares no transient status on that side.
 //!
-//! `ConflictException` refuses an update that asks for the status the lever is already held
-//! at: the state a request carries is a status and the reason FOR that status, so a request
-//! that changes no status is not a way to rewrite the reason
-//! ([`crate::state::safety_lever_change_refusal`]). It stores nothing and stops no
+//! `ConflictException` refuses an engage of a lever that is already holding: an engage
+//! holds every experiment of the account back, and the reason stored beside it records why,
+//! so a second engage conflicts with the hold already in place rather than rewriting that
+//! record ([`crate::state::safety_lever_change_refusal`]). It stores nothing and stops no
 //! experiment, while the records the settle it performed materialised are still delivered by
-//! it, as they are by every other refusal this service answers. The other conflict an
-//! engaged lever causes is a `StartExperiment` refused while it holds.
+//! it, as they are by every other refusal this service answers. A disengage holds nothing
+//! back, so a disengage of a lever that is already disengaged conflicts with nobody: it
+//! changes nothing and is answered with the state the lever already stood in. The other
+//! conflict an engaged lever causes is a `StartExperiment` refused while it holds.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -211,12 +213,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (outcome, deliveries) = {
             let mut store = state.lock();
 
-            // The lever's reason is not independently writable, so an update asking for the
-            // status the lever is already held at is refused rather than applied, which is
-            // what leaves the stored state — its reason included — as the last accepted
-            // status change set it. Judged against the lever as it stands at `now`, the
-            // transition the clock already owed it materialised, so the request is compared
-            // with the status a caller reading the lever would see.
+            // An engage is a hold on the account and the reason stored beside it records
+            // why the hold is in place, so an engage of a lever that is already holding is
+            // refused rather than applied, which is what leaves the stored state — its
+            // reason included — as the engage that engaged it set it. A disengage holds
+            // nothing back and is carried out whatever the lever stands at: one of a lever
+            // already disengaged changes nothing and stores no reason. Judged against the
+            // lever as it stands at `now`, the transition the clock already owed it
+            // materialised, so the request is compared with the status a caller reading the
+            // lever would see.
             let record = store.settled_safety_lever(now);
             let refusal =
                 crate::state::safety_lever_change_refusal(record, input.state.status.as_str());

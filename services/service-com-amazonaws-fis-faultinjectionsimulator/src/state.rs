@@ -2339,16 +2339,18 @@ impl SafetyLeverRecord {
 
     /// Engage the lever, recording `reason`.
     ///
-    /// A lever that is already engaging or engaged is left where it is apart from the
-    /// reason: the lever is engaged once, so nothing restarts the span or takes an engaged
-    /// lever back to `engaging`. `UpdateSafetyLeverState` refuses such a request before it
-    /// gets here ([`safety_lever_change_refusal`]), so the only engage this applies is one
-    /// of a disengaged lever.
+    /// A lever that already holds is left exactly where it is, its reason included: the
+    /// lever is engaged once, so nothing restarts the span, takes an engaged lever back to
+    /// `engaging` or rewrites the reason it holds under.
+    /// `UpdateSafetyLeverState` refuses such a request before it gets here
+    /// ([`safety_lever_change_refusal`]), so the only engage this applies is one of a
+    /// disengaged lever.
     pub fn engage(&mut self, reason: &str, now: SystemTime) {
-        if self.status == SafetyLeverStatusKind::Disengaged {
-            self.status = SafetyLeverStatusKind::Engaging;
-            self.transition_due = Some(now + TRANSITION_DELAY);
+        if self.held_at() != SafetyLeverStatusKind::Disengaged {
+            return;
         }
+        self.status = SafetyLeverStatusKind::Engaging;
+        self.transition_due = Some(now + TRANSITION_DELAY);
         self.reason = Some(reason.to_string());
     }
 
@@ -2357,7 +2359,15 @@ impl SafetyLeverRecord {
     /// Immediate: the model declares no transient status on the way to `disengaged`, so
     /// nothing is owed the clock afterwards — including by an engage that had not taken
     /// effect yet.
+    ///
+    /// A lever that holds nothing is left exactly as it stands, its reason included: the
+    /// reason a lever reports is the reason of the status change that last moved it, and a
+    /// disengage of a lever already held disengaged moves nothing — it is the no-op its
+    /// caller asked for ([`safety_lever_change_refusal`]).
     pub fn disengage(&mut self, reason: &str) {
+        if self.held_at() == SafetyLeverStatusKind::Disengaged {
+            return;
+        }
         self.status = SafetyLeverStatusKind::Disengaged;
         self.transition_due = None;
         self.reason = Some(reason.to_string());
@@ -2424,19 +2434,26 @@ pub fn safety_lever_status_refusal(status: &str) -> Option<ValidationException> 
     Some(invalid_input(invalid_safety_lever_status_message(status)))
 }
 
-/// `None` when a request asking the lever for `requested` asks it for a status CHANGE;
-/// otherwise the `ConflictException` (409) that refuses the update.
+/// `None` when a request asking the lever for `requested` is one FIS carries out — a status
+/// change, or a disengage of a lever that holds nothing; otherwise the `ConflictException`
+/// (409) that refuses the update.
 ///
-/// `UpdateSafetyLeverStateInput` carries the target status and the reason for it TOGETHER,
-/// and the reason is not independently writable: the reason a lever reports is the reason
-/// of the status change that last moved it. So a request naming the status the lever is
-/// already held at carries no change to make, and is refused rather than applied — which is
-/// what leaves the stored reason as the last accepted status change set it.
+/// An engage is a HOLD on the account: it keeps everyone's experiments from running, and
+/// the reason stored beside it records why they are held. `UpdateSafetyLeverStateInput`
+/// carries the target status and the reason for it TOGETHER, so there is no other way to
+/// reach that reason — which is why a request asking an already-holding lever to engage
+/// conflicts with the hold somebody else already has rather than rewriting its record, and
+/// the reason an engaged lever reports stays the reason of the engage that engaged it.
 ///
 /// A lever whose engage is still taking effect ([`SafetyLeverStatusKind::Engaging`]) is
-/// already held engaged, so it answers a further engage the same way a settled one does:
-/// which of the two the clock has reached decides nothing, since neither is a state another
+/// already holding, so it answers a further engage the same way a settled one does: which
+/// of the two the clock has reached decides nothing, since neither is a state another
 /// engage would move.
+///
+/// A disengage holds nothing back and so conflicts with nobody: a request asking a lever
+/// that is already disengaged to disengage changes nothing, and is carried out as the no-op
+/// it is — it stores no reason, so the lever reports the state it already stood in
+/// ([`SafetyLeverRecord::disengage`]).
 ///
 /// The sentence is FIXED: FIS states the conflict without interpolating the request or the
 /// stored state.
@@ -2444,7 +2461,8 @@ pub fn safety_lever_change_refusal(
     record: &SafetyLeverRecord,
     requested: &str,
 ) -> Option<ConflictException> {
-    if requested != record.held_at().as_wire() {
+    let holds = record.held_at() == SafetyLeverStatusKind::Engaged;
+    if !holds || requested != SafetyLeverStatusKind::Engaged.as_wire() {
         return None;
     }
     Some(ConflictException {

@@ -3,34 +3,39 @@
 //! What a `Counts` array may hold, and what a publish carrying a number that is no count is
 //! answered with.
 //!
-//! The rule under test: **a `Counts` entry is a number of OCCURRENCES, so every entry must be
-//! greater than 0 — a batch carrying one that is not is refused as the modelled
-//! parameter-value fault naming that datum's `Counts` member, nothing of the batch is stored,
-//! and a read of the metric afterwards reports no datapoint at all.** "Each number in the
-//! `Count` array is the number of times the corresponding value in the `Values` array occurred
-//! during the period." (`smithy_query(query="doc",shape="MetricDatum",member="Counts")`)
+//! The rule under test: **a `Counts` entry is a number of OCCURRENCES, so no entry may be
+//! negative — a batch carrying one that is is refused as the modelled parameter-value fault
+//! naming that datum's `Counts` member, nothing of the batch is stored, and a read of the
+//! metric afterwards reports no datapoint at all.** "Each number in the `Count` array is the
+//! number of times the corresponding value in the `Values` array occurred during the
+//! period." (`smithy_query(query="doc",shape="MetricDatum",member="Counts")`)
+//!
+//! Zero IS a number of occurrences — none — so a count of zero is accepted, and the value it
+//! counts weights no sample and nothing of itself into the window it was published into while
+//! still belonging to the span that window reports. That is the other half of the rule, and it
+//! is `crate::counts_may_count_no_occurrence`'s.
 //!
 //! The rows of the refused table differ along what the rule generalises over: WHICH number is
-//! no count (zero itself, negative zero, the largest double just below zero, a small and a
-//! large negative), WHERE in the `Counts` array it sits (the only entry, the first, the last,
-//! one in the middle, every entry), how long the arrays are, and WHERE in the request the
-//! offending datum sits — the first datum of a batch, a later one, and one carried on
-//! `EntityMetricData` rather than on `MetricData` — since the member path the sentence names is
-//! read off the request. The negative first count of a two-value histogram is one row of that
-//! table, not the requirement.
+//! no count (the double just above zero's other side, a small and a large negative), WHERE in
+//! the `Counts` array it sits (the only entry, the first, the last, one in the middle, every
+//! entry), how long the arrays are, and WHERE in the request the offending datum sits — the
+//! first datum of a batch, a later one, and one carried on `EntityMetricData` rather than on
+//! `MetricData` — since the member path the sentence names is read off the request. The
+//! negative first count of a two-value histogram is one row of that table, not the
+//! requirement.
 //!
 //! The accepted side is a table too, and it is what makes a refusal attributable to the count
-//! alone: a count greater than 0 is ingested and weights the value beside it, including the
-//! fractions of an occurrence that sit between the bound and one. The accepted form at large —
+//! alone: a count above 0 is ingested and weights the value beside it, including the
+//! fractions of an occurrence that sit between zero and one. The accepted form at large —
 //! whole counts, an omitted `Counts` array — is `crate::probe_counts`'s, so it is not repeated
 //! here beyond the one control row.
 //!
 //! The last test is the AGGREGATION half of the same rule, and it is reached from the other
-//! writer of this metric store (the services that publish their own telemetry into it), since a
-//! publish can no longer place such a window: **a window whose datapoints stand for no sample
-//! defines no statistic, so no reader reports a datapoint for it** — asserted through
-//! `GetMetricStatistics` and `GetMetricData`, beside a window of the same series that does hold
-//! samples and is reported.
+//! writer of this metric store (the services that publish their own telemetry into it), since
+//! a publish can no longer place such a window: **a window whose datapoints stand for no
+//! sample defines no statistic, so no reader reports a datapoint for it** — asserted through
+//! `GetMetricStatistics` and `GetMetricData`, beside a window of the same series that does
+//! hold samples and is reported.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state::{
@@ -135,25 +140,23 @@ fn refused_rows(at: f64) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
 
     // WHICH number is no count, and where in the array it sits — each on the first datum of a
-    // one-datum batch. `-f64::MIN_POSITIVE` is the double just below the bound: the nearest
-    // number to zero that is still not greater than it.
+    // one-datum batch. `-f64::MIN_POSITIVE` is the negative double nearest zero: the smallest
+    // magnitude a count can miss the rule by.
     for (case, values, counts) in [
         ("a negative count first", vec![1.0, 2.0], vec![-1.0, 1.0]),
         ("a negative count last", vec![1.0, 2.0], vec![1.0, -1.0]),
-        ("zero as the only count", vec![4.0], vec![0.0]),
-        ("negative zero as the only count", vec![4.0], vec![-0.0]),
         (
-            "the double just below the bound",
+            "the negative double nearest zero as the only count",
             vec![4.0],
             vec![-f64::MIN_POSITIVE],
         ),
         (
-            "zero among positive counts",
+            "a negative count among positive ones",
             vec![1.0, 2.0, 3.0, 4.0],
-            vec![1.0, 2.0, 0.0, 4.0],
+            vec![1.0, 2.0, -3.0, 4.0],
         ),
         (
-            "every count non-positive",
+            "every count negative",
             vec![1.0, 2.0, 3.0],
             vec![-1.0, -2.0, -3.0],
         ),
@@ -198,7 +201,7 @@ fn refused_rows(at: f64) -> Vec<Row> {
             REFUSED_METRIC,
             at,
             &[1.0, 2.0],
-            Some(&[0.0, 1.0]),
+            Some(&[-2.0, 1.0]),
         )])),
         parameter: "EntityMetricData.member.1.MetricData.member.1.Counts".to_string(),
     });
@@ -268,7 +271,7 @@ async fn window_folds(
 }
 
 #[tokio::test]
-async fn a_count_that_is_not_greater_than_zero_is_refused_naming_the_datums_counts_member() {
+async fn a_negative_count_is_refused_naming_the_datums_counts_member() {
     let at = base_time();
 
     for Row {
@@ -346,15 +349,15 @@ async fn a_count_that_is_not_greater_than_zero_is_refused_naming_the_datums_coun
 }
 
 #[tokio::test]
-async fn every_count_greater_than_zero_is_accepted_and_weights_its_value() {
+async fn every_count_above_zero_is_accepted_and_weights_its_value() {
     let router = build_router();
     let at = base_time();
 
     // The accepted histogram form at large — whole counts, a count of one everywhere, an
     // omitted `Counts` array — is pinned by `crate::probe_counts`; these rows are the SIDE OF
-    // THE BOUND that suite does not reach: the bound is "greater than 0", not "at least one",
-    // so a fraction of an occurrence is a count the service holds and weights its value by.
-    // One whole count rides along as the control the refusals above are attributed against.
+    // ZERO that suite does not reach: a fraction of an occurrence is a count the service
+    // holds and weights its value by. One whole count rides along as the control the refusals
+    // above are attributed against.
     let rows: Vec<Accepted> = vec![
         Accepted {
             case: "a fractional count on every value",
@@ -406,7 +409,7 @@ async fn every_count_greater_than_zero_is_accepted_and_weights_its_value() {
         .await;
         assert_eq!(
             status, 200,
-            "case {case:?}: a histogram whose counts are all greater than 0 must be accepted, \
+            "case {case:?}: a histogram whose counts are all above 0 must be accepted, \
              got {status} {body}"
         );
 
@@ -421,9 +424,9 @@ async fn every_count_greater_than_zero_is_accepted_and_weights_its_value() {
 
 /// Store `data` directly in the `metric` series of [`NAMESPACE`], the way the services that
 /// publish their OWN telemetry into this store write it
-/// (`State::append_datapoints`) — the writer that can place a window `PutMetricData` cannot,
-/// now that it refuses a count that is not greater than 0, so the aggregation half of the rule
-/// is reached from here.
+/// (`State::append_datapoints`) — the writer that can place a window whose sum is not zero
+/// while it stands for no sample at all, which `PutMetricData` cannot now that a negative
+/// count is refused, so the aggregation half of the rule is reached from here.
 fn seed(engine: &engine::InMemoryEngine, metric: &str, data: Vec<StoredDatum>) {
     let key = MetricKey {
         namespace: NAMESPACE.to_string(),

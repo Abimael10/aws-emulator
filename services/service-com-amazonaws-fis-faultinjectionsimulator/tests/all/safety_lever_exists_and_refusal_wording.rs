@@ -221,8 +221,8 @@ async fn the_lever_that_already_exists_takes_an_update_without_a_create() {
     // The rows differ along the state asked for of a lever NOTHING created: each
     // requestable status, with the status the update itself reports back (an engage takes
     // effect, so it reports the transient status the service reaches). The disengage is
-    // asked of a lever engaged first, because a request repeating the state the lever is
-    // already held at changes no status and is refused rather than applied
+    // asked of a lever engaged first, because a disengage of a lever that already holds
+    // nothing stores no reason of its own
     // (`tests/all/safety_lever_status_change.rs`).
     let cases: [(&str, &str, bool); 2] = [
         ("engaged", "engaging", false),

@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! RULE: `UpdateSafetyLeverState` applies a STATUS CHANGE. The state a request carries is a
-//! status together with the reason for it, and the reason is not independently writable, so
-//! a request naming the status the lever is already held at is refused with
-//! `ConflictException` (HTTP 409) and leaves the stored state — its reason included — as the
-//! last accepted status change set it.
+//! RULE: an engage is a HOLD on the account, and the reason stored beside it records why
+//! the account's experiments are held, so `UpdateSafetyLeverState` refuses an engage of a
+//! lever that is already holding with `ConflictException` (HTTP 409), leaving the stored
+//! state — its reason included — as the engage that engaged it set it. A disengage holds
+//! nothing back and conflicts with nobody: one asked of a lever that is already disengaged
+//! changes nothing, and is answered with the state the lever already stood in rather than
+//! storing the reason it carried.
 //!
-//! A lever whose engage is still taking effect is already held engaged, so it answers a
-//! further engage exactly as a settled one does: whether the clock has moved it from
-//! `engaging` to `engaged` yet decides nothing.
+//! A lever whose engage is still taking effect is already holding, so it answers a further
+//! engage exactly as a settled one does: whether the clock has moved it from `engaging` to
+//! `engaged` yet decides nothing.
 //!
 //! The rows differ along what the rule generalises over: the status the lever is held at
 //! (the one it has before any update, one taking effect, one settled, one it was taken back
@@ -156,7 +158,11 @@ enum Outcome {
     /// It is a status change: accepted, reported at this status straight away, and the
     /// request's reason is what the lever stores.
     Applied(&'static str),
-    /// It changes no status: refused as a reason-only update, and nothing is stored.
+    /// It asks a lever that holds nothing to hold nothing: accepted, and answered with the
+    /// state the lever already stood in — the request's reason is not stored.
+    Unchanged,
+    /// It asks a lever that is already holding to hold again: refused, and nothing is
+    /// stored.
     Conflict,
 }
 
@@ -179,13 +185,30 @@ struct Step {
 fn rows() -> Vec<(&'static str, Vec<Step>)> {
     vec![
         (
-            "the status an untouched lever is already held at",
+            "a disengage of the untouched lever, which holds nothing",
             vec![Step {
                 settled_at: None,
                 requested: "disengaged",
                 reason: "a reason of its own",
-                outcome: Outcome::Conflict,
+                outcome: Outcome::Unchanged,
             }],
+        ),
+        (
+            "a disengage of the untouched lever, repeated",
+            vec![
+                Step {
+                    settled_at: None,
+                    requested: "disengaged",
+                    reason: "one reason",
+                    outcome: Outcome::Unchanged,
+                },
+                Step {
+                    settled_at: None,
+                    requested: "disengaged",
+                    reason: "another reason",
+                    outcome: Outcome::Unchanged,
+                },
+            ],
         ),
         (
             "a repeat of an engage that is still taking effect",
@@ -257,7 +280,7 @@ fn rows() -> Vec<(&'static str, Vec<Step>)> {
                     settled_at: None,
                     requested: "disengaged",
                     reason: "disengaged again",
-                    outcome: Outcome::Conflict,
+                    outcome: Outcome::Unchanged,
                 },
             ],
         ),
@@ -284,11 +307,34 @@ fn rows() -> Vec<(&'static str, Vec<Step>)> {
                 },
             ],
         ),
+        (
+            "a disengage of an engage that is still taking effect, then another disengage",
+            vec![
+                Step {
+                    settled_at: None,
+                    requested: "engaged",
+                    reason: "engaged first",
+                    outcome: Outcome::Applied("engaging"),
+                },
+                Step {
+                    settled_at: None,
+                    requested: "disengaged",
+                    reason: "released while it was taking effect",
+                    outcome: Outcome::Applied("disengaged"),
+                },
+                Step {
+                    settled_at: None,
+                    requested: "disengaged",
+                    reason: "released once more",
+                    outcome: Outcome::Unchanged,
+                },
+            ],
+        ),
     ]
 }
 
 #[tokio::test]
-async fn an_update_that_changes_no_status_is_refused_and_stores_nothing() {
+async fn an_engage_of_a_holding_lever_is_refused_and_a_repeat_disengage_stores_nothing() {
     for (case, steps) in rows() {
         let router = emulator();
         // What the lever holds before any update: the state FIS seeded it with.
@@ -332,11 +378,29 @@ async fn an_update_that_changes_no_status_is_refused_and_stores_nothing() {
                     );
                     stored = (immediate.to_string(), step.reason.to_string());
                 }
+                Outcome::Unchanged => {
+                    assert_eq!(
+                        answer.status, 200,
+                        "case {case:?}: step {index} asks for {:?} while the lever holds \
+                         nothing, so it must be accepted; got {} with {:?}",
+                        step.requested, answer.status, answer.body
+                    );
+                    let reported = &answer.body["safetyLever"]["state"];
+                    assert_eq!(
+                        (
+                            reported["status"].as_str(),
+                            reported["reason"].as_str()
+                        ),
+                        (Some(stored.0.as_str()), Some(stored.1.as_str())),
+                        "case {case:?}: step {index} changes nothing, so it must report the \
+                         state the lever already stood in ({stored:?}), got {reported:?}"
+                    );
+                }
                 Outcome::Conflict => {
                     assert_eq!(
                         answer.status, 409,
                         "case {case:?}: step {index} asks for {:?} while the lever is already \
-                         held there, so it must be refused with HTTP 409; got {} with {:?}",
+                         holding, so it must be refused with HTTP 409; got {} with {:?}",
                         step.requested, answer.status, answer.body
                     );
                     assert_eq!(
@@ -400,8 +464,8 @@ async fn a_refused_reason_never_reaches_the_engaged_levers_reason() {
     );
 
     // The rows here differ along the reason the refused request carries: a different one,
-    // the stored one, and one that is empty of everything but a space — none of them is a
-    // status change, so none of them is stored.
+    // the stored one, and one that is empty of everything but a space — the lever is already
+    // holding, so none of them engages it and none of them is stored.
     for refused_reason in ["a different reason", engaged_for, " "] {
         let refused = update_lever(&router, "engaged", refused_reason).await;
         assert_eq!(

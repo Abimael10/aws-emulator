@@ -229,7 +229,9 @@ pub struct MetricKey {
 /// * a `StatisticValues` statistic set is stored as given;
 /// * each entry of `Values`/`Counts` becomes its own datum with `sample_count = count`,
 ///   `sum = value * count` and `minimum = maximum = value`, which keeps the individual
-///   published values recoverable for percentile statistics.
+///   published values recoverable for percentile statistics — so an entry counted zero
+///   times weights no sample and no sum into its window while the value it counts still
+///   belongs to the span the window reports.
 #[derive(Debug, Clone)]
 pub struct StoredDatum {
     /// The observation's time stamp, as epoch seconds.

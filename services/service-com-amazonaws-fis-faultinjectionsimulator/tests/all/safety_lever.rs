@@ -269,8 +269,8 @@ async fn the_reported_lever_carries_only_the_members_the_model_declares() {
     // The rows differ along what the lever has been asked for, which is what decides
     // whether `reason` is carried and which status is reported: an untouched lever, one
     // whose engage is still taking effect, and a disengaged one. The disengage is asked of
-    // a lever that was engaged first, because a request repeating the state the lever is
-    // already held at changes no status and is refused rather than applied
+    // a lever that was engaged first, because a disengage of a lever that already holds
+    // nothing stores no reason of its own
     // (`tests/all/safety_lever_status_change.rs`).
     let cases: [(&str, &[&str]); 3] = [
         ("untouched", &[]),
@@ -427,8 +427,8 @@ async fn the_state_a_request_asks_for_is_persisted_and_taken_up_on_the_clock() {
     // The rows differ along the state asked for, the state the lever is already in, and
     // how many updates it takes: each requestable state asked for from the other one, and a
     // lever taken through both and back again. No row repeats the state the lever is already
-    // held at: that asks for no state change at all, which is refused rather than persisted
-    // (`tests/all/safety_lever_status_change.rs`).
+    // held at: an engage of a holding lever is refused, and a disengage of a lever that
+    // holds nothing stores no reason (`tests/all/safety_lever_status_change.rs`).
     let cases: [(&str, Vec<Step>); 3] = [
         (
             "engage-an-untouched-lever",
