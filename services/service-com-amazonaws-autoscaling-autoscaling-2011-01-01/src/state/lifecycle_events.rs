@@ -1060,11 +1060,11 @@ fn lifecycle_event_detail(event: &PendingLifecycleEvent) -> ::serde_json::Value 
     );
     detail.insert(
         "StartTime".to_string(),
-        ::serde_json::Value::String(date_time_text(event.start_time)),
+        ::serde_json::Value::String(super::millisecond_text(event.start_time)),
     );
     detail.insert(
         "EndTime".to_string(),
-        ::serde_json::Value::String(date_time_text(event.due)),
+        ::serde_json::Value::String(super::millisecond_text(event.due)),
     );
     detail.insert(
         "Cause".to_string(),
@@ -1082,14 +1082,6 @@ fn lifecycle_event_detail(event: &PendingLifecycleEvent) -> ::serde_json::Value 
         ::serde_json::Value::String(event.instance_move.destination.name().to_string()),
     );
     ::serde_json::Value::Object(detail)
-}
-
-/// The date-time text a timestamp is reported as inside an event's `detail`: RFC 3339 in
-/// UTC, which is the form every AWS event body carries an instant in.
-fn date_time_text(at: SystemTime) -> String {
-    super::to_date_time(at)
-        .fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .unwrap_or_default()
 }
 
 /// `at` as the epoch milliseconds the event's `time` carries.

@@ -177,7 +177,7 @@ pub fn test_notification_document(
     insert_text(&mut document, "AutoScalingGroupName", &group.name);
     insert_text(&mut document, "Service", NOTIFICATION_SERVICE);
     insert_text(&mut document, "Event", TEST_NOTIFICATION);
-    insert_text(&mut document, "Time", &date_time_text(at));
+    insert_text(&mut document, "Time", &super::millisecond_text(at));
     ::serde_json::Value::Object(document).to_string()
 }
 
@@ -237,12 +237,16 @@ fn lifecycle_document(event: &PendingLifecycleEvent) -> String {
     // The request that carried the activity out is the activity itself, which is how this
     // service reports it everywhere: one id for the activity and for the request behind it.
     insert_text(&mut document, "RequestId", &event.activity_id);
-    insert_text(&mut document, "EndTime", &date_time_text(event.due));
+    insert_text(&mut document, "EndTime", &super::millisecond_text(event.due));
     insert_text(&mut document, "AutoScalingGroupARN", &event.group_arn);
     insert_text(&mut document, "ActivityId", &event.activity_id);
-    insert_text(&mut document, "StartTime", &date_time_text(event.start_time));
+    insert_text(
+        &mut document,
+        "StartTime",
+        &super::millisecond_text(event.start_time),
+    );
     insert_text(&mut document, "Service", NOTIFICATION_SERVICE);
-    insert_text(&mut document, "Time", &date_time_text(event.due));
+    insert_text(&mut document, "Time", &super::millisecond_text(event.due));
     insert_text(&mut document, "EC2InstanceId", &event.instance_id);
     insert_text(&mut document, "StatusCode", event.status_code);
     insert_text(
@@ -274,14 +278,6 @@ pub(crate) fn insert_text(
         key.to_string(),
         ::serde_json::Value::String(value.to_string()),
     );
-}
-
-/// The date-time text a notification carries an instant in: RFC 3339 in UTC, the one form
-/// this emulator writes into a document it renders itself.
-fn date_time_text(at: SystemTime) -> String {
-    super::to_date_time(at)
-        .fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .unwrap_or_default()
 }
 
 /// Publish every notification in `notifications` onto the topic it names.

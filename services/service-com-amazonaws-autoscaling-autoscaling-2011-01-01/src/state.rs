@@ -4064,6 +4064,30 @@ pub fn whole_seconds_text(at: SystemTime) -> String {
         .unwrap_or_default()
 }
 
+/// `at` as RFC 3339 UTC text at MILLISECOND precision, which is the precision Amazon EC2
+/// Auto Scaling states an instant to inside a document it PUBLISHES: the messages its own
+/// documentation shows a notification topic receiving carry a thousandths fraction and
+/// nothing finer (`"Time": "2016-09-30T19:00:36.414Z"`, `"StartTime":
+/// "2016-09-30T19:00:11.44Z"`, with a trailing zero of that fraction left off).
+///
+/// THE ONE rendering of an instant inside a document this service renders itself — the
+/// Amazon SNS notifications of [`sns_notifications`] and the EventBridge event details of
+/// [`lifecycle_events`] — so the two reports of one lifecycle step state its instants
+/// identically. The instant is read in whole milliseconds rather than through the
+/// floating-point conversion the wire SHAPES take ([`to_date_time`]), whose remainder prints
+/// as a sub-millisecond fraction that no document of this service's own carries and that a
+/// client reading the document with a date-time parser bounded at microseconds — the bound
+/// of the one in every Python standard library — cannot read at all.
+pub fn millisecond_text(at: SystemTime) -> String {
+    let millis = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    ::aws_smithy_types::DateTime::from_millis(i64::try_from(millis).unwrap_or(i64::MAX))
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default()
+}
+
 /// The ARN of an Auto Scaling group, in the form the service reports:
 /// `arn:aws:autoscaling:{region}:{account}:autoScalingGroup:{id}:autoScalingGroupName/{name}`.
 pub fn group_arn(region: &str, resource_id: &str, name: &str) -> String {
