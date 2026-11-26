@@ -1119,53 +1119,58 @@ async fn a_bulk_entry_that_addresses_nobody_is_reported_in_its_own_result() {
 }
 
 #[tokio::test]
-async fn the_identity_a_bulk_send_sends_from_is_weighed_before_any_entry_is_read() {
+async fn the_identity_a_bulk_send_sends_from_is_weighed_before_an_entrys_own_members() {
     // The gates on the REQUEST — the account's ability to send, the configuration set it
     // names and the identity every message of the call is sent FROM — are weighed for every
-    // call, whatever its entries carry: a call this account has no identity to send as is
-    // refused WHOLE, rather than reported entry by entry, even when nothing it carries could
-    // have been sent anyway. The rows span what the entries of such a call can be: an entry
-    // with a defect of its own, one carrying a header the service writes itself, one carrying
-    // a tag name no tag may take, and a well-formed entry — and a template name the account
-    // holds nothing under, so no row is answered by a lookup instead. Every recipient here is
-    // the mailbox simulator's, which belongs to no account and needs no identity, so the one
-    // identity the refusal names is the sender the call states.
-    let rows: Vec<(&str, Value, Value)> = vec![
-        (
-            "an entry that addresses nobody",
-            json!({"TemplateName": TEMPLATE, "TemplateData": DATA}),
-            json!({"Destination": {}}),
-        ),
-        (
-            "an entry that addresses nobody, through a template the account holds nothing \
-             under",
-            json!({"TemplateName": "no-such-template", "TemplateData": DATA}),
-            json!({"Destination": {}}),
-        ),
+    // call that HAS a message to compose, whatever else its entries carry: such a call is
+    // refused WHOLE, rather than reported entry by entry, even when what the entries state
+    // for their own messages could not have been sent either. The rows span what the entries
+    // of such a call can be: one carrying a header the service writes itself, one carrying a
+    // tag name no tag may take, a well-formed entry, and a well-formed entry beside one that
+    // addresses nobody — and a template name the account holds nothing under, so no row is
+    // answered by a lookup instead. Every recipient here is the mailbox simulator's, which
+    // belongs to no account and needs no identity, so the one identity the refusal names is
+    // the sender the call states. A call whose EVERY entry addresses nobody has no message to
+    // compose at all and is settled on its entries instead
+    // (`tests/all/bulk_send_settled_on_its_entries.rs`).
+    let rows: Vec<(&str, Value, Vec<Value>)> = vec![
         (
             "an entry stating a header the service writes itself",
             json!({"TemplateName": TEMPLATE, "TemplateData": DATA}),
-            json!({
+            vec![json!({
                 "Destination": {"ToAddresses": [SIMULATOR]},
                 "ReplacementHeaders": [{"Name": "From", "Value": "someone@example.net"}],
-            }),
+            })],
         ),
         (
             "an entry stating a tag name no tag may take",
             json!({"TemplateName": TEMPLATE, "TemplateData": DATA}),
-            json!({
+            vec![json!({
                 "Destination": {"ToAddresses": [SIMULATOR]},
                 "ReplacementTags": [{"Name": "not a tag", "Value": "v"}],
-            }),
+            })],
         ),
         (
             "a well-formed entry",
             json!({"TemplateName": TEMPLATE, "TemplateData": DATA}),
-            json!({"Destination": {"ToAddresses": [SIMULATOR]}}),
+            vec![json!({"Destination": {"ToAddresses": [SIMULATOR]}})],
+        ),
+        (
+            "a well-formed entry beside one that addresses nobody",
+            json!({"TemplateName": TEMPLATE, "TemplateData": DATA}),
+            vec![
+                json!({"Destination": {}}),
+                json!({"Destination": {"ToAddresses": [SIMULATOR]}}),
+            ],
+        ),
+        (
+            "a well-formed entry through a template the account holds nothing under",
+            json!({"TemplateName": "no-such-template", "TemplateData": DATA}),
+            vec![json!({"Destination": {"ToAddresses": [SIMULATOR]}})],
         ),
     ];
 
-    for (case, template, entry) in rows {
+    for (case, template, entries) in rows {
         let ses = verified().await;
         let created = ses.create_template().await;
         assert_eq!(
@@ -1173,7 +1178,7 @@ async fn the_identity_a_bulk_send_sends_from_is_weighed_before_any_entry_is_read
             "case {case:?}: the template must be saved first, got {} {:?}",
             created.status, created.body
         );
-        let reply = ses.send_bulk(bulk(UNVERIFIED, template, vec![entry])).await;
+        let reply = ses.send_bulk(bulk(UNVERIFIED, template, entries)).await;
         assert_eq!(
             (reply.status, reply.error_code().as_str()),
             (400, "MessageRejected"),

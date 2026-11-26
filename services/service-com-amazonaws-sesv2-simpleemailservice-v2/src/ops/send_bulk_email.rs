@@ -20,8 +20,10 @@
 //! could be sent
 //! for carries the `BulkEmailStatus` of what stopped it instead of an id, and the other
 //! entries are sent: only a failure of the REQUEST (the template, the sender, the
-//! configuration set, the account's switches) refuses the whole call. This is the ONLY
-//! file to touch for this operation.
+//! configuration set, the account's switches) refuses the whole call — and a call with no
+//! message to compose at all, every one of its entries carrying a defect of its own, is
+//! settled on those entries alone, so none of those request gates is weighed for it. This is
+//! the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -331,11 +333,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .map(entry_defect)
             .collect();
-        // Whether any entry has a message to compose at all. The template a message is
-        // rendered FROM is a resource of the account, so it is resolved only for work that
-        // needs it: a call whose every entry is reported INVALID_PARAMETER renders nothing,
-        // and so looks up nothing.
-        let renders_a_message = entry_defects.iter().any(Option::is_none);
+        // A call that has NO message to compose is settled on its entries alone, and that
+        // settlement is the operation's 200 with one result per entry: `BulkEmailEntryResults`
+        // is required, so a request whose every entry carries a defect of its own has already
+        // been answered in full by those results. Nothing of the ACCOUNT is weighed for it —
+        // not the sending switch, not the configuration set or the template the request names,
+        // not the identity it would have sent from — because there is no message for any of
+        // them to apply to: an entry addressing nobody has nothing composed, handed to no
+        // identity and rendered from no template.
+        if entry_defects.iter().all(Option::is_some) {
+            return Ok(SendBulkEmailOutput {
+                bulk_email_entry_results: entry_defects
+                    .into_iter()
+                    .map(|defect| BulkEmailEntryResult {
+                        status: Some(STATUS_INVALID_PARAMETER.to_string()),
+                        error: defect,
+                        message_id: None,
+                    })
+                    .collect(),
+            });
+        }
 
         // The recipients the messages of this call address, read BEFORE the store is locked
         // and BOUNDED by what the request may send: only an entry that has a message to
@@ -370,12 +387,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request shares is locked.
         //
         // Every gate here is a gate on the REQUEST — the account's sending switch, the
-        // configuration set it names, and the identity every message of this call is sent
-        // from — so every call passes them, whatever its entries carry: a request this account
-        // has no ability to send, or has no identity to send as, is refused whole rather than
-        // reported entry by entry. Only the TEMPLATE is resolved for the messages there ARE to
-        // render, because that is what a message is rendered FROM: a call whose every entry is
-        // reported `INVALID_PARAMETER` renders nothing, and so looks up nothing.
+        // configuration set it names, the identity every message of this call is sent from,
+        // and the template they are rendered from — so a call that HAS a message to compose
+        // passes them whatever else its entries carry: a request this account has no ability
+        // to send, has no identity to send as, or names a resource it does not hold, is
+        // refused whole rather than reported entry by entry. A call with no message at all was
+        // already settled on its entries above, so nothing here is read for one.
         let content = {
             let mut store = state.lock();
             store.settle(now);
@@ -456,11 +473,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // The template every message of this call is rendered from, read back out of
             // the account's template store: a resource of the account, resolved for the
-            // messages this call has to render.
-            match renders_a_message {
-                false => None,
-                true => Some(template_content(&store, template)?),
-            }
+            // messages this call has to render — and this call has at least one, or it
+            // would have been settled on its entries above.
+            template_content(&store, template)?
         };
 
         // One message composed per entry, with no lock held: each entry's own values are
@@ -469,20 +484,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let default_tags = input.default_email_tags.clone().unwrap_or_default();
         let mut composed = Vec::new();
         for (entry, defect) in input.bulk_email_entries.iter().zip(&entry_defects) {
-            composed.push(match (defect.as_deref(), content.as_ref()) {
-                (Some(error), _) => Composed::Refused {
+            composed.push(match defect.as_deref() {
+                Some(error) => Composed::Refused {
                     status: STATUS_INVALID_PARAMETER,
                     error: error.to_string(),
                 },
-                (None, Some(content)) => {
-                    compose(entry, content, &default_variables, template, &default_tags)?
-                }
-                // Unreachable: the template was resolved above exactly when some entry has
-                // a message to render, and this is such an entry.
-                (None, None) => Composed::Refused {
-                    status: STATUS_FAILED,
-                    error: TEMPLATE_CONTENT_REQUIRED.to_string(),
-                },
+                None => compose(entry, &content, &default_variables, template, &default_tags)?,
             });
         }
 
@@ -1063,9 +1070,11 @@ fn validate_request(
 /// reporting it as that entry's result. What is read per entry is the DESTINATION it addresses
 /// ([`entry_defect`]).
 ///
-/// Read AFTER the gates on sending (the handler): a call is weighed against the account's
-/// ability to send and against the identity it sends from before anything one of its entries
-/// carries is read, which is the order Amazon SES is recorded answering in.
+/// Read AFTER the gates on sending (the handler): a call that has a message to compose is
+/// weighed against the account's ability to send and against the identity it sends from
+/// before anything one of its entries carries is read, which is the order Amazon SES is
+/// recorded answering in. A call with no message to compose at all never reaches this stage:
+/// it is settled on its entries' own destinations ([`entry_defect`]).
 fn validate_entry_members(input: &SendBulkEmailInput) -> Result<(), SendBulkEmailError> {
     for entry in &input.bulk_email_entries {
         if let Some(defect) = crate::state::send_validation::headers_defect(
@@ -1091,6 +1100,11 @@ fn validate_entry_members(input: &SendBulkEmailInput) -> Result<(), SendBulkEmai
 /// than failing the call. Read the way a single send reads the same member
 /// ([`crate::state::send_validation`]): the recipients it addresses, how many of them one
 /// message may carry, and each of their addresses.
+///
+/// This is also what decides whether the call has a message to compose AT ALL: an entry with
+/// a defect here addresses nobody, so a call whose every entry has one composes nothing, and
+/// is settled on these results alone (the handler) — no identity, no template and no
+/// configuration set is weighed for a message that does not exist.
 fn entry_defect(entry: &BulkEmailEntry) -> Option<String> {
     let recipients = crate::state::send_validation::destination_recipients(&entry.destination);
     if recipients.is_empty() {
