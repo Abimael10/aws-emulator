@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePrompt
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePrompt`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePrompt::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes what the request addresses from [`crate::state`]: the prompt and every
+//! version cut from it when no version is named, or the one numbered version when a
+//! version is. The removal is committed to the store, so a following `GetPrompt` of
+//! what was removed answers the modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +155,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePrompt` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePromptErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePrompt"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeletePromptErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the bedrock-agent store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The modelled `PromptIdentifier` admits a prompt ARN — optionally qualified with
+        // a version — or a bare prompt id, and nothing else. The boundary validator lets
+        // other values through, because the pattern's top-level alternation leaves its
+        // first branch anchored only at the start, so an identifier of neither form is
+        // refused here as the bad request it is rather than reported as a missing prompt.
+        let Some(selection) = crate::state::prompt_from_identifier(&input.prompt_identifier)
+        else {
+            return Err(DeletePromptErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::prompt_identifier_pattern_message(
+                        &input.prompt_identifier,
+                    )),
+                    field_list: None,
+                },
+            )
+            .into());
+        };
+        let prompt_id = selection.prompt_id.to_string();
+
+        // WHICH resource this call removes: `promptVersion` is documented "The version of
+        // the prompt to delete. To delete the prompt, omit this field", and a qualified
+        // identifier addresses that same numbered version, so either names the version and
+        // neither names the prompt itself.
+        let requested_version = input
+            .prompt_version
+            .as_deref()
+            .or(selection.version)
+            .map(str::to_string);
+
+        // The removal happens here and now: `DeletePromptResponse` carries only the ids,
+        // and this plane models no status for a prompt at all, so there is no transient
+        // state for a reader to observe and nothing for the clock to owe.
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialise_due_transitions(now);
+
+        // The prompt is resolved first whichever resource is addressed: a prompt that is
+        // not stored is a missing `Prompt`, however the request spelled the version.
+        if !state.prompts.contains_key(&prompt_id) {
+            return Err(DeletePromptErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::prompt_not_found_message(Self::NAME)),
+                },
+            )
+            .into());
+        }
+
+        let Some(requested_version) = requested_version else {
+            // No version named: the prompt goes, and with it the working draft it IS and
+            // every numbered version cut from it — a version is identified by the prompt
+            // it was cut from, so nothing addresses one once the prompt is gone.
+            let Some(record) = state.remove_prompt(&prompt_id) else {
+                return Err(DeletePromptErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::prompt_not_found_message(Self::NAME)),
+                    },
+                )
+                .into());
+            };
+            return Ok(DeletePromptOutput {
+                id: record.prompt_id,
+                // The response's `version` is the modelled `NumericalVersion` of the
+                // version that was deleted, and what this call deleted is the prompt
+                // itself, so there is no numbered version to report.
+                version: None,
+            });
+        };
+
+        // A version the prompt holds no cut under is a missing `PromptVersion`, refused
+        // apart from a missing prompt exactly as the read of a version refuses them. The
+        // number the response reports is read off the stored record before anything is
+        // written, so the answer names the resource that was there rather than the token
+        // the request spelled it with.
+        let Some(version) = state
+            .prompt_version_of(&prompt_id, &requested_version)
+            .map(|record| record.version)
+        else {
+            return Err(DeletePromptErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::prompt_version_not_found_message(Self::NAME)),
+                },
+            )
+            .into());
+        };
+        // The prompt's working draft and the versions cut either side of this one stay
+        // exactly as they were, and so does its numbering: the next cut takes the next
+        // number rather than the one this version held.
+        state.remove_prompt_version(&prompt_id, &requested_version);
+
+        Ok(DeletePromptOutput {
+            id: prompt_id,
+            version: Some(version.to_string()),
+        })
     }
 }

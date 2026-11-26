@@ -430,6 +430,48 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
             .count()
     }
 
+    /// Forget a prompt, every numbered version cut from it and the indexes that let a
+    /// repeated create or cut replay either; `None` when no prompt is stored under that
+    /// id, which is the one thing that makes a delete of it a missing resource.
+    ///
+    /// The prompt's working draft IS this record, so removing it removes the draft, and
+    /// the versions cut from it go with it: a numbered version is identified by the
+    /// prompt it was cut from, so nothing addresses it once the prompt is gone. The tags
+    /// both carry live on those same records, so no tag of a removed prompt survives it.
+    pub fn remove_prompt(&mut self, prompt_id: &str) -> Option<PromptRecord> {
+        let record = self.prompts.remove(prompt_id)?;
+        self.prompt_versions
+            .retain(|(versioned_prompt_id, _), _| versioned_prompt_id != prompt_id);
+        self.prompt_version_client_tokens
+            .retain(|(versioned_prompt_id, _), _| versioned_prompt_id != prompt_id);
+        self.prompt_client_tokens.retain(|_, id| id != prompt_id);
+        Some(record)
+    }
+
+    /// Forget the numbered version the modelled `NumericalVersion` token names on this
+    /// prompt, and the index that let a repeated cut replay it; `None` when the prompt
+    /// holds no version under that number, which is the one thing that makes a delete of
+    /// it a missing resource.
+    ///
+    /// The prompt's working draft and the versions cut either side of this one are left
+    /// exactly as they were, and so is the prompt's numbering:
+    /// [`PromptRecord::versions_cut`] is a high-water mark, so the next cut takes the
+    /// next number rather than the one the removed version held.
+    pub fn remove_prompt_version(
+        &mut self,
+        prompt_id: &str,
+        prompt_version: &str,
+    ) -> Option<PromptVersionRecord> {
+        let version = numerical_version(prompt_version)?;
+        let record = self
+            .prompt_versions
+            .remove(&(prompt_id.to_string(), version))?;
+        self.prompt_version_client_tokens.retain(
+            |(versioned_prompt_id, _), cut| versioned_prompt_id != prompt_id || *cut != version,
+        );
+        Some(record)
+    }
+
     /// The number `CreatePromptVersion` cuts this prompt's next version as: one past the
     /// highest number the prompt has ever reached ([`PromptRecord::versions_cut`]), so a
     /// number a deleted version held is never handed out again, and versions are numbered
