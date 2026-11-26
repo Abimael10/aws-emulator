@@ -433,6 +433,35 @@ pub(crate) fn assert_access_denied_message(
     expected
 }
 
+/// Assert that `actual` is the whole `AccessDenied` message for a refused IAM call whose
+/// recordings carry NO pointer at the authorization detail of the decision: the sentence
+/// naming the principal, the action, the resource and `reason`, and nothing after it.
+///
+/// The counterpart of [`assert_access_denied_message`] for the other family of this wording
+/// (`tests/all/session_refusal_authorization_detail_pointer.rs` is the table for which family
+/// a refusal belongs to), so a suite asserts the SAME parts either way and the two differ
+/// only in the pointer. Both assert the whole message, so a pointer appearing here fails as
+/// loudly as one missing there.
+pub(crate) fn assert_access_denied_sentence(
+    case: &str,
+    actual: &str,
+    principal: &str,
+    action: &str,
+    named_as: &str,
+    reason: &str,
+) -> String {
+    let expected = format!(
+        "User: {principal} is not authorized to perform: {action} on resource: {named_as} \
+         {reason}"
+    );
+    assert_eq!(
+        actual, expected,
+        "case {case:?}: expected the refusal to be the sentence alone {expected:?}, got \
+         {actual:?}"
+    );
+    expected
+}
+
 /// What an IAM refusal's message closes with, before the authorization id: the console
 /// address of the decision's authorization detail and the API to read that detail from.
 ///

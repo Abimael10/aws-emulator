@@ -4,8 +4,10 @@
 //! at them.
 //!
 //! A refusal IAM decides by evaluating the policies in force closes with a pointer to the
-//! detail of that decision ([`pointer_clause`]), naming an authorization id this service
-//! mints for that one request ([`mint_authorization_id`]) — "supported services include an
+//! detail of that decision ([`pointer_clause`]) — unless it is one of the refusals whose
+//! recordings carry no such pointer ([`DeniedRequest::points_at_its_detail`]) — naming an
+//! authorization id this service mints for that one request ([`mint_authorization_id`]) —
+//! "supported services include an
 //! authorization ID in the access denied error message. Pass that ID to this operation to
 //! retrieve the details" (`GetRequestAuthorizationDetails`). The id is therefore only half
 //! of the pointer: the other half is a RECORD of what was decided, which this module writes
@@ -179,7 +181,8 @@ impl AuthorizationDetailsStore {
 }
 
 /// What the gate knows about the request it is refusing, which is what the record of the
-/// refusal is built from.
+/// refusal is built from — and what decides whether the refusal's message points at that
+/// record at all ([`DeniedRequest::points_at_its_detail`]).
 #[derive(Debug)]
 pub struct DeniedRequest<'a> {
     /// The ARN of the principal the request speaks for, as the refusal names it.
@@ -199,6 +202,41 @@ pub struct DeniedRequest<'a> {
     pub boundary: Option<&'a str>,
     /// How many session policy documents scoped the credential the request was signed with.
     pub session_policies: usize,
+    /// Whether the credential the request was signed with is a role SESSION's temporary one,
+    /// whose permissions are the role's capped by the session policies its mint passed — as
+    /// against an identity's own long-term key.
+    pub session_credential: bool,
+    /// Whether the grant the decision could not find is the IDENTITY-based one: nothing in
+    /// force allowed the call at all, as against a call the identity's own documents DID
+    /// allow and the session policies or the boundary withheld.
+    pub identity_grant_absent: bool,
+    /// Whether a document in force on the principal — one of the identity's own, or a session
+    /// policy its credential was scoped with — states an `Allow` NAMING the action asked for,
+    /// so the decision was reached although a grant about that action was read.
+    pub grant_names_the_action: bool,
+}
+
+impl DeniedRequest<'_> {
+    /// Whether this refusal's message CLOSES with the pointer at the detail of its decision
+    /// ([`pointer_clause`]), as against stating the decision in its sentence alone.
+    ///
+    /// No trait of any model governs the text of an `AccessDenied`, so which refusals carry
+    /// the pointer is recorded behaviour, and the recordings draw ONE line through it: a
+    /// refusal of a request signed with a role SESSION, reached although a document in force
+    /// on that session states an `Allow` naming the action — so the grant was read and did not
+    /// apply, the session-policy intersection or a condition the session does not satisfy
+    /// having withheld it — is the sentence and nothing else. The pointer closes every other
+    /// refusal this gate words: one of a long-term credential whichever document decided it,
+    /// one no `Allow` about the action was in force for, one a statement about the request
+    /// explicitly denied, and one withheld by the session policies or by the boundary rather
+    /// than by the identity's own documents.
+    #[must_use]
+    pub fn points_at_its_detail(&self) -> bool {
+        !(self.session_credential
+            && self.identity_grant_absent
+            && !self.explicit_deny
+            && self.grant_names_the_action)
+    }
 }
 
 /// File the authorization details of a refused request, answering the authorization id they

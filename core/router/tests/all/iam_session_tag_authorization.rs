@@ -253,10 +253,13 @@ pub(crate) fn assert_withheld(
         Some("AccessDenied"),
         "case {case:?}: {session_name} expected the error code AccessDenied, got {body}"
     );
-    // The sentence this suite set up, closed by the pointer at this refusal's own
-    // authorization details (`iam_authorization_details_pointer.rs`, which owns that
-    // reader).
-    crate::iam_authorization_details_pointer::assert_identity_refusal(
+    // The sentence this suite set up, which is the whole message: a session's refusal reached
+    // although a document in force NAMES the action — the role's grant here, conditioned on a
+    // tag the session does not carry — carries no pointer at the detail of the decision
+    // (`iam_authorization_details_pointer.rs` owns both readers, and the table for that line
+    // is the identity service's own
+    // `tests/all/session_refusal_authorization_detail_pointer.rs`).
+    crate::iam_authorization_details_pointer::assert_refusal_sentence(
         case,
         &element(body, "Message"),
         &withheld_message(role_name, session_name),

@@ -11,9 +11,10 @@
 //! deny). A refused call is answered HTTP 403 with the error code `AccessDenied`
 //! ([`crate::scaffolded::Scaffolded::access_denied`]) and a message built from the three
 //! things the decision was made about — the principal, the action and the resource —
-//! closed by why the decision went that way and then by the pointer at that decision's own
-//! authorization detail ([`details`]), which is where the sentence ENDS, whichever action
-//! was asked for and whichever document decided it.
+//! closed by why the decision went that way and then, for the refusals whose recordings
+//! carry it ([`details::DeniedRequest::points_at_its_detail`]), by the pointer at that
+//! decision's own authorization detail ([`details`]), which is where the sentence ENDS,
+//! whichever action was asked for and whichever document decided it.
 //!
 //! The five pieces, each held in exactly one place:
 //!
@@ -945,6 +946,10 @@ fn authorize_request(
         policies,
         scope,
     } = signer;
+    // Which KIND of credential presented this request, read before the caller is spent on
+    // the condition context: a refusal of a role SESSION is not worded like a refusal of an
+    // identity's own long-term key ([`details::DeniedRequest::points_at_its_detail`]).
+    let session_credential = matches!(caller, Caller::RoleSession { .. });
     let (context, published) = request_context(
         store,
         caller,
@@ -1049,7 +1054,9 @@ fn authorize_request(
     );
     // The refusal states the decision and then points at its DETAIL: the authorization id
     // the message names is minted here and the record it resolves to is filed under it
-    // ([`details::record_denial`]), out of what this decision was made from.
+    // ([`details::record_denial`]), out of what this decision was made from — for the
+    // refusals that carry a pointer at all
+    // ([`details::DeniedRequest::points_at_its_detail`]).
     Err(not_authorized_detailed(
         store,
         &details::DeniedRequest {
@@ -1061,19 +1068,55 @@ fn authorize_request(
             explicit_deny,
             boundary: boundary.as_deref(),
             session_policies: scope.documents.len(),
+            session_credential,
+            identity_grant_absent: !granted,
+            // Read only where it can decide the wording: the question costs a parse of every
+            // document in force, and only a session's refusal for want of an identity-based
+            // grant is worded by it.
+            grant_names_the_action: session_credential
+                && !granted
+                && !explicit_deny
+                && a_grant_names_the_action(action, &policies, &scope),
         },
         named_as,
         &reason,
     ))
 }
 
+/// Whether a document in force on the principal states an `Allow` NAMING `action`: one of the
+/// identity's own documents, or a session policy the mint of the presented credential scoped
+/// it with.
+///
+/// The tree's weaker reading of a grant
+/// ([`::service_common::iam_authorization::identity_may_allow_action`]), which answers the
+/// question about the ACTION alone: an `Allow` naming it counts whichever resource it is
+/// scoped to and whether or not its `Condition` holds at the instant of the call. So it
+/// separates a decision that read a grant about the action and did not apply it from one no
+/// readable `Allow` was about at all — which is what the refusal's wording turns on
+/// ([`details::DeniedRequest::points_at_its_detail`]). The session policies are read as
+/// WRITTEN here, so a credential no mint scoped names nothing, unlike
+/// [`ScopingPolicies::decision`], which reads an absent scope as capping nothing.
+fn a_grant_names_the_action(
+    action: &str,
+    policies: &PrincipalPolicies,
+    scope: &ScopingPolicies,
+) -> bool {
+    let names = |documents: &[String]| {
+        iam::identity_may_allow_action(&iam::prepare_documents(documents), action)
+    };
+    names(&policies.documents) || names(&scope.documents)
+}
+
 /// The `AccessDenied` text AWS words a call it will not perform for its caller with:
 /// what the refusal is about — the principal that signed the request, the action it
 /// asked for and the resource it asked for it on — closed by `reason`, which says why,
-/// and then by the POINTER at the detail of that decision ([`details::pointer_clause`]),
-/// naming the authorization id its record is filed under ([`details::record_denial`]) — so a
-/// caller that reads the id out of the message and calls the API the message names is served
-/// the detail of this very decision.
+/// and then, for a refusal whose recordings carry one
+/// ([`details::DeniedRequest::points_at_its_detail`]), by the POINTER at the detail of that
+/// decision ([`details::pointer_clause`]), naming the authorization id its record is filed
+/// under ([`details::record_denial`]) — so a caller that reads the id out of the message and
+/// calls the API the message names is served the detail of this very decision. A refusal that
+/// carries no pointer files no record either: the id is the only way to reach one, so a
+/// record no message hands out the id of resolves for nobody.
 ///
 /// ONE wording for the code, so a refusal an operation reaches for a reason of its own
 /// is worded exactly as the policy decision above is, differing only in that reason.
@@ -1089,29 +1132,21 @@ fn not_authorized_detailed(
     named_as: &str,
     reason: &str,
 ) -> AccessDenied {
-    let authorization_id = details::record_denial(store, denied);
-    worded(
+    // The sentence itself is the tree's ONE wording of the identity-based refusal, so this
+    // service and every other one that reaches the same decision word it alike.
+    let sentence = iam::not_authorized_by_identity_policy(
         denied.principal,
         denied.action,
         named_as,
         reason,
-        &authorization_id,
-    )
-}
-
-/// The sentence [`not_authorized_detailed`] answers, closed by the pointer at the
-/// authorization detail filed under `authorization_id`.
-fn worded(
-    principal: &str,
-    action: &str,
-    named_as: &str,
-    reason: &str,
-    authorization_id: &str,
-) -> AccessDenied {
+    );
+    if !denied.points_at_its_detail() {
+        return AccessDenied::new(sentence);
+    }
+    let authorization_id = details::record_denial(store, denied);
     AccessDenied::new(format!(
-        "User: {principal} is not authorized to perform: {action} on resource: {named_as} \
-         {reason}{}",
-        details::pointer_clause(authorization_id)
+        "{sentence}{}",
+        details::pointer_clause(&authorization_id)
     ))
 }
 
