@@ -20585,6 +20585,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-route53-awsdnsv20130401",
  "service-common",
  "sha2 0.10.9",
  "tokio",

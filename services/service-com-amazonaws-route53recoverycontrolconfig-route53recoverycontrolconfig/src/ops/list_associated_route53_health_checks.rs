@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAssociatedRoute53HealthChecks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAssociatedRoute53HealthChecks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: pages through the ids of the Amazon Route 53 health checks that FOLLOW the
+//! named routing control, read from the Route 53 store that owns them
+//! ([`crate::state::associated_health_checks`]), honouring `MaxResults` and round-tripping
+//! `NextToken`. A routing control nothing follows is answered with an empty list, an ARN no
+//! routing control is stored under is `ResourceNotFoundException` (404), and a `NextToken`
+//! that names no id of this page set is `ValidationException` (400).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAssociatedRoute53HealthChecks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A health check is a RESOURCE OF ROUTE 53, not of this service: a client creates one with
+//! `CreateHealthCheck` and makes it follow a routing control by naming that control in
+//! `HealthCheckConfig$RoutingControlArn`. This operation therefore reports what that
+//! service holds at the moment of the call rather than a list of its own, so a health check
+//! deleted there stops being reported here.
+//!
+//! A pure read: the cursor is the id of the next page's first item, so paging needs no
+//! server-side bookkeeping and this call writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +82,9 @@
 //! * `ValidationException` (HTTP 400) — 400 response - Multiple causes. For example, you
 //!   might have a malformed query string and input parameter might be out of range, or you
 //!   might have used parameters together incorrectly.
+//! * `AccessDeniedException` (HTTP 403) — widened in through `extra_errors` (see below): the
+//!   shape this SERVICE states a caller acting on another account's resource with, which
+//!   this operation's own error list omits.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -91,9 +100,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-route53recoverycontrolc
 // here — hence the `ListAssociatedRoute53HealthChecksError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.route53recoverycontrolconfig#ListAssociatedRoute53HealthChecks")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.route53recoverycontrolconfig#ListAssociatedRoute53HealthChecks",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum ListAssociatedRoute53HealthChecksErrorModeled {
+    // Widened in through `extra_errors`: this SERVICE models the shape, and every
+    // operation of it that takes a caller-supplied resource ARN refuses one naming ANOTHER
+    // account with it (`crate::state::read_resource_arn`). This operation's own error list
+    // omits it, so it is widened in here rather than letting this one ARN-addressed read
+    // answer that class differently from the rest of the surface.
+    AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
@@ -150,18 +168,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAssociatedRoute53HealthChecks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAssociatedRoute53HealthChecksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAssociatedRoute53HealthChecks"))
+        let _ = ctx;
+        // The authorization check this service's ARN-addressed operations share: decided
+        // from the request alone, so it runs before the ARN is looked up.
+        crate::state::read_resource_arn(Self::NAME, &input.routing_control_arn).map_err(
+            |refused| {
+                refused.lifted(
+                    ListAssociatedRoute53HealthChecksErrorModeled::ValidationException,
+                    ListAssociatedRoute53HealthChecksErrorModeled::AccessDeniedException,
+                )
+            },
+        )?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListAssociatedRoute53HealthChecksErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the route53-recovery-control-config store is unavailable \
+                                  on this engine"
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The routing control is this service's own resource, so whether it exists is
+        // answered from this store — and the guard is released before the health checks are
+        // read, because those live in another service's store and the two are never locked
+        // at once.
+        let stored = state
+            .lock()
+            .routing_controls
+            .contains_key(&input.routing_control_arn);
+        if !stored {
+            return Err(
+                ListAssociatedRoute53HealthChecksErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::not_found_message(
+                            crate::state::ROUTING_CONTROL_NOUN,
+                            &input.routing_control_arn,
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Which health checks follow the control is a fact of the Route 53 store that holds
+        // them, read in ascending id order so a cursor always resumes at the same place.
+        let ids = crate::state::associated_health_checks::following_health_check_ids(
+            &*self.engine,
+            &input.routing_control_arn,
+        );
+        let ordered: Vec<&String> = ids.iter().collect();
+        let Some(page) = crate::state::paginate(
+            &ordered,
+            |id: &String| id.as_str(),
+            input.next_token.as_deref(),
+            input.max_results,
+        ) else {
+            return Err(
+                ListAssociatedRoute53HealthChecksErrorModeled::ValidationException(
+                    ValidationException {
+                        message: "NextToken does not name a health check associated with \
+                                  this routing control"
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(ListAssociatedRoute53HealthChecksOutput {
+            // A routing control nothing follows is answered with the EMPTY list rather than
+            // with no member at all: the list is what this operation returns, and its
+            // length is the answer.
+            health_check_ids: Some(page.items.iter().map(|id| (*id).clone()).collect()),
+            next_token: page.next_token,
+        })
     }
 }

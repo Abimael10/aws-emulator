@@ -22,6 +22,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The account's own Amazon Route 53 inventory: a Route 53 health check is what FOLLOWS a
+# routing control of this service ("HealthCheckConfig$RoutingControlArn"), and the health
+# checks are records of that service's own store, read through its own accessors
+# (`state::associated_health_checks`) for `ListAssociatedRoute53HealthChecks`.
+service-com-amazonaws-route53-awsdnsv20130401 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

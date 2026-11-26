@@ -933,8 +933,7 @@ fn invalid_arn_format(value: &str) -> String {
 
 /// Every operation of this service whose input carries a caller-supplied resource ARN,
 /// addressed or referenced (`smithy_query(query="digest")`): the whole surface the ARN
-/// gate applies to. `ListAssociatedRoute53HealthChecks` is left out because it is still a
-/// 501 scaffold.
+/// gate applies to.
 const ARN_TAKING_OPERATIONS: &[&str] = &[
     "DescribeCluster",
     "DeleteCluster",
@@ -951,6 +950,7 @@ const ARN_TAKING_OPERATIONS: &[&str] = &[
     "ListControlPanels",
     "ListRoutingControls",
     "ListSafetyRules",
+    "ListAssociatedRoute53HealthChecks",
     "ListTagsForResource",
     "TagResource",
     "UntagResource",
@@ -1020,6 +1020,15 @@ async fn with_arn(router: &MultiServiceRouter, operation: &str, arn: &str) -> (u
                 router,
                 "GET",
                 &format!("/controlpanel/{label}/safetyrules"),
+                None,
+            )
+            .await
+        }
+        "ListAssociatedRoute53HealthChecks" => {
+            call(
+                router,
+                "GET",
+                &format!("/routingcontrol/{label}/associatedRoute53HealthChecks"),
                 None,
             )
             .await
@@ -1160,6 +1169,7 @@ async fn a_well_formed_arn_that_is_not_stored_stays_a_not_found() {
         ("UpdateSafetyRule", &rule),
         ("ListRoutingControls", &panel),
         ("ListSafetyRules", &panel),
+        ("ListAssociatedRoute53HealthChecks", &control),
         ("ListTagsForResource", &cluster),
         ("TagResource", &cluster),
         ("UntagResource", &cluster),

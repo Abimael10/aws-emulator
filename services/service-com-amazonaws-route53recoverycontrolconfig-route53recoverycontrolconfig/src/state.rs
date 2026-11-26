@@ -32,6 +32,11 @@
 //!
 //! [`routing_controls`]: Store::routing_controls
 
+/// The Amazon Route 53 health checks that FOLLOW a routing control stored here. They are
+/// resources of Route 53, so they are read from that service's own store rather than held
+/// beside the records above.
+pub mod associated_health_checks;
+
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 

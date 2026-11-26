@@ -12,11 +12,16 @@
 //! the published bounds of `MaxResults` and one step outside each, and every resource
 //! level of the hierarchy for the not-found and conflict rules.
 //!
-//! The last two suites here cover the members the endpoint puts on the wire BESIDE the
+//! Two suites here cover the members the endpoint puts on the wire BESIDE the
 //! ones the public model declares: the generic `Arn` member a control panel and a safety
 //! rule carry beside their typed ARN member, and the Route 53 health-check sequence
 //! number a routing control carries — each asserted over every operation that projects
 //! the resource rather than the one read that exposed it.
+//!
+//! The last four suites are about what FOLLOWS a routing control: the Amazon Route 53
+//! health checks `ListAssociatedRoute53HealthChecks` reports. Those are resources of
+//! Route 53, so they are built through that service's own API over the same shared engine,
+//! and read back here.
 
 use std::time::Duration;
 
@@ -1833,6 +1838,414 @@ async fn a_routing_control_reports_its_health_check_sequence_number() {
             sequence_number(&format!("untouched {other_arn}"), &read["RoutingControl"]),
             *number,
             "case {other_arn}: deploying another control does not move this one's number"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The Amazon Route 53 health checks that FOLLOW a routing control.
+//
+// A health check is a resource of Route 53, not of this service: a client creates one with
+// `CreateHealthCheck` and makes it follow a routing control by naming that control in
+// `HealthCheckConfig$RoutingControlArn`. So these suites mount Route 53 BESIDE this service
+// on one shared engine and build every association through that service's own API, which is
+// what a client does — the ids this service reports are then demonstrably the other
+// service's, and not a list of its own.
+// ---------------------------------------------------------------------------
+
+/// The endpoint host a Route 53 request is addressed to, which is also the routing signal
+/// the router resolves that service from.
+const ROUTE53_ENDPOINT: &str = "route53.amazonaws.com";
+
+/// The Route 53 API version every one of its routes is prefixed with.
+const ROUTE53_PREFIX: &str = "/2013-04-01";
+
+/// The `HealthCheckType` of a health check that follows a routing control: "RECOVERY_CONTROL
+/// … the health check is associated with a Route 53 Application Recovery Controller routing
+/// control" (`smithy_query(query="shape",shape="HealthCheckType")` on the Route 53 model).
+const RECOVERY_CONTROL: &str = "RECOVERY_CONTROL";
+
+/// A router with this service AND Amazon Route 53 mounted on ONE shared engine, so a health
+/// check created through Route 53 is held in the store this service reads.
+fn router_with_route53() -> MultiServiceRouter {
+    let (mut router, engine) = super::common::router_with_engine();
+    router.register_service(
+        service_com_amazonaws_route53_awsdnsv20130401::EmulatedService::new(engine),
+    );
+    router
+}
+
+/// Send one Route 53 request (restXml) and return `(status, body)`.
+async fn route53_call(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> (u16, String) {
+    let request = http::Request::builder()
+        .method(method)
+        .uri(format!("{ROUTE53_PREFIX}{path}"))
+        .header(http::header::HOST, ROUTE53_ENDPOINT)
+        .header(http::header::CONTENT_TYPE, "application/xml")
+        .body(bytes::Bytes::from(body.to_owned()))
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    (status, String::from_utf8_lossy(response.body()).to_string())
+}
+
+/// The text of the first `<name>` element of an XML body.
+fn xml_first(case: &str, body: &str, name: &str) -> String {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let at = body
+        .find(&open)
+        .unwrap_or_else(|| panic!("case {case}: expected a {open} element, got {body}"))
+        + open.len();
+    let rest = &body[at..];
+    let end = rest
+        .find(&close)
+        .unwrap_or_else(|| panic!("case {case}: expected a {close} element, got {body}"));
+    rest[..end].to_string()
+}
+
+/// Create one Route 53 health check that follows `routing_control_arn`, and answer the id
+/// Route 53 minted for it.
+async fn follow_routing_control(
+    router: &MultiServiceRouter,
+    reference: &str,
+    routing_control_arn: &str,
+) -> String {
+    let (status, body) = route53_call(
+        router,
+        "POST",
+        "/healthcheck",
+        &format!(
+            "<CreateHealthCheckRequest \
+             xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\">\
+             <CallerReference>{reference}</CallerReference>\
+             <HealthCheckConfig><Type>{RECOVERY_CONTROL}</Type>\
+             <RoutingControlArn>{routing_control_arn}</RoutingControlArn>\
+             </HealthCheckConfig></CreateHealthCheckRequest>"
+        ),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case CreateHealthCheck {reference}: expected 201, got {status} {body}"
+    );
+    xml_first(&format!("CreateHealthCheck {reference}"), &body, "Id")
+}
+
+/// `ListAssociatedRoute53HealthChecks` for `routing_control_arn`, with `query` appended to
+/// the route; answers `(status, parsed body)`.
+async fn associated(
+    router: &MultiServiceRouter,
+    routing_control_arn: &str,
+    query: &str,
+) -> (u16, Value) {
+    call(
+        router,
+        "GET",
+        &format!(
+            "/routingcontrol/{}/associatedRoute53HealthChecks{query}",
+            enc(routing_control_arn)
+        ),
+        None,
+    )
+    .await
+}
+
+/// The `HealthCheckIds` of a successful page.
+fn health_check_ids(case: &str, body: &Value) -> Vec<String> {
+    body["HealthCheckIds"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case}: expected a HealthCheckIds list, got {body:?}"))
+        .iter()
+        .map(|id| id.as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// RULE: the operation reports the ids of exactly those Route 53 health checks whose
+/// configuration names the routing control addressed — read from the store that service
+/// holds them in, at the moment of the call — so a control nothing follows is reported with
+/// the empty list and no control is reported another's checks.
+///
+/// The rows span what the rule generalises over: how many checks follow one control (none,
+/// one, several), with every row read back through Route 53's own `GetHealthCheck` so the
+/// ids reported are demonstrably that service's records and each really names the control it
+/// was reported under.
+#[tokio::test]
+async fn associated_health_checks_are_the_route53_checks_that_follow_the_control() {
+    let router = router_with_route53();
+    let (_panel_arn, controls) = panel_with_controls(&router, "associated", 3).await;
+
+    // (case, the control, how many health checks follow it)
+    let rows: Vec<(&str, &str, usize)> = vec![
+        ("a control nothing follows", controls[0].as_str(), 0),
+        ("a control one check follows", controls[1].as_str(), 1),
+        ("a control three checks follow", controls[2].as_str(), 3),
+    ];
+
+    let mut expected: Vec<(&str, &str, Vec<String>)> = Vec::new();
+    for (case, control_arn, checks) in &rows {
+        let mut ids = Vec::new();
+        for n in 0..*checks {
+            ids.push(follow_routing_control(&router, &format!("{case}-{n}"), control_arn).await);
+        }
+        ids.sort();
+        expected.push((case, control_arn, ids));
+    }
+
+    for (case, control_arn, ids) in &expected {
+        let (status, body) = associated(&router, control_arn, "").await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected 200, got {status} {body:?}"
+        );
+        let reported = health_check_ids(case, &body);
+        assert_eq!(
+            &reported, ids,
+            "case {case}: expected the ids of the checks following {control_arn}, got \
+             {reported:?}"
+        );
+        assert!(
+            body["NextToken"].is_null(),
+            "case {case}: one page holds every id, so there is no NextToken, got {body:?}"
+        );
+
+        // Each reported id is a record of Route 53's, and its configuration names this
+        // control: the association is the other service's, read rather than invented.
+        for id in &reported {
+            let (status, check) = route53_call(&router, "GET", &format!("/healthcheck/{id}"), "")
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case}: expected GetHealthCheck 200 for {id}, got {status} {check}"
+            );
+            let followed = xml_first(case, &check, "RoutingControlArn");
+            assert_eq!(
+                &followed, control_arn,
+                "case {case}: health check {id} must follow the control it was reported \
+                 under, got {followed:?}"
+            );
+        }
+    }
+}
+
+/// RULE, on the page: a page carries at most `MaxResults` ids and the `NextToken` beside it
+/// resumes at the next one, so walking the tokens visits every id exactly once in one
+/// stable order.
+///
+/// The rows span the page size against the population: one id per page, a size that does
+/// not divide it, the exact count, one past it, and the published maximum of `MaxResults`
+/// (`smithy_query(query="operation",operation="ListAssociatedRoute53HealthChecks")` ->
+/// range 1..1000).
+#[tokio::test]
+async fn a_page_is_max_results_long_and_the_next_token_resumes_after_it() {
+    let router = router_with_route53();
+    let (_panel_arn, controls) = panel_with_controls(&router, "paged", 1).await;
+    let control_arn = controls[0].clone();
+
+    let mut all: Vec<String> = Vec::new();
+    for n in 0..5 {
+        all.push(follow_routing_control(&router, &format!("paged-{n}"), &control_arn).await);
+    }
+    all.sort();
+
+    // The whole set in one page, which is also the order every paged walk must reproduce.
+    let (status, body) = associated(&router, &control_arn, "").await;
+    assert_eq!(
+        status, 200,
+        "case the unpaged read: expected 200, got {status} {body:?}"
+    );
+    assert_eq!(
+        health_check_ids("the unpaged read", &body),
+        all,
+        "case the unpaged read: expected every id of the control"
+    );
+
+    for page_size in [1_usize, 2, 5, 6, 1000] {
+        let mut walked: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let query = match &token {
+                None => format!("?MaxResults={page_size}"),
+                Some(token) => format!("?MaxResults={page_size}&NextToken={token}"),
+            };
+            let (status, body) = associated(&router, &control_arn, &query).await;
+            assert_eq!(
+                status, 200,
+                "case MaxResults={page_size} page {pages}: expected 200, got {status} {body:?}"
+            );
+            let page = health_check_ids(&format!("MaxResults={page_size}"), &body);
+            let remaining = all.len() - walked.len();
+            assert_eq!(
+                page.len(),
+                page_size.min(remaining),
+                "case MaxResults={page_size} page {pages}: expected {} ids, got {page:?}",
+                page_size.min(remaining)
+            );
+            walked.extend(page);
+            pages += 1;
+            assert!(
+                pages <= all.len() + 1,
+                "case MaxResults={page_size}: the walk must end, got {pages} pages"
+            );
+            match body["NextToken"].as_str() {
+                Some(next) => token = Some(next.to_string()),
+                None => break,
+            }
+        }
+        assert_eq!(
+            walked, all,
+            "case MaxResults={page_size}: the walk must visit every id once, in the one order"
+        );
+    }
+}
+
+/// RULE, on where the answer comes from: the ids are read from Route 53's store on every
+/// call, so a health check created there appears and one deleted there stops being
+/// reported, with no call to this service in between.
+#[tokio::test]
+async fn the_reported_ids_follow_route53s_own_store() {
+    let router = router_with_route53();
+    let (_panel_arn, controls) = panel_with_controls(&router, "tracking", 2).await;
+    let (control_arn, other_arn) = (controls[0].clone(), controls[1].clone());
+
+    // A check following the OTHER control, which must never be reported under this one.
+    let other = follow_routing_control(&router, "tracking-other", &other_arn).await;
+
+    let first = follow_routing_control(&router, "tracking-first", &control_arn).await;
+    let second = follow_routing_control(&router, "tracking-second", &control_arn).await;
+    let mut both = vec![first.clone(), second.clone()];
+    both.sort();
+
+    let mut expected = both.clone();
+    let (status, body) = associated(&router, &control_arn, "").await;
+    assert_eq!(status, 200, "case both created: got {status} {body:?}");
+    assert_eq!(
+        health_check_ids("both created", &body),
+        expected,
+        "case both created: expected both ids"
+    );
+
+    // Deleted in Route 53: the id is gone from this answer, without this service being
+    // told.
+    let (status, deleted) =
+        route53_call(&router, "DELETE", &format!("/healthcheck/{first}"), "").await;
+    assert_eq!(
+        status, 200,
+        "case DeleteHealthCheck {first}: expected 200, got {status} {deleted}"
+    );
+    expected.retain(|id| id != &first);
+    let (status, body) = associated(&router, &control_arn, "").await;
+    assert_eq!(status, 200, "case after the delete: got {status} {body:?}");
+    assert_eq!(
+        health_check_ids("after the delete", &body),
+        expected,
+        "case after the delete: expected only the check Route 53 still holds"
+    );
+
+    // And a third one created there appears, in the same one order.
+    let third = follow_routing_control(&router, "tracking-third", &control_arn).await;
+    expected.push(third);
+    expected.sort();
+    let (status, body) = associated(&router, &control_arn, "").await;
+    assert_eq!(status, 200, "case after the third create: got {status} {body:?}");
+    assert_eq!(
+        health_check_ids("after the third create", &body),
+        expected,
+        "case after the third create: expected the checks Route 53 holds"
+    );
+    assert!(
+        !health_check_ids("the other control's check", &body).contains(&other),
+        "case the other control's check: {other} follows {other_arn} and must not be \
+         reported under {control_arn}"
+    );
+}
+
+/// RULE, on the refusals: the operation reads the ARN's SYNTAX first (400, naming the value
+/// it could not read), then whose account it names (403), then whether this service holds a
+/// routing control under it (404) — and a `NextToken` naming no id of the page set is
+/// refused as input (400).
+///
+/// The rows span each class against several values: three ways a value can fail to be an
+/// ARN, two foreign accounts, a well-formed routing-control ARN that was never minted, and
+/// two tokens that name no associated check.
+#[tokio::test]
+async fn the_refusals_state_the_class_of_the_request() {
+    let router = router_with_route53();
+    let (_panel_arn, controls) = panel_with_controls(&router, "refusals", 1).await;
+    let control_arn = controls[0].clone();
+    follow_routing_control(&router, "refusals-check", &control_arn).await;
+
+    // Not an ARN at all: refused as malformed input, echoing the value the request carried.
+    for (case, value) in [
+        ("no ARN fields at all", "not-an-arn"),
+        (
+            "five fields: no resource field",
+            "arn:aws:route53-recovery-control::000000000000",
+        ),
+        ("an empty vendor", "arn:aws:::000000000000:controlpanel/abc"),
+    ] {
+        let (status, body) = associated(&router, value, "").await;
+        let expected = format!("ARN format is invalid: {value}.");
+        assert_eq!(
+            (
+                status,
+                error_code(&body).as_str(),
+                body["message"].as_str().unwrap_or_default()
+            ),
+            (400, "ValidationException", expected.as_str()),
+            "case {case}: expected 400 ValidationException {expected:?}, got {status} {body:?}"
+        );
+    }
+
+    // Another account's ARN: a denial, before anything is looked up.
+    for account in ["123456789012", "999999999999"] {
+        let foreign = control_arn.replace(ACCOUNT, account);
+        let (status, body) = associated(&router, &foreign, "").await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (403, "AccessDeniedException"),
+            "case an ARN of {account}: expected 403 AccessDeniedException, got {status} \
+             {body:?}"
+        );
+    }
+
+    // The caller's own, well formed, and no routing control stored under it.
+    let unstored = format!(
+        "{ARN_PREFIX}controlpanel/00000000-0000-0000-0000-000000000000/routingcontrol/\
+         00000000-0000-0000-0000-000000000000"
+    );
+    let (status, body) = associated(&router, &unstored, "").await;
+    let expected = format!("No record corresponding to routing control Arn({unstored})");
+    assert_eq!(
+        (
+            status,
+            error_code(&body).as_str(),
+            body["message"].as_str().unwrap_or_default()
+        ),
+        (404, "ResourceNotFoundException", expected.as_str()),
+        "case an unstored routing control: expected 404 ResourceNotFoundException \
+         {expected:?}, got {status} {body:?}"
+    );
+
+    // A token that names no id of this control's page set.
+    for (case, token) in [
+        ("a token that is no health check id", "not-an-id"),
+        (
+            "a well-formed id nothing was minted for",
+            "00000000-0000-0000-0000-000000000000",
+        ),
+    ] {
+        let (status, body) = associated(&router, &control_arn, &format!("?NextToken={token}")).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "ValidationException"),
+            "case {case}: expected 400 ValidationException, got {status} {body:?}"
         );
     }
 }
