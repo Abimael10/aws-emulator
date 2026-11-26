@@ -241,9 +241,19 @@ fn is_entity_version(value: &str) -> bool {
     !value.starts_with('0') && !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// The `message` AWS states for this read's `ResourceNotFoundException`: fixed text for
-/// the error class, with nothing of the request in it.
-const NOT_FOUND_MESSAGE: &str = "The requested resource was not found.";
+/// The `message` AWS states for this read's `ResourceNotFoundException`: the
+/// `ServiceResourceType` of the entity being read, then the id the identifier names.
+/// Pinned over the whole entity surface by `not_found_refusal_wording.rs`.
+const NOT_FOUND_RESOURCE_TYPE: &str = "Deployment";
+
+/// The id an identifier names: the resource segment of the ARN the model documents an
+/// identifier to be, or the value itself when it is a bare id. This reading covers only
+/// those two forms, which are the ones the table below spells; a version-qualified
+/// identifier (whose `EntityVersion` suffix the service drops as well) is covered by
+/// `not_found_refusal_wording.rs`.
+fn entity_id_in(identifier: &str) -> &str {
+    identifier.split('/').next_back().unwrap_or(identifier)
+}
 
 /// One row of the create table: what a `CreateDeployment` request may vary along.
 #[derive(Debug, Clone)]
@@ -488,8 +498,9 @@ async fn a_created_deployment_is_read_back_by_arn_and_by_id() {
 }
 
 /// RULE: an identifier no stored deployment answers to is refused with the modelled
-/// `ResourceNotFoundException` — HTTP 404, that error code, and the error class's fixed
-/// message — whatever form the identifier takes.
+/// `ResourceNotFoundException` — HTTP 404, that error code, and the error class's message
+/// naming the resource type and the id the identifier carries — whatever form the
+/// identifier takes.
 #[tokio::test]
 async fn an_unknown_deployment_identifier_is_refused_as_not_found() {
     let emulator = Emulator::new();
@@ -551,14 +562,20 @@ async fn an_unknown_deployment_identifier_is_refused_as_not_found() {
         );
         assert_eq!(
             reply.json["message"].as_str(),
-            Some(NOT_FOUND_MESSAGE),
+            Some(
+                format!(
+                    "{NOT_FOUND_RESOURCE_TYPE} not found: {}",
+                    entity_id_in(&identifier)
+                )
+                .as_str()
+            ),
             "case {label:?}: unexpected message, got {:?}",
             reply.json["message"]
         );
         assert_eq!(
             reply.json["resourceId"].as_str(),
-            Some(identifier.as_str()),
-            "case {label:?}: resourceId must name the identifier the request carried, got {:?}",
+            Some(entity_id_in(&identifier)),
+            "case {label:?}: resourceId must name the deployment the identifier carried, got {:?}",
             reply.json["resourceId"]
         );
         assert_eq!(

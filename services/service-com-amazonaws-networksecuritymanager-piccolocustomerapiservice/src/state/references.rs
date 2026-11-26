@@ -86,7 +86,7 @@ fn names_resource(reference: &str, arn: &str, resource_id: &str) -> bool {
 /// `@pattern("^[1-9][0-9]*$")`.
 ///
 /// The one reading of a version suffix in this service, so the reference match and the
-/// identifier reading ([`super::rule_id_in`]) agree on what part of an identifier is one.
+/// identifier reading ([`super::entity_id_in`]) agree on what part of an identifier is one.
 pub(super) fn is_entity_version(value: &str) -> bool {
     (1..=10).contains(&value.len())
         && !value.starts_with('0')

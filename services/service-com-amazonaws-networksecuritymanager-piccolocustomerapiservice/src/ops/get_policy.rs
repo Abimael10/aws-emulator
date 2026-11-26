@@ -189,15 +189,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // decided in `crate::state`, so this read and `CreatePolicySnapshot` cannot
         // disagree about them.
         let Some(facts) = store.policy_facts(&input.policy_identifier) else {
+            // The miss names the resource type this read resolves and the policy id the
+            // identifier carries, in the wording `crate::state` states for every entity.
             return Err(GetPolicyErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!(
-                        "no policy answers to the identifier {:?}",
-                        input.policy_identifier
-                    ),
-                    resource_id: Some(input.policy_identifier.clone()),
-                    resource_type: Some(crate::state::RESOURCE_TYPE_POLICY.to_string()),
-                },
+                crate::state::resource_not_found(
+                    crate::state::RESOURCE_TYPE_POLICY,
+                    &input.policy_identifier,
+                ),
             )
             .into());
         };

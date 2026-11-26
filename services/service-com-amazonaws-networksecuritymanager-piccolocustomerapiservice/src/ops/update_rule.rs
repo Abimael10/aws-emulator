@@ -237,15 +237,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         let Some(rule_id) = store.resolve_rule_id(&input.rule_identifier) else {
-            // The wording this service states for a rule miss, as the rule read states
-            // it: fixed text and the rule id the identifier names.
-            let missing = crate::state::rule_id_in(&input.rule_identifier);
+            // The miss names the resource type this update resolves and the rule id the
+            // identifier carries, in the wording `crate::state` states for every entity.
             return Err(UpdateRuleErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!("Rule not found: {missing}"),
-                    resource_id: Some(missing.to_string()),
-                    resource_type: Some(crate::state::RESOURCE_TYPE_RULE.to_string()),
-                },
+                crate::state::resource_not_found(
+                    crate::state::RESOURCE_TYPE_RULE,
+                    &input.rule_identifier,
+                ),
             )
             .into());
         };

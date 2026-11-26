@@ -121,12 +121,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let Some(scope) = store.scope_by_identifier(&input.scope_identifier) else {
+            // The miss names the resource type this read resolves and the scope id the
+            // identifier carries — the service's wording for an absent entity, stated
+            // once in `crate::state`.
             return Err(GetScopeErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
-                    resource_id: Some(input.scope_identifier.clone()),
-                    resource_type: Some(crate::state::RESOURCE_TYPE_SCOPE.to_string()),
-                },
+                crate::state::resource_not_found(
+                    crate::state::RESOURCE_TYPE_SCOPE,
+                    &input.scope_identifier,
+                ),
             )
             .into());
         };

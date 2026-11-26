@@ -34,8 +34,8 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    AssociatedTemplateOrRule, PolicyConfiguration, PolicySummary, TemplateOrRuleReference,
-    ValidationExceptionField,
+    AssociatedTemplateOrRule, PolicyConfiguration, PolicySummary, ResourceNotFoundException,
+    TemplateOrRuleReference, ValidationExceptionField,
 };
 
 /// This service's ARN namespace (`awsService.arnNamespace` / `aws.auth#sigv4` name in
@@ -67,15 +67,40 @@ pub const POLICY_CONFIGURATION_MEMBER: &str = "policyConfiguration";
 /// `ConflictException` / `ResourceNotFoundException` shapes carry.
 pub const RESOURCE_TYPE_POLICY: &str = "Policy";
 
-/// The `message` this service states when a read's identifier names no resource of the
-/// entity it reads: fixed text for the error class, naming neither the identifier nor the
-/// resource type, because the `ResourceNotFoundException` shape carries those in its own
-/// optional `resourceId` / `resourceType` members.
+/// The modelled `ResourceNotFoundException` this service answers when an identifier names
+/// no resource of the entity being resolved: the `ServiceResourceType` of that entity,
+/// then the id the identifier names ([`entity_id_in`]).
 ///
-/// One home for the sentence, with one exception that is NOT this one: the rule read
-/// words its own miss as `Rule not found: <ruleId>`, so a read whose wording is known to
-/// differ states its own rather than taking this.
-pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The requested resource was not found.";
+/// `resource_type` is one of the modelled `ServiceResourceType` values — `Rule`,
+/// `Template`, `Policy`, `Deployment`, `Scope` — which is also the word the sentence opens
+/// with, so the message names the kind of thing that is absent and the one variable part
+/// is the id taken from the request. One home for the refusal, so every operation that
+/// resolves such an identifier words its miss alike and fills `resourceId` /
+/// `resourceType` from the same reading of the identifier.
+pub fn resource_not_found(resource_type: &str, identifier: &str) -> ResourceNotFoundException {
+    let resource_id = entity_id_in(identifier);
+    ResourceNotFoundException {
+        message: format!("{resource_type} not found: {resource_id}"),
+        resource_id: Some(resource_id.to_string()),
+        resource_type: Some(resource_type.to_string()),
+    }
+}
+
+/// The entity id an identifier names, whether or not a resource still answers to it: the
+/// resource segment of the ARN the model documents an identifier to be ("This is the
+/// <entity>'s Amazon Resource Name (ARN)"), with the version suffix a version-qualified
+/// identifier carries dropped ([`is_entity_version`]), or the value itself when it carries
+/// neither.
+///
+/// What a miss reports, so a refusal names the resource rather than the whole ARN the
+/// caller sent.
+pub fn entity_id_in(identifier: &str) -> &str {
+    let unversioned = match identifier.rsplit_once(':') {
+        Some((head, suffix)) if is_entity_version(suffix) => head,
+        _ => identifier,
+    };
+    unversioned.split('/').next_back().unwrap_or(unversioned)
+}
 
 /// The `message` this service states when a write's `updateToken` is not the one the
 /// addressed resource currently carries — the modelled `ConflictException`'s

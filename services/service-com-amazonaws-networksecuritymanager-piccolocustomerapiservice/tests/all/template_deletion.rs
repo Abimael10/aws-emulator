@@ -23,11 +23,11 @@ use smithy_server_runtime::MultiServiceRouter;
 /// it — the whole sentence is fixed text for this error class.
 const IN_USE_MESSAGE: &str = "The resource is currently in use and cannot be modified";
 
-/// The message AWS states when an identifier names no resource of the entity being read.
-const NOT_FOUND_MESSAGE: &str = "The requested resource was not found.";
-
 /// The `ServiceResourceType` value naming a template, as the modelled enum declares it
-/// (`smithy_query(query="shape", shape="ServiceResourceType")`).
+/// (`smithy_query(query="shape", shape="ServiceResourceType")`). It is also the word the
+/// not-found message for an absent template opens with, in front of the template id the
+/// identifier names — the wording `not_found_refusal_wording.rs` pins over the whole
+/// entity surface.
 const RESOURCE_TYPE_TEMPLATE: &str = "Template";
 
 /// One reply, reduced to what a caller branches on.
@@ -418,7 +418,7 @@ async fn deleting_an_unreferenced_template_removes_only_that_template() {
             );
             assert_eq!(
                 read.json["message"].as_str(),
-                Some(NOT_FOUND_MESSAGE),
+                Some(format!("{RESOURCE_TYPE_TEMPLATE} not found: {template_id}").as_str()),
                 "case {:?}: unexpected not-found message, got {:?}",
                 case.name,
                 read.json

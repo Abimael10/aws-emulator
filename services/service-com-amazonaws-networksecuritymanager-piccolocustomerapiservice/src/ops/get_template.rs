@@ -4,7 +4,9 @@
 //! Reads one template out of this service's template store, resolving
 //! `templateIdentifier` the way the model documents it. A REPORTING operation — it writes
 //! nothing, so two reads of one identifier answer alike. An identifier no stored template
-//! answers to is refused with the modelled `ResourceNotFoundException` (HTTP 404).
+//! answers to is refused with the modelled `ResourceNotFoundException` (HTTP 404), stating
+//! the resource type and the template id the identifier names
+//! ([`crate::state::resource_not_found`]).
 //!
 //! ## Shape of an operation
 //!
@@ -180,12 +182,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let Some(template) = store.template_by_identifier(&input.template_identifier) else {
+            // The miss names what is absent: the `ServiceResourceType` of the entity this
+            // read resolves, then the template id the identifier carries. The sentence
+            // itself is `crate::state`'s, so every entity's miss is worded alike.
             return Err(GetTemplateErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
-                    resource_id: Some(input.template_identifier.clone()),
-                    resource_type: Some(crate::state::RESOURCE_TYPE_TEMPLATE.to_string()),
-                },
+                crate::state::resource_not_found(
+                    crate::state::RESOURCE_TYPE_TEMPLATE,
+                    &input.template_identifier,
+                ),
             )
             .into());
         };

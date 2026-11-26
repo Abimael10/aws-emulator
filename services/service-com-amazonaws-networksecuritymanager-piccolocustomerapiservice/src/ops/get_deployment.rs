@@ -195,15 +195,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let Some(deployment) = store.deployment_by_identifier(&input.deployment_identifier) else {
             // The modelled 404 for this class, worded as this service words it: the
-            // sentence is fixed text, and the identifier the request carried is reported
-            // in the optional `resourceId`/`resourceType` members rather than spliced
-            // into it.
+            // resource type this read resolves, then the deployment id the identifier
+            // carries, which the optional `resourceId`/`resourceType` members report too.
             return Err(GetDeploymentErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
-                    resource_id: Some(input.deployment_identifier.clone()),
-                    resource_type: Some(crate::state::RESOURCE_TYPE_DEPLOYMENT.to_string()),
-                },
+                crate::state::resource_not_found(
+                    crate::state::RESOURCE_TYPE_DEPLOYMENT,
+                    &input.deployment_identifier,
+                ),
             )
             .into());
         };
