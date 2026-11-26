@@ -2179,6 +2179,31 @@ pub fn too_many_zones_message() -> String {
     )
 }
 
+/// The analysis types a firewall enables, as they are RETAINED: the types
+/// `requested` names, each kept once and in the order it was first named, and
+/// `None` where the request named no setting at all.
+///
+/// `EnabledAnalysisTypes` is "an optional setting indicating the specific traffic
+/// analysis types to enable on the firewall"
+/// (`smithy_query(query="doc",shape="Firewall",member="EnabledAnalysisTypes")`)
+/// over an enumerated element type
+/// (`smithy_query(query="shape",shape="EnabledAnalysisType")`), so the setting is
+/// the SET of types that are on: naming one of them twice enables nothing twice,
+/// and what is retained is that set rather than a transcript of the request —
+/// which is also what keeps one request from making a single record arbitrarily
+/// large, the discipline [`MAX_POLICY_LIST_ENTRIES`] and
+/// [`MAX_LOG_DESTINATION_CONFIGS`] state for the other lists this state retains.
+pub fn retained_analysis_types(requested: Option<Vec<String>>) -> Option<Vec<String>> {
+    let requested = requested?;
+    let mut named: HashSet<String> = HashSet::new();
+    Some(
+        requested
+            .into_iter()
+            .filter(|analysis_type| named.insert(analysis_type.clone()))
+            .collect(),
+    )
+}
+
 /// A firewall, as persisted. Every member `Firewall` / `FirewallStatus` reports
 /// is read back from here.
 #[derive(Debug, Clone)]

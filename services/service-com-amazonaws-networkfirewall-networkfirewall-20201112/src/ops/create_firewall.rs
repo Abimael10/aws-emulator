@@ -499,7 +499,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateFirewall<En
             encryption_configuration: Some(crate::state::effective_encryption_configuration(
                 input.encryption_configuration,
             )),
-            enabled_analysis_types: input.enabled_analysis_types,
+            enabled_analysis_types: crate::state::retained_analysis_types(
+                input.enabled_analysis_types,
+            ),
             status: crate::state::FIREWALL_PROVISIONING.to_string(),
             config_sync_state: crate::state::SYNC_IN_SYNC.to_string(),
             sync_states,

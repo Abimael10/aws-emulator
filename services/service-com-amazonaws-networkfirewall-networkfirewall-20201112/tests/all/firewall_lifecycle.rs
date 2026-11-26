@@ -19,8 +19,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_networkfirewall_networkfirewall_20201112::state;
 
 use crate::harness::{
-    error_code, is_uuid_form, minimal_policy_document as minimal_policy, string_at, with_tag_list,
-    Harness, ACCOUNT, REGION,
+    error_code, error_message, is_uuid_form, minimal_policy_document as minimal_policy, string_at,
+    with_tag_list, Harness, ACCOUNT, NOT_FOUND_MESSAGE, REGION,
 };
 
 /// One row of the create -> describe round-trip table.
@@ -488,6 +488,358 @@ async fn updating_the_description_writes_through_and_rotates_the_token() {
             "case {case:?}: expected a stale UpdateToken to be refused, got {status} {body:?}"
         );
     }
+}
+
+/// The values the model's `EnabledAnalysisType` enumeration carries
+/// (`smithy_query(query="shape",shape="EnabledAnalysisType")`), written out here so these
+/// tests pin the published set instead of restating the code.
+const TLS_SNI: &str = "TLS_SNI";
+/// See [`TLS_SNI`].
+const HTTP_HOST: &str = "HTTP_HOST";
+
+/// The firewall ARN this emulator builds for `name`.
+fn firewall_arn_of(name: &str) -> String {
+    format!("arn:aws:network-firewall:{REGION}:{ACCOUNT}:firewall/{name}")
+}
+
+/// One row of the analysis-settings replacement table.
+#[derive(Debug)]
+struct AnalysisCase {
+    /// What this row is, named by every assertion it drives.
+    case: &'static str,
+    /// The analysis types the request names, or `None` when it omits the member.
+    requested: Option<Vec<&'static str>>,
+    /// The set the firewall carries once the call is served.
+    retained: Option<Vec<&'static str>>,
+    /// Whether that set, and so the `UpdateToken`, moves.
+    moves: bool,
+}
+
+/// RULE: a request that names the analysis types to enable on a firewall REPLACES the
+/// set the firewall carries with exactly the types named — each of them once, and none
+/// at all when it names none — writes that set through to the stored resource, and
+/// re-mints the `UpdateToken` exactly when the set moved.
+///
+/// Rows span what the rule generalises over: which of the published analysis types are
+/// named, how many are named (two, one, none), the order they are named in, whether a
+/// type is named more than once, and whether the set named is the one the firewall
+/// already carries.
+#[tokio::test]
+async fn updating_the_analysis_settings_replaces_the_enabled_set() {
+    let rows = vec![
+        AnalysisCase {
+            case: "both published types",
+            requested: Some(vec![TLS_SNI, HTTP_HOST]),
+            retained: Some(vec![TLS_SNI, HTTP_HOST]),
+            moves: true,
+        },
+        AnalysisCase {
+            case: "the same two, named in the other order",
+            requested: Some(vec![HTTP_HOST, TLS_SNI]),
+            retained: Some(vec![HTTP_HOST, TLS_SNI]),
+            moves: true,
+        },
+        AnalysisCase {
+            case: "one type named twice",
+            requested: Some(vec![HTTP_HOST, HTTP_HOST]),
+            retained: Some(vec![HTTP_HOST]),
+            moves: true,
+        },
+        AnalysisCase {
+            // The row above retained that type ONCE, so naming it once now asks for
+            // the set the firewall already carries.
+            case: "that same type named once",
+            requested: Some(vec![HTTP_HOST]),
+            retained: Some(vec![HTTP_HOST]),
+            moves: false,
+        },
+        AnalysisCase {
+            case: "the first type alone",
+            requested: Some(vec![TLS_SNI]),
+            retained: Some(vec![TLS_SNI]),
+            moves: true,
+        },
+        AnalysisCase {
+            case: "no type at all, the member omitted",
+            requested: None,
+            retained: None,
+            moves: true,
+        },
+        AnalysisCase {
+            case: "the member omitted a second time",
+            requested: None,
+            retained: None,
+            moves: false,
+        },
+    ];
+
+    let harness = Harness::new();
+    let policy = harness.create_policy("analysis-policy").await;
+    let policy_arn =
+        string_at(&policy, &["FirewallPolicyResponse", "FirewallPolicyArn"]).to_string();
+    harness
+        .ok(
+            "CreateFirewall",
+            &json!({
+                "FirewallName": "analysis-fw",
+                "FirewallPolicyArn": policy_arn,
+                "VpcId": "vpc-0123abcd",
+                "SubnetMappings": [{ "SubnetId": "subnet-0123abcd" }],
+            }),
+        )
+        .await;
+
+    for AnalysisCase {
+        case,
+        requested,
+        retained,
+        moves,
+    } in rows
+    {
+        let before = harness
+            .ok("DescribeFirewall", &json!({ "FirewallName": "analysis-fw" }))
+            .await;
+        let previous_token = string_at(&before, &["UpdateToken"]).to_string();
+        let expected: Value = retained.map_or(Value::Null, |types| json!(types));
+
+        let mut request = json!({ "FirewallName": "analysis-fw", "UpdateToken": previous_token });
+        if let Some(types) = &requested {
+            request["EnabledAnalysisTypes"] = json!(types.clone());
+        }
+        let updated = harness
+            .ok("UpdateFirewallAnalysisSettings", &request)
+            .await;
+
+        assert_eq!(
+            updated["EnabledAnalysisTypes"], expected,
+            "case {case}: expected the response to carry the set retained for the types named, \
+             got {updated:?}"
+        );
+        assert_eq!(
+            string_at(&updated, &["FirewallName"]),
+            "analysis-fw",
+            "case {case}: expected the response to name the firewall, got {updated:?}"
+        );
+        assert_eq!(
+            string_at(&updated, &["FirewallArn"]),
+            firewall_arn_of("analysis-fw"),
+            "case {case}: expected the response to identify the firewall by ARN, got {updated:?}"
+        );
+
+        let token = string_at(&updated, &["UpdateToken"]).to_string();
+        assert!(
+            is_uuid_form(&token),
+            "case {case}: expected an UpdateToken in the modelled UUID form, got {token:?}"
+        );
+        assert_eq!(
+            token != previous_token,
+            moves,
+            "case {case}: expected the UpdateToken to move exactly when the stored set did \
+             (before {previous_token:?}, after {token:?})"
+        );
+
+        // The response is not a per-call projection: a later reader sees the same set,
+        // and the token the resource then carries is the one handed back.
+        let after = harness
+            .ok("DescribeFirewall", &json!({ "FirewallName": "analysis-fw" }))
+            .await;
+        assert_eq!(
+            after["Firewall"]["EnabledAnalysisTypes"], expected,
+            "case {case}: expected the describe to report the stored set, got {after:?}"
+        );
+        assert_eq!(
+            string_at(&after, &["UpdateToken"]),
+            token,
+            "case {case}: expected the describe to report the token the update handed back, got \
+             {after:?}"
+        );
+
+        if moves {
+            // The token a caller read before this update marked the state the firewall
+            // was in then, so a conditional change still quoting it is refused and
+            // writes nothing.
+            let (status, body) = harness
+                .call(
+                    "UpdateFirewallAnalysisSettings",
+                    &json!({
+                        "FirewallName": "analysis-fw",
+                        "UpdateToken": previous_token,
+                        "EnabledAnalysisTypes": [TLS_SNI],
+                    }),
+                )
+                .await;
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (400, "InvalidTokenException"),
+                "case {case}: expected the superseded token to be refused, got {status} {body:?}"
+            );
+            assert_eq!(
+                error_message(&body),
+                "Update token isn't valid.",
+                "case {case}: expected the fixed token message, got {body:?}"
+            );
+            let unchanged = harness
+                .ok("DescribeFirewall", &json!({ "FirewallName": "analysis-fw" }))
+                .await;
+            assert_eq!(
+                unchanged["Firewall"]["EnabledAnalysisTypes"], expected,
+                "case {case}: expected the refusal to leave the stored set as it was, got \
+                 {unchanged:?}"
+            );
+        }
+    }
+}
+
+/// RULE: the firewall whose analysis settings a call replaces is identified by its name,
+/// by its ARN or by both ("You must specify the ARN or the name, and you can specify
+/// both" — `UpdateFirewallAnalysisSettings$FirewallArn`), a reference that resolves to no
+/// stored firewall locates no resource (`ResourceNotFoundException`, HTTP 400, this
+/// service's one not-found text), a reference that is not one is a bad request, and a
+/// request carrying no `UpdateToken` is the unconditional change that member documents.
+#[tokio::test]
+async fn an_analysis_settings_update_identifies_its_firewall() {
+    let harness = Harness::new();
+    let policy = harness.create_policy("analysis-ref-policy").await;
+    let policy_arn =
+        string_at(&policy, &["FirewallPolicyResponse", "FirewallPolicyArn"]).to_string();
+    for name in ["ref-name-fw", "ref-arn-fw", "ref-both-fw"] {
+        let created = harness
+            .ok(
+                "CreateFirewall",
+                &json!({
+                    "FirewallName": name,
+                    "FirewallPolicyArn": policy_arn.clone(),
+                    "VpcId": "vpc-0123abcd",
+                    "SubnetMappings": [{ "SubnetId": "subnet-0123abcd" }],
+                    // The create retains the same type SET an update does, so a type
+                    // named twice is enabled once here too.
+                    "EnabledAnalysisTypes": [TLS_SNI, TLS_SNI],
+                }),
+            )
+            .await;
+        assert_eq!(
+            created["Firewall"]["EnabledAnalysisTypes"],
+            json!([TLS_SNI]),
+            "case create {name}: expected each named type retained once, got {created:?}"
+        );
+    }
+
+    // (case, the members identifying the firewall, the firewall the call must change)
+    let served: Vec<(&str, Value, &str)> = vec![
+        (
+            "by name alone",
+            json!({ "FirewallName": "ref-name-fw" }),
+            "ref-name-fw",
+        ),
+        (
+            "by ARN alone",
+            json!({ "FirewallArn": firewall_arn_of("ref-arn-fw") }),
+            "ref-arn-fw",
+        ),
+        (
+            "by name and ARN together",
+            json!({
+                "FirewallName": "ref-both-fw",
+                "FirewallArn": firewall_arn_of("ref-both-fw"),
+            }),
+            "ref-both-fw",
+        ),
+    ];
+
+    for (case, identifiers, firewall) in served {
+        // No `UpdateToken`: the change is unconditional, so it is served whatever the
+        // firewall has done since the caller last read it.
+        let mut request = identifiers;
+        request["EnabledAnalysisTypes"] = json!([HTTP_HOST]);
+        let updated = harness
+            .ok("UpdateFirewallAnalysisSettings", &request)
+            .await;
+        assert_eq!(
+            updated["EnabledAnalysisTypes"],
+            json!([HTTP_HOST]),
+            "case {case}: expected the named set in the response, got {updated:?}"
+        );
+        let described = harness
+            .ok("DescribeFirewall", &json!({ "FirewallName": firewall }))
+            .await;
+        assert_eq!(
+            described["Firewall"]["EnabledAnalysisTypes"],
+            json!([HTTP_HOST]),
+            "case {case}: expected the describe to report the replaced set, got {described:?}"
+        );
+    }
+
+    // (case, request, the error code, the whole message)
+    let refused: Vec<(&str, Value, &str, &str)> = vec![
+        (
+            "a name no firewall carries",
+            json!({ "FirewallName": "absent-fw", "EnabledAnalysisTypes": [TLS_SNI] }),
+            "ResourceNotFoundException",
+            NOT_FOUND_MESSAGE,
+        ),
+        (
+            "an ARN no firewall carries",
+            json!({
+                "FirewallArn": firewall_arn_of("absent-fw"),
+                "EnabledAnalysisTypes": [TLS_SNI],
+            }),
+            "ResourceNotFoundException",
+            NOT_FOUND_MESSAGE,
+        ),
+        (
+            "neither a name nor an ARN",
+            json!({ "EnabledAnalysisTypes": [TLS_SNI] }),
+            "InvalidRequestException",
+            "At least one of FirewallName or FirewallArn must be set",
+        ),
+        (
+            "a name and an ARN naming two different firewalls",
+            json!({
+                "FirewallName": "ref-name-fw",
+                "FirewallArn": firewall_arn_of("ref-arn-fw"),
+                "EnabledAnalysisTypes": [TLS_SNI],
+            }),
+            "InvalidRequestException",
+            "Name and Arn(Name in Arn) do not match",
+        ),
+        (
+            "an ARN of another kind of resource",
+            json!({ "FirewallArn": policy_arn.clone(), "EnabledAnalysisTypes": [TLS_SNI] }),
+            "InvalidRequestException",
+            "Resource Type and Arn(Type in Arn) do not match",
+        ),
+    ];
+
+    for (case, request, code, message) in refused {
+        let (status, body) = harness
+            .call("UpdateFirewallAnalysisSettings", &request)
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case}: expected HTTP 400, got {status} with body {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            code,
+            "case {case}: expected {code}, got {body:?}"
+        );
+        assert_eq!(
+            error_message(&body),
+            message,
+            "case {case}: expected {message:?}, got {body:?}"
+        );
+    }
+
+    // A refused reference wrote nothing: the firewall the mismatched pair named still
+    // carries what the served calls above left on it.
+    let described = harness
+        .ok("DescribeFirewall", &json!({ "FirewallName": "ref-name-fw" }))
+        .await;
+    assert_eq!(
+        described["Firewall"]["EnabledAnalysisTypes"],
+        json!([HTTP_HOST]),
+        "case after the refusals: expected the stored set untouched, got {described:?}"
+    );
 }
 
 /// RULE: a paginated listing returns at most `MaxResults` items, a `NextToken`

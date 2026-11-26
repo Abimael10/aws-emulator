@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFirewallAnalysisSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFirewallAnalysisSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFirewallAnalysisSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: replaces the stored `FirewallRecord`'s `EnabledAnalysisTypes` with the
+//! set the request names — none when it names none — so a following `DescribeFirewall`
+//! shows the change, and re-mints the `UpdateToken` exactly when that set moved. A
+//! stale token is refused with `InvalidTokenException`.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +177,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFirewallAnalysisSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFirewallAnalysisSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateFirewallAnalysisSettingsErrorModeled::InternalServerError(
+                    InternalServerError {
+                        message: Some("the firewall store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+
+        // "You must specify the ARN or the name, and you can specify both", so the
+        // firewall whose analysis settings this call replaces is identified exactly the
+        // way every other firewall operation identifies one — and a name or ARN that
+        // names nothing stored locates no resource, whether it never existed or
+        // `DeleteFirewall` has since removed it.
+        let key = state
+            .resolve_firewall(input.firewall_name.as_deref(), input.firewall_arn.as_deref())
+            .map_err(update_lookup_error)?;
+        let Some(record) = state.firewalls.get_mut(&key) else {
+            return Err(
+                UpdateFirewallAnalysisSettingsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The `PROVISIONING` -> `READY` move the clock owed at `ready_at()` is
+        // materialised here too, so every handler that touches the record sees the same
+        // status a reader would, not a stale one.
+        record.settle(::std::time::SystemTime::now());
+
+        // `UpdateToken` is the resource's optimistic lock: when the caller sends one it
+        // must be the token the firewall currently carries, so a caller that read the
+        // firewall before someone else changed it is refused rather than overwriting
+        // that change.
+        if input
+            .update_token
+            .as_ref()
+            .is_some_and(|token| token != &record.update_token)
+        {
+            return Err(
+                UpdateFirewallAnalysisSettingsErrorModeled::InvalidTokenException(
+                    InvalidTokenException {
+                        message: Some(crate::state::INVALID_TOKEN_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The setting is the WHOLE set of traffic analysis types that are to be enabled
+        // on the firewall, so this call replaces what the firewall carries rather than
+        // adding to it, and a request naming none leaves the firewall analysing nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFirewallAnalysisSettings"))
+        // The token "marks the state of the firewall resource at the time of the
+        // request", so it is re-minted exactly when this call moved that state: a
+        // request naming the set the firewall already carries changes nothing and leaves
+        // the resource — its token included — as it was.
+        let requested = crate::state::retained_analysis_types(input.enabled_analysis_types);
+        if record.enabled_analysis_types != requested {
+            record.enabled_analysis_types = requested;
+            record.update_token = crate::state::new_uuid();
+        }
+
+        Ok(UpdateFirewallAnalysisSettingsOutput {
+            firewall_arn: Some(record.firewall_arn.clone()),
+            firewall_name: Some(record.firewall_name.clone()),
+            enabled_analysis_types: record.enabled_analysis_types.clone(),
+            update_token: Some(record.update_token.clone()),
+        })
     }
 }
+
+crate::state::impl_resolve_error!(
+    update_lookup_error -> UpdateFirewallAnalysisSettingsError,
+    UpdateFirewallAnalysisSettingsErrorModeled,
+    name_member = "FirewallName", arn_member = "FirewallArn"
+);
