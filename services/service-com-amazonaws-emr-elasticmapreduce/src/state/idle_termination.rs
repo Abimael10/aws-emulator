@@ -65,11 +65,20 @@ impl ClusterRecord {
     /// queue, or the instant it became ready to run steps when it has run none. A cluster that
     /// is not ready yet has not begun to be idle, and one that is already shutting down or
     /// gone is not idle but finished.
+    ///
+    /// A cluster a termination lock HELD is also not idle for the policy's purposes while the
+    /// lock holds: the lock "prevent[s] the Amazon EC2 instances from being terminated"
+    /// (`Cluster$TerminationProtected` doc), so for that span the policy had no shutdown to
+    /// take and the window it counts begins again when the lock is cleared
+    /// ([`Self::termination_unlocked_at`]).
     pub(crate) fn idle_since(&self) -> Option<SystemTime> {
         if !cluster_state::ACTIVE.contains(&self.status.state.as_str()) {
             return None;
         }
         let mut idle_since = self.status.ready_date_time?;
+        if let Some(unlocked_at) = self.termination_unlocked_at {
+            idle_since = idle_since.max(unlocked_at);
+        }
         for step in &self.steps {
             // A step that has not ended is work in hand: the cluster is not idle at all.
             if !step.is_terminal() {
@@ -101,8 +110,11 @@ impl ClusterRecord {
     /// `TERMINATED_WITH_ERRORS`. Termination protection "prevent[s] the Amazon EC2 instances
     /// from being terminated by an API call or user intervention"
     /// (`Cluster$TerminationProtected` doc), so a protected cluster keeps its capacity here as
-    /// it does against `TerminateJobFlows`: the timer stays armed and fires once the lock is
-    /// cleared.
+    /// it does against `TerminateJobFlows`: the policy stays attached, and the idle window it
+    /// counts runs from the instant the lock was cleared ([`Self::idle_since`]) rather than
+    /// through the span the lock held — so the unlocked cluster is up for one more idle
+    /// timeout, and the caller that unlocks it to shut it down itself is the one whose
+    /// shutdown the cluster records.
     pub(crate) fn stop_once_idle_timeout_elapsed(&mut self, now: SystemTime) {
         let Some(due) = self.idle_termination_due_at() else {
             return;

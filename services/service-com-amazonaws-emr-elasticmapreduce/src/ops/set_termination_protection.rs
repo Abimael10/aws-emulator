@@ -206,6 +206,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and `TerminateJobFlows` reads.
         for job_flow_id in &input.job_flow_ids {
             if let Some(cluster) = store.cluster_mut(job_flow_id, now) {
+                // Clearing a lock that was still HOLDING hands the cluster back to the timer
+                // the lock had taken it out of reach of: the idle time an auto-termination
+                // policy counts runs from this instant too
+                // ([`crate::state::ClusterRecord::termination_unlocked_at`]), so the unlock
+                // does not shut a long-idle cluster down behind the caller that asked for it.
+                if !input.termination_protected && cluster.termination_protection_holds() {
+                    cluster.termination_unlocked_at = Some(now);
+                }
                 cluster.instances.termination_protected = input.termination_protected;
             }
         }

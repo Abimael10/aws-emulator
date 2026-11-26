@@ -3066,6 +3066,18 @@ pub struct ClusterRecord {
     /// reading straight after the call still sees the cluster up, and a call that asks again
     /// for what the cluster is already doing postpones nothing.
     pub auto_terminate_since: Option<SystemTime>,
+    /// When a CALLER last cleared a termination lock that was HOLDING on this cluster — the
+    /// instant `SetTerminationProtection(false)` reached a cluster whose lock still had a
+    /// shutdown to hold off ([`Self::termination_protection_holds`]) — and `None` for a
+    /// cluster no held lock has been cleared on.
+    ///
+    /// The idle time an attached auto-termination policy counts runs from this instant too
+    /// ([`Self::idle_since`]): while the lock held, the policy was not free to shut the
+    /// cluster down, so the idle window it measures begins again once the lock is cleared,
+    /// rather than being owed for a span the cluster was out of the policy's reach for. A
+    /// caller that unlocks a long-idle cluster therefore still finds it up, and the shutdown
+    /// it asks for itself is the one the cluster records.
+    pub termination_unlocked_at: Option<SystemTime>,
     pub step_concurrency_level: i32,
     pub ebs_root_volume_size: Option<i32>,
     pub ebs_root_volume_iops: Option<i32>,

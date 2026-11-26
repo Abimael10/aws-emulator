@@ -821,6 +821,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // No caller has asked this cluster to stop staying up: whatever shutdown it is
             // owed is its launch's own (`crate::state::ClusterRecord::auto_terminate_since`).
             auto_terminate_since: None,
+            // Nor has any caller cleared a lock on it: whatever idle window a policy of this
+            // cluster counts is its own
+            // (`crate::state::ClusterRecord::termination_unlocked_at`).
+            termination_unlocked_at: None,
             step_concurrency_level,
             ebs_root_volume_size: input.ebs_root_volume_size,
             ebs_root_volume_iops: input.ebs_root_volume_iops,
