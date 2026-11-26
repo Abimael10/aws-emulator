@@ -131,6 +131,25 @@ pub fn image_not_found_message(image: &str) -> String {
     )
 }
 
+/// The `statusReason` of a job whose image reference names a repository the registry does not
+/// PUBLISH at all: the same `CannotPullContainerError` class, in the words the container agent
+/// words a repository that is not there with.
+///
+/// A registry grants the pull scope of a repository it holds, so a request for one it holds
+/// none of is answered with no such scope rather than with a missing manifest — the agent
+/// reports that the access was denied and that the repository may not be there, having retried
+/// the fetch to the end of its budget ([`MANIFEST_FETCH_RETRIES`]). The same sentence the
+/// Amazon ECS crate reports as the `stoppedReason` of such a task, because a Batch job's
+/// container IS an Amazon ECS task's container.
+pub fn repository_does_not_exist_message(image: &str) -> String {
+    format!(
+        "CannotPullContainerError: pull image manifest has been retried \
+         {MANIFEST_FETCH_RETRIES} time(s): failed to resolve ref {image}: pull access denied, \
+         repository does not exist or may require authorization: server message: \
+         insufficient_scope: authorization failed"
+    )
+}
+
 /// How many times the runtime retried the image MANIFEST fetch before it reported the
 /// failure: a registry that refuses a request refuses it however often it is asked, so the
 /// fetch is retried until the whole retry budget is spent and that budget is what the failure
@@ -370,11 +389,16 @@ pub fn settle_job_image_fetches<Eng: Send + Sync + 'static>(engine: &Eng) {
                 // A repository the gallery AWS serves publishes ITSELF, whose image this
                 // emulator holds: what it publishes decides the reference, so a tag it
                 // publishes no release under resolves to no image and the fetch fails in the
-                // agent's own words ([`published_images`], [`image_not_found_message`]).
+                // agent's own words ([`published_images`], [`image_not_found_message`]) — as
+                // does a reference into the namespace that gallery mirrors naming a repository
+                // its published catalogue does not list at all.
                 match published {
                     published_images::PublishedImage::Published => ImageFetch::Served,
                     published_images::PublishedImage::NotPublished => {
                         ImageFetch::Refused(image_not_found_message(&fetch.image))
+                    }
+                    published_images::PublishedImage::NoSuchRepository => {
+                        ImageFetch::Refused(repository_does_not_exist_message(&fetch.image))
                     }
                 }
             } else {

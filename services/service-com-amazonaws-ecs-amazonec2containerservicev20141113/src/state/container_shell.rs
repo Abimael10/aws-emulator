@@ -180,9 +180,9 @@
 //!
 //! # A duration the program STATES is not time this emulator spends
 //!
-//! The seconds in a `sleep` are a caller's word about how long its program took, so this
-//! session does not spend them out of this emulator's wall clock: the wait is taken as STATED
-//! and what the program does next — its next command, or its own end — follows at once
+//! The seconds in a `sleep` are a program's own account of how long it took, so this session
+//! does not spend them out of this emulator's wall clock: the wait is taken as STATED and what
+//! the program does next — its next command, or its own end — follows at once
 //! ([`ContainerShell::states_a_wait_rather_than_spending_it`]). Otherwise a container's own
 //! words would decide how long this emulator takes to answer everything that waits on its
 //! task — the AWS Batch job whose dependents are held until this container ends, the
@@ -193,8 +193,11 @@
 //! thing entirely: a wait with no end of its own (`sleep infinity`, a foreground server), or
 //! one the program goes round a loop on, is the container WAITING for something else — the
 //! stop its task is sent, a file another container writes — which is how a container stays up.
-//! Those name no duration of the program's own, so there is nothing to state: they are
-//! honoured, up to the run's own deadline.
+//! Those name no duration of the program's own, so there is nothing to state: they are spent,
+//! up to the run's own deadline. So is the wait a container is given as its WHOLE program
+//! (`["sleep", "3600"]`): there is no work for those seconds to be the account of, so they are
+//! the span the container runs for, and spending them holds nothing up — the container is
+//! simply still there while every call about its task is answered.
 
 use std::collections::BTreeMap;
 use std::pin::Pin;
@@ -258,6 +261,13 @@ const CONTINUE_COMMAND: &str = "continue";
 /// second one — a program that reports a value writes it with either utility.
 const PRINTF_COMMAND: &str = "printf";
 
+/// The utility that WAITS: "the `sleep` utility shall suspend execution for at least the
+/// integral number of seconds specified by the `time` operand". Named here because what a
+/// wait COSTS depends on where it stands
+/// ([`ContainerShell::states_a_wait_rather_than_spending_it`]), so the dispatch, the catalog
+/// and that reading all name the one utility.
+const SLEEP_COMMAND: &str = "sleep";
+
 /// The utility that REPLACES the session with the command it names: "the `exec` utility shall
 /// open, close, and/or copy file descriptors as specified by any redirections as part of the
 /// command. If `exec` is specified with command, it shall replace the shell with command without
@@ -290,7 +300,8 @@ const EXEC_COMMAND: &str = "exec";
 /// ([`super::container_servers`]) needs a program or a network this container does not
 /// have.
 pub const BUILT_IN_COMMANDS: &[&str] = &[
-    "echo", PRINTF_COMMAND, "true", "false", ":", "exit", "export", "unset", "trap", "sleep",
+    "echo", PRINTF_COMMAND, "true", "false", ":", "exit", "export", "unset", "trap",
+    SLEEP_COMMAND,
     "wait", "test", "[", "set", "exec", "hostname", "pwd", "id", "ulimit", "df", BREAK_COMMAND,
     CONTINUE_COMMAND, "stty", "tput",
 ];
@@ -751,6 +762,11 @@ pub struct ContainerShell {
     /// decides whether a `break` or a `continue` has a loop to leave at all
     /// ([`Self::run_loop_control`]).
     loop_depth: usize,
+    /// Whether this session's whole program IS a wait: the argument vector the container
+    /// runtime exec's names the wait and nothing else ([`ContainerShell::run_argv`]), so the
+    /// seconds it names describe no work of the program's and are spent rather than stated
+    /// ([`ContainerShell::states_a_wait_rather_than_spending_it`]).
+    program_is_a_wait: bool,
     /// The loop the program asked to leave and how many enclosing loops it is leaving —
     /// `None` while no `break` or `continue` is in flight. Set by those commands and taken by
     /// the loop that honours it ([`Self::taken_loop_control`]).
@@ -855,6 +871,7 @@ impl ContainerShell {
             condition_depth: 0,
             compound_depth: 0,
             loop_depth: 0,
+            program_is_a_wait: false,
             loop_control: None,
             negated_pipeline: false,
             serving,
@@ -1473,6 +1490,10 @@ impl ContainerShell {
     /// Run the argument vector of a container whose image exec's it directly: its first
     /// word is the utility and the rest are its arguments, with no shell to expand or split
     /// them.
+    ///
+    /// Such a vector is the container's WHOLE program, so a vector whose utility is the wait
+    /// is a container given nothing to do but wait: the seconds it names are spent rather
+    /// than stated ([`Self::states_a_wait_rather_than_spending_it`]).
     async fn run_argv(&mut self, argv: &[String]) -> i32 {
         let Some((name, arguments)) = argv.split_first() else {
             return EXIT_SUCCESS;
@@ -1480,6 +1501,7 @@ impl ContainerShell {
         if !self.take_command_budget().await {
             return EXIT_COMMAND_NOT_FOUND;
         }
+        self.program_is_a_wait = name == SLEEP_COMMAND;
         // A vector the image exec's carries no redirection of its own: there is no shell to
         // read one.
         let redirections = Redirections::default();
@@ -1580,23 +1602,28 @@ impl ContainerShell {
     /// Whether a wait the program states in seconds is a duration this session only STATES,
     /// rather than one it spends out of this emulator's own wall clock.
     ///
-    /// It is, wherever that wait stands in the program: the seconds in a `sleep` are a
-    /// caller's word about how long its program took, and spending them would let that word
-    /// decide how long this emulator takes to answer everything waiting on the task — the job
-    /// whose terminal status a client polls for, the dependents held until this container
-    /// ends, the deployment whose stabilisation is watched. So the wait is taken as stated and
-    /// what the program does next — its next command, or its own end carrying the status that
-    /// wait answered — follows at once, which is what the container then reports. The wait a
-    /// program ENDS on is no different: it names an end of its own, so what the program comes
-    /// to is settled by that wait rather than by anything outside the container.
+    /// It is, wherever that wait stands in a program that does something ELSE: the seconds in
+    /// a `sleep` are then that program's own account of how long it took, and spending them
+    /// would let it decide how long this emulator takes to answer everything waiting on the
+    /// task — the job whose terminal status a client polls for, the dependents held until this
+    /// container ends, the deployment whose stabilisation is watched. So the wait is taken as
+    /// stated and what the program does next — its next command, or its own end carrying the
+    /// status that wait answered — follows at once, which is what the container then reports.
     ///
-    /// It is NOT, inside a LOOP the program is going round: a wait there states no duration of
-    /// the program's own work, because what ends the loop is something else — the stop its
-    /// task is sent, a file another container writes — which is how a container stays up. So
-    /// it is honoured until the run's own deadline, exactly as a wait that names no end at all
-    /// is ([`Self::run_sleep`]).
+    /// It is NOT, where the wait is the WHOLE PROGRAM ([`Self::program_is_a_wait`]): the
+    /// container was given nothing to do but wait, so there is no work for those seconds to be
+    /// the account of — they are the span the container RUNS FOR, which is what
+    /// `Task$lastStatus` reports of a task while its containers are up. Spending them holds
+    /// nothing up that this emulator owes anyone: the container is simply still there, as it is
+    /// for a wait with no end at all, and every call about its task is answered throughout.
+    ///
+    /// It is NOT either, inside a LOOP the program is going round: a wait there states no
+    /// duration of the program's own work, because what ends the loop is something else — the
+    /// stop its task is sent, a file another container writes — which is how a container stays
+    /// up. So it is spent until the run's own deadline, exactly as a wait that names no end at
+    /// all is ([`Self::run_sleep`]).
     fn states_a_wait_rather_than_spending_it(&self) -> bool {
-        self.loop_depth == 0
+        self.loop_depth == 0 && !self.program_is_a_wait
     }
 
     /// The action this session has recorded for the termination signal, under any of the
@@ -2401,7 +2428,7 @@ impl ContainerShell {
                 // loops its argument names ([`Self::run_loop_control`]).
                 BREAK_COMMAND => self.run_loop_control(false, arguments),
                 CONTINUE_COMMAND => self.run_loop_control(true, arguments),
-                "sleep" => self.run_sleep(arguments).await,
+                SLEEP_COMMAND => self.run_sleep(arguments).await,
                 // "wait: ... If no process ID is given, waits for all currently active
                 // child processes" — this session has none, so there is nothing to wait
                 // for and the utility answers success.
@@ -2680,9 +2707,10 @@ impl ContainerShell {
     /// The seconds a program states are a duration this session STATES rather than one it
     /// spends ([`Self::states_a_wait_rather_than_spending_it`]): what the program does next —
     /// its next command, or its own end — follows at once, so what the container reports is
-    /// still its own program's outcome while nothing waiting on the task is held by a caller's
-    /// word. A wait that names no end of its own, and one the program goes round a loop on,
-    /// are honoured: those are the container waiting for something else.
+    /// still its own program's outcome while nothing waiting on the task is held by that
+    /// program's account of itself. A wait that names no end of its own, one the program goes
+    /// round a loop on, and one the container was given as its WHOLE program are spent: those
+    /// are the container waiting rather than reporting how long it worked.
     async fn run_sleep(&mut self, arguments: &[String]) -> i32 {
         let Some(argument) = arguments.first() else {
             return EXIT_FAILURE;

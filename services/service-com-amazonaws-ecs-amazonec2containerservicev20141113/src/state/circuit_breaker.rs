@@ -75,12 +75,17 @@ pub const CIRCUIT_BREAKER_STOPPED_REASON: &str =
 /// `Deployment$rolloutState` makes `FAILED` the END of that rollout ("A deployment in
 /// `FAILED` state doesn't launch any new tasks") and the rollback is a rollout of its own, so
 /// the state the breaker produced is one a client WATCHES for rather than a step on the way
-/// somewhere. The span is what makes it observable: a client polling the rollout at an
-/// ordinary interval — seconds apart, as a client waiting on a deployment polls — reads the
+/// somewhere. The span is what makes it observable: a client polling the rollout reads the
 /// `FAILED` rollout the breaker left before the rollback replaces it, instead of finding the
 /// service already back on the revision it was rolled back to with nothing to say which state
 /// took it there. Stored and compared, never slept on.
-pub const CIRCUIT_BREAKER_ROLLBACK_SPAN: Duration = Duration::from_secs(5);
+///
+/// Which is why the span is wider than the interval such a client polls at: the AWS CLI's own
+/// `aws ecs wait services-stable` re-reads the service every 15 seconds, so that is the
+/// cadence a client waiting on a deployment looks at it with, and a state that lasted less
+/// than one interval would be one a conforming client never sees. This span is a whole
+/// interval and a margin wide, so a poll lands inside it wherever the client's grid falls.
+pub const CIRCUIT_BREAKER_ROLLBACK_SPAN: Duration = Duration::from_secs(20);
 
 /// WHICH failure-detection method a deployment configuration turned on failed a rollout.
 ///

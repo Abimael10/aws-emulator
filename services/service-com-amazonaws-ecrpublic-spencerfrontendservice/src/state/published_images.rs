@@ -19,8 +19,16 @@
 //! an image whose RELEASES it holds too — the tags that repository publishes — so a reference
 //! into one of them IS decided here: a tag the repository publishes is served, and a tag it
 //! publishes no release under resolves to no image, exactly as a repository of this registry's
-//! own does. A repository, or an alias, this emulator holds no image of is left undecided as
-//! before.
+//! own does. An alias this emulator holds no image of is left undecided as before.
+//!
+//! What is decided for a repository no image is held of turns on whether that repository
+//! EXISTS, and for this one namespace that is a published fact rather than an absent store:
+//! the namespace the mirror carries is the Docker Official Images, whose repository list is
+//! itself the catalogue of those images ([`OFFICIAL_IMAGE_NAMES`]). So a reference into that
+//! namespace naming a repository the catalogue does not list names no repository at all, and
+//! the registry answers it as one — while a repository the catalogue DOES list, whose releases
+//! this emulator simply does not hold, stays undecided, as every repository of every other
+//! namespace, alias and registry does.
 //!
 //! # What the entries state, and where they come from
 //!
@@ -148,6 +156,163 @@ const DOCKER_OFFICIAL_IMAGES_ALIAS: &str = "docker";
 /// reference that names the bare `<name>` addresses the same repository.
 const OFFICIAL_IMAGES_NAMESPACE: &str = "library";
 
+/// The names the Docker Official Images catalogue publishes a repository under, which is the
+/// repository list of the namespace the gallery's [`DOCKER_OFFICIAL_IMAGES_ALIAS`] mirrors
+/// ([`OFFICIAL_IMAGES_NAMESPACE`]).
+///
+/// SOURCE: that namespace's own published catalogue — the `library/` image definitions of the
+/// Docker Official Images, which is the list the gallery's mirror of them carries and the list
+/// a container runtime resolves a bare reference against. The entries this emulator holds an
+/// IMAGE of are a few of these ([`PUBLISHED_REPOSITORIES`]); the rest are repositories that
+/// exist and whose releases are not held here, which is why a reference into one of them is
+/// left undecided rather than answered.
+///
+/// ABSENCE from this list is the only thing decided from it, so a name too many only leaves a
+/// reference undecided, exactly as before.
+const OFFICIAL_IMAGE_NAMES: &[&str] = &[
+    "adminer",
+    "aerospike",
+    "almalinux",
+    "alpine",
+    "alt",
+    "amazoncorretto",
+    "amazonlinux",
+    "api-firewall",
+    "arangodb",
+    "archlinux",
+    "backdrop",
+    "bash",
+    "bonita",
+    "buildpack-deps",
+    "busybox",
+    "caddy",
+    "cassandra",
+    "chronograf",
+    "cirros",
+    "clearlinux",
+    "clefos",
+    "clickhouse",
+    "clojure",
+    "composer",
+    "convertigo",
+    "couchbase",
+    "couchdb",
+    "crate",
+    "dart",
+    "debian",
+    "docker",
+    "drupal",
+    "eclipse-mosquitto",
+    "eclipse-temurin",
+    "eggdrop",
+    "elasticsearch",
+    "elixir",
+    "emqx",
+    "erlang",
+    "fedora",
+    "flink",
+    "fluentd",
+    "friendica",
+    "gazebo",
+    "gcc",
+    "geonetwork",
+    "ghost",
+    "golang",
+    "gradle",
+    "groovy",
+    "haproxy",
+    "haskell",
+    "haxe",
+    "hello-world",
+    "hitch",
+    "httpd",
+    "hylang",
+    "ibm-semeru-runtimes",
+    "ibmjava",
+    "influxdb",
+    "irssi",
+    "jetty",
+    "joomla",
+    "jruby",
+    "julia",
+    "kapacitor",
+    "kibana",
+    "kong",
+    "krakend",
+    "lightstreamer",
+    "logstash",
+    "mageia",
+    "mariadb",
+    "matomo",
+    "maven",
+    "mediawiki",
+    "memcached",
+    "mongo",
+    "mongo-express",
+    "monica",
+    "mono",
+    "mysql",
+    "nats",
+    "neo4j",
+    "neurodebian",
+    "nextcloud",
+    "nginx",
+    "node",
+    "notary",
+    "odoo",
+    "open-liberty",
+    "openjdk",
+    "oraclelinux",
+    "orientdb",
+    "percona",
+    "perl",
+    "photon",
+    "php",
+    "phpmyadmin",
+    "plone",
+    "postfixadmin",
+    "postgres",
+    "pypy",
+    "python",
+    "r-base",
+    "rabbitmq",
+    "rakudo-star",
+    "redis",
+    "redmine",
+    "registry",
+    "rethinkdb",
+    "rocket.chat",
+    "rockylinux",
+    "ros",
+    "ruby",
+    "rust",
+    "sapmachine",
+    "satosa",
+    "scratch",
+    "silverpeas",
+    "solr",
+    "sonarqube",
+    "spark",
+    "spiped",
+    "storm",
+    "swift",
+    "swipl",
+    "teamspeak",
+    "telegraf",
+    "tomcat",
+    "tomee",
+    "traefik",
+    "ubuntu",
+    "unit",
+    "varnish",
+    "websphere-liberty",
+    "wordpress",
+    "xwiki",
+    "yourls",
+    "znc",
+    "zookeeper",
+];
+
 /// What this catalogue says about one reference into a repository it holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishedImage {
@@ -155,6 +320,34 @@ pub enum PublishedImage {
     Published,
     /// The repository publishes no release under it, so the reference resolves to no image.
     NotPublished,
+    /// The registry publishes no such repository AT ALL, so the reference names nothing for a
+    /// tag to be asked of: the mirrored namespace's own catalogue does not list it
+    /// ([`OFFICIAL_IMAGE_NAMES`]).
+    NoSuchRepository,
+}
+
+/// Whether the MIRRORED namespace publishes a repository named `repository_name` — the name as
+/// that namespace spells it, `library/<name>` — which is what tells a repository whose
+/// releases are merely not held here from one that does not exist.
+///
+/// `None` for a name outside that namespace, about which this catalogue says nothing.
+fn official_images_namespace_publishes(repository_name: &str) -> Option<bool> {
+    let name = repository_name
+        .strip_prefix(OFFICIAL_IMAGES_NAMESPACE)?
+        .strip_prefix('/')?;
+    Some(OFFICIAL_IMAGE_NAMES.contains(&name))
+}
+
+/// What the catalogue says about a reference into `repository_name` once no entry of this
+/// emulator's own holds that repository: within the mirrored namespace its published
+/// catalogue decides it, and a repository outside that namespace is not answered at all.
+fn unheld_repository(repository_name: &str) -> Option<PublishedImage> {
+    match official_images_namespace_publishes(repository_name)? {
+        // A repository that namespace publishes whose releases this emulator does not hold:
+        // the repository is there, and nothing here knows which releases it carries.
+        true => None,
+        false => Some(PublishedImage::NoSuchRepository),
+    }
 }
 
 /// The entry for the repository `repository_name` of the registry `registry_alias`, or `None`
@@ -169,15 +362,28 @@ pub fn published_repository(
     })
 }
 
-/// Whether the gallery publishes the image `reference` names, and `None` where this emulator
-/// holds no image of that repository — in which case nothing is decided about the reference,
-/// as for every other registry it holds no store for.
+/// Whether the gallery publishes the image `reference` names, and `None` where nothing here
+/// decides it: a repository of the MIRRORED namespace whose releases this emulator does not
+/// hold, and every repository of every other alias, as for any registry it holds no store for.
+///
+/// A repository the mirrored namespace does not publish at all is answered
+/// ([`unheld_repository`]): the namespace's catalogue is published, so absence from it is a
+/// fact about the registry rather than about this emulator's store.
 ///
 /// A reference addressing a DIGEST is not answered either (see the module docs).
 #[must_use]
 pub fn published_image(reference: &GalleryReference) -> Option<PublishedImage> {
-    let published = published_repository(&reference.registry_alias, &reference.repository_name)?;
     let tag = reference.image_tag.as_deref()?;
+    let Some(published) =
+        published_repository(&reference.registry_alias, &reference.repository_name)
+    else {
+        // The mirrored namespace is the one this gallery's own alias for it carries, so only a
+        // reference under THAT alias is answered from its catalogue.
+        if reference.registry_alias != DOCKER_OFFICIAL_IMAGES_ALIAS {
+            return None;
+        }
+        return unheld_repository(&reference.repository_name);
+    };
     Some(if published.image_tags.contains(&tag) {
         PublishedImage::Published
     } else {
@@ -196,9 +402,11 @@ pub fn published_image(reference: &GalleryReference) -> Option<PublishedImage> {
 /// a reference addresses it through — which is what keeps one tag from naming an image under
 /// one spelling and no image at all under the other.
 ///
-/// `None` for every repository path that is no Docker Official Image this emulator holds, so a
-/// reference into another repository of that registry is left undecided exactly as a reference
-/// into an alias no image is held of is.
+/// `None` for every repository path nothing here decides: one the mirrored namespace publishes
+/// whose releases this emulator does not hold, and a path under another namespace of that
+/// registry, which is left undecided exactly as a reference into an alias no image is held of
+/// is. A path the namespace publishes NO repository under is answered
+/// ([`unheld_repository`]).
 #[must_use]
 pub fn official_image(repository_path: &str, image_tag: &str) -> Option<PublishedImage> {
     let repository_name = match repository_path.split_once('/') {
@@ -212,7 +420,10 @@ pub fn official_image(repository_path: &str, image_tag: &str) -> Option<Publishe
         // container runtime completes with that namespace.
         None => format!("{OFFICIAL_IMAGES_NAMESPACE}/{repository_path}"),
     };
-    let published = published_repository(DOCKER_OFFICIAL_IMAGES_ALIAS, &repository_name)?;
+    let Some(published) = published_repository(DOCKER_OFFICIAL_IMAGES_ALIAS, &repository_name)
+    else {
+        return unheld_repository(&repository_name);
+    };
     Some(if published.image_tags.contains(&image_tag) {
         PublishedImage::Published
     } else {
@@ -236,8 +447,10 @@ mod tests {
 
     /// RULE: a reference into a repository of the gallery whose image this emulator holds is
     /// decided by the tags that repository publishes — a published tag names an image and any
-    /// other tag names none — while a repository or an alias no image is held of, and a
-    /// reference that addresses a digest, are not answered at all.
+    /// other tag names none; a repository the MIRRORED namespace's published catalogue does
+    /// not list names no repository at all; and a repository that catalogue does list whose
+    /// releases are not held, an alias no image is held of, and a reference that addresses a
+    /// digest are not answered at all.
     #[test]
     fn the_published_tags_of_a_held_repository_decide_a_reference() {
         // (case, the reference, what the catalogue says)
@@ -270,6 +483,16 @@ mod tests {
             (
                 "a repository of that registry no image is held of",
                 reference("docker", "library/python", Some("3.12"), None),
+                None,
+            ),
+            (
+                "a repository that namespace publishes none of",
+                reference("docker", "library/no-such-official-image", Some("1"), None),
+                Some(PublishedImage::NoSuchRepository),
+            ),
+            (
+                "a path under another namespace of the mirrored registry's alias",
+                reference("docker", "someone/no-such-official-image", Some("1"), None),
                 None,
             ),
             (
@@ -315,8 +538,10 @@ mod tests {
     }
 
     /// RULE: the releases of a held image decide a reference into the repository the mirror
-    /// carries it FROM as well — with or without that registry's namespace — while a path
-    /// under another namespace, and a repository no image is held of, are left undecided.
+    /// carries it FROM as well — with or without that registry's namespace; a name that
+    /// namespace's published catalogue does not list names no repository there; and a path
+    /// under another namespace, and a repository the catalogue lists no image of which is
+    /// held, are left undecided.
     ///
     /// The rows differ along the spelling of the path, the repository named, and whether the
     /// tag asked for is one the entry publishes; `library/httpd` is a repository the table
@@ -368,9 +593,33 @@ mod tests {
                 None,
             ),
             (
+                "the bare name of such a repository",
+                "maven",
+                "3",
+                None,
+            ),
+            (
+                "a bare name that namespace publishes no repository under",
+                "no-such-official-image",
+                "1.0",
+                Some(PublishedImage::NoSuchRepository),
+            ),
+            (
+                "the same under the namespaced spelling",
+                "library/no-such-official-image",
+                "1.0",
+                Some(PublishedImage::NoSuchRepository),
+            ),
+            (
                 "a path under somebody else's namespace of that registry",
                 "someone/busybox",
                 "1.36",
+                None,
+            ),
+            (
+                "a path under somebody else's namespace naming no official image either",
+                "someone/no-such-official-image",
+                "1.0",
                 None,
             ),
         ];
@@ -379,6 +628,26 @@ mod tests {
             assert_eq!(
                 answered, *expected,
                 "case {case:?}: expected {expected:?}, got {answered:?}"
+            );
+        }
+    }
+
+    /// Every repository this emulator holds an image of under the mirrored alias is a
+    /// repository that namespace PUBLISHES: the entries are its mirror of those images, so a
+    /// held entry the catalogue did not list would answer "no such repository" for the very
+    /// reference it holds the image for.
+    #[test]
+    fn every_held_mirrored_entry_is_a_repository_that_namespace_publishes() {
+        for published in PUBLISHED_REPOSITORIES
+            .iter()
+            .filter(|published| published.registry_alias == DOCKER_OFFICIAL_IMAGES_ALIAS)
+        {
+            assert_eq!(
+                official_images_namespace_publishes(published.repository_name),
+                Some(true),
+                "case {}: expected the mirrored namespace to publish the held repository, \
+                 its catalogue does not list it",
+                published.repository_name
             );
         }
     }

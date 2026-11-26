@@ -2,14 +2,16 @@
 
 //! What a duration a container's PROGRAM states costs this emulator, and what it does not.
 //!
-//! RULE under test: **the seconds in a container's `sleep` are a caller's word about how long
-//! its program took, so a wait the program STATES is taken as stated and what the program does
-//! next — its next step, or its own end — follows at once: the task stops on the status its
-//! program exited with, however many seconds that program said it waited. The wait a container
-//! has nothing but something OUTSIDE its program to end it is another thing: a wait with no end
-//! of its own (`sleep infinity`) and one the program goes round a LOOP on are the container
-//! waiting for something else to end it, which is how a container stays up, so those are
-//! honoured and the task goes on RUNNING.**
+//! RULE under test: **the seconds in a container's `sleep` are its program's own account of
+//! how long that program took, so a wait a program STATES among steps of its own is taken as
+//! stated and what the program does next — its next step, or its own end — follows at once:
+//! the task stops on the status its program exited with, however many seconds that program
+//! said it waited. The wait a container has nothing but something OUTSIDE its program to end
+//! it is another thing: a wait with no end of its own (`sleep infinity`), one the program goes
+//! round a LOOP on and one a container is given as its WHOLE program are the container waiting
+//! for something else to end it, which is how a container stays up, so those are spent — the
+//! last of them for the seconds it names ([`crate::container_whole_program_wait`]), the others
+//! up to the run's own deadline.**
 //!
 //! Why the bound has to be this emulator's: a container's program is request-supplied, and
 //! everything that waits on its task waits with it — the AWS Batch job whose dependents are
@@ -69,8 +71,8 @@ const ESSENTIAL_CONTAINER_EXITED: &str = "EssentialContainerExited";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ends {
     /// The program states a wait and then goes on — to another step, or to its own end: the
-    /// task stops with this exit status, which a run that SPENT the stated seconds could not
-    /// reach inside [`POLL_BUDGET`].
+    /// task stops with this exit status, which a run that SPENT a wait stated among the
+    /// program's own steps could not reach inside [`POLL_BUDGET`].
     Exits(i64),
     /// The program's wait names no end of its own, so the container stays up and the task
     /// goes on RUNNING through [`WATCH_WINDOW`].
@@ -116,6 +118,9 @@ const ROWS: &[Row] = &[
         ends: Ends::Exits(0),
     },
     Row {
+        // The container's WHOLE program: the seconds are spent, so the task stops on the
+        // status that wait answered once they are up — well inside this suite's budget for
+        // the seconds this row names ([`crate::container_whole_program_wait`]).
         case: "a wait the program states as its whole argument vector",
         command: &["sleep", "30"],
         ends: Ends::Exits(0),

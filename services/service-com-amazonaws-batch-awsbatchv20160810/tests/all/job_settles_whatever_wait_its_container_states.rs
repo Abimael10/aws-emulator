@@ -3,12 +3,16 @@
 //! What a placed Fargate job REPORTS when its container's program states a wait, driven end to
 //! end against the services that own the facts.
 //!
-//! The RULE under test: **the seconds in a container's `sleep` are a caller's word about how
-//! long its program took, not wall clock this emulator spends — wherever that wait stands in
-//! the program, the wait a program ENDS on included — so a placed job settles on the status its
-//! container's program exited with however many seconds that program said it waited; only a
-//! wait that names no end of its own keeps the container up, and a job whose container is still
-//! running is still reported running.**
+//! The RULE under test: **the seconds in a container's `sleep` are its program's own account
+//! of how long that program took, not wall clock this emulator spends — wherever that wait
+//! stands in a program that does something else, the wait a program ENDS on included — so a
+//! placed job settles on the status its container's program exited with however many seconds
+//! that program said it waited; only a wait nothing in the program will end keeps the
+//! container up, and a job whose container is still running is still reported running.** A
+//! wait a container is given as its WHOLE program is one of those: there is no work for the
+//! seconds to be the account of, so the container is still there for them (the Amazon ECS
+//! crate's `container_whole_program_wait` suite pins that reading) and the job goes on
+//! running.
 //!
 //! Why the bound has to be the emulator's: `JobStatus` is what every client of AWS Batch waits
 //! on — `aws batch wait jobs-complete`, a Step Functions `.sync` integration, any step that
@@ -22,8 +26,8 @@
 //! (the whole program, last after a line it wrote, last before a step that exits non-zero, the
 //! whole argument vector, inside a bounded loop), HOW it is spelled (whole seconds and seconds
 //! with a fraction), HOW LONG it states (from ninety seconds to ten minutes, every one of them
-//! far beyond [`SETTLES_WITHIN`]) and WHETHER it names an end of its own at all — the contrast
-//! row, whose container goes on running because nothing in its program will end it.
+//! far beyond [`SETTLES_WITHIN`]) and WHETHER anything in the program will end it at all — the
+//! contrast rows, whose containers go on running because nothing in their program will.
 //!
 //! Sources: `smithy_query(query="shape",shape="JobStatus")` for the statuses and their terminal
 //! pair; `smithy_query(query="shape",shape="AttemptContainerDetail")` for the attempt's
@@ -61,9 +65,10 @@ const SETTLES_WITHIN: Duration = Duration::from_secs(60);
 /// How long the compute environment is given to reach `VALID`.
 const SETUP_WITHIN: Duration = Duration::from_secs(60);
 
-/// How long the contrast row is watched once its job is RUNNING, re-read inside the loop that
-/// spends it: its program's wait names no end of its own, so a job that honoured it is still
-/// running at the end of this window however slowly the host got there.
+/// How long a contrast row is watched once its job is RUNNING, re-read inside the loop that
+/// spends it: nothing in its program will end the wait inside this window, so a job whose
+/// container is still there is still running at the end of it however slowly the host got
+/// there.
 const WATCH_WINDOW: Duration = Duration::from_secs(2);
 
 /// `JobStatus` members this suite names beside the terminal pair it imports.
@@ -75,8 +80,9 @@ enum Ends {
     /// The program's wait is stated, so the job settles on this status with this exit code —
     /// inside [`SETTLES_WITHIN`], which a spent wait could not reach.
     Settles(&'static str, i64),
-    /// The program's wait names no end of its own, so its container stays up and the job goes
-    /// on being reported `RUNNING` through [`WATCH_WINDOW`].
+    /// Nothing in the program will end the wait inside this suite's window — it names no end
+    /// of its own, or it IS the whole program — so the container stays up and the job goes on
+    /// being reported `RUNNING` through [`WATCH_WINDOW`].
     RunsOn,
 }
 
@@ -102,9 +108,12 @@ const ROWS: &[Row] = &[
         ends: Ends::Settles(SUCCEEDED, 0),
     },
     Row {
+        // The container's WHOLE program is the wait: there is no work for those seconds to be
+        // the account of, so the container is still there for them and the job is still
+        // running — the reading the Amazon ECS crate's own suite pins.
         case: "a wait the program states as its whole argument vector",
         command: &["sleep", "300"],
-        ends: Ends::Settles(SUCCEEDED, 0),
+        ends: Ends::RunsOn,
     },
     Row {
         // Seconds with a fraction, which the utility also reads, so the shape the seconds are
@@ -422,30 +431,37 @@ async fn a_job_settles_whatever_wait_its_container_states() {
         );
     }
 
-    // The CONTRAST row: its program's wait names no end of its own, so the container stays up
-    // and the job goes on being reported RUNNING, read after read.
-    let contrast = ROWS
+    // The CONTRAST rows: nothing in their programs will end the wait, so their containers stay
+    // up and the jobs go on being reported running, read after read.
+    let contrasts: Vec<(&str, &String)> = ROWS
         .iter()
         .zip(submitted.iter())
-        .find(|(row, _)| row.ends == Ends::RunsOn)
+        .filter(|(row, _)| row.ends == Ends::RunsOn)
         .map(|(row, (_, job_id))| (row.case, job_id))
-        .expect("the table carries the contrast row");
-    let (case, job_id) = contrast;
-    until_running(&router, case, job_id).await;
+        .collect();
+    assert!(
+        !contrasts.is_empty(),
+        "the table carries at least one contrast row"
+    );
+    for (case, job_id) in &contrasts {
+        until_running(&router, case, job_id).await;
+    }
     let until = Instant::now() + WATCH_WINDOW;
     while Instant::now() < until {
         tokio::time::sleep(POLL_INTERVAL).await;
-        let detail = described(&router, job_id).await;
-        assert_eq!(
-            detail["status"].as_str(),
-            Some(RUNNING),
-            "case {case:?}: a container whose wait names no end of its own stays up, so its job \
-             goes on running, got {detail}"
-        );
-        assert!(
-            detail["container"]["exitCode"].as_i64().is_none(),
-            "case {case:?}: no exit status is reported for a program that has not ended, got \
-             {detail}"
-        );
+        for (case, job_id) in &contrasts {
+            let detail = described(&router, job_id).await;
+            assert_eq!(
+                detail["status"].as_str(),
+                Some(RUNNING),
+                "case {case:?}: a container nothing in its program will stop stays up, so its \
+                 job goes on running, got {detail}"
+            );
+            assert!(
+                detail["container"]["exitCode"].as_i64().is_none(),
+                "case {case:?}: no exit status is reported for a program that has not ended, \
+                 got {detail}"
+            );
+        }
     }
 }

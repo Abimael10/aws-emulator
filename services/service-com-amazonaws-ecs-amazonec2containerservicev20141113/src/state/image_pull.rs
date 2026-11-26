@@ -60,15 +60,22 @@
 //!      image, so the same releases decide it
 //!      ([`::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::published_images::official_image`]):
 //!      a tag that names a release of it is fetched, and a tag it publishes no release under
-//!      resolves to no image whichever of the two spellings the reference carries.
+//!      resolves to no image whichever of the two spellings the reference carries;
+//!    * the NAMESPACE that mirror carries those images from, whose repository list is itself
+//!      the published catalogue of them, so a reference into it naming a repository the
+//!      catalogue does not list names no repository at all and the registry answers the
+//!      request with no pull scope for it
+//!      ([`repository_does_not_exist_message`]) — while a repository the catalogue DOES list
+//!      whose releases this emulator holds none of is left undecided, as a repository nothing
+//!      here holds a store for is.
 //!
 //!    Either way the registry that holds the image is the one that answers, and the manifest
 //!    digest it resolved is what the container reports for the image it ran
 //!    (`Container$imageDigest`). A reference naming any OTHER registry — an alias that
 //!    gallery was not assigned, which names another public registry, another registry
-//!    altogether, or a repository of the mirrored registry no image is held of — is no
-//!    registry's here to answer, so nothing beyond the path above is decided for it and no
-//!    digest is known for it.
+//!    altogether, or another namespace of the mirrored registry — is no registry's here to
+//!    answer, so nothing beyond the path above is decided for it and no digest is known for
+//!    it.
 //!
 //! The pull is attempted at LAUNCH, by the call that places the task: the instants it took
 //! are recorded on the task (`Task$pullStartedAt`/`pullStoppedAt`) and a failure with them
@@ -323,6 +330,24 @@ pub fn image_not_found_message(image: &str) -> String {
     )
 }
 
+/// The `stoppedReason` of a task whose image reference names a repository the registry does
+/// not PUBLISH at all.
+///
+/// The same `CannotPullContainerError` class, worded for what the runtime saw: a registry
+/// grants the pull scope of a repository it holds, so a request for one it holds none of is
+/// answered with no such scope rather than with a missing manifest — the runtime reports that
+/// the access was denied and that the repository may not be there, having retried the fetch to
+/// the end of its budget ([`MANIFEST_FETCH_RETRIES`]) as it does for every manifest it cannot
+/// resolve.
+pub fn repository_does_not_exist_message(image: &str) -> String {
+    format!(
+        "CannotPullContainerError: pull image manifest has been retried \
+         {MANIFEST_FETCH_RETRIES} time(s): failed to resolve ref {image}: pull access denied, \
+         repository does not exist or may require authorization: server message: \
+         insufficient_scope: authorization failed"
+    )
+}
+
 /// The REGISTRY an image reference is fetched from: the part before the first `/` when
 /// that part is a host — it carries a `.` or a `:`, or is `localhost` — and
 /// [`DOCKER_HUB_REGISTRY`] otherwise, which is how a container runtime resolves a
@@ -344,14 +369,23 @@ pub fn registry_host(image: &str) -> &str {
 /// resolved against.
 const MIRRORED_REGISTRY_HOSTS: [&str; 3] = ["docker.io", "index.docker.io", DOCKER_HUB_REGISTRY];
 
+/// The tag a reference that names none asks for: the moving tag a container runtime completes
+/// a reference with, which is the one both registries this emulator serves read such a
+/// reference as naming
+/// ([`::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::gallery_pull::DEFAULT_IMAGE_TAG`]).
+const DEFAULT_IMAGE_TAG: &str =
+    ::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::gallery_pull::DEFAULT_IMAGE_TAG;
+
 /// The `(repository path, tag)` of `image` for a reference into that mirrored registry, and
-/// `None` for a reference naming any other registry or naming no release.
+/// `None` for a reference naming any other registry.
 ///
 /// The path is what follows the host, which the registry reads as its own namespaces, so it
 /// is handed on exactly as written for that registry's catalogue to decide
 /// ([`::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::published_images::official_image`]).
-/// A reference that addresses a DIGEST names content rather than a release, so the releases a
-/// repository publishes state nothing about it and it is not answered here.
+/// A reference that names NO tag names the moving one a container runtime completes it with
+/// ([`DEFAULT_IMAGE_TAG`]), the same reading the registries this emulator serves take of their
+/// own references. A reference that addresses a DIGEST names content rather than a release, so
+/// the releases a repository publishes state nothing about it and it is not answered here.
 fn mirrored_image_reference(image: &str) -> Option<(String, String)> {
     let path = match image.split_once('/') {
         Some((host, rest)) if MIRRORED_REGISTRY_HOSTS.contains(&host) => rest,
@@ -363,7 +397,9 @@ fn mirrored_image_reference(image: &str) -> Option<(String, String)> {
     if path.contains('@') {
         return None;
     }
-    let (repository_path, image_tag) = path.rsplit_once(':')?;
+    let (repository_path, image_tag) = path
+        .rsplit_once(':')
+        .unwrap_or((path, DEFAULT_IMAGE_TAG));
     Some((repository_path.to_string(), image_tag.to_string()))
 }
 
@@ -766,6 +802,9 @@ fn fetch_image<Eng: Send + Sync + 'static>(
             Some(published_images::PublishedImage::NotPublished) => {
                 ImageFetch::Refused(image_not_found_message(image))
             }
+            Some(published_images::PublishedImage::NoSuchRepository) => {
+                ImageFetch::Refused(repository_does_not_exist_message(image))
+            }
             None => ImageFetch::Undecided,
         };
     };
@@ -791,6 +830,9 @@ fn fetch_image<Eng: Send + Sync + 'static>(
         },
         Some(published_images::PublishedImage::NotPublished) => {
             ImageFetch::Refused(image_not_found_message(image))
+        }
+        Some(published_images::PublishedImage::NoSuchRepository) => {
+            ImageFetch::Refused(repository_does_not_exist_message(image))
         }
         None => ImageFetch::Undecided,
     }
