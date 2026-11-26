@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers the device certificate the request carries in this account's
+//! device-certificate store, under the CA certificate of this account's CA registry that
+//! signed it ([`crate::state::certificate_registrations`]): the id and the ARN this call
+//! answers are the id and the ARN `DescribeCertificate` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +162,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterCertificate"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RegisterCertificateErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+
+        let registration = crate::state::CertificateRegistration {
+            certificate_pem: input.certificate_pem,
+            ca_certificate_pem: input.ca_certificate_pem,
+            status: input.status,
+            set_as_active: input.set_as_active,
+        };
+
+        // The one write a registration makes, with every rule it follows stated beside the
+        // store it writes
+        // ([`crate::state::ComAmazonawsIotAwsiotserviceState::register_certificate`]); each
+        // refusal it answers names the modelled class for what refused it.
+        let registered = state
+            .lock()
+            .register_certificate(
+                &region,
+                ::engine::emulator_account_id(),
+                registration,
+                ::std::time::SystemTime::now(),
+            )
+            .map_err(|refusal| -> Self::Error {
+                match refusal {
+                    crate::state::CertificateRegistrationRefusal::InvalidCertificate(message) => {
+                        RegisterCertificateErrorModeled::CertificateValidationException(
+                            CertificateValidationException {
+                                message: Some(message),
+                            },
+                        )
+                        .into()
+                    }
+                    crate::state::CertificateRegistrationRefusal::UnverifiableSigningCa(
+                        message,
+                    ) => RegisterCertificateErrorModeled::CertificateConflictException(
+                        CertificateConflictException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                    crate::state::CertificateRegistrationRefusal::UnsettableStatus(message) => {
+                        RegisterCertificateErrorModeled::CertificateStateException(
+                            CertificateStateException {
+                                message: Some(message),
+                            },
+                        )
+                        .into()
+                    }
+                    crate::state::CertificateRegistrationRefusal::AlreadyRegistered {
+                        message,
+                        certificate_id,
+                        certificate_arn,
+                    } => RegisterCertificateErrorModeled::ResourceAlreadyExistsException(
+                        ResourceAlreadyExistsException {
+                            message: Some(message),
+                            resource_id: Some(certificate_id),
+                            resource_arn: Some(certificate_arn),
+                        },
+                    )
+                    .into(),
+                    crate::state::CertificateRegistrationRefusal::RegistryFull(message) => {
+                        RegisterCertificateErrorModeled::ServiceUnavailableException(
+                            ServiceUnavailableException {
+                                message: Some(message),
+                            },
+                        )
+                        .into()
+                    }
+                }
+            })?;
+
+        // The response is built from the record that was persisted, so what this call
+        // reports and what the next `DescribeCertificate` reads are one value, not two that
+        // could drift.
+        Ok(RegisterCertificateOutput {
+            certificate_arn: Some(registered.certificate_arn),
+            certificate_id: Some(registered.certificate_id),
+        })
     }
 }

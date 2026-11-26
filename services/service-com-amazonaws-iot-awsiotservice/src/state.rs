@@ -3391,13 +3391,26 @@ pub use certificates::{
     active_certificate_deletion_message, attached_policies_deletion_message, certificate_arn,
     certificate_id, certificate_listing_row, certificate_listing_row_id, certificate_listing_rows,
     mint_keys_and_certificate, mint_keys_and_certificate_valid_until, missing_certificate_message,
-    unmodifiable_current_status_message, unsettable_target_status_message,
+    read_certificate_material, unmodifiable_current_status_message,
+    unreadable_certificate_material_message, unsettable_target_status_message,
     CertificateDeletionRefusal, CertificateStatusUpdateRefusal, MintedKeysAndCertificate,
     RegisteredCertificate, CERTIFICATE_MODE_DEFAULT, CERTIFICATE_STATUS_ACTIVE,
     CERTIFICATE_STATUS_INACTIVE, CERTIFICATE_STATUS_PENDING_TRANSFER,
     CERTIFICATE_STATUS_REVOKED, DEFAULT_CERTIFICATE_PAGE_SIZE,
     FIRST_CERTIFICATE_CUSTOMER_VERSION, INTERNAL_CERTIFICATE_STATUSES, MAX_CERTIFICATES,
     PROVISIONING_CLAIM_VALIDITY, TERMINAL_CERTIFICATE_STATUSES,
+};
+
+// The REGISTRATION of a device certificate a CALLER owns — what `RegisterCertificate`
+// reads out of the material, the registered CA it resolves as the signer, and what it
+// refuses — lives in `state/certificate_registrations.rs`, beside the record it writes.
+// Its names are re-exported here so a handler reaches them as `crate::state::<name>`.
+pub mod certificate_registrations;
+pub use certificate_registrations::{
+    ambiguous_signing_ca_message, certificate_store_full_message, unknown_signing_ca_message,
+    unmatched_signing_ca_message, unregistered_signing_ca_message,
+    unsettable_registration_status_message, CertificateRegistration,
+    CertificateRegistrationRefusal, CA_CERTIFICATE_PEM_MEMBER, CERTIFICATE_PEM_MEMBER,
 };
 
 // The CERTIFICATE SIGNING REQUEST a caller hands `CreateCertificateFromCsr` — what this

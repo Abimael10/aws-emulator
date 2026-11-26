@@ -34,11 +34,14 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use x509_cert::der::oid::AssociatedOid;
-use x509_cert::der::{Decode, DecodePem, Encode};
+use x509_cert::der::{Decode, Encode};
 use x509_cert::ext::pkix::BasicConstraints;
 use x509_cert::Certificate;
 
-use super::{certificate_id, fresh_uuid, CERTIFICATE_MODE_DEFAULT};
+use super::{
+    certificate_id, fresh_uuid, read_certificate_material,
+    unreadable_certificate_material_message, CERTIFICATE_MODE_DEFAULT,
+};
 use crate::ops::types::{CACertificateDescription, CertificateValidity, RegistrationConfig};
 
 /// `CACertificateStatus$ACTIVE` — the status of a CA certificate a registration asked to
@@ -244,15 +247,16 @@ pub enum CaCertificateRegistrationRefusal {
     RegistryFull(String),
 }
 
-/// The message a registration refuses material it cannot read as a certificate with.
-///
-/// AWS publishes the CLASS for this — `CertificateValidationException`, "The certificate
-/// is invalid" — and not the sentence it states it in, so the fixed text here is this
-/// emulator's rendering of that class, naming what about the material was not readable so
-/// a caller can tell it from the refusal below.
+/// The member a `RegisterCACertificate` carries the CA material at, which is what a
+/// refusal of unreadable material names ([`unreadable_certificate_material_message`]).
+const CA_CERTIFICATE_MEMBER: &str = "caCertificate";
+
+/// The message a registration refuses material it cannot read as a certificate with: the
+/// one rendering every operation that takes certificate material refuses unreadable
+/// material with ([`unreadable_certificate_material_message`]), naming this operation's
+/// member, so a caller can tell it from the refusal below.
 pub fn unreadable_ca_certificate_message() -> String {
-    "Invalid certificate: the caCertificate field is not a PEM-encoded X.509 certificate"
-        .to_string()
+    unreadable_certificate_material_message(CA_CERTIFICATE_MEMBER)
 }
 
 /// The message a registration refuses a certificate that is not a certificate AUTHORITY
@@ -363,14 +367,14 @@ impl super::ComAmazonawsIotAwsiotserviceState {
             };
             // The verification certificate is certificate material too, so it is read the
             // same way and refused the same way when it cannot be read.
-            if read_certificate(material).is_none() {
+            if read_certificate_material(material).is_none() {
                 return Err(CaCertificateRegistrationRefusal::InvalidCertificate(
                     unreadable_ca_certificate_message(),
                 ));
             }
         }
 
-        let Some(certificate) = read_certificate(&request.ca_certificate) else {
+        let Some(certificate) = read_certificate_material(&request.ca_certificate) else {
             return Err(CaCertificateRegistrationRefusal::InvalidCertificate(
                 unreadable_ca_certificate_message(),
             ));
@@ -449,15 +453,6 @@ impl super::ComAmazonawsIotAwsiotserviceState {
             .insert(certificate_id, registered.clone());
         Ok(registered)
     }
-}
-
-/// The X.509 certificate `material` holds, or `None` when it is not a PEM-encoded one.
-///
-/// The surrounding whitespace is trimmed because `CertificatePem` is modelled with the
-/// pattern `^[\s\S]*$` — any whitespace is part of a legal value — so a PEM block that
-/// arrived with a trailing newline is the same certificate as one that did not.
-fn read_certificate(material: &str) -> Option<Certificate> {
-    Certificate::from_pem(material.trim().as_bytes()).ok()
 }
 
 /// Whether `certificate` is a certificate AUTHORITY: whether its `basicConstraints`
