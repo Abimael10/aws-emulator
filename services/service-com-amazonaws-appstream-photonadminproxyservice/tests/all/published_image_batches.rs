@@ -213,9 +213,12 @@ async fn a_published_image_is_reported_with_the_whole_projection_a_client_reads(
             let name = name_of(&image);
             let case = format!("{region} {name}");
 
-            // The one family the image runs on, as a token: the first (and for a graphics
-            // image the only) family it states support for, in upper case with its words
-            // joined by underscores.
+            // The family the image reports as its own, as a token: the hardware it runs
+            // on, in upper case with its words joined by underscores. An image that states
+            // ONE family runs on that family's hardware, so the token is that family's; an
+            // image that states several (one built with a GPU vendor's whole driver) runs
+            // on the vendor's own hardware, so the token is `GRAPHICS_<the accelerator its
+            // name carries>`.
             let families: Vec<String> = image["SupportedInstanceFamilies"]
                 .as_array()
                 .cloned()
@@ -223,9 +226,21 @@ async fn a_published_image_is_reported_with_the_whole_projection_a_client_reads(
                 .iter()
                 .map(|family| family.as_str().unwrap_or_default().to_string())
                 .collect();
-            let expected = families
-                .first()
-                .map(|family| family.to_uppercase().replace(' ', "_"));
+            let accelerator = name
+                .strip_prefix("AppStream-Graphics-")
+                .and_then(|tail| tail.split('-').next())
+                .map(str::to_uppercase);
+            let expected = match accelerator {
+                // An accelerated image that states ONE family runs on that family's
+                // hardware; one that states several runs on the vendor's own.
+                Some(accelerator) if families.len() > 1 => {
+                    Some(format!("GRAPHICS_{accelerator}"))
+                }
+                // A general-purpose image reports the first of the families it serves.
+                _ => families
+                    .first()
+                    .map(|family| family.to_uppercase().replace(' ', "_")),
+            };
             assert_eq!(
                 image["InstanceFamily"].as_str().map(str::to_string),
                 expected,
@@ -251,10 +266,10 @@ async fn a_published_image_is_reported_with_the_whole_projection_a_client_reads(
                     "RootVolumeConfig",
                     json!({ "VolumeSizeInGb": 200, "VolumeType": "gp2" }),
                 ),
-                (
-                    "appStreamRecipeArn",
-                    json!(format!("arn:aws:appstream:{region}::recipe/{name}")),
-                ),
+                // The provenance members an image reports — the recipe it was built from,
+                // the instance type groups it serves and its software metadata — are the
+                // published catalog's own, and are asserted over the whole catalog in
+                // `tests/all/published_image_provenance.rs`.
             ];
             for (member, expected) in rows {
                 assert_eq!(

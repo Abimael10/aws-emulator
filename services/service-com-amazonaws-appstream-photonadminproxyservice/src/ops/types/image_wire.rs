@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The `Image` every reader of an image answers with, and the six members of it the
+//! The `Image` every reader of an image answers with, and the seven members of it the
 //! on-disk model does not declare.
 //!
 //! WHY THIS MODULE EXISTS. `#[smithy_macros::smithy(shape = ...)]` derives a structure's
@@ -8,10 +8,10 @@
 //! it admits EXACTLY that list: a Rust field with no member behind it is a compile error,
 //! so a member the service really reports but the model omits cannot be declared through
 //! the derive at all. An image reports, beside the members the model declares, the instance
-//! family it runs on, whether its licence is brought by the account, the configuration of
-//! its root volume, whether its application catalog is dynamic, and the ARN and the release
-//! instant of the published recipe it was built from — six members the shape's modelled
-//! member list does not mention — so this module emits for `Image` the same items the
+//! family it runs on, the instance type groups it serves, whether its licence is brought by
+//! the account, the configuration of its root volume, whether its application catalog is
+//! dynamic, and the ARN and the release instant of the published recipe it was built from —
+//! seven members the shape's modelled member list does not mention — so this module emits for `Image` the same items the
 //! derive emits: one member schema per member (index = its position in the member list),
 //! the struct `SCHEMA` naming them in that order, the `IMAGE_SCHEMA` static and the
 //! `SerializableStruct`/`DeserializableStruct` pair. It is the same arrangement
@@ -130,7 +130,7 @@ impl DeserializableStruct for ImageVolumeConfig {
 /// Describes an image, as every operation that reports one answers it.
 ///
 /// The first twenty-four members are `com.amazonaws.appstream#Image`'s, in the model's
-/// member order. The six after them are the ones AppStream reports beyond the published
+/// member order. The seven after them are the ones AppStream reports beyond the published
 /// model.
 #[derive(Debug, Clone, Default)]
 pub struct Image {
@@ -171,6 +171,9 @@ pub struct Image {
     pub appstream_recipe_arn: Option<String>,
     /// When that recipe was released.
     pub appstream_recipe_release_timestamp: Option<DateTime>,
+    /// The instance type groups the image serves, reported as a list that is PRESENT and
+    /// empty when the image states none.
+    pub supported_instance_type_groups: Option<Vec<String>>,
 }
 
 /// One member this service's model DOES declare: its shape id in the service's own
@@ -255,6 +258,8 @@ impl Image {
         recorded_member!("appStreamRecipeArn", ShapeType::String, 28);
     pub const M_APPSTREAM_RECIPE_RELEASE_TIMESTAMP: Schema =
         recorded_member!("appStreamRecipeReleaseTimestamp", ShapeType::Timestamp, 29);
+    pub const M_SUPPORTED_INSTANCE_TYPE_GROUPS: Schema =
+        recorded_member!("SupportedInstanceTypeGroups", ShapeType::List, 30);
 
     pub const SCHEMA: Schema = Schema::new_struct(
         ShapeId::from_static(
@@ -294,6 +299,7 @@ impl Image {
             &Self::M_DYNAMIC_APPLICATION_CATALOG_ENABLED,
             &Self::M_APPSTREAM_RECIPE_ARN,
             &Self::M_APPSTREAM_RECIPE_RELEASE_TIMESTAMP,
+            &Self::M_SUPPORTED_INSTANCE_TYPE_GROUPS,
         ],
     );
 }
@@ -405,6 +411,14 @@ impl SerializableStruct for Image {
         if let Some(value) = self.appstream_recipe_release_timestamp.as_ref() {
             s.write_timestamp(&Self::M_APPSTREAM_RECIPE_RELEASE_TIMESTAMP, value)?;
         }
+        if let Some(value) = self.supported_instance_type_groups.as_ref() {
+            s.write_list(&Self::M_SUPPORTED_INSTANCE_TYPE_GROUPS, &|element| {
+                for group in value.iter() {
+                    element.write_string(&Self::M_SUPPORTED_INSTANCE_TYPE_GROUPS, group.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
         Ok(())
     }
 }
@@ -500,6 +514,14 @@ impl DeserializableStruct for Image {
                 Some(29) => {
                     image.appstream_recipe_release_timestamp =
                         Some(d.read_timestamp(&Self::M_APPSTREAM_RECIPE_RELEASE_TIMESTAMP)?)
+                }
+                Some(30) => {
+                    let mut groups: Vec<String> = Vec::new();
+                    d.read_list(&Self::M_SUPPORTED_INSTANCE_TYPE_GROUPS, &mut |element| {
+                        groups.push(element.read_string(&Self::M_SUPPORTED_INSTANCE_TYPE_GROUPS)?);
+                        Ok(())
+                    })?;
+                    image.supported_instance_type_groups = Some(groups);
                 }
                 _ => {}
             }

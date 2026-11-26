@@ -15,7 +15,7 @@
 //! written with AWS's own base-image naming
 //! (`AppStream-[Graphics-<accelerator>-]<operating system>-<MM-DD-YYYY>`, the release date
 //! of the published image). It carries, for every release batch the catalog publishes
-//! ([`PUBLISHED_RELEASE_DATES`]) and every operating system this API models an image
+//! ([`PUBLISHED_RELEASE_BATCHES`]) and every operating system this API models an image
 //! platform for, the general-purpose base image, and for every operating system AWS
 //! publishes accelerated images for, one base image per graphics accelerator — so a client
 //! choosing an image finds one for each instance family it can launch a fleet on, under
@@ -26,6 +26,12 @@
 //! (`smithy_query(query="doc", shape="Image", member="SupportedInstanceFamilies")`:
 //! General Purpose, Compute Optimized, Memory Optimized, Graphics G4, Graphics G5,
 //! Graphics G6).
+//!
+//! What the catalog PUBLISHES about an image is carried in the table rather than rendered
+//! from the row's name or accelerator: the description AWS words per operating system and
+//! per accelerator, the recipe the image was built from (its name, its revision and the
+//! build service that owns it) and the GPU driver the batch's accelerated images carry are
+//! each published data, and no two of them can be derived from one another.
 //!
 //! A row carries only what the published image states: the members an account's own
 //! activity fills — the image builder that produced it, the base image it was created
@@ -124,13 +130,33 @@ pub fn published_image_arn(region: &str, name: &str) -> String {
 /// name in the ARN of the published build an image was made from.
 pub const RECIPE_ARN_RESOURCE_TYPE: &str = "recipe";
 
-/// `arn:aws:appstream:<region>::recipe/<name>` — the ARN of a recipe AWS publishes.
+/// The ARN `service` segment of a published image recipe.
 ///
-/// A published recipe is addressed exactly as the published image built from it is: no
-/// account owns it, so the ARN's account field is EMPTY and the Region is the one the
-/// request asks about ([`published_image_arn`]).
-pub fn published_recipe_arn(region: &str, name: &str) -> String {
-    format!("arn:aws:{ARN_NAMESPACE}:{region}::{RECIPE_ARN_RESOURCE_TYPE}/{name}")
+/// A recipe is NOT an AppStream resource: it is the image-build recipe of the AWS service
+/// that builds the published AMIs this API's base images are, so the provenance ARN an
+/// image reports names that service rather than this one — an `appstream` ARN built from
+/// the image's own name names no resource at all and tells a client the wrong owning
+/// service.
+pub const RECIPE_ARN_NAMESPACE: &str = "amifarm";
+
+/// The account the published recipes belong to: AWS builds its base images in its own
+/// account, so the recipe ARN names that account and not the one the request is signed for
+/// (which owns nothing of the build).
+pub const RECIPE_PUBLISHER_ACCOUNT: &str = "121014824124";
+
+/// `arn:aws:amifarm:<region>:<publisher>:recipe/<name>/<version>` — the ARN of the recipe
+/// revision a published image was built from.
+///
+/// The recipe is named per operating system and accelerator and is shared by every image
+/// built from it, so the revision the image came out of is the ARN's trailing segment: two
+/// images of one operating system from two release batches name the same recipe under two
+/// versions. The Region is the one the request asks about, the way the published image's own
+/// ARN is ([`published_image_arn`]).
+pub fn published_recipe_arn(region: &str, name: &str, version: u32) -> String {
+    format!(
+        "arn:aws:{RECIPE_ARN_NAMESPACE}:{region}:{RECIPE_PUBLISHER_ACCOUNT}:\
+         {RECIPE_ARN_RESOURCE_TYPE}/{name}/{version}"
+    )
 }
 
 /// The instance family of an image written as the TOKEN the `InstanceFamily` member
@@ -197,6 +223,11 @@ pub struct ImageRecord {
     /// The instance families a fleet or image builder may launch this image on; empty for
     /// an image that states none.
     pub supported_instance_families: Vec<String>,
+    /// The instance type groups the image serves, which an image that serves none reports
+    /// as an EMPTY list rather than by leaving the member out: the groups are a property
+    /// every image states, not a configuration an image can be without, so a client that
+    /// walks them sees a list on every image.
+    pub supported_instance_type_groups: Vec<String>,
     /// One of `DYNAMIC_APP_PROVIDERS_ENABLED_VALUES`.
     pub dynamic_app_providers_enabled: Option<String>,
     /// One of `IMAGE_SHARED_WITH_OTHERS_VALUES`.
@@ -216,12 +247,15 @@ pub struct ImageRecord {
     /// Whether the image serves a dynamic application catalog.
     pub dynamic_application_catalog_enabled: Option<bool>,
     /// The name of the published recipe the image was built from, and `None` for an image
-    /// built from no published recipe. A recipe AWS publishes is addressed by the
-    /// accountless ARN of the Region the request asks about, the way the published image
-    /// itself is ([`ImageRecord::arn`]), so the record keeps the NAME and the read builds
-    /// the ARN ([`published_recipe_arn`]).
+    /// built from no published recipe. A recipe is addressed by the ARN of the Region the
+    /// request asks about, the way the published image itself is ([`ImageRecord::arn`]), so
+    /// the record keeps the recipe's NAME and REVISION and the read builds the ARN
+    /// ([`published_recipe_arn`]).
     pub appstream_recipe_name: Option<String>,
-    /// When that recipe was released.
+    /// The revision of that recipe the image was built from, the trailing segment of the
+    /// recipe ARN; `None` for an image built from no published recipe.
+    pub appstream_recipe_version: Option<u32>,
+    /// When that recipe revision was released.
     pub appstream_recipe_released: Option<::aws_smithy_types::DateTime>,
 }
 
@@ -262,6 +296,9 @@ impl ImageRecord {
             image_errors: Some(self.image_errors.clone()),
             latest_appstream_agent_version: self.latest_appstream_agent_version.clone(),
             supported_instance_families: reported(&self.supported_instance_families),
+            // PRESENT and empty when the image serves no instance type group, so code that
+            // iterates the groups of every reported image never meets a missing member.
+            supported_instance_type_groups: Some(self.supported_instance_type_groups.clone()),
             dynamic_app_providers_enabled: self.dynamic_app_providers_enabled.clone(),
             image_shared_with_others: self.image_shared_with_others.clone(),
             managed_software_included: self.managed_software_included,
@@ -271,10 +308,15 @@ impl ImageRecord {
             byol: self.byol,
             root_volume_config: self.root_volume_config.clone(),
             dynamic_application_catalog_enabled: self.dynamic_application_catalog_enabled,
-            appstream_recipe_arn: self
-                .appstream_recipe_name
-                .as_deref()
-                .map(|recipe| published_recipe_arn(region, recipe)),
+            appstream_recipe_arn: match (
+                self.appstream_recipe_name.as_deref(),
+                self.appstream_recipe_version,
+            ) {
+                (Some(recipe), Some(version)) => {
+                    Some(published_recipe_arn(region, recipe, version))
+                }
+                _ => None,
+            },
             appstream_recipe_release_timestamp: self.appstream_recipe_released,
         }
     }
@@ -290,50 +332,85 @@ const GENERAL_INSTANCE_FAMILIES: &[&str] =
 struct Accelerator {
     /// The token the published image's name carries after `Graphics-`.
     token: &'static str,
-    /// The instance family a fleet or image builder launches such an image on, as the
-    /// model's `Image$SupportedInstanceFamilies` doc names it. A graphics image runs on
-    /// the accelerated hardware it was built for and on no other, so this is the ONE
-    /// family it states support for.
-    family: &'static str,
+    /// The `InstanceFamily` TOKEN such an image reports: the family of the accelerated
+    /// hardware it was built for, which is the image's own family whatever set of families
+    /// a fleet may launch it on.
+    instance_family: &'static str,
+    /// The instance families a fleet or image builder may launch such an image on, as the
+    /// model's `Image$SupportedInstanceFamilies` doc names them
+    /// (`smithy_query(query="doc", shape="Image", member="SupportedInstanceFamilies")`).
+    /// An image built for ONE accelerator states that one family; an image built with the
+    /// vendor's whole driver runs on every accelerated family of that vendor, so it states
+    /// all of them.
+    families: &'static [&'static str],
+    /// The token the published recipe's name carries after the operating system
+    /// (`AppStream<operating system>Graphics<this>Recipe`).
+    recipe_token: &'static str,
 }
 
+/// The accelerated instance families of the model's `Image$SupportedInstanceFamilies`
+/// enumeration (`Graphics G4`, `Graphics G5`, `Graphics G6`), and the ones AWS has
+/// published accelerated images for since that doc was written, which it names by the same
+/// `Graphics <generation>` convention.
+const ACCELERATED_INSTANCE_FAMILIES: &[&str] =
+    &["Graphics G4", "Graphics G5", "Graphics G6", "Graphics G7"];
+
 /// The graphics accelerators the published catalog carries base images for: one per
-/// accelerated instance family the model's `Image$SupportedInstanceFamilies` doc
-/// enumerates (`Graphics G4`, `Graphics G5`, `Graphics G6`), plus the accelerators AWS has
-/// published base images for since that doc was written, which name their family by the
-/// same `Graphics <token>` convention the enumerated ones do — so a client choosing an
-/// image finds one for each accelerated family it can launch a fleet or an image builder
-/// on.
+/// accelerated instance family above — so a client choosing an image finds one for each
+/// accelerated family it can launch a fleet or an image builder on — plus the image built
+/// with the GPU vendor's generic driver, which is published under the vendor's own token
+/// and runs on every one of those families.
 const GRAPHICS_ACCELERATORS: &[Accelerator] = &[
     Accelerator {
         token: "G4dn",
-        family: "Graphics G4",
+        instance_family: "GRAPHICS_G4",
+        families: &["Graphics G4"],
+        recipe_token: "G4",
     },
     Accelerator {
         token: "G5",
-        family: "Graphics G5",
+        instance_family: "GRAPHICS_G5",
+        families: &["Graphics G5"],
+        recipe_token: "G5",
     },
     Accelerator {
         token: "G6",
-        family: "Graphics G6",
+        instance_family: "GRAPHICS_G6",
+        families: &["Graphics G6"],
+        recipe_token: "G6",
     },
     Accelerator {
         token: "G7",
-        family: "Graphics G7",
+        instance_family: "GRAPHICS_G7",
+        families: &["Graphics G7"],
+        recipe_token: "G7",
     },
     Accelerator {
         token: "NV",
-        family: "Graphics NV",
+        instance_family: "GRAPHICS_NV",
+        families: ACCELERATED_INSTANCE_FAMILIES,
+        recipe_token: "NV",
     },
 ];
 
 /// One operating system the published catalog carries base images for.
 #[derive(Debug, Clone, Copy)]
 struct PublishedOs {
-    /// The operating-system token a published image's name carries.
+    /// The operating-system token a published image's name carries, and the one its
+    /// published recipe's name carries (`AppStream<this>NonGraphicsRecipe`).
     token: &'static str,
-    /// What that operating system is called, the subject of the image's description.
-    name: &'static str,
+    /// The subject of the description AWS publishes for this operating system's
+    /// general-purpose base image: the words the published sentence opens with, before the
+    /// clause stating what the image launches.
+    ///
+    /// PUBLISHED TEXT, not a rendering of [`Self::token`]: AWS words each operating system
+    /// its own way (one names its distribution and its release in brackets, another spells
+    /// its name out), so the sentence cannot be generated from the platform and is carried
+    /// per operating system instead.
+    general_description_subject: &'static str,
+    /// The same subject for an ACCELERATED base image of this operating system, which AWS
+    /// words separately from the general-purpose one.
+    graphics_description_subject: &'static str,
     /// The image platform, one of `PLATFORM_TYPE_VALUES`.
     platform: &'static str,
     /// Whether AWS publishes accelerated base images for this operating system: a
@@ -350,78 +427,145 @@ struct PublishedOs {
 const PUBLISHED_OPERATING_SYSTEMS: &[PublishedOs] = &[
     PublishedOs {
         token: "AmazonLinux2",
-        name: "Amazon Linux 2",
+        general_description_subject: "AppStream amazon linux 2 image",
+        graphics_description_subject: "AppStream amazon linux 2 image",
         platform: "AMAZON_LINUX2",
         graphics: true,
     },
     PublishedOs {
         token: "RHEL8",
-        name: "Red Hat Enterprise Linux 8",
+        general_description_subject: "AppStream redhat linux (RHEL 8) image",
+        graphics_description_subject: "AppStream redhat linux image (RHEL 8)",
         platform: "RHEL8",
         graphics: true,
     },
     PublishedOs {
         token: "RockyLinux8",
-        name: "Rocky Linux 8",
+        general_description_subject: "AppStream Rocky Linux 8 image",
+        graphics_description_subject: "AppStream Rocky Linux 8 image",
         platform: "ROCKY_LINUX8",
-        graphics: false,
+        graphics: true,
     },
     PublishedOs {
         token: "UbuntuPro2404",
-        name: "Ubuntu Pro 24.04",
+        general_description_subject: "AppStream Ubuntu Pro 24.04 image",
+        graphics_description_subject: "AppStream Ubuntu Pro 24.04 image",
         platform: "UBUNTU_PRO_2404",
         graphics: false,
     },
     PublishedOs {
         token: "WinServer2019",
-        name: "Windows Server 2019",
+        general_description_subject: "AppStream Windows Server 2019 image",
+        graphics_description_subject: "AppStream Windows Server 2019 image",
         platform: "WINDOWS_SERVER_2019",
         graphics: true,
     },
     PublishedOs {
         token: "WinServer2022",
-        name: "Windows Server 2022",
+        general_description_subject: "AppStream Windows Server 2022 image",
+        graphics_description_subject: "AppStream Windows Server 2022 image",
         platform: "WINDOWS_SERVER_2022",
         graphics: true,
     },
     PublishedOs {
         token: "WinServer2025",
-        name: "Windows Server 2025",
+        general_description_subject: "AppStream Windows Server 2025 image",
+        graphics_description_subject: "AppStream Windows Server 2025 image",
         platform: "WINDOWS_SERVER_2025",
         graphics: true,
     },
 ];
 
-/// The release dates of the published base-image batches this catalog ships,
-/// `YYYY-MM-DD`.
+/// One release batch of the published base images this catalog ships.
+#[derive(Debug, Clone, Copy)]
+struct PublishedBatch {
+    /// The day the batch was released, `YYYY-MM-DD`.
+    released: &'static str,
+    /// The NVIDIA GRID driver release the batch's ACCELERATED images were built with, and
+    /// `None` for a batch whose published images state no software metadata.
+    ///
+    /// PUBLISHED per batch: AWS builds a batch's accelerated images from one driver
+    /// release, and the batches that publish the driver's version are the ones whose
+    /// snapshot states it. The model's `ImageSoftwareMetadata$nvidiaGridDriverVersion`
+    /// doc: "The version of the NVIDIA GRID driver installed on the image. This field is
+    /// empty if no NVIDIA GRID driver is installed", and its `@pattern` is
+    /// `^[0-9]+(\.[0-9]+){1,2}$` (`smithy_query(query="shape",
+    /// shape="ImageSoftwareMetadata")`).
+    nvidia_grid_driver: Option<&'static str>,
+}
+
+/// The published base-image batches this catalog ships, oldest first.
 ///
 /// AWS refreshes its published base images in batches and names every image of a batch
 /// after the day the batch was released, so the date is the `<MM-DD-YYYY>` tail of each
 /// image's name and the `PublicBaseImageReleasedDate` it reports. The shipped snapshot
-/// transcribes every batch the catalog is known to publish, oldest first. The images of
-/// every entry are published SIDE BY SIDE, because a batch does not withdraw the one
-/// before it: an account can still address an image of an older batch, and that is why
-/// this is a list rather than the single most recent date. A batch released later is
-/// another entry here and needs no other change.
-const PUBLISHED_RELEASE_DATES: &[&str] = &[
-    "2024-06-17",
-    "2025-05-30",
-    "2025-07-28",
-    "2025-09-05",
-    "2025-11-10",
-    "2026-02-18",
-    "2026-04-16",
-    "2026-08-31",
-    "2026-09-22",
+/// transcribes every batch the catalog is known to publish. The images of every entry are
+/// published SIDE BY SIDE, because a batch does not withdraw the one before it: an account
+/// can still address an image of an older batch, and that is why this is a list rather
+/// than the single most recent date. A batch released later is another entry here and
+/// needs no other change.
+const PUBLISHED_RELEASE_BATCHES: &[PublishedBatch] = &[
+    PublishedBatch {
+        released: "2024-06-17",
+        nvidia_grid_driver: None,
+    },
+    PublishedBatch {
+        released: "2025-05-30",
+        nvidia_grid_driver: None,
+    },
+    PublishedBatch {
+        released: "2025-07-28",
+        nvidia_grid_driver: None,
+    },
+    PublishedBatch {
+        released: "2025-09-05",
+        nvidia_grid_driver: None,
+    },
+    PublishedBatch {
+        released: "2025-11-10",
+        nvidia_grid_driver: None,
+    },
+    PublishedBatch {
+        released: "2026-02-18",
+        nvidia_grid_driver: None,
+    },
+    PublishedBatch {
+        released: "2026-04-16",
+        nvidia_grid_driver: None,
+    },
+    PublishedBatch {
+        released: "2026-08-31",
+        nvidia_grid_driver: Some("580.82.07"),
+    },
+    PublishedBatch {
+        released: "2026-09-22",
+        nvidia_grid_driver: Some("580.95.05"),
+    },
 ];
 
+/// The revision the recipe of a GENERAL-PURPOSE base image carried in the oldest batch of
+/// this snapshot.
+///
+/// A recipe is revised for every batch it publishes an image in, so the revision in a
+/// published image's recipe ARN advances by one per batch ([`PublishedImage::recipe`]).
+/// AWS's recipes were revised before this snapshot's oldest batch, so the count does not
+/// start at one: the snapshot carries the revision the catalog publishes for its first
+/// batch, and the non-graphics and the graphics recipe lines are a revision apart.
+const GENERAL_FIRST_RECIPE_REVISION: u32 = 6;
+
+/// The same for the recipe of an ACCELERATED base image.
+const GRAPHICS_FIRST_RECIPE_REVISION: u32 = 5;
+
 /// One published base image: an operating system, the accelerator it is built for when it
-/// is a graphics image, and the release date of the batch it belongs to.
+/// is a graphics image, and the release batch it belongs to.
 #[derive(Debug, Clone, Copy)]
 struct PublishedImage {
     os: PublishedOs,
     accelerator: Option<Accelerator>,
-    released: &'static str,
+    batch: PublishedBatch,
+    /// How many batches of [`PUBLISHED_RELEASE_BATCHES`] precede this image's batch: the
+    /// number of revisions this image's recipe has had since the snapshot's first batch.
+    batch_index: u32,
 }
 
 /// The date slot of a published image's name: the release date written `MM-DD-YYYY`, the
@@ -439,7 +583,7 @@ impl PublishedImage {
     /// `AppStream-[Graphics-<accelerator>-]<operating system>-<MM-DD-YYYY>`, AWS's naming
     /// of its published base images.
     fn name(&self) -> String {
-        let date = name_date(self.released);
+        let date = name_date(self.batch.released);
         let os = self.os.token;
         match self.accelerator {
             Some(accelerator) => {
@@ -449,24 +593,34 @@ impl PublishedImage {
         }
     }
 
-    /// What the image is: the operating system it runs, and the accelerator it is built
-    /// for when it is a graphics image.
+    /// The description AWS publishes for the image: the subject its operating system is
+    /// published under, and the clause stating what the image launches — an accelerated
+    /// image names the accelerator the instances it launches carry.
+    ///
+    /// The subject is the operating system's PUBLISHED text and not a rendering of its
+    /// platform or its name token ([`PublishedOs::general_description_subject`]).
     fn description(&self) -> String {
-        let os = self.os.name;
         match self.accelerator {
             Some(accelerator) => format!(
-                "AppStream 2.0 {} graphics base image for {os}",
-                accelerator.token
+                "{} for launching Graphics {} image builder instances",
+                self.os.graphics_description_subject, accelerator.token
             ),
-            None => format!("AppStream 2.0 base image for {os}"),
+            None => format!(
+                "{} for launching image builder instances",
+                self.os.general_description_subject
+            ),
         }
     }
 
-    /// The instance families a fleet or image builder may launch this image on: the one
-    /// family a graphics image's accelerator serves, or the general-purpose families.
+    /// The instance families a fleet or image builder may launch this image on: the ones
+    /// a graphics image's accelerator serves, or the general-purpose families.
     fn supported_instance_families(&self) -> Vec<String> {
         match self.accelerator {
-            Some(accelerator) => vec![accelerator.family.to_string()],
+            Some(accelerator) => accelerator
+                .families
+                .iter()
+                .map(|family| (*family).to_string())
+                .collect(),
             None => GENERAL_INSTANCE_FAMILIES
                 .iter()
                 .map(|family| (*family).to_string())
@@ -474,13 +628,55 @@ impl PublishedImage {
         }
     }
 
+    /// The `InstanceFamily` token the image reports: the accelerated family a graphics
+    /// image's hardware is, and for a general-purpose image the first of the families it
+    /// serves, written as a token ([`instance_family_token`]).
+    fn instance_family(&self) -> Option<String> {
+        match self.accelerator {
+            Some(accelerator) => Some(accelerator.instance_family.to_string()),
+            None => GENERAL_INSTANCE_FAMILIES
+                .first()
+                .map(|family| instance_family_token(family)),
+        }
+    }
+
+    /// The published recipe this image was built from: its name — one recipe per operating
+    /// system and accelerator, shared by every batch's image of that combination — and the
+    /// revision of it this batch was built from.
+    fn recipe(&self) -> (String, u32) {
+        match self.accelerator {
+            Some(accelerator) => (
+                format!(
+                    "AppStream{}Graphics{}Recipe",
+                    self.os.token, accelerator.recipe_token
+                ),
+                GRAPHICS_FIRST_RECIPE_REVISION + self.batch_index,
+            ),
+            None => (
+                format!("AppStream{}NonGraphicsRecipe", self.os.token),
+                GENERAL_FIRST_RECIPE_REVISION + self.batch_index,
+            ),
+        }
+    }
+
+    /// The software metadata the image states: the NVIDIA GRID driver version its batch
+    /// published for its accelerated images, and nothing for an image with no such driver
+    /// installed — which is every general-purpose image, and every accelerated image of a
+    /// batch that published no driver version.
+    fn image_software_metadata(&self) -> Option<ImageSoftwareMetadata> {
+        self.accelerator?;
+        self.batch
+            .nvidia_grid_driver
+            .map(|version| ImageSoftwareMetadata {
+                nvidia_grid_driver_version: Some(version.to_string()),
+            })
+    }
+
     /// The stored record this published image is read out of.
     fn record(&self) -> ImageRecord {
-        let released = instant(&format!("{}T00:00:00Z", self.released));
+        let released = instant(&format!("{}T00:00:00Z", self.batch.released));
         let name = self.name();
-        let recipe_name = name.clone();
-        let families = self.supported_instance_families();
-        let families_token = families.first().map(|family| instance_family_token(family));
+        let (recipe_name, recipe_revision) = self.recipe();
         ImageRecord {
             // AWS publishes the image under its own name, so the name to display for it
             // is that name.
@@ -512,16 +708,17 @@ impl PublishedImage {
             latest_appstream_agent_version: Some(
                 LATEST_APPSTREAM_AGENT_VERSION_FALSE.to_string(),
             ),
-            supported_instance_families: families,
+            supported_instance_families: self.supported_instance_families(),
+            // A base image AWS publishes serves no instance type group of its own, and
+            // states so with an empty list rather than by leaving the member out.
+            supported_instance_type_groups: Vec::new(),
             dynamic_app_providers_enabled: Some(DYNAMIC_APP_PROVIDERS_DISABLED.to_string()),
             image_shared_with_others: Some(IMAGE_SHARED_WITH_OTHERS_FALSE.to_string()),
             // A published base image includes no licence-included application.
             managed_software_included: Some(false),
             image_type: Some(IMAGE_TYPE_NATIVE.to_string()),
-            image_software_metadata: None,
-            // The one family of the image, which for a published base image is the first
-            // (and for a graphics image the only) family it supports.
-            instance_family: families_token,
+            image_software_metadata: self.image_software_metadata(),
+            instance_family: self.instance_family(),
             // AWS publishes the licence of the operating system with the image, so the
             // account brings none of its own.
             byol: Some(false),
@@ -532,29 +729,35 @@ impl PublishedImage {
             // The image carries the applications it was built with rather than a catalog
             // resolved at session start.
             dynamic_application_catalog_enabled: Some(false),
-            // AWS publishes the recipe a base image was built from beside the image, under
-            // the image's own name, and releases the two together.
+            // The recipe a base image was built from is the published build it came out
+            // of: one recipe per operating system and accelerator, at the revision this
+            // batch was built from.
             appstream_recipe_name: Some(recipe_name),
+            appstream_recipe_version: Some(recipe_revision),
             appstream_recipe_released: Some(released),
         }
     }
 }
 
 /// Every base image AWS publishes to every account in the shipped snapshot: for each
-/// release date of [`PUBLISHED_RELEASE_DATES`], the general-purpose image of each operating
-/// system of [`PUBLISHED_OPERATING_SYSTEMS`], and one graphics image per accelerator of
-/// [`GRAPHICS_ACCELERATORS`] for each operating system that has accelerated images — so a
-/// client choosing an image finds one for every platform and every instance family it can
-/// launch a fleet or an image builder with, under every release date still published.
+/// release batch of [`PUBLISHED_RELEASE_BATCHES`], the general-purpose image of each
+/// operating system of [`PUBLISHED_OPERATING_SYSTEMS`], and one graphics image per
+/// accelerator of [`GRAPHICS_ACCELERATORS`] for each operating system that has accelerated
+/// images — so a client choosing an image finds one for every platform and every instance
+/// family it can launch a fleet or an image builder with, under every release batch still
+/// published.
 fn published_images() -> Vec<PublishedImage> {
-    PUBLISHED_RELEASE_DATES
+    PUBLISHED_RELEASE_BATCHES
         .iter()
-        .flat_map(|released| {
+        .enumerate()
+        .flat_map(|(index, batch)| {
+            let batch_index = u32::try_from(index).unwrap_or_default();
             PUBLISHED_OPERATING_SYSTEMS.iter().flat_map(move |os| {
                 let general = PublishedImage {
                     os: *os,
                     accelerator: None,
-                    released,
+                    batch: *batch,
+                    batch_index,
                 };
                 let graphics = GRAPHICS_ACCELERATORS
                     .iter()
@@ -562,7 +765,8 @@ fn published_images() -> Vec<PublishedImage> {
                     .map(move |accelerator| PublishedImage {
                         os: *os,
                         accelerator: Some(*accelerator),
-                        released,
+                        batch: *batch,
+                        batch_index,
                     });
                 ::std::iter::once(general).chain(graphics)
             })
