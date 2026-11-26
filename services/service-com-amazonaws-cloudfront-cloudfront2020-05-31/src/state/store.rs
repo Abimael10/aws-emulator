@@ -2225,15 +2225,13 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     }
 
     /// The `host:port` the listener this distribution's edge was given answers on, or `None`
-    /// for a distribution that was given none — one created through the emulator's own
-    /// endpoint, where the whole surface including the edge is already served.
+    /// for a distribution that was given none — one minted on an engine that vends no
+    /// listeners.
     ///
-    /// NOT what the distribution publishes: `Distribution$DomainName` is the DNS name
-    /// CloudFront assigns it ([`Self::allocate_domain_name`]), which is what every read of the
-    /// distribution reports and what the edge resolves a viewer request by. This is the
-    /// address of this emulator a client with no other address of it can DIAL, where a request
-    /// addressed to the published name arrives ([`crate::state::edge_endpoint`]), and no
-    /// modelled member carries it.
+    /// This is the address the distribution PUBLISHES as its `DomainName`
+    /// ([`Self::create_distribution`] stores it): a client that can dial nothing else of this
+    /// emulator reaches the edge there, and the edge resolves a request that arrives on it to
+    /// the one distribution the listener was opened for ([`crate::state::edge_endpoint`]).
     pub fn edge_listener_authority(&self, distribution_id: &str) -> Option<&str> {
         self.edge_endpoints
             .get(distribution_id)
@@ -2243,13 +2241,17 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// Allocate the domain name a distribution is served on: a generated label under
     /// `cloudfront.net`, in the lowercase DNS labels take.
     ///
-    /// The one derivation of that name, for every distribution this store mints: the member
-    /// carries the name CloudFront ASSIGNS, so it never names an address of this emulator
-    /// (see [`crate::state::edge_endpoint`] for what makes the name reach it).
+    /// The one rendering of the name CloudFront's own zone would give a resource, for the one
+    /// case where this emulator has no address of its own to publish for it: an engine that
+    /// vends no listener (see [`Self::create_distribution`] and
+    /// [`Self::minted_routing_endpoint`]). A resource this emulator opened a listener for
+    /// publishes that listener's address instead, because a published value is one a client
+    /// DIALS and nothing resolves this zone to this process
+    /// (see [`crate::state::edge_endpoint`]).
     ///
     /// What a distribution REPORTS is [`StoredDistribution::reported_domain_name`]: a
     /// multi-tenant distribution has no domain of its own, so it reports the placeholder
-    /// instead of the label allocated here.
+    /// instead of what was allocated here.
     ///
     /// A connection group's `RoutingEndpoint` is "also known as the DNS name ... such as
     /// `d111111abcdef8.cloudfront.net`" — the same generated name in the same shape, so a group

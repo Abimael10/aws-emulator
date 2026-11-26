@@ -206,8 +206,7 @@ pub(crate) fn is_published_edge_address(domain: &str) -> bool {
 /// `SocketAddr` is exactly the set of values a client can dial without resolving a name (an
 /// IPv6 literal included, which carries brackets).
 ///
-/// `pub(crate)` so every suite that reads a published routing endpoint holds it to the one
-/// rule.
+/// `pub(crate)` so every suite that reads a published edge address holds it to the one rule.
 pub(crate) fn is_reachable_authority(domain: &str) -> bool {
     domain.parse::<std::net::SocketAddr>().is_ok()
 }

@@ -156,11 +156,12 @@
 //!
 //! # Addressing
 //!
-//! A client on the machine this emulator runs on cannot reach `d<label>.cloudfront.net`
-//! at all: nothing resolves it there, so it points at the emulator's own endpoint and
-//! carries in the PATH what it cannot carry in the host. [`resolve`] reads three
-//! addressings, and each one is checked against this service's own records, so one
-//! request still has one claimant:
+//! A distribution PUBLISHES the address this emulator answers its edge on
+//! ([`crate::state::edge_endpoint`]), so a client handed that value dials it and arrives on
+//! the listener opened for that distribution. A client that reached the emulator at another
+//! address of its own — its one endpoint — carries in the PATH what it cannot carry in the
+//! host. [`resolve`] reads three addressings, and each one is checked against this service's
+//! own records, so one request still has one claimant:
 //!
 //! * HOST-STYLE: the host is a distribution's `DomainName` or one of its `Aliases`, and
 //!   the whole path is the viewer path;
@@ -815,17 +816,18 @@ fn resolve<'s, 'r>(
         })
 }
 
-/// Whether `host` is a domain name this distribution is served on: the `DomainName`
-/// CloudFront assigned it, or one of the alternate domain names its `Aliases` carry.
+/// Whether `host` is a name or address this distribution is served on: the `DomainName` it
+/// PUBLISHED — the address this emulator answers its edge on
+/// ([`crate::state::edge_endpoint`]) — or one of the alternate domain names its `Aliases`
+/// carry.
 ///
 /// DNS names are case-insensitive, so the comparison is ([`same_domain`]). A multi-tenant
 /// distribution reports no domain of its own and so is served on none: its viewers reach
 /// it through a connection group's routing endpoint.
 ///
-/// The `DomainName` is compared against the host AS ADDRESSED first and then without its
-/// port: the name CloudFront assigns carries none — it is a domain name — so a viewer
-/// addresses it with whatever port its own client dialled, and a value that does carry one
-/// still names the distribution it belongs to.
+/// The published value is compared against the host AS ADDRESSED first and then without its
+/// port: a published `host:port` is matched by the client that dialled exactly it, and a
+/// published name carrying no port is matched whatever port the client's own URL named.
 ///
 /// An alias is only read when it is a name a VIEWER could be sent to: the alternate domain
 /// names are caller-supplied and unverifiable here, so one spelled like another service's
@@ -2568,8 +2570,10 @@ fn plan_resolved(
     // already been through an edge (its `Via` names CloudFront). Either way, fetching it
     // would hand the request back to the edge it came from, so the fetch is not made and
     // the request is answered the way an origin CloudFront cannot get a response from is.
-    if serves_host(resolved.distribution, bare_host(&origin.domain_name))
-        || carries_cloudfront_via(req)
+    if serves_host(
+        resolved.distribution,
+        origin_access::origin_authority(&origin.domain_name),
+    ) || carries_cloudfront_via(req)
     {
         ::tracing::warn!(
             distribution = %distribution_id,
@@ -2989,6 +2993,17 @@ fn vpc_origin_endpoint<'s>(
 /// HTTP to access the origin", `https-only` only HTTPS, and `match-viewer` is CloudFront
 /// "communicating with your origin using HTTP or HTTPS, depending on the protocol of the
 /// viewer request", which is what `viewer_scheme` carries.
+///
+/// WHAT THIS URI IS, AND IS NOT: nothing dials it. The fetch it addresses is dispatched over
+/// the IN-PROCESS transport `OperationContext::callback` hands this handler
+/// ([`fetch_origin`], which calls `ctx.callback().http_connector()`), so a configured
+/// `DomainName` can reach only an origin this emulator itself serves, whatever host, address
+/// or port the configuration names: no socket is opened, no name is resolved, and nothing off
+/// this process — a link-local or metadata address, a host on the operator's network — is
+/// addressable through it. A host this emulator serves nothing at answers nothing, and the
+/// viewer is answered the status CloudFront answers for an origin it could not reach
+/// ([`BAD_GATEWAY`] with [`NO_ORIGIN_DETAIL`], or the [`GATEWAY_TIMEOUT`] of a connection
+/// that never came about).
 fn origin_uri(
     origin: &Origin,
     vpc_endpoint: Option<&VpcOriginEndpointConfig>,
@@ -3307,9 +3322,12 @@ impl Fetched {
 
 /// Fetch the origin, serve what it answered, and cache it when the behaviour caches it.
 ///
-/// The fetch goes through the transport `OperationContext::callback` hands this handler,
-/// so an origin this emulator serves answers it in process. An origin that answers
-/// nothing at all is reported as CloudFront reports an origin it could not reach.
+/// The fetch goes through the transport `OperationContext::callback` hands this handler
+/// (`ctx.callback().http_connector()`, the one call below that carries the request), so an
+/// origin this emulator serves answers it IN PROCESS: no socket is opened and no name is
+/// resolved, so the configured origin — whatever host, address or port it names — reaches
+/// nothing outside this process. An origin that answers nothing at all is reported as
+/// CloudFront reports an origin it could not reach.
 ///
 /// The CONNECTION comes first: an origin endpoint that accepts no connection of the kind this
 /// origin's protocol policy opens ([`origin_connection_opens`]) is one no request is sent to at

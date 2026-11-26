@@ -935,7 +935,30 @@ async fn an_added_instance_group_runs_the_amazon_ec2_instances_it_asks_for() {
     };
 
     let ids = ec2_ids(&instances);
-    let held = described_in_ec2(&emulator, &ids).await;
+    // Amazon EC2 owes its own instance a `pending` -> `running` transition, which is a
+    // transition of the INSTANCE rather than of the group EMR reports: the two are owed at
+    // their own instants, so what EC2 reports is polled for here as well, never read once
+    // off the back of EMR's answer.
+    let deadline = Instant::now() + WAIT_DEADLINE;
+    let held = loop {
+        let held = described_in_ec2(&emulator, &ids).await;
+        let running = ids.iter().all(|id| {
+            held.get(id)
+                .is_some_and(|instance| instance.state == "running")
+        });
+        if running {
+            break held;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: Amazon EC2 must run the added group's instances {ids:?}, it reports \
+             {:?}",
+            ids.iter()
+                .map(|id| (id, held.get(id).map(|instance| instance.state.as_str())))
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    };
     for id in &ids {
         let instance = held.get(id).unwrap_or_else(|| {
             panic!("case {case:?}: Amazon EC2 must hold {id:?}, it holds {:?}", held.keys())

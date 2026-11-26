@@ -224,10 +224,9 @@ impl Served {
 /// Whether `authority` is an address a client on the machine this emulator runs on can DIAL: a
 /// `host:port`, which is exactly the set of values a client reaches without resolving a name.
 ///
-/// What a distribution PUBLISHES is a domain name
-/// ([`crate::cloudfront_oac_s3_origin_edge::is_published_edge_address`]); this is the address
-/// that name resolves to for a client on this machine — the listener this emulator opened for
-/// the distribution — which is what a viewer opens its connection to.
+/// What a distribution PUBLISHES is such an address
+/// ([`crate::cloudfront_oac_s3_origin_edge::is_published_edge_address`]): the listener this
+/// emulator opened for the distribution, which is what a viewer opens its connection to.
 pub(crate) fn is_dialable(authority: &str) -> bool {
     authority.parse::<SocketAddr>().is_ok()
 }

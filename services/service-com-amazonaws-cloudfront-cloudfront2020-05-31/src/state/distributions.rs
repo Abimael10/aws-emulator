@@ -405,8 +405,9 @@ pub struct StoredDistribution {
     pub id: String,
     /// `Distribution$ARN`. CloudFront is a global service, so the ARN carries no region.
     pub arn: String,
-    /// `Distribution$DomainName`, allocated at creation and stable for the
-    /// distribution's whole life.
+    /// `Distribution$DomainName`: the address this emulator serves this distribution's edge
+    /// on (the authority of the listener opened for it, see [`crate::state::edge_endpoint`]),
+    /// taken at creation and stable for the distribution's whole life.
     pub domain_name: String,
     /// [`STATUS_IN_PROGRESS`] until [`StoredDistribution::deployed_due`], then
     /// [`STATUS_DEPLOYED`].

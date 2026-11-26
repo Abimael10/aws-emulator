@@ -5,11 +5,11 @@
 //!
 //! Three rules are under test here:
 //!
-//! * a distribution reports, as its `DomainName`, the DNS name CloudFront assigns it — one
-//!   label under `cloudfront.net` — and the emulator ANSWERS on that name: the suite opens a
-//!   socket to the address this emulator opened for the distribution, states the published
-//!   name as the host it addressed (which is what a client handed a domain name sends) and
-//!   fetches an object through it, and both schemes a viewer may dial are served there;
+//! * a distribution reports, as its `DomainName`, an address this emulator SERVES its edge on —
+//!   the `host:port` of the listener it opened for that distribution — and the emulator ANSWERS
+//!   there: the suite opens a socket to that address, states the published value as the host it
+//!   addressed (which is what a client handed the value sends) and fetches an object through it,
+//!   and both schemes a viewer may dial are served there;
 //! * a MULTI-TENANT distribution's configuration may state none of the members the service
 //!   documents as supported only on a standard distribution (or as a connection group's to
 //!   carry): each is refused `InvalidArgument` (HTTP 400) with the sentence that names it,
