@@ -43,11 +43,11 @@ use service_com_amazonaws_eventbridge_awsevents::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region every call of this suite is signed for, and the one the API's own ARN carries.
-const REGION: &str = "eu-west-2";
+pub(crate) const REGION: &str = "eu-west-2";
 
 /// The source every event of this suite is published with; each case matches on its own
 /// `detail-type`, so one case's rule never sees another case's event.
-const SOURCE: &str = "com.demo.appsync";
+pub(crate) const SOURCE: &str = "com.demo.appsync";
 
 /// The table the API's resolvers resolve against, and the attribute its items are keyed by.
 const TABLE: &str = "appsync-target-items";
@@ -57,7 +57,7 @@ const KEY_ATTRIBUTE: &str = "id";
 const DATA_SOURCE: &str = "items";
 
 /// The service principal a data source's service role is assumed by.
-const APPSYNC_PRINCIPAL: &str = "appsync.amazonaws.com";
+pub(crate) const APPSYNC_PRINCIPAL: &str = "appsync.amazonaws.com";
 
 /// The schema the API is created with: one mutation that writes an item, one query that reads
 /// one back, and one mutation whose resolver RAISES, under an explicit `schema` definition
@@ -86,12 +86,12 @@ const POLL_SPACING: Duration = Duration::from_millis(100);
 
 /// The emulator: EventBridge and every service this delivery spans, on ONE engine — the shape
 /// `core/router/src/lib.rs` mounts them in.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
-fn emulator() -> Emulator {
+pub(crate) fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // What a case pins is what each service ANSWERS, never signature verification, which the
@@ -131,7 +131,7 @@ fn emulator() -> Emulator {
 
 /// One `awsJson` RPC call against the service whose signing name is `signing_name` — the
 /// credential scope is what routes it.
-async fn rpc(
+pub(crate) async fn rpc(
     emulator: &Emulator,
     signing_name: &str,
     target_prefix: &str,
@@ -169,7 +169,7 @@ async fn rpc(
 }
 
 /// One EventBridge call.
-async fn events(emulator: &Emulator, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn events(emulator: &Emulator, operation: &str, body: &Value) -> (u16, Value) {
     rpc(emulator, "events", "AWSEvents", "1.1", operation, body).await
 }
 
@@ -283,7 +283,7 @@ async fn appsync_ok(
 
 /// Create the table the resolvers resolve against, and wait until DynamoDB first reports it
 /// `ACTIVE` — the wait is on the CONDITION that service reports, not on a span.
-async fn given_table(emulator: &Emulator, case: &str) -> String {
+pub(crate) async fn given_table(emulator: &Emulator, case: &str) -> String {
     let created = dynamodb(
         emulator,
         case,
@@ -329,7 +329,7 @@ async fn given_table(emulator: &Emulator, case: &str) -> String {
 ///
 /// Both documents are written free of the characters an `application/x-www-form-urlencoded`
 /// body treats specially, so they need no encoding.
-async fn given_role(
+pub(crate) async fn given_role(
     emulator: &Emulator,
     case: &str,
     name: &str,
@@ -383,18 +383,18 @@ const GET_ITEM_REQUEST: &str = "{\"version\": \"2018-05-29\", \"operation\": \"G
 
 /// One created API: the id AppSync minted for it, the ARN the account holds it under, and
 /// the address its `GRAPHQL` endpoint is published at.
-struct GraphqlApi {
-    api_id: String,
-    arn: String,
+pub(crate) struct GraphqlApi {
+    pub(crate) api_id: String,
+    pub(crate) arn: String,
     /// `dns.GRAPHQL`, the `host:port` that endpoint is served at — the address an endpoint
     /// ARN's label is read off.
-    graphql: String,
+    pub(crate) graphql: String,
 }
 
 /// Create the `AWS_IAM` API with [`SCHEMA`], the `AMAZON_DYNAMODB` data source reached under
 /// `role_arn`, and the three resolvers the rows select — each defined by its two VTL mapping
 /// templates.
-async fn given_api(emulator: &Emulator, case: &str, role_arn: &str) -> GraphqlApi {
+pub(crate) async fn given_api(emulator: &Emulator, case: &str, role_arn: &str) -> GraphqlApi {
     let created = appsync_ok(
         emulator,
         case,
@@ -509,19 +509,23 @@ async fn given_api(emulator: &Emulator, case: &str, role_arn: &str) -> GraphqlAp
 
 /// How an endpoint ARN names the API: the resource an AppSync GraphQL endpoint's ARN carries,
 /// with `label` read off the address that endpoint is published at.
-fn endpoint_arn(label: &str) -> String {
+pub(crate) fn endpoint_arn(label: &str) -> String {
     engine::emulator_arn("appsync", REGION, &format!("endpoints/graphql-api/{label}"))
 }
 
 /// How an IAM policy — and a rule's target — addresses one field of one API: the API's own
 /// ARN extended with the type and the field.
-fn field_arn(api_arn: &str, type_name: &str, field: &str) -> String {
+pub(crate) fn field_arn(api_arn: &str, type_name: &str, field: &str) -> String {
     format!("{api_arn}/types/{type_name}/fields/{field}")
 }
 
 /// A dead-letter queue called `name`, carrying the policy EventBridge's own dead-letter write
 /// needs ("grant permissions to the EventBridge service principal"); answers its url and ARN.
-async fn given_dead_letter_queue(emulator: &Emulator, case: &str, name: &str) -> (String, String) {
+pub(crate) async fn given_dead_letter_queue(
+    emulator: &Emulator,
+    case: &str,
+    name: &str,
+) -> (String, String) {
     let (status, created) = sqs(emulator, "CreateQueue", &json!({"QueueName": name})).await;
     assert_eq!(
         status, 200,
@@ -621,7 +625,7 @@ async fn publish(emulator: &Emulator, case: &str, detail_type: &str, detail: &Va
 }
 
 /// What EventBridge recorded about each handover of `rule`: its outcome.
-fn outcomes(emulator: &Emulator, rule: &str) -> Vec<InvocationOutcome> {
+pub(crate) fn outcomes(emulator: &Emulator, rule: &str) -> Vec<InvocationOutcome> {
     emulator
         .engine
         .state::<ComAmazonawsEventbridgeAwseventsState>()
@@ -634,7 +638,7 @@ fn outcomes(emulator: &Emulator, rule: &str) -> Vec<InvocationOutcome> {
 }
 
 /// The item the table holds under `id`, as a client reads it — `None` when it holds none.
-async fn item(emulator: &Emulator, case: &str, id: &str) -> Option<Value> {
+pub(crate) async fn item(emulator: &Emulator, case: &str, id: &str) -> Option<Value> {
     let held = dynamodb(
         emulator,
         case,
@@ -646,7 +650,7 @@ async fn item(emulator: &Emulator, case: &str, id: &str) -> Option<Value> {
 }
 
 /// Every message waiting on the queue at `url`, with its attributes.
-async fn dead_letters(emulator: &Emulator, case: &str, url: &str) -> Vec<Value> {
+pub(crate) async fn dead_letters(emulator: &Emulator, case: &str, url: &str) -> Vec<Value> {
     let (status, received) = sqs(
         emulator,
         "ReceiveMessage",
@@ -678,7 +682,7 @@ fn parked_refusal(parked: &Value) -> (String, String) {
 
 /// AppSync's own error type for a call it has not authorized, which the sentence of a
 /// delivery the target's role barred carries beside the status that endpoint answers.
-const UNAUTHORIZED_ERROR_TYPE: &str = "UnauthorizedException";
+pub(crate) const UNAUTHORIZED_ERROR_TYPE: &str = "UnauthorizedException";
 
 /// What the dead letter of a delivery `expected` must report: the condition, and — for a
 /// delivery the role's policies barred — the answer the API's own endpoint gives an identity
@@ -736,10 +740,11 @@ struct Row {
 
 /// The operation each row's target carries: a document with named variables, which is what
 /// the target's input fills.
-const PUT_OPERATION: &str = "mutation PutItem($id: ID!, $kind: String!) \
+pub(crate) const PUT_OPERATION: &str = "mutation PutItem($id: ID!, $kind: String!) \
                              { putItem(id: $id, kind: $kind) { id kind } }";
 const GET_OPERATION: &str = "query GetItem($id: ID!) { getItem(id: $id) { id kind } }";
-const REFUSE_OPERATION: &str = "mutation RefuseItem($id: ID!) { refuseItem(id: $id) { id } }";
+pub(crate) const REFUSE_OPERATION: &str =
+    "mutation RefuseItem($id: ID!) { refuseItem(id: $id) { id } }";
 
 /// An operation selecting TWO root fields: the call reaches both, so the role the target
 /// names has to be granted `appsync:GraphQL` on each of them.
