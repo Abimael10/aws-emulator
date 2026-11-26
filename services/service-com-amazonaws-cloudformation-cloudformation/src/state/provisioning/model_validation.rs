@@ -51,7 +51,10 @@
 //! failed ([`enum_reason`]) — so a value no resource of the type could ever have is refused by
 //! the provider rather than sent to the owning service or admitted as the template's business.
 //! A value outside a length or a pattern the schema states is the same class of failure and is
-//! left where that value is read, as the rest of this stage's partiality is.
+//! left where that value is read, as the rest of this stage's partiality is. A value outside a
+//! numeric RANGE the schema states is judged here, by the third catalogue
+//! ([`BOUNDED_PROPERTIES`]): the sentence is the same one, naming the location of that property
+//! and the bound keyword that failed ([`range_reason`]).
 //!
 //! Both of those questions are asked a second time, of other types, by the PRE-DEPLOYMENT
 //! stage ([`crate::state::property_validation`]), which refuses the OPERATION rather than
@@ -285,6 +288,84 @@ pub(super) const ENUMERATED_PROPERTIES: &[ConstrainedProperty] = &[
 /// document the provider validated, which is the resource's own property document.
 const ROOT: &str = "#";
 
+/// One property whose value its type's schema holds between published BOUNDS.
+///
+/// A row carries the two keywords a JSON schema states a numeric range with, each `None` where
+/// the schema states none: the location and the KEYWORD are what the validator's sentence
+/// names ([`range_reason`]), so which of the two a value broke is what a client is told.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct BoundedProperty {
+    /// The resource type the property belongs to, as a template declares it.
+    pub(super) resource_type: &'static str,
+    /// The property's name, as a template spells it.
+    pub(super) property: &'static str,
+    /// The schema's `minimum`, which is the smallest value the property admits.
+    pub(super) minimum: Option<f64>,
+    /// The schema's `maximum`, which is the largest.
+    pub(super) maximum: Option<f64>,
+}
+
+/// The two JSON-schema keywords a numeric range is stated with, which are the names the
+/// validator's sentence carries for a value that broke one of them.
+const MINIMUM_KEYWORD: &str = "minimum";
+const MAXIMUM_KEYWORD: &str = "maximum";
+
+impl BoundedProperty {
+    /// The keyword this row's value broke, or `None` for a value inside the bounds.
+    ///
+    /// The value is read as the NUMBER the schema says the property is, in either spelling a
+    /// template gives one — a JSON number, or the quoted scalar a YAML template writes — so a
+    /// declaration that states the bound as text is judged by the same rule. A value that is
+    /// no number at all breaks a constraint this stage does not judge (the schema's `type`),
+    /// so it is left to the owning service, which is the authority on everything here is not.
+    fn broken_keyword(&self, declared: &Value) -> Option<&'static str> {
+        let value = declared
+            .as_f64()
+            .or_else(|| declared.as_str().and_then(|text| text.trim().parse().ok()))?;
+        if self.minimum.is_some_and(|minimum| value < minimum) {
+            return Some(MINIMUM_KEYWORD);
+        }
+        if self.maximum.is_some_and(|maximum| value > maximum) {
+            return Some(MAXIMUM_KEYWORD);
+        }
+        None
+    }
+}
+
+/// The properties whose value this stage holds to the bounds its type's schema publishes.
+///
+/// A catalogue grown one row at a time and deliberately PARTIAL, for the reason the two above
+/// are: a property no row names is left to the service that owns the resource. A row belongs
+/// here where the RANGE is a fact of the type rather than of one request — the bounds the
+/// type's schema publishes for the property, which the owning API documents as that
+/// parameter's own range — so a value outside it can never name a resource that service would
+/// make.
+pub(super) const BOUNDED_PROPERTIES: &[BoundedProperty] = &[
+    // `AWS::CloudFront::RealtimeLogConfig$SamplingRate` is the percentage of viewer requests a
+    // configuration's log data represents, and CloudFront publishes the range: "You can specify
+    // a whole number between 1 and 100 (inclusive)"
+    // (`smithy_query(query="doc",shape="CreateRealtimeLogConfigRequest",member="SamplingRate")`),
+    // which is the `minimum`/`maximum` pair that type's schema states for the property. A value
+    // outside it names no configuration that service could hold, and it is THIS stage that
+    // judges it: a stack declaring one is ADMITTED and the configuration's own resource is what
+    // fails.
+    //
+    // The OWNING service reads the same published range for the rate a configuration may carry
+    // at all (its own `MIN_SAMPLING_RATE`/`MAX_SAMPLING_RATE` and `realtime_log_config_refusal`,
+    // in
+    // `services/service-com-amazonaws-cloudfront-cloudfront2020-05-31/src/state/realtime_log_configs.rs`);
+    // the bounds are restated here because nothing of that crate's state is reachable from this
+    // one and the two stages word the refusal differently — the schema validator's sentence
+    // here, that service's own there — and each doc names the other so they cannot drift
+    // silently.
+    BoundedProperty {
+        resource_type: crate::state::template::CLOUDFRONT_REALTIME_LOG_CONFIG,
+        property: "SamplingRate",
+        minimum: Some(1.0),
+        maximum: Some(100.0),
+    },
+];
+
 /// The error code a model-validation failure carries: the provider refused the REQUEST it was
 /// handed, which is the class CloudFormation reports such a failure under
 /// (`HandlerErrorCode: InvalidRequest`, per [`super::handler_error_code`]).
@@ -308,11 +389,37 @@ pub(super) fn refusal(resource_type: &str, properties: &Value) -> Option<Refusal
             message: reason(missing),
         });
     }
+    if let Some((property, keyword)) = property_outside_published_bounds(resource_type, properties)
+    {
+        return Some(Refusal {
+            code: MODEL_VALIDATION_CODE.to_string(),
+            message: range_reason(property, keyword),
+        });
+    }
     let outside = property_outside_published_set(resource_type, properties)?;
     Some(Refusal {
         code: MODEL_VALIDATION_CODE.to_string(),
         message: enum_reason(outside),
     })
+}
+
+/// The first property of `resource_type` whose declared value is outside the bounds its schema
+/// publishes for it ([`BOUNDED_PROPERTIES`]), with the KEYWORD that value broke; `None` where
+/// every such property the document carries states a value inside its bounds, and for a
+/// property the document does not carry at all.
+fn property_outside_published_bounds(
+    resource_type: &str,
+    properties: &Value,
+) -> Option<(&'static str, &'static str)> {
+    BOUNDED_PROPERTIES
+        .iter()
+        .filter(|row| row.resource_type == resource_type)
+        .find_map(|row| {
+            properties
+                .get(row.property)
+                .and_then(|declared| row.broken_keyword(declared))
+                .map(|keyword| (row.property, keyword))
+        })
 }
 
 /// The first property of `resource_type` whose declared value is outside the set its schema
@@ -367,6 +474,18 @@ pub(super) fn enum_reason(property: &str) -> String {
     format!(
         "Model validation failed ({ROOT}/{property}: failed validation constraint for keyword \
          [enum])"
+    )
+}
+
+/// How a resource provider's model validation reports a property whose declared value is
+/// outside the bounds its type's schema publishes: the same sentence [`enum_reason`] carries,
+/// around the LOCATION of that property and the name of the bound keyword that failed
+/// (`minimum` or `maximum`) — the validator names the constraint it checked rather than the
+/// value it was given.
+pub(super) fn range_reason(property: &str, keyword: &str) -> String {
+    format!(
+        "Model validation failed ({ROOT}/{property}: failed validation constraint for keyword \
+         [{keyword}])"
     )
 }
 
@@ -608,6 +727,175 @@ mod tests {
             assert_eq!(
                 rows, 1,
                 "case {:?}: expected one row per type, got {rows}",
+                row.resource_type
+            );
+        }
+    }
+
+    /// RULE: a property whose value its type's schema holds between published bounds is refused
+    /// for any value outside them, at the location of THAT property and naming the bound
+    /// keyword that failed — while every value inside them passes this stage.
+    ///
+    /// The rows span each published bound, one step past each of them, a value between them,
+    /// each spelling a template gives a number (a JSON number and a quoted scalar), a value
+    /// that is no number at all and a type this stage holds no bounded row for.
+    #[test]
+    fn a_value_outside_the_published_bounds_is_refused_naming_the_broken_keyword() {
+        let configuration = crate::state::template::CLOUDFRONT_REALTIME_LOG_CONFIG;
+        /// The members the configuration carries beside the one under test, so the VALUE is
+        /// what each row judges.
+        fn declared(sampling_rate: Value) -> Value {
+            ::serde_json::json!({
+                "Name": "edge-logs",
+                "SamplingRate": sampling_rate,
+                "Fields": ["timestamp"],
+                "EndPoints": [{"StreamType": "Kinesis"}],
+            })
+        }
+        /// One row: what it is about, the type, the declared document, and the property and
+        /// bound keyword the validator must report — `None` for a document it must pass.
+        struct Row {
+            case: &'static str,
+            resource_type: &'static str,
+            properties: Value,
+            broken: Option<(&'static str, &'static str)>,
+        }
+        let row = |case: &'static str,
+                   resource_type: &'static str,
+                   properties: Value,
+                   broken: Option<(&'static str, &'static str)>| Row {
+            case,
+            resource_type,
+            properties,
+            broken,
+        };
+        let cases = [
+            row(
+                "the published minimum",
+                configuration,
+                declared(::serde_json::json!(1)),
+                None,
+            ),
+            row(
+                "the published maximum",
+                configuration,
+                declared(::serde_json::json!(100)),
+                None,
+            ),
+            row(
+                "a value between the bounds",
+                configuration,
+                declared(::serde_json::json!(37)),
+                None,
+            ),
+            row(
+                "one past the maximum",
+                configuration,
+                declared(::serde_json::json!(101)),
+                Some(("SamplingRate", MAXIMUM_KEYWORD)),
+            ),
+            row(
+                "one below the minimum",
+                configuration,
+                declared(::serde_json::json!(0)),
+                Some(("SamplingRate", MINIMUM_KEYWORD)),
+            ),
+            row(
+                "far below the minimum",
+                configuration,
+                declared(::serde_json::json!(-5)),
+                Some(("SamplingRate", MINIMUM_KEYWORD)),
+            ),
+            row(
+                "a bound written as the quoted scalar a YAML template gives one",
+                configuration,
+                declared(::serde_json::json!("100")),
+                None,
+            ),
+            row(
+                "a value past the maximum written as a quoted scalar",
+                configuration,
+                declared(::serde_json::json!("101")),
+                Some(("SamplingRate", MAXIMUM_KEYWORD)),
+            ),
+            row(
+                // What it breaks is the schema's `type`, a constraint this stage does not
+                // judge, so it is left to the service that owns the resource.
+                "a value that is no number at all",
+                configuration,
+                declared(::serde_json::json!({"Fn::Join": []})),
+                None,
+            ),
+            row(
+                "a type this stage holds no bounded row for",
+                "AWS::SNS::Topic",
+                ::serde_json::json!({"SamplingRate": 1000}),
+                None,
+            ),
+        ];
+        for Row {
+            case,
+            resource_type,
+            properties,
+            broken,
+        } in &cases
+        {
+            let refused = refusal(resource_type, properties);
+            assert_eq!(
+                refused.as_ref().map(|refusal| refusal.message.clone()),
+                broken.map(|(property, keyword)| range_reason(property, keyword)),
+                "case {case:?}: expected the failure for {broken:?}, got {refused:?}"
+            );
+        }
+    }
+
+    /// The sentence a broken bound carries, which is the validator's own wording around the
+    /// keyword it checked.
+    #[test]
+    fn the_range_reason_names_the_keyword_the_schema_states() {
+        assert_eq!(
+            range_reason("SamplingRate", MAXIMUM_KEYWORD),
+            "Model validation failed (#/SamplingRate: failed validation constraint for keyword \
+             [maximum])",
+            "expected the schema validator's own wording for a broken maximum"
+        );
+        assert_eq!(
+            range_reason("SamplingRate", MINIMUM_KEYWORD),
+            "Model validation failed (#/SamplingRate: failed validation constraint for keyword \
+             [minimum])",
+            "expected the schema validator's own wording for a broken minimum"
+        );
+    }
+
+    /// Every bounded row names a type once per property and states at least one bound, with the
+    /// minimum no greater than the maximum: a row with neither bound could never report
+    /// anything.
+    #[test]
+    fn every_bounded_row_states_a_range_it_can_judge() {
+        for row in BOUNDED_PROPERTIES {
+            assert!(
+                row.minimum.is_some() || row.maximum.is_some(),
+                "case {:?}: expected the row to state a bound for {:?}",
+                row.resource_type,
+                row.property
+            );
+            if let (Some(minimum), Some(maximum)) = (row.minimum, row.maximum) {
+                assert!(
+                    minimum <= maximum,
+                    "case {:?}: expected {minimum} <= {maximum} for {:?}",
+                    row.resource_type,
+                    row.property
+                );
+            }
+            let rows = BOUNDED_PROPERTIES
+                .iter()
+                .filter(|other| {
+                    other.resource_type == row.resource_type && other.property == row.property
+                })
+                .count();
+            assert_eq!(
+                rows, 1,
+                "case {:?}: expected one row per type and property, got {rows}",
                 row.resource_type
             );
         }

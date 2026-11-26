@@ -69,6 +69,19 @@ pub const CLOUDFRONT_MONITORING_SUBSCRIPTION: &str = "AWS::CloudFront::Monitorin
 /// CloudFront mints and named by the ARN built around that id.
 pub const CLOUDFRONT_VPC_ORIGIN: &str = "AWS::CloudFront::VpcOrigin";
 
+/// The `AWS::CloudFront::RealtimeLogConfig` resource type: the real-time log configuration a
+/// cache behaviour sends its log records to an Amazon Kinesis data stream through, identified
+/// by the ARN CloudFront mints for it around the name the declaration gives it — the value a
+/// behaviour's `RealtimeLogConfigArn` names one by, and the only value this type publishes.
+pub const CLOUDFRONT_REALTIME_LOG_CONFIG: &str = "AWS::CloudFront::RealtimeLogConfig";
+
+/// The resource type a real-time log configuration's ARN spells, as the type's own "Return
+/// values" section writes one
+/// (`arn:aws:cloudfront::<account>:realtime-log-config/<Name>`) — the same form the owning
+/// service mints a configuration's ARN in (`realtime_log_config_arn` in
+/// `services/service-com-amazonaws-cloudfront-cloudfront2020-05-31/src/state/realtime_log_configs.rs`).
+pub(crate) const CLOUDFRONT_REALTIME_LOG_CONFIG_ARN_TYPE: &str = "realtime-log-config";
+
 /// The Amazon API Gateway resource types whose published `Ref` is a SERVICE-ASSIGNED id
 /// rather than a name a template states: a REST API, a resource of one, and a deployment
 /// of one.

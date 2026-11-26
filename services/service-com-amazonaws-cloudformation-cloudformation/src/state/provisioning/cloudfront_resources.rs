@@ -98,6 +98,11 @@ mod monitoring_subscription;
 /// instance inside a VPC: another per-type half beside this one, reached through the same seam.
 mod vpc_origin;
 
+/// The real-time log configuration a stack declares so a cache behaviour can send its log
+/// records to an Amazon Kinesis data stream: another per-type half beside this one, reached
+/// through the same seam.
+mod realtime_log_config;
+
 /// The two resource types this file provisions itself.
 pub(crate) const CLOUDFRONT_DISTRIBUTION: &str = "AWS::CloudFront::Distribution";
 pub(crate) const CLOUDFRONT_ORIGIN_ACCESS_CONTROL: &str = "AWS::CloudFront::OriginAccessControl";
@@ -122,6 +127,8 @@ pub(crate) enum Kind {
     MonitoringSubscription,
     /// `AWS::CloudFront::VpcOrigin`, whose arms are [`vpc_origin`]'s.
     VpcOrigin,
+    /// `AWS::CloudFront::RealtimeLogConfig`, whose arms are [`realtime_log_config`]'s.
+    RealtimeLogConfig,
 }
 
 /// The kind of CloudFront resource `resource_type` is, or `None` for a type no module here
@@ -134,6 +141,7 @@ pub(crate) fn kind_of(resource_type: &str) -> Option<Kind> {
             Some(Kind::MonitoringSubscription)
         }
         vpc_origin::CLOUDFRONT_VPC_ORIGIN => Some(Kind::VpcOrigin),
+        realtime_log_config::CLOUDFRONT_REALTIME_LOG_CONFIG => Some(Kind::RealtimeLogConfig),
         other => policy_and_key_resources::kind_of(other)
             .map(Kind::PolicyOrKey)
             .or_else(|| {
@@ -346,6 +354,12 @@ const RENAMED_MEMBERS: &[(&str, &str)] = &[
     // A key value store's import source: `ImportSource$SourceARN` in CloudFront's own model,
     // spelled `SourceArn` by the type that declares one.
     ("SourceArn", "SourceARN"),
+    // A real-time log configuration's Kinesis endpoint: `KinesisStreamConfig$RoleARN` and
+    // `$StreamARN` in CloudFront's own model
+    // (`smithy_query(query="shape",shape="KinesisStreamConfig")`), spelled `RoleArn` and
+    // `StreamArn` by the resource reference for the type that declares one.
+    ("RoleArn", "RoleARN"),
+    ("StreamArn", "StreamARN"),
 ];
 
 /// How a declared LIST reaches the API: the container the model wraps it in, and the element
@@ -501,6 +515,17 @@ const WRAPPED_LISTS: &[(&str, &str, &str, ListShape)] = &[
         "member",
         ListShape::Unwrapped,
     ),
+    // A real-time log configuration's two lists, neither of which the model wraps in a
+    // container: `EndPointList`'s member carries the default element name a restXml list
+    // member has, and `FieldList`'s carries the `xmlName` `Field`
+    // (`smithy_query(query="shape",shape="EndPointList,FieldList")`).
+    (
+        "EndPoints",
+        "EndPoints",
+        UNWRAPPED_ITEM_ELEMENT,
+        ListShape::Unwrapped,
+    ),
+    ("Fields", "Fields", "Field", ListShape::Unwrapped),
 ];
 
 /// Create the resource one of these declarations describes, in Amazon CloudFront itself — so
@@ -533,6 +558,10 @@ pub(super) async fn create(
             monitoring_subscription::create(ctx, region, resource).await
         }
         Kind::VpcOrigin => vpc_origin::create(ctx, region, resource, propagated).await,
+        // `AWS::CloudFront::RealtimeLogConfig` publishes no `Tags` property and
+        // `CreateRealtimeLogConfig` takes none: the type is not taggable, so no tags are
+        // propagated to it.
+        Kind::RealtimeLogConfig => realtime_log_config::create(ctx, region, resource).await,
     }
 }
 
@@ -621,6 +650,9 @@ pub(super) async fn update(
             monitoring_subscription::update(ctx, region, resource, declared).await
         }
         Kind::VpcOrigin => Ok(vpc_origin::update()),
+        Kind::RealtimeLogConfig => {
+            realtime_log_config::update(ctx, region, resource, declared).await
+        }
     }
 }
 
@@ -672,6 +704,7 @@ pub(super) async fn delete(
             monitoring_subscription::delete(ctx, region, resource).await
         }
         Kind::VpcOrigin => vpc_origin::delete(ctx, region, resource).await,
+        Kind::RealtimeLogConfig => realtime_log_config::delete(ctx, region, resource).await,
     }
 }
 
@@ -697,6 +730,9 @@ pub(super) async fn removal(
         // of an origin whose endpoint has not reached the edge locations yet, so the deletion
         // is asked for again until that service no longer holds it ([`vpc_origin::remove`]).
         Kind::VpcOrigin => vpc_origin::remove(ctx, region, physical_resource_id).await,
+        // A real-time log configuration is gone as its delete answers: nothing propagates to
+        // the edge locations before it is removed.
+        Kind::RealtimeLogConfig => Ok(Removal::Gone),
     }
 }
 

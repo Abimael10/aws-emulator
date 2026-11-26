@@ -3087,6 +3087,9 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     // The VPC origin a distribution reads a private endpoint inside a VPC through, publishing
     // the ARN and the id CloudFront mints for it beside that service's own report of it.
     CLOUDFRONT_VPC_ORIGIN,
+    // The real-time log configuration a cache behaviour sends its log records through,
+    // publishing the ARN CloudFront mints for it.
+    CLOUDFRONT_REALTIME_LOG_CONFIG,
     "AWS::CloudWatch::Alarm",
     "AWS::CloudWatch::CompositeAlarm",
     CLOUDWATCH_METRIC_STREAM,

@@ -244,8 +244,10 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         | CLOUDFRONT_VPC_ORIGIN => "Id",
         // A key value store is identified by the ARN its own data plane addresses it by, a
         // connection function by the ARN CloudFront built around the id it minted, and a
-        // function by the ARN a cache behaviour names it by.
-        CLOUDFRONT_KEY_VALUE_STORE => "Arn",
+        // function by the ARN a cache behaviour names it by. A real-time log configuration is
+        // in that same position: the ARN CloudFront minted for it is what a cache behaviour's
+        // `RealtimeLogConfigArn` names one by and what its own `Ref` returns.
+        CLOUDFRONT_KEY_VALUE_STORE | CLOUDFRONT_REALTIME_LOG_CONFIG => "Arn",
         CLOUDFRONT_CONNECTION_FUNCTION => "ConnectionFunctionArn",
         CLOUDFRONT_FUNCTION => "FunctionARN",
         // The API Gateway types, each identified by the id that service assigns. An api and

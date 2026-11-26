@@ -589,6 +589,11 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // A VPC origin publishes the ARN and the id CloudFront minted for it, the status that
         // service reports it in and the two instants of its own clock.
         CLOUDFRONT_VPC_ORIGIN => &["Arn", "CreatedTime", "Id", "LastModifiedTime", "Status"],
+        // A real-time log configuration publishes the ARN CloudFront minted for it, which is
+        // also what its `Ref` returns: the type declares the configuration's name, its
+        // sampling rate, its fields and its endpoints, and the ARN is the one read-only value
+        // beside them.
+        CLOUDFRONT_REALTIME_LOG_CONFIG => &["Arn"],
         APIGATEWAY_REST_API => &["RestApiId", "RootResourceId"],
         APIGATEWAY_RESOURCE => &["ResourceId"],
         // The AppSync types' own half of the catalogue, beside their return values.
