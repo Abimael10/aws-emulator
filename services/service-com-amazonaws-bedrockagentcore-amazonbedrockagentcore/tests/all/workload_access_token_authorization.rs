@@ -52,11 +52,11 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every row's calls are signed for, which is the region segment of the ARN the
 /// gate judges them on.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The emulator's own published long-term access key: the account credential, which holds no
 /// IAM policies.
-const ACCOUNT_KEY: &str = "AKIDEXAMPLE";
+pub(crate) const ACCOUNT_KEY: &str = "AKIDEXAMPLE";
 
 /// The workload identity every row asks for a token for, and another one a policy can be
 /// scoped to instead. Both are inside `WorkloadIdentityNameType` (len 3..255, pattern
@@ -66,13 +66,13 @@ const OTHER_WORKLOAD: &str = "elsewhere.agent";
 
 /// The IAM action namespace of this service, which is its `arnNamespace`
 /// (`smithy_query query="service_info"`).
-const ACTION_PREFIX: &str = "bedrock-agentcore";
+pub(crate) const ACTION_PREFIX: &str = "bedrock-agentcore";
 
 /// The code and status AWS refuses a call IAM does not permit with (`AccessDeniedException`,
 /// `@httpError` 403, from `smithy_query query="operation"
 /// operation="GetWorkloadAccessToken"`).
-const DENIED_CODE: &str = "AccessDeniedException";
-const DENIED_STATUS: u16 = 403;
+pub(crate) const DENIED_CODE: &str = "AccessDeniedException";
+pub(crate) const DENIED_STATUS: u16 = 403;
 
 /// One `userToken` this suite presents: a compact JWS whose header names a signing algorithm
 /// and whose claim set is inside its own window, so the JWT mint's own validation does not
@@ -95,13 +95,13 @@ fn user_token(subject: &str) -> String {
 
 /// The router every case drives: this service, plus the two that own the identity a request
 /// speaks for (STS) and the policies in force on it (IAM), all on ONE engine.
-struct Harness {
+pub(crate) struct Harness {
     engine: Arc<InMemoryEngine>,
     router: MultiServiceRouter,
 }
 
 impl Harness {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -121,7 +121,7 @@ impl Harness {
 
     /// One call of this service, signed with `access_key_id`: `method` and `path` are the
     /// operation's own HTTP binding, and `body` the payload for an operation that takes one.
-    async fn call(
+    pub(crate) async fn call(
         &self,
         access_key_id: &str,
         method: &str,
@@ -165,7 +165,7 @@ impl Harness {
 
     /// Create the AgentCore Memory container the memory-record cases read, the way the
     /// CONTROL plane's `CreateMemory` does — this data plane creates none of its own.
-    fn create_memory(&self, memory_id: &str) {
+    pub(crate) fn create_memory(&self, memory_id: &str) {
         super::harness::create_memory(&self.engine, memory_id);
     }
 
@@ -209,7 +209,11 @@ impl Harness {
     /// it through STS, and answer the access key id of the session together with the
     /// principal ARN STS reports for it — the credential a caller then signs with, and the
     /// principal a refusal names.
-    async fn assumed_role(&self, role_name: &str, policy: Option<&str>) -> (String, String) {
+    pub(crate) async fn assumed_role(
+        &self,
+        role_name: &str,
+        policy: Option<&str>,
+    ) -> (String, String) {
         let account = engine::EMULATOR_ACCOUNT_ID;
         let trust = json!({
             "Version": "2012-10-17",
@@ -330,7 +334,7 @@ fn workload_identity_arn(workload: &str) -> String {
 }
 
 /// The error shape a failure answered with.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .map(|code| code.rsplit(['#', '/']).next().unwrap_or(code).to_string())
@@ -579,7 +583,7 @@ fn conditioned_policy(actions: &[String], resource: &str, clauses: Option<Value>
 }
 
 /// This service's action for one operation name.
-fn action(operation: &str) -> String {
+pub(crate) fn action(operation: &str) -> String {
     format!("{ACTION_PREFIX}:{operation}")
 }
 
@@ -592,14 +596,32 @@ fn action(operation: &str) -> String {
 /// Spelled out here rather than imported, so a wrong sentence in `src` fails this test.
 fn refusal_for(principal: &str, operation: &str, resource: &str) -> String {
     let action = action(operation);
+    refusal_with_reason(
+        principal,
+        operation,
+        resource,
+        &format!("because no identity-based policy allows the {action} action"),
+    )
+}
+
+/// The same sentence with the clause naming ANY of IAM's rules: the one spelling of this
+/// refusal the suites of this crate assert against, so a wrong sentence in `src` fails
+/// wherever a gate of this service is driven.
+pub(crate) fn refusal_with_reason(
+    principal: &str,
+    operation: &str,
+    resource: &str,
+    reason: &str,
+) -> String {
+    let action = action(operation);
     format!(
         "User: {principal} is not authorized to perform: {action} on resource: {resource} \
-         because no identity-based policy allows the {action} action"
+         {reason}"
     )
 }
 
 /// The message a refusal carried.
-fn message_of(body: &Value) -> String {
+pub(crate) fn message_of(body: &Value) -> String {
     body.get("message")
         .or_else(|| body.get("Message"))
         .and_then(Value::as_str)
