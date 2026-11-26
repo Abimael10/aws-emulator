@@ -33,6 +33,27 @@ impl ComAmazonawsQuicksightQuicksight20180401State {
         ))
     }
 
+    /// Removes the membership `(aws_account_id, namespace, group_name)` holds under
+    /// `member_name`, answering the record that went, or `None` when that group holds no
+    /// such member — so a membership delete can tell a removal from nothing to remove.
+    ///
+    /// Only the membership goes: the group holding it and the user it names are resources
+    /// of their own.
+    pub fn remove_group_member(
+        &mut self,
+        aws_account_id: &str,
+        namespace: &str,
+        group_name: &str,
+        member_name: &str,
+    ) -> Option<GroupMemberRecord> {
+        self.group_members.remove(&(
+            aws_account_id.to_string(),
+            namespace.to_string(),
+            group_name.to_string(),
+            member_name.to_string(),
+        ))
+    }
+
     /// How many members `(aws_account_id, namespace, group_name)` holds — what
     /// [`MAX_GROUP_MEMBERS_PER_GROUP`] is checked against.
     pub fn group_member_count(

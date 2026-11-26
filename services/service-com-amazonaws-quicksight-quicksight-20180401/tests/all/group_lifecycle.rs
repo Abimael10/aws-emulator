@@ -1657,6 +1657,426 @@ async fn a_membership_list_needs_the_group_and_the_namespace_it_is_held_in() {
     );
 }
 
+// --- Taking a member out of a group -----------------------------------------------
+//
+// The rule under test: a membership is identified by
+// `(AwsAccountId, Namespace, GroupName, MemberName)`, and the delete addressed to it
+// removes exactly that stored membership — so the membership's own read reports the miss
+// again, the group's membership listing reports every OTHER member it holds, and the two
+// resources the membership joined (the group and the user) are untouched and can be
+// joined again. A membership the group does not hold is nothing to remove, and so are a
+// group name the namespace holds nothing under and a namespace the account does not
+// hold. The rows vary what the rule generalises over (the member's name form and length,
+// how many members the group holds, which of them is removed, the namespace and the
+// account) rather than re-running one recorded call.
+
+/// `DeleteGroupMembership`: `DELETE` on the membership's own address.
+/// Source: smithy_query(query="operation", operation="DeleteGroupMembership").
+async fn remove_group_member(
+    harness: &Harness,
+    account: &str,
+    namespace: &str,
+    group_name: &str,
+    member_name: &str,
+) -> (u16, Value) {
+    harness
+        .call(
+            "DELETE",
+            &membership_path(account, namespace, group_name, member_name),
+            None,
+        )
+        .await
+}
+
+/// One row of the removal table: the group a case fills, the members it is given, and
+/// the one of them the case takes out again.
+struct RemovalRow {
+    case: &'static str,
+    account: &'static str,
+    namespace: &'static str,
+    group_name: &'static str,
+    members: Vec<String>,
+    removed: String,
+}
+
+fn removal_rows() -> Vec<RemovalRow> {
+    vec![
+        RemovalRow {
+            // The only member a group holds.
+            case: "the-one-member-the-group-holds",
+            account: ACCOUNT,
+            namespace: DEFAULT_NAMESPACE,
+            group_name: "Readers",
+            members: vec!["reader-1".to_string()],
+            removed: "reader-1".to_string(),
+        },
+        RemovalRow {
+            // One of several, so the rest of the group has to survive it.
+            case: "one-of-several-members",
+            account: ACCOUNT,
+            namespace: DEFAULT_NAMESPACE,
+            group_name: "Analysts",
+            members: vec![
+                "zoe".to_string(),
+                "adam".to_string(),
+                "Mikael".to_string(),
+            ],
+            removed: "adam".to_string(),
+        },
+        RemovalRow {
+            // `GroupMemberName` admits `\u0020`, so a member's name can hold spaces.
+            // Source: smithy_query(query="shape", shape="GroupMemberName").
+            case: "a-name-holding-spaces",
+            account: ACCOUNT,
+            namespace: DEFAULT_NAMESPACE,
+            group_name: "Sales Management East",
+            members: vec!["Jane Doe".to_string(), "John Roe".to_string()],
+            removed: "Jane Doe".to_string(),
+        },
+        RemovalRow {
+            // The pattern reaches `\u00FF`, so a name can hold a Latin-1 letter.
+            case: "a-non-ascii-name",
+            account: ACCOUNT,
+            namespace: DEFAULT_NAMESPACE,
+            group_name: "Ventes-Café",
+            members: vec!["Émile Zola".to_string(), "café au lait".to_string()],
+            removed: "Émile Zola".to_string(),
+        },
+        RemovalRow {
+            // The shortest name the model admits (len 1..256).
+            case: "the-shortest-name",
+            account: ACCOUNT,
+            namespace: DEFAULT_NAMESPACE,
+            group_name: "g",
+            members: vec!["u".to_string()],
+            removed: "u".to_string(),
+        },
+        RemovalRow {
+            // And the longest: `GroupMemberName` is len 1..256.
+            case: "the-longest-name",
+            account: ACCOUNT,
+            namespace: DEFAULT_NAMESPACE,
+            group_name: "Bounded",
+            members: vec!["m".repeat(256), "m".to_string()],
+            removed: "m".repeat(256),
+        },
+        RemovalRow {
+            // The same names again, in another namespace of the same account.
+            case: "custom-namespace",
+            account: ACCOUNT,
+            namespace: CUSTOM_NAMESPACE,
+            group_name: "Readers",
+            members: vec!["reader-1".to_string(), "reader-2".to_string()],
+            removed: "reader-2".to_string(),
+        },
+        RemovalRow {
+            // And once more in another account's default namespace.
+            case: "other-account",
+            account: OTHER_ACCOUNT,
+            namespace: DEFAULT_NAMESPACE,
+            group_name: "Readers",
+            members: vec!["reader-1".to_string()],
+            removed: "reader-1".to_string(),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn removing_a_member_takes_the_membership_out_of_every_later_read() {
+    let harness = Harness::new();
+    // A user QuickSight manages itself needs an account with an identity store of its
+    // own, so both accounts are signed up for one.
+    sign_up_for_quicksight_identities(&harness, ACCOUNT).await;
+    sign_up_for_quicksight_identities(&harness, OTHER_ACCOUNT).await;
+    create_settled_custom_namespace(&harness, ACCOUNT).await;
+
+    for row in removal_rows() {
+        let RemovalRow {
+            case,
+            account,
+            namespace,
+            group_name,
+            members,
+            removed,
+        } = row;
+        let removed = removed.as_str();
+
+        given_group(&harness, case, account, namespace, group_name).await;
+        for member in &members {
+            given_user(&harness, case, account, namespace, member).await;
+            let (status, body) =
+                add_group_member(&harness, account, namespace, group_name, member).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the fixture membership for {member:?} expected 200, got \
+                 {status} with {body}"
+            );
+        }
+        let held_before = held_memberships(&harness);
+        let kept: Vec<&str> = members
+            .iter()
+            .map(String::as_str)
+            .filter(|member| *member != removed)
+            .collect();
+
+        let (status, body) =
+            remove_group_member(&harness, account, namespace, group_name, removed).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: removing a member the group holds expected 200, got {status} \
+             with {body}"
+        );
+        assert_eq!(
+            body["Status"],
+            Value::Null,
+            "case {case:?}: Status is the HTTP status, so it is not a body member: {body}"
+        );
+        assert!(
+            body["RequestId"]
+                .as_str()
+                .is_some_and(|request_id| !request_id.is_empty()),
+            "case {case:?}: the removal reported no RequestId: {body}"
+        );
+
+        // Exactly that membership went from the shared store: the ones the group still
+        // holds are still there, and nothing else was removed with it.
+        {
+            let state = qs_state::service_state(&*harness.engine).expect("the QuickSight store");
+            let store = state.lock();
+            assert!(
+                store
+                    .group_member(account, namespace, group_name, removed)
+                    .is_none(),
+                "case {case:?}: the removed membership is still stored"
+            );
+            for member in &kept {
+                assert!(
+                    store
+                        .group_member(account, namespace, group_name, member)
+                        .is_some(),
+                    "case {case:?}: the membership of {member:?} must survive the removal"
+                );
+            }
+            assert_eq!(
+                store.group_members.len(),
+                held_before - 1,
+                "case {case:?}: exactly one membership goes with the removal"
+            );
+        }
+
+        // The membership's own read reports the miss again, as it did before the member
+        // was ever added.
+        let (status, body) =
+            describe_group_member(&harness, account, namespace, group_name, removed).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: the removed membership expected 404, got {status} with {body}"
+        );
+        assert_eq!(
+            body["__type"],
+            json!("ResourceNotFoundException"),
+            "case {case:?}: expected ResourceNotFoundException, got {body}"
+        );
+        assert_eq!(
+            body["ResourceType"],
+            json!("USER"),
+            "case {case:?}: a group's members are users: {body}"
+        );
+        assert_eq!(
+            body["Message"],
+            json!(membership_locator(account, namespace, group_name, removed)),
+            "case {case:?}: the miss must report the address the call named: {body}"
+        );
+
+        // And the group's membership listing reports exactly the members it still holds.
+        let (status, body) = list_group_members(&harness, account, namespace, group_name, "").await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the listing expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            reported_group_members(case, &body),
+            expected_group_members(account, namespace, &kept),
+            "case {case:?}: the listing must report exactly the members left: {body}"
+        );
+
+        // A membership that is already gone is nothing to remove, so the repeat is a
+        // miss rather than a second deletion.
+        let (status, body) =
+            remove_group_member(&harness, account, namespace, group_name, removed).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: removing a membership the group does not hold expected 404, \
+             got {status} with {body}"
+        );
+        assert_eq!(
+            body["Message"],
+            json!(membership_locator(account, namespace, group_name, removed)),
+            "case {case:?}: the repeated removal must report the address it named: {body}"
+        );
+        assert_eq!(
+            held_memberships(&harness),
+            held_before - 1,
+            "case {case:?}: a refused removal must not remove a second membership"
+        );
+
+        // Only the membership went: the group that held it still reads, and the user it
+        // named is still a user of the namespace — which is why the two can be joined
+        // again, and the rejoined membership reads like any other.
+        let (status, body) = describe_group(&harness, account, namespace, group_name).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the group must survive the removal of a member, got {status} \
+             with {body}"
+        );
+        let (status, body) =
+            add_group_member(&harness, account, namespace, group_name, removed).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: re-adding the removed member expected 200, got {status} with \
+             {body}"
+        );
+        assert_eq!(
+            body["GroupMember"]["Arn"],
+            json!(member_arn(account, namespace, removed)),
+            "case {case:?}: the re-added member carries the ARN of the user it names: {body}"
+        );
+        let (status, body) =
+            describe_group_member(&harness, account, namespace, group_name, removed).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the rejoined membership expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            held_memberships(&harness),
+            held_before,
+            "case {case:?}: the rejoined membership is one membership again"
+        );
+    }
+}
+
+#[tokio::test]
+async fn removing_a_member_needs_the_namespace_the_group_and_the_membership() {
+    let harness = Harness::new();
+    sign_up_for_quicksight_identities(&harness, ACCOUNT).await;
+    create_settled_custom_namespace(&harness, ACCOUNT).await;
+
+    // One group that does hold a member, so every row below is about the address the
+    // call named rather than about an empty store.
+    given_group(&harness, "fixture", ACCOUNT, DEFAULT_NAMESPACE, "Members").await;
+    given_user(&harness, "fixture", ACCOUNT, DEFAULT_NAMESPACE, "member-1").await;
+    let (status, body) =
+        add_group_member(&harness, ACCOUNT, DEFAULT_NAMESPACE, "Members", "member-1").await;
+    assert_eq!(
+        status, 200,
+        "the fixture membership expected 200, got {status} with {body}"
+    );
+    // A user of that namespace the group was never given, so a row can show that a
+    // membership is removable only where it was created.
+    given_user(&harness, "fixture", ACCOUNT, DEFAULT_NAMESPACE, "outsider").await;
+
+    let rows = [
+        (
+            "a registered user the group does not hold",
+            ACCOUNT,
+            DEFAULT_NAMESPACE,
+            "Members",
+            "outsider",
+            "USER",
+            membership_locator(ACCOUNT, DEFAULT_NAMESPACE, "Members", "outsider"),
+        ),
+        (
+            "a member name no user is known by",
+            ACCOUNT,
+            DEFAULT_NAMESPACE,
+            "Members",
+            "nobody at all",
+            "USER",
+            membership_locator(ACCOUNT, DEFAULT_NAMESPACE, "Members", "nobody at all"),
+        ),
+        (
+            "a name no group of the namespace is held under",
+            ACCOUNT,
+            DEFAULT_NAMESPACE,
+            "No Such Group",
+            "member-1",
+            "GROUP",
+            group_miss_message(ACCOUNT, DEFAULT_NAMESPACE, "No Such Group"),
+        ),
+        (
+            "a group held in another namespace only",
+            ACCOUNT,
+            CUSTOM_NAMESPACE,
+            "Members",
+            "member-1",
+            "GROUP",
+            group_miss_message(ACCOUNT, CUSTOM_NAMESPACE, "Members"),
+        ),
+        (
+            "a group held in another account only",
+            OTHER_ACCOUNT,
+            DEFAULT_NAMESPACE,
+            "Members",
+            "member-1",
+            "GROUP",
+            group_miss_message(OTHER_ACCOUNT, DEFAULT_NAMESPACE, "Members"),
+        ),
+        (
+            "a namespace the account does not hold",
+            ACCOUNT,
+            "no-such-namespace",
+            "Members",
+            "member-1",
+            "NAMESPACE",
+            "Namespace no-such-namespace not found".to_string(),
+        ),
+    ];
+
+    for (case, account, namespace, group_name, member_name, resource_type, message) in rows {
+        let (status, body) =
+            remove_group_member(&harness, account, namespace, group_name, member_name).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: a membership is removed only where it is held, so this \
+             expected 404, got {status} with {body}"
+        );
+        assert_eq!(
+            body["__type"],
+            json!("ResourceNotFoundException"),
+            "case {case:?}: expected ResourceNotFoundException, got {body}"
+        );
+        assert_eq!(
+            body["ResourceType"],
+            json!(resource_type),
+            "case {case:?}: the refusal must name the resource that is missing: {body}"
+        );
+        assert_eq!(
+            body["Message"],
+            json!(message),
+            "case {case:?}: the refusal must report the address the call named: {body}"
+        );
+    }
+
+    // And the membership the group does hold survived every refusal above.
+    let (status, body) =
+        describe_group_member(&harness, ACCOUNT, DEFAULT_NAMESPACE, "Members", "member-1").await;
+    assert_eq!(
+        status, 200,
+        "the held membership must survive the refusals, got {status} with {body}"
+    );
+    let (status, body) =
+        list_group_members(&harness, ACCOUNT, DEFAULT_NAMESPACE, "Members", "").await;
+    assert_eq!(
+        status, 200,
+        "the group that holds a member must stay readable, got {status} with {body}"
+    );
+    assert_eq!(
+        reported_group_members("after-the-misses", &body),
+        expected_group_members(ACCOUNT, DEFAULT_NAMESPACE, &["member-1"]),
+        "the held membership must survive the refusals: {body}"
+    );
+}
+
 // --- A role's members -------------------------------------------------------------
 //
 // The rule under test: a role membership joins one of the service's roles to a GROUP of
