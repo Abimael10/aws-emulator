@@ -57,7 +57,12 @@ const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Look again until `job_id`'s status is `status`, answering the read that saw it.
-async fn polled_until_status(batch: &Batch, case: &str, job_id: &str, status: &str) -> Value {
+pub(crate) async fn polled_until_status(
+    batch: &Batch,
+    case: &str,
+    job_id: &str,
+    status: &str,
+) -> Value {
     let deadline = Instant::now() + SETTLE_DEADLINE;
     loop {
         let detail = described(batch, case, job_id).await;
@@ -78,7 +83,7 @@ async fn polled_until_status(batch: &Batch, case: &str, job_id: &str, status: &s
 /// Read from the store the handlers read and write (`Batch::store`), because the dispatch is
 /// the one part of a placement a client cannot see when nothing serves it: a placed job and a
 /// resting one are both `RUNNABLE` on the wire until that service answers.
-fn is_placed(batch: &Batch, job_id: &str) -> bool {
+pub(crate) fn is_placed(batch: &Batch, job_id: &str) -> bool {
     let store = batch.store();
     let store = store.lock();
     store.service_jobs.get(job_id).is_some_and(|job| {
@@ -87,7 +92,7 @@ fn is_placed(batch: &Batch, job_id: &str) -> bool {
 }
 
 /// Look again until the scheduler has placed `job_id` ([`is_placed`]).
-async fn polled_until_placed(batch: &Batch, case: &str, job_id: &str) {
+pub(crate) async fn polled_until_placed(batch: &Batch, case: &str, job_id: &str) {
     let deadline = Instant::now() + SETTLE_DEADLINE;
     loop {
         // A read is what drives the dispatch the clock made due, so the job is described
@@ -106,7 +111,11 @@ async fn polled_until_placed(batch: &Batch, case: &str, job_id: &str) {
 
 /// A service environment publishing `capacity_limits`, and a `SAGEMAKER_TRAINING` queue
 /// over it; answers the queue's name.
-async fn environment_and_queue(batch: &Batch, suffix: &str, capacity_limits: Value) -> String {
+pub(crate) async fn environment_and_queue(
+    batch: &Batch,
+    suffix: &str,
+    capacity_limits: Value,
+) -> String {
     let environment = format!("se-{suffix}");
     batch
         .ok(
@@ -134,7 +143,7 @@ async fn environment_and_queue(batch: &Batch, suffix: &str, capacity_limits: Val
 }
 
 /// `SubmitServiceJob` on `queue` with `payload`, answering the minted job id.
-async fn submit(batch: &Batch, suffix: &str, queue: &str, payload: &str) -> String {
+pub(crate) async fn submit(batch: &Batch, suffix: &str, queue: &str, payload: &str) -> String {
     let accepted = batch
         .ok(
             "/v1/submitservicejob",

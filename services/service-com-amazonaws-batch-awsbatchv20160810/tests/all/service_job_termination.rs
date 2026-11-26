@@ -203,7 +203,7 @@ pub(crate) async fn terminate(batch: &Batch, case: &str, job_id: &str, reason: &
 }
 
 /// `TerminateServiceJobs` (the BULK form) over the wire: the status and the decoded body.
-async fn terminate_many(batch: &Batch, jobs: &[String], reason: &str) -> (u16, Value) {
+pub(crate) async fn terminate_many(batch: &Batch, jobs: &[String], reason: &str) -> (u16, Value) {
     batch
         .call(
             "/v1/terminateservicejobs",
