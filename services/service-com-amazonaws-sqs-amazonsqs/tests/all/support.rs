@@ -515,6 +515,26 @@ pub fn error_code(body: &Value) -> String {
         .to_string()
 }
 
+/// The `message` member of a refusal, as awsJson renders it — and as the legacy query envelope
+/// spells the same member. The ONE reader of that sentence, so a suite asserting a refusal's
+/// wording does not re-derive which member carries it.
+pub fn message_of(body: &Value) -> String {
+    body.get("message")
+        .or_else(|| body.get("Message"))
+        .and_then(Value::as_str)
+        .unwrap_or("<no message>")
+        .to_string()
+}
+
+/// The value of one response header, or `None` when the answer carries none: the reader for
+/// [`QUERY_ERROR_HEADER`] and any other header an answer states something in.
+pub fn header_of(headers: &http::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string)
+}
+
 /// A JSON object of strings as a sorted map, so two attribute maps compare directly.
 pub fn as_map(value: &Value) -> BTreeMap<String, String> {
     value

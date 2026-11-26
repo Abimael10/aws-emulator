@@ -19,12 +19,19 @@
 //! — [`crate::state::SETTABLE_ATTRIBUTES`] minus the one marked `create_only`, because
 //! of `FifoQueue`'s "You can provide this attribute only during queue creation. You
 //! can't change it for an existing queue." A name outside that list is not an attribute
-//! THIS operation has, so it is refused as an unknown one (`InvalidAttributeName`,
-//! [`crate::state::unknown_attribute_name`]) — the create-only attribute exactly like an
-//! attribute that applies only to the other kind of queue, and whatever a read of the
-//! addressed queue reports for it. Only a value of an attribute the operation does take is
-//! refused as a value (`InvalidAttributeValue`). Either way the queue's stored type is
-//! left as its create fixed it.
+//! THIS operation has for the queue it addresses, so it is refused as an unknown one
+//! (`InvalidAttributeName`, [`crate::state::unknown_attribute_name`]) — an attribute that
+//! applies only to the other kind of queue, and the attribute designating the FIFO kind on a
+//! queue that carries no such attribute at all, exactly alike.
+//!
+//! The one exception is that designator on a queue that DOES carry and report it, a FIFO
+//! queue: the name is one that queue has, so what the map got wrong is the CHANGE its value
+//! asks for, and the kind of queue is settled when the queue is made. That is refused as a
+//! value (`InvalidAttributeValue`) stating the rule it broke
+//! ([`crate::state::QUEUE_TYPE_NOT_MODIFIABLE`]), whatever value the call supplied, ahead of
+//! the create-only branch rather than through it. Every other value of an attribute the
+//! operation does take is refused as a value too. Either way the queue's stored type is left
+//! as its create fixed it.
 //!
 //! Server-side encryption is the one pair of attributes a change to either reaches the
 //! other: "only one server-side encryption option is supported per queue", so a call
