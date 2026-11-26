@@ -207,11 +207,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // A pure read: every destination's state is derived from the
-        // configuration that replicates the table, the destination table
-        // bucket, what the account's IAM holds about the configuration's role
-        // and the clock, and nothing in either store is touched — so two reads
-        // of a table nobody reconfigured answer the same.
+        // Every destination's state is derived from the configuration that
+        // replicates the table, the destination table bucket, what the
+        // account's IAM holds about the configuration's role and the clock. The
+        // one thing this read writes is the replication the clock has already
+        // made due — the copying that leaves the replica at a destination,
+        // which was owed at this instant whether or not anybody asked — so two
+        // reads of a table nobody reconfigured answer the same.
         let at = ::std::time::SystemTime::now();
         // What the configuration replicating this table rests on, read under
         // this service's own guard and nothing else: the table's own ARN, the
@@ -266,7 +268,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &named_destinations,
         );
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // The replication the clock has already made due is carried out before
+        // the status is derived, so what the read reports for a destination is
+        // a fact about the replica that destination really holds.
+        store.replicate_due(&source_table_arn, at, &role_refusals);
         let table = store
             .table_by_arn(&input.table_arn)
             // Reachable only if the table was removed between the two reads

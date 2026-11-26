@@ -1337,6 +1337,88 @@ pub async fn listed_tags(
         .unwrap_or_default()
 }
 
+/// The namespace names `ListNamespaces` reports for `bucket_arn` — the first name of
+/// each listed namespace, which is the name a single-level namespace is addressed by.
+///
+/// Held here because more than one suite asks what a table bucket holds, a destination
+/// bucket of a replication included.
+pub async fn listed_namespace_names(
+    emulator: &Emulator,
+    region: &str,
+    bucket_arn: &str,
+    case: &str,
+) -> Vec<String> {
+    let listing = served(
+        emulator.list_namespaces(region, bucket_arn, &[]).await,
+        "ListNamespaces",
+        case,
+    );
+    listing
+        .list("namespaces")
+        .iter()
+        .filter_map(|row| {
+            row.get("namespace")
+                .and_then(Value::as_array)
+                .and_then(|names| names.first())
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// How long [`await_replication_completed`] keeps looking before it gives up.
+/// GENEROUS on purpose: it polls for the condition and asserts nothing about how long
+/// it took, so a loaded host only makes it poll more often.
+pub const REPLICATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long it waits between two polls of a destination's state.
+pub const REPLICATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The `destinations` of `table_arn` once the replication to every one of them has been
+/// CARRIED OUT, looked for until it has.
+///
+/// Replication is asynchronous: the call that configures it answers before anything has
+/// been copied, so a destination holds the replica only once the replication to it has
+/// completed. Every suite that needs a replica really standing at a destination waits
+/// for that CONDITION — never for a span — which is this one loop.
+pub async fn await_replication_completed(
+    emulator: &Emulator,
+    region: &str,
+    table_arn: &str,
+    destinations: usize,
+    case: &str,
+) -> Vec<Value> {
+    let deadline = std::time::Instant::now() + REPLICATION_DEADLINE;
+    loop {
+        let read = served(
+            emulator
+                .get_table_replication_status(region, table_arn)
+                .await,
+            "GetTableReplicationStatus",
+            case,
+        );
+        let reported = read.list("destinations");
+        let states: Vec<String> = reported
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .get("replicationStatus")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        if states.len() == destinations && states.iter().all(|state| state == "completed") {
+            return reported;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected the replication to {destinations} destination(s) of \
+             {table_arn} to be carried out, got {states:?}"
+        );
+        tokio::time::sleep(REPLICATION_POLL_INTERVAL).await;
+    }
+}
+
 pub fn now_seconds() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)

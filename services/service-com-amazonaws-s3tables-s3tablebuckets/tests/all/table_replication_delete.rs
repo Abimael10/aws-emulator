@@ -15,9 +15,9 @@
 //! delete addressed to a table the store does not hold is the modelled
 //! not-found and changes nothing. What the delete removes is the TABLE's own
 //! record alone: the configuration the table bucket holding it carries is left
-//! exactly as it was, and the replicas the write that set the configuration
-//! provisioned at the destinations remain, since "existing replicated copies
-//! will remain in destination buckets" (`DeleteTableReplication`).
+//! exactly as it was, and the replicas the replication already left at the
+//! destinations remain, since "existing replicated copies will remain in
+//! destination buckets" (`DeleteTableReplication`).
 //!
 //! The model is what bounds the shapes the rows span
 //! (`smithy_query(query="operation", operation="DeleteTableReplication")` and
@@ -32,7 +32,7 @@
 
 use serde_json::{json, Value};
 
-use super::harness::{Emulator, Reply, ACCOUNT};
+use super::harness::{await_replication_completed, Emulator, Reply, ACCOUNT};
 use super::table_record_expiration::create_table;
 
 /// The fixed sentence this service states a table that has no replication
@@ -454,6 +454,17 @@ async fn the_delete_removes_the_tables_own_record_and_nothing_else() {
     let emulator = Emulator::new();
     for row in &write_rows(&emulator).await {
         let case = format!("{label} (what the delete leaves)", label = row.label);
+        // The replication the configuration asked for, carried out: it is what
+        // leaves the replica at a destination, and only a replica that was
+        // really left there is a copy the delete has to leave standing.
+        await_replication_completed(
+            &emulator,
+            row.region,
+            &row.table_arn,
+            row.destinations.len(),
+            &case,
+        )
+        .await;
         let deleted = emulator
             .delete_table_replication(
                 row.region,
@@ -465,9 +476,9 @@ async fn the_delete_removes_the_tables_own_record_and_nothing_else() {
             .await;
         assert_deleted(&deleted, &case);
 
-        // The replica the write that set the configuration provisioned at each
-        // destination stands where it stood: the delete stops further updates
-        // being replicated, it does not remove what was replicated already.
+        // The replica the replication left at each destination stands where it
+        // stood: the delete stops further updates being replicated, it does not
+        // remove what was replicated already.
         let namespace = format!("{table}_ns", table = row.table);
         for destination in &row.destinations {
             let replica = emulator

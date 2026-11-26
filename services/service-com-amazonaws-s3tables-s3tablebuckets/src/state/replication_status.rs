@@ -5,15 +5,19 @@
 //! be replicated to at all — and the replica each destination holds, which is
 //! what replication leaves behind there.
 //!
-//! Setting a replication configuration provisions a table at the destination:
-//! the operation that sets one takes "s3tables:CreateTable permission for the
-//! destination" and "s3tables:CreateNamespace permission for the destination"
-//! (`PutTableReplication`), so a destination table bucket of a configuration
-//! this store holds really does hold the replica — and the state a read reports
-//! for that destination is a fact about that record rather than a claim about
-//! work nothing performed.
+//! Replication provisions a table at the destination: the operation that sets a
+//! configuration takes "s3tables:CreateTable permission for the destination" and
+//! "s3tables:CreateNamespace permission for the destination"
+//! (`PutTableReplication`), so a destination replication has copied the table to
+//! really does hold the replica — and the state a read reports for that
+//! destination is a fact about that record rather than a claim about work
+//! nothing performed. That write is the REPLICATION's, not the configuring
+//! call's: the put answers before anything has been copied anywhere, so a
+//! destination takes its replica only once the replication of the table's state
+//! to it is due and the configuration's role permits the writes replication
+//! performs ([`ComAmazonawsS3tablesS3tablebucketsState::replicate_due`]).
 //!
-//! Nothing a READ does here is written: a destination's state is DERIVED from
+//! Nothing a derivation does here is written: a destination's state is DERIVED from
 //! records this store already holds — the replication configuration that covers
 //! the table, the table itself, the destination table bucket and the replica in
 //! it — plus what the account's IAM holds about the configuration's role
@@ -110,6 +114,24 @@ pub struct ReplicationDestinationStatus {
     pub failure_message: Option<String>,
 }
 
+/// When the replication of `table`'s current state under `configuration` to a
+/// destination completes.
+///
+/// Replication copies the table AS IT STANDS, so what is owed is the
+/// replication of its current state: the span runs from the later of the
+/// instant the configuration was set and the instant the table last changed.
+/// `checked_add`, so a clock far enough in the future that the span does not
+/// fit cannot panic a read.
+fn replication_completes_at(
+    configuration: &ReplicationConfiguration,
+    table: &Table,
+) -> SystemTime {
+    let since = configuration.configured_at.max(table.modified_at);
+    since
+        .checked_add(REPLICATION_COMPLETION_DELAY)
+        .unwrap_or(since)
+}
+
 impl ComAmazonawsS3tablesS3tablebucketsState {
     /// The replication configuration that replicates `table`, or `None` when
     /// nothing does.
@@ -136,16 +158,68 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
             .as_ref()
     }
 
+    /// Carry out the replication of the table `table_arn` that the CLOCK has
+    /// already made due, answering the ARN of each replica that stands at a
+    /// destination afterwards.
+    ///
+    /// A destination holds the replica only once replication to it has actually
+    /// happened, which is NOT what the call that configures replication does: a
+    /// put answers synchronously while the copying is carried out afterwards, as
+    /// the role the configuration names, so this is owed for a destination once
+    /// the replication of the table's current state to it is due
+    /// ([`REPLICATION_COMPLETION_DELAY`]) and `role_refusals` withholds nothing
+    /// for it. A configuration removed before any of its destinations came due
+    /// therefore leaves every destination table bucket exactly as it was, with
+    /// no namespace and no replica of this store's making in it.
+    ///
+    /// Owed at the same instant whether or not anybody asked, which is why the
+    /// read that REPORTS replication takes it ([`Self::table_replication_status`]
+    /// derives from what this leaves behind), and IDEMPOTENT, so two reads of a
+    /// table nobody reconfigured answer the same.
+    ///
+    /// `role_refusals` is handed in rather than read here for the same reason
+    /// [`Self::table_replication_status`] takes it: the records it rests on
+    /// belong to another service's store, whose guard is taken with no guard of
+    /// this one held.
+    pub fn replicate_due(
+        &mut self,
+        table_arn: &str,
+        at: SystemTime,
+        role_refusals: &super::replication_role::ReplicationRoleRefusals,
+    ) -> Vec<String> {
+        let Some(table) = self.table_by_arn(table_arn) else {
+            return Vec::new();
+        };
+        let Some(configuration) = self.replicating_configuration(table) else {
+            return Vec::new();
+        };
+        if at < replication_completes_at(configuration, table) {
+            return Vec::new();
+        }
+        let source_table_arn = table.table_arn.clone();
+        let destinations: Vec<String> = configuration
+            .rules
+            .iter()
+            .flat_map(|rule| rule.destinations.iter())
+            // Replication is carried out acting as the configuration's role, so
+            // a destination that role cannot be used to write to takes nothing:
+            // what the read reports for it is the modeled failed state, and
+            // nothing is created there.
+            .filter(|destination| role_refusals.refusal_for(destination).is_none())
+            .cloned()
+            .collect();
+        self.provision_replicas(&source_table_arn, &destinations, at)
+    }
+
     /// Provision the replica of the table `source_table_arn` at every
     /// destination table bucket `destinations` names, answering the ARN of each
     /// replica that stands at a destination afterwards.
     ///
-    /// This is what the write that SETS a replication configuration leaves at
-    /// the destinations: the replica lives under the source table's own
-    /// namespace and name, in a namespace created there when the destination
-    /// holds none of that name — which is why setting a configuration takes
-    /// permission to create a namespace and a table at the destination
-    /// (`PutTableReplication`).
+    /// What a replication leaves at its destinations: the replica lives under
+    /// the source table's own namespace and name, in a namespace created there
+    /// when the destination holds none of that name — which is why setting a
+    /// configuration takes permission to create a namespace and a table at the
+    /// destination (`PutTableReplication`).
     ///
     /// IDEMPOTENT, and it never takes anything over: a destination table bucket
     /// this store does not hold takes no replica (a configuration may name one
@@ -155,7 +229,7 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
     /// the model allows one configuration (`@length(min: 1, max: 5)`), and each
     /// destination's own bounds ([`super::NAMESPACES_PER_TABLE_BUCKET`],
     /// [`super::TABLES_PER_NAMESPACE`]) refuse a replica past them.
-    pub fn provision_replicas(
+    fn provision_replicas(
         &mut self,
         source_table_arn: &str,
         destinations: &[String],
@@ -193,24 +267,6 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
         provisioned
     }
 
-    /// Every table of the table bucket `table_bucket_arn`, by its own ARN.
-    ///
-    /// What a configuration set on the BUCKET covers: its rules "define which
-    /// tables to replicate and where to replicate them"
-    /// (`TableBucketReplicationConfiguration`), so the tables the bucket holds
-    /// are the tables it replicates. The list is as long as the bucket's
-    /// resident tables, which this store's own bounds cap
-    /// ([`super::NAMESPACES_PER_TABLE_BUCKET`], [`super::TABLES_PER_NAMESPACE`]).
-    pub fn table_arns_in_bucket(&self, table_bucket_arn: &str) -> Vec<String> {
-        self.table_buckets
-            .get(table_bucket_arn)
-            .into_iter()
-            .flat_map(|bucket| bucket.namespaces.values())
-            .flat_map(|namespace| namespace.tables.values())
-            .map(|table| table.table_arn.clone())
-            .collect()
-    }
-
     /// The state of replication of `table` to each destination that replicates
     /// it, as of `at`, or `None` when no configuration replicates the table at
     /// all — a table with no destination has no status to report.
@@ -236,15 +292,7 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
     ) -> Option<Vec<ReplicationDestinationStatus>> {
         let configuration = self.replicating_configuration(table)?;
         let location = self.tables_by_arn.get(&table.table_arn)?;
-        // Replication copies the table AS IT STANDS, so what is owed is the
-        // replication of its current state: the span runs from the later of the
-        // instant the configuration was set and the instant the table last
-        // changed. `checked_add`, so a clock far enough in the future that the
-        // span does not fit cannot panic a read.
-        let since = configuration.configured_at.max(table.modified_at);
-        let completes_at = since
-            .checked_add(REPLICATION_COMPLETION_DELAY)
-            .unwrap_or(since);
+        let completes_at = replication_completes_at(configuration, table);
         Some(
             configuration
                 .rules

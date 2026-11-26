@@ -268,11 +268,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect(),
             version_token: version_token.clone(),
         };
-        let destinations: Vec<String> = stored
-            .rules
-            .iter()
-            .flat_map(|rule| rule.destinations.iter().cloned())
-            .collect();
         let resource = match store.table_by_arn_mut(&input.table_arn) {
             // The whole configuration is applied as ONE replacement, so a table
             // is never left carrying a mix of two callers' rules.
@@ -285,13 +280,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // between.
             None => return Err(not_found(crate::state::TABLE_NOT_FOUND_MESSAGE)),
         };
-        // Replicating a table means there is a table at the destination to
-        // replicate it to, which is why this operation takes permission to
-        // create a namespace and a table there (see this file's modeled
-        // contract above). It is provisioned here, by the write that starts the
-        // replication, so what `GetTableReplicationStatus` reports for a
-        // destination is a fact about a record the destination really holds.
-        store.provision_replicas(&resource, &destinations, now);
+        // Nothing is created at a destination here: this write configures
+        // replication and answers, while the copying that leaves a replica
+        // there is carried out afterwards, acting as the role the configuration
+        // names — so a destination takes its replica once the replication of
+        // the table's state to it is due and that role permits it
+        // (`ComAmazonawsS3tablesS3tablebucketsState::replicate_due`), and a
+        // configuration removed before then leaves every destination table
+        // bucket exactly as it was.
         // The lock covers the state change only; everything below is owned.
         drop(store);
 

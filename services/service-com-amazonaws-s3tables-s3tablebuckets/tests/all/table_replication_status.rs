@@ -8,9 +8,11 @@
 //! a put sets one on it, else the configuration of the table bucket holding it,
 //! whose rules cover that bucket's tables — in the order that configuration's
 //! rule holds them, and every member of an entry is derived from state and the
-//! clock: a destination is pending until it holds the replica of the table and
-//! the replication of the table's current state to it is due, completed once
-//! both hold — reporting the metadata document it replicated, the instant it
+//! clock: a destination is pending until the replication of the table's current
+//! state to it is due — the configuring put answers before anything has been
+//! copied anywhere, so a pending destination holds no replica at all — completed
+//! once that replication has been carried out, which is what leaves the replica
+//! there, reporting the metadata document it replicated, the instant it
 //! completed and the replica's own ARN — and failed when the store holds no
 //! such destination table bucket at all, stated with the sentence this service
 //! states that class with. A table nothing replicates has no destination to
@@ -29,14 +31,14 @@
 //! many destinations it names — one, several and the modelled maximum of five —
 //! how many of those destination buckets the store holds, and whether the table
 //! has a metadata file to replicate at all.
-//! `replication_to_a_destination_holding_the_replica_completes_and_the_read_reports_it`
+//! `replication_provisions_the_replica_and_the_read_reports_the_completion`
 //! is where the progression to completed is pinned, by polling for it.
 
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 
-use super::harness::{timestamp_seconds, Emulator, Reply, ACCOUNT};
+use super::harness::{listed_namespace_names, timestamp_seconds, Emulator, Reply, ACCOUNT};
 use super::wire_forms::create_table_request;
 
 /// The fixed sentence this service states a table nothing replicates with.
@@ -464,82 +466,95 @@ async fn every_destination_of_the_configuration_that_replicates_the_table_is_rep
                 );
                 continue;
             }
-            // A destination the store holds took the replica the put
-            // provisioned there, so the entry names it and nothing refuses it:
-            // the replication of the table's current state to it is pending
-            // until it is due, and a host slow enough for it to have become due
-            // in between reports it completed — never failed.
+            // Nothing refuses a destination the store holds: the replication of
+            // the table's current state to it is pending until it is due, and a
+            // host slow enough for it to have become due in between reports it
+            // completed — never failed.
             assert!(
                 entry.get("failureMessage").is_none(),
                 "case {label:?}: nothing refuses {destination}, so it must carry no \
                  failureMessage, got {entry}"
             );
-            let replica = entry
-                .get("destinationTableArn")
-                .and_then(Value::as_str)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "case {label:?}: {destination} holds the replica, so the entry must name \
-                         its table ARN, got {entry}"
-                    )
-                });
-            assert!(
-                replica.starts_with(&format!("{destination}/table/")),
-                "case {label:?}: expected the replica to stand under {destination}, got \
-                 {replica:?}"
-            );
-            // The ARN is one a read of that table answers for, rather than a
-            // claim about a table nothing holds.
-            let held = emulator.get_table_by_arn(case.region, replica).await;
-            assert_eq!(
-                held.status, 200,
-                "case {label:?}: the replica {replica} must resolve, got {status} {body}",
-                status = held.status,
-                body = held.body
-            );
             match actual.as_str() {
-                PENDING => assert!(
-                    entry.get("lastSuccessfulReplicatedUpdate").is_none(),
-                    "case {label:?}: no replication to {destination} has completed, so it must \
-                     report no update, got {entry}"
-                ),
-                COMPLETED => match entry.get("lastSuccessfulReplicatedUpdate") {
-                    // A table with no metadata file has no document to
-                    // replicate, so a completed destination of it reports no
-                    // update either.
-                    None => assert!(
-                        !case.metadata,
-                        "case {label:?}: the table carries metadata, so a completed destination \
-                         must report the update it replicated, got {entry}"
-                    ),
-                    Some(update) => {
-                        assert!(
-                            case.metadata,
-                            "case {label:?}: the table carries no metadata file, so no update \
-                             may be reported, got {entry}"
-                        );
-                        let replicated = update
-                            .get("metadataLocation")
-                            .and_then(Value::as_str)
-                            .unwrap_or_else(|| {
-                                panic!(
-                                    "case {label:?}: a reported update names the metadata it \
-                                     replicated, got {update}"
-                                )
-                            });
-                        assert!(
-                            replicated.starts_with("s3://"),
-                            "case {label:?}: expected the replicated metadata's S3 location, got \
-                             {replicated:?}"
-                        );
-                        let at = timestamp_seconds(update, "timestamp", label);
-                        assert!(
-                            at >= created_at && at <= super::harness::now_seconds(),
-                            "case {label:?}: expected the completion instant to fall between the \
-                             table's creation ({created_at}) and now, got {at}"
-                        );
+                PENDING => {
+                    // The configuration was written; nothing has been copied to
+                    // the destination yet, so it holds no replica for the entry
+                    // to name and reports no update.
+                    assert!(
+                        entry.get("destinationTableArn").is_none(),
+                        "case {label:?}: no replication to {destination} has completed, so it \
+                         holds no replica to name, got {entry}"
+                    );
+                    assert!(
+                        entry.get("lastSuccessfulReplicatedUpdate").is_none(),
+                        "case {label:?}: no replication to {destination} has completed, so it \
+                         must report no update, got {entry}"
+                    );
+                }
+                COMPLETED => {
+                    // A completed replication left the replica at the
+                    // destination, so the entry names it — and that ARN is one a
+                    // read of the table answers for, rather than a claim about a
+                    // table nothing holds.
+                    let replica = entry
+                        .get("destinationTableArn")
+                        .and_then(Value::as_str)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "case {label:?}: the replication to {destination} completed, so \
+                                 the entry must name the replica's table ARN, got {entry}"
+                            )
+                        });
+                    assert!(
+                        replica.starts_with(&format!("{destination}/table/")),
+                        "case {label:?}: expected the replica to stand under {destination}, got \
+                         {replica:?}"
+                    );
+                    let held = emulator.get_table_by_arn(case.region, replica).await;
+                    assert_eq!(
+                        held.status, 200,
+                        "case {label:?}: the replica {replica} must resolve, got {status} {body}",
+                        status = held.status,
+                        body = held.body
+                    );
+                    match entry.get("lastSuccessfulReplicatedUpdate") {
+                        // A table with no metadata file has no document to
+                        // replicate, so a completed destination of it reports no
+                        // update either.
+                        None => assert!(
+                            !case.metadata,
+                            "case {label:?}: the table carries metadata, so a completed \
+                             destination must report the update it replicated, got {entry}"
+                        ),
+                        Some(update) => {
+                            assert!(
+                                case.metadata,
+                                "case {label:?}: the table carries no metadata file, so no update \
+                                 may be reported, got {entry}"
+                            );
+                            let replicated = update
+                                .get("metadataLocation")
+                                .and_then(Value::as_str)
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "case {label:?}: a reported update names the metadata it \
+                                         replicated, got {update}"
+                                    )
+                                });
+                            assert!(
+                                replicated.starts_with("s3://"),
+                                "case {label:?}: expected the replicated metadata's S3 location, \
+                                 got {replicated:?}"
+                            );
+                            let at = timestamp_seconds(update, "timestamp", label);
+                            assert!(
+                                at >= created_at && at <= super::harness::now_seconds(),
+                                "case {label:?}: expected the completion instant to fall between \
+                                 the table's creation ({created_at}) and now, got {at}"
+                            );
+                        }
                     }
-                },
+                }
                 other => panic!(
                     "case {label:?}: expected {destination} to report {PENDING} (or the \
                      replication it completed), got {other:?} in {entry}"
@@ -562,8 +577,9 @@ async fn replication_provisions_the_replica_and_the_read_reports_the_completion(
         .as_secs_f64();
     let (source_bucket, table_arn) =
         create_table(&emulator, region, "repl-status-source", namespace, table, true).await;
-    // An EMPTY destination table bucket: the put is what gives it the namespace
-    // and the replica, which is the state a replication leaves behind there.
+    // An EMPTY destination table bucket: the replication is what gives it the
+    // namespace and the replica, which is the state a replication leaves behind
+    // there.
     let destinations =
         destination_buckets(&emulator, region, "repl-status-replica", 1, case).await;
     let destination_bucket = destinations[0].clone();
@@ -578,32 +594,15 @@ async fn replication_provisions_the_replica_and_the_read_reports_the_completion(
     )
     .await;
 
-    // The namespace the source table lives in now stands at the destination
-    // too, because that is where the replica has to go.
-    let namespaces = emulator
-        .list_namespaces(region, &destination_bucket, &[])
-        .await;
-    assert_eq!(
-        namespaces.status, 200,
-        "case {case:?}: the destination's namespace listing must be served, got {status} {body}",
-        status = namespaces.status,
-        body = namespaces.body
-    );
-    let listed: Vec<String> = namespaces
-        .list("namespaces")
-        .iter()
-        .filter_map(|row| {
-            row.get("namespace")
-                .and_then(Value::as_array)
-                .and_then(|names| names.first())
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .collect();
+    // The put configures the replication and answers; nothing has been copied
+    // to the destination yet, so the destination table bucket still holds
+    // nothing at all.
+    let before_any_replication =
+        listed_namespace_names(&emulator, region, &destination_bucket, case).await;
     assert!(
-        listed.contains(&namespace.to_string()),
-        "case {case:?}: expected the replicated namespace {namespace:?} at the destination, got \
-         {listed:?}"
+        before_any_replication.is_empty(),
+        "case {case:?}: nothing has been replicated yet, so the destination must hold no \
+         namespace, got {before_any_replication:?}"
     );
 
     // Poll for the CONDITION — the replication having completed — rather than
@@ -637,6 +636,15 @@ async fn replication_provisions_the_replica_and_the_read_reports_the_completion(
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     };
+
+    // The namespace the source table lives in stands at the destination now,
+    // because that is where the replication put the replica.
+    let listed = listed_namespace_names(&emulator, region, &destination_bucket, case).await;
+    assert!(
+        listed.contains(&namespace.to_string()),
+        "case {case:?}: expected the replicated namespace {namespace:?} at the destination, got \
+         {listed:?}"
+    );
 
     // A completed destination names the replica it holds, under the source
     // table's own name — and that ARN is one a read of the table answers for
