@@ -225,32 +225,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "You can use a single key for up to 5 domains" (this operation's own doc),
-        // so a request naming more domains than one key can be used for is refused
-        // rather than stored: the key it asks for could not serve all of them.
+        // so a request naming more domains than one key can be used for has hit a
+        // QUOTA: the key it asks for could not serve all of them, and what corrects
+        // the request is raising the limit or splitting the key rather than rewriting
+        // a domain, so WAF answers the modelled limits exception naming the quota —
+        // not the parameter-format refusal a malformed domain draws above.
         if input.token_domains.len() > crate::state::MAX_TOKEN_DOMAINS_PER_API_KEY {
-            // The first domain past the bound — the value at fault, and a bounded
-            // echo: `TokenDomain` caps one domain's length, where the whole list's
-            // is caller-chosen. The branch is only reached with more domains than
-            // the bound, so the element is there.
-            let offending = input
-                .token_domains
-                .get(crate::state::MAX_TOKEN_DOMAINS_PER_API_KEY)
-                .map_or_else(String::new, String::clone);
             crate::state::audit(
                 Self::NAME,
                 &input.scope,
                 "",
                 "",
-                "WAFInvalidParameterException",
+                "WAFLimitsExceededException",
             );
-            return Err(CreateAPIKeyErrorModeled::WAFInvalidParameterException(
-                crate::state::invalid_parameter_exception(
-                    crate::state::FIELD_TOKEN_DOMAIN,
-                    &offending,
-                    &format!(
-                        "a single API key can be used for up to {} token domains",
-                        crate::state::MAX_TOKEN_DOMAINS_PER_API_KEY
-                    ),
+            return Err(CreateAPIKeyErrorModeled::WAFLimitsExceededException(
+                crate::state::named_limit_exceeded_exception(
+                    crate::state::NUM_TOKEN_DOMAINS_IN_API_KEY_QUOTA,
                 ),
             )
             .into());

@@ -109,9 +109,9 @@ fn definitions() -> Vec<Definition> {
             domains: vec!["one.example.com".to_string(), "two.example.com".to_string()],
         },
         Definition {
-            case: "the punctuation the domain pattern permits".to_string(),
+            case: "the punctuation a domain name may carry".to_string(),
             scope: SCOPE_REGIONAL,
-            domains: vec!["a_b-c.example.com/path".to_string()],
+            domains: vec!["a_b-c.example.com".to_string()],
         },
         Definition {
             case: "the documented maximum of five domains".to_string(),

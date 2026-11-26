@@ -167,13 +167,13 @@ fn key_cases() -> Vec<KeyCase> {
             token_domains: vec!["zeta.example.com".to_string(), "alpha.example.com".to_string()],
         },
         KeyCase {
-            case: "three domains, with the punctuation the pattern allows",
+            case: "three domains, with the punctuation a name may carry",
             scope: SCOPE_REGIONAL,
             api_key: "regional+three/domains=".to_string(),
             token_domains: vec![
                 "sub_domain.example.com".to_string(),
                 "hyphen-ated.example.com".to_string(),
-                "path/segment".to_string(),
+                "digits0123.example.com".to_string(),
             ],
         },
         KeyCase {

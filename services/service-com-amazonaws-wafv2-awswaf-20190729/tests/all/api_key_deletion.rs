@@ -104,16 +104,16 @@ async fn delete(waf: &Waf, scope: &str, api_key: &str, case: &str) {
 }
 
 /// A token list spanning what a definition can be: one domain, the documented
-/// maximum of them, and the punctuation `TokenDomain`'s pattern allows.
+/// maximum of them, and the punctuation a domain name may carry.
 fn domain_sets() -> Vec<(&'static str, Vec<String>)> {
     vec![
         ("one domain", vec!["example.com".to_string()]),
         (
-            "the punctuation the pattern allows",
+            "the punctuation a name may carry",
             vec![
                 "sub_domain.example.com".to_string(),
                 "hyphen-ated.example.com".to_string(),
-                "path/segment".to_string(),
+                "digits0123.example.com".to_string(),
             ],
         ),
         (

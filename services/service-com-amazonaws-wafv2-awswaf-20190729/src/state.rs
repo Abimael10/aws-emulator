@@ -239,6 +239,36 @@ pub fn limits_exceeded_exception() -> WAFLimitsExceededException {
     }
 }
 
+/// The sentence `WAFLimitsExceededException` carries when the quota the request
+/// exceeded is one WAF NAMES, as the recorded WAF responses word it: the
+/// resource-limit sentence, ending in the quota's own token and nothing else.
+///
+/// The generic form ([`LIMITS_EXCEEDED_MESSAGE`]) states the class and illustrates
+/// it; this one states WHICH quota was hit, and the token is the only variable part
+/// — no name, id or value from the request appears, because the quota is a property
+/// of the account's limits rather than of the call (see the note above
+/// [`DUPLICATE_ITEM_MESSAGE`]).
+pub fn named_limit_exceeded_message(quota: &str) -> String {
+    format!(
+        "AWS WAF couldn’t perform the operation because you exceeded your resource \
+         limit {quota}"
+    )
+}
+
+/// `WAFLimitsExceededException` as WAF returns it for a quota it names:
+/// [`named_limit_exceeded_message`] and no `SourceType`.
+///
+/// This is the LIMIT refusal and not [`invalid_parameter_exception`]: a request that
+/// asks for more of something than the account's quota allows is corrected by
+/// raising the quota or splitting the request, not by rewriting the member, so it
+/// carries no `Field` or `Parameter` naming one.
+pub fn named_limit_exceeded_exception(quota: &str) -> WAFLimitsExceededException {
+    WAFLimitsExceededException {
+        message: Some(named_limit_exceeded_message(quota)),
+        source_type: None,
+    }
+}
+
 /// The sentence `WAFFeatureNotIncludedInPricingPlanException` carries: the shape's
 /// own documented sentence
 /// (`smithy_query(query="shape",shape="WAFFeatureNotIncludedInPricingPlanException")`).
@@ -2469,6 +2499,14 @@ pub const MAX_API_KEYS_PER_SCOPE: usize = 10;
 /// for all of them.
 pub const MAX_TOKEN_DOMAINS_PER_API_KEY: usize = 5;
 
+/// The token WAF names [`MAX_TOKEN_DOMAINS_PER_API_KEY`] by in its resource-limit
+/// sentence, as the recorded refusal of that quota carries it.
+///
+/// WAF names the quota a request hit rather than describing it, so a client reads
+/// WHICH limit to raise or split from the message
+/// ([`named_limit_exceeded_message`]).
+pub const NUM_TOKEN_DOMAINS_IN_API_KEY_QUOTA: &str = "NUM_TOKEN_DOMAINS_IN_API_KEY";
+
 /// The most addresses one IP set holds: WAF's published quota is 10,000 IP
 /// addresses or ranges per IP set. It bounds how large a single stored entry can
 /// be, beside the serve path's own 16 MiB request-body cap.
@@ -3364,57 +3402,6 @@ pub fn label_namespace(kind: &str, name: &str) -> String {
         "awswaf:{}:{kind}:{name}:",
         ::engine::emulator_account_id()
     )
-}
-
-/// Check one `Addresses` entry against the set's declared `IPAddressVersion`.
-///
-/// `IPSet$Addresses` documents the rule: "All addresses must be specified using
-/// Classless Inter-Domain Routing (CIDR) notation. WAF supports all IPv4 and IPv6
-/// CIDR ranges except for `/0`", and `IPAddressVersion` fixes which family the
-/// entries belong to. `Err` carries the reason, for the refusal's message.
-///
-/// What the doc does NOT say is anything about the host bits below the prefix
-/// length, so `10.0.0.1/8` is deliberately accepted and stored verbatim: the
-/// documented rule is the notation, the family and the `/0` exclusion, and this
-/// check goes no further than the rule it can cite.
-pub fn validate_cidr(address: &str, ip_address_version: &str) -> Result<(), String> {
-    let Some((literal, prefix)) = address.split_once('/') else {
-        return Err(format!(
-            "{address:?} is not in CIDR notation; expected <address>/<prefix length>"
-        ));
-    };
-    if prefix.is_empty() || !prefix.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(format!("{address:?} has a non-numeric CIDR prefix length"));
-    }
-    let Ok(prefix_len) = prefix.parse::<u32>() else {
-        return Err(format!("{address:?} has an out-of-range CIDR prefix length"));
-    };
-    // `/0` is the one range WAF documents as unsupported, for either family.
-    let (parsed, max_prefix) = match ip_address_version {
-        "IPV4" => (
-            literal.parse::<::std::net::Ipv4Addr>().is_ok(),
-            32_u32,
-        ),
-        "IPV6" => (
-            literal.parse::<::std::net::Ipv6Addr>().is_ok(),
-            128_u32,
-        ),
-        other => {
-            return Err(format!("{other:?} is not a known IPAddressVersion"));
-        }
-    };
-    if !parsed {
-        return Err(format!(
-            "{address:?} is not an {ip_address_version} address in CIDR notation"
-        ));
-    }
-    if prefix_len == 0 || prefix_len > max_prefix {
-        return Err(format!(
-            "{address:?} has prefix length /{prefix_len}; {ip_address_version} \
-             CIDR ranges must be between /1 and /{max_prefix}"
-        ));
-    }
-    Ok(())
 }
 
 /// The `Description` a WAFv2 entity reports when the save that created it supplied

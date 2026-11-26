@@ -20,6 +20,83 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// The longest prefix an IPv4 CIDR block can carry: the width of an IPv4 address in
+/// bits. `IPSet$Addresses` supports "all IPv4 and IPv6 CIDR ranges except for `/0`",
+/// so a block's prefix length runs from `/1` to the width of its family.
+const IPV4_MAX_PREFIX_LEN: u32 = 32;
+
+/// The longest prefix an IPv6 CIDR block can carry. See [`IPV4_MAX_PREFIX_LEN`].
+const IPV6_MAX_PREFIX_LEN: u32 = 128;
+
+/// Whether one `Addresses` entry is a CIDR block of the family the set declares.
+///
+/// `IPSet$Addresses` documents the rule: "All addresses must be specified using
+/// Classless Inter-Domain Routing (CIDR) notation. WAF supports all IPv4 and IPv6
+/// CIDR ranges except for `/0`", and `IPAddressVersion` fixes which family the
+/// entries belong to.
+///
+/// What the doc does NOT say is anything about the host bits below the prefix
+/// length, so `10.0.0.1/8` is deliberately accepted and stored verbatim: the
+/// documented rule is the notation, the family and the `/0` exclusion, and this
+/// check goes no further than the rule it can cite.
+pub fn is_cidr_block(address: &str, ip_address_version: &str) -> bool {
+    let Some((literal, prefix)) = address.split_once('/') else {
+        return false;
+    };
+    if prefix.is_empty() || !prefix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(prefix_len) = prefix.parse::<u32>() else {
+        return false;
+    };
+    let (parsed, max_prefix) = match ip_address_version {
+        "IPV4" => (
+            literal.parse::<::std::net::Ipv4Addr>().is_ok(),
+            IPV4_MAX_PREFIX_LEN,
+        ),
+        "IPV6" => (
+            literal.parse::<::std::net::Ipv6Addr>().is_ok(),
+            IPV6_MAX_PREFIX_LEN,
+        ),
+        // A family this service does not know names no notation to judge the entry
+        // against, so no entry is a block of it.
+        _ => return false,
+    };
+    // `/0` is the one range WAF documents as unsupported, for either family.
+    parsed && (1..=max_prefix).contains(&prefix_len)
+}
+
+/// The first entry of `addresses` WAF will not accept for a set declaring
+/// `ip_address_version`, or `None` when every one of them is a CIDR block of that
+/// family.
+///
+/// One reading for every operation that saves an IP set's membership
+/// ([`is_cidr_block`]), so a create and an update cannot disagree about which
+/// entries a set may hold.
+pub fn refused_ip_set_address<'addresses>(
+    addresses: &'addresses [String],
+    ip_address_version: &str,
+) -> Option<&'addresses str> {
+    addresses
+        .iter()
+        .map(String::as_str)
+        .find(|address| !is_cidr_block(address, ip_address_version))
+}
+
+/// [`invalid_parameter_exception`] for an `Addresses` entry WAF will not accept:
+/// `Field` [`FIELD_IP_ADDRESS`] (the settings the address was written in),
+/// `Parameter` the entry as the request wrote it and `Reason`
+/// [`FORMAT_NOT_VALID_REASON`].
+///
+/// ONE sentence for the whole class — text that is no CIDR block at all, a prefix
+/// length outside the family's range, and a well-formed block of the OTHER family
+/// alike — because that is what WAF answers for all of them: the `Parameter` member
+/// carries the rejected entry, so the reason does not have to distinguish them, and
+/// the refusal discloses nothing per entry beyond the value the request sent.
+pub fn invalid_ip_address_exception(address: &str) -> WAFInvalidParameterException {
+    invalid_parameter_exception(FIELD_IP_ADDRESS, address, FORMAT_NOT_VALID_REASON)
+}
+
 /// The smallest table the set's entries are laid out in, in buckets: the floor a
 /// hash table keeps even for a membership far below it.
 const ADDRESS_TABLE_MIN_BUCKETS: usize = 16;
@@ -44,7 +121,7 @@ const ADDRESS_HASH_MULTIPLIER: i32 = 31;
 ///    stored fully expanded, zero-padded and lowercase, with the prefix length it
 ///    was given. An IPv4 address has a single notation, so an `IPV4` entry is
 ///    stored exactly as submitted. An entry this does not recognize as an address
-///    of the family (which [`validate_cidr`] refuses on ingress) is kept verbatim
+///    of the family (which [`is_cidr_block`] refuses on ingress) is kept verbatim
 ///    rather than silently changed.
 /// 2. The entries are laid out as the SET they are: a value that appears twice is
 ///    one entry, and the list is ordered by [`address_set_order`] — the set's own

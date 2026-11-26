@@ -29,6 +29,12 @@ hex = { workspace = true }
 # crate rather than a hand-written matcher: its automaton does not backtrack, so a
 # caller-stored pattern cannot blow up the time one request's evaluation takes.
 regex = "1.13"
+# The AST of a caller-supplied expression, for the ONE construct that has to be read
+# off the written form rather than off whether the matcher compiles it: a possessive
+# quantifier, which the matcher above reads as an ordinary nested repetition
+# (`state::patterns`). The parser the matcher itself parses with, so one expression has
+# one reading.
+regex-syntax = "0.8"
 # CIDR containment for an `IPSet`'s `Addresses`, the same version the sibling
 # elasticloadbalancingv2/ses services declare it at: one parse of a CIDR range and one
 # definition of which addresses it holds.

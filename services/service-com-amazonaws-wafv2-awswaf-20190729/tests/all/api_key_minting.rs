@@ -27,8 +27,9 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_wafv2_awswaf_20190729::state::{
-    is_api_key_shaped, API_KEY_ENVELOPE_LEN, MAX_API_KEYS_PER_SCOPE, MAX_TOKEN_DOMAINS_PER_API_KEY,
-    SCOPE_CLOUDFRONT, SCOPE_REGIONAL,
+    is_api_key_shaped, named_limit_exceeded_message, API_KEY_ENVELOPE_LEN, MAX_API_KEYS_PER_SCOPE,
+    MAX_TOKEN_DOMAINS_PER_API_KEY, NUM_TOKEN_DOMAINS_IN_API_KEY_QUOTA, SCOPE_CLOUDFRONT,
+    SCOPE_REGIONAL,
 };
 
 use crate::web_acl_lifecycle::Waf;
@@ -192,12 +193,12 @@ fn mint_cases() -> Vec<MintCase> {
             ],
         },
         MintCase {
-            case: "the punctuation TokenDomain's pattern allows",
+            case: "the punctuation a token domain's name may carry",
             scope: SCOPE_REGIONAL,
             token_domains: vec![
                 "sub_domain.example.com".to_string(),
                 "hyphen-ated.example.com".to_string(),
-                "path/segment".to_string(),
+                "digits0123.example.com".to_string(),
             ],
         },
         MintCase {
@@ -353,8 +354,11 @@ async fn every_mint_for_one_definition_answers_the_same_key() {
 }
 
 /// A request naming more token domains than one key can be used for is refused —
-/// with WAF's own invalid-parameter refusal naming the token domain — and stores
-/// nothing; the documented maximum itself is honoured.
+/// with the QUOTA refusal naming the limit it hit — and stores nothing; the
+/// documented maximum itself is honoured.
+///
+/// What that refusal says, and how it differs from the per-domain format refusal, is
+/// spanned by `crate::api_key_token_domain_quota`.
 #[tokio::test]
 async fn a_mint_refuses_more_domains_than_one_key_can_serve() {
     let waf = Waf::new();
@@ -390,18 +394,14 @@ async fn a_mint_refuses_more_domains_than_one_key_can_serve() {
             .refused(
                 CREATE,
                 json!({ "Scope": SCOPE_REGIONAL, "TokenDomains": wanted.clone() }),
-                "WAFInvalidParameterException",
+                "WAFLimitsExceededException",
                 &case,
             )
             .await;
         assert_eq!(
-            (body["Field"].as_str(), body["Parameter"].as_str()),
-            (
-                Some("TOKEN_DOMAIN"),
-                wanted.get(MAX_TOKEN_DOMAINS_PER_API_KEY).map(String::as_str)
-            ),
-            "case {case:?}: the refusal must name the token domain as the field at \
-             fault and the first domain past the bound as the parameter, got {body}"
+            crate::parameter_validation::error_message(&body),
+            named_limit_exceeded_message(NUM_TOKEN_DOMAINS_IN_API_KEY_QUOTA),
+            "case {case:?}: the refusal must name the quota that was hit, got {body}"
         );
         assert!(
             body["APIKey"].is_null(),

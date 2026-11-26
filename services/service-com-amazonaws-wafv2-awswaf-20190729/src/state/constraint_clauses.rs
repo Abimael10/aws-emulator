@@ -10,10 +10,13 @@
 //! the framework leaves open and WAF makes differently:
 //!
 //! * a member that breaks both its `@pattern` and a `@length` bound has its PATTERN
-//!   clause stated first, and
+//!   clause stated first,
 //! * a `@pattern` is reported as the FULL-MATCH expression equivalent to the Smithy
 //!   partial match, so an unanchored pattern is reported wrapped in `.*`
-//!   ([`full_match_pattern`]).
+//!   ([`full_match_pattern`]), and
+//! * an enumerated member's value set is listed in the order the SERVICE declares
+//!   that enum in, which is not always the order the model declares it in
+//!   ([`STATED_ENUM_VALUE_ORDER`]).
 //!
 //! Both are reached from the one reporter this service words a constraint failure
 //! through ([`constraint_envelope`]) — the boundary walk's refusal goes through it from
@@ -44,6 +47,28 @@ pub fn full_match_pattern(pattern: &str) -> String {
     }
     stated
 }
+
+/// The order WAF's request validator STATES an enum's value set in, for the enums
+/// whose stated order is not the order the model declares them in.
+///
+/// Each entry is one enum's whole value set, written in the order WAF lists it; a
+/// violation about a member whose value set is that same set is stated in this
+/// order, and every other enum keeps the model's declared order — which is what the
+/// recorded messages show for them (`Scope`, declared `CLOUDFRONT, REGIONAL`, is
+/// listed `[CLOUDFRONT, REGIONAL]`).
+///
+/// Recorded behaviour is the only source for a stated order that differs: WAF lists
+/// the oversize-handling set as the two inspection DECISIONS first and the value
+/// that keeps inspecting last, while the model declares `CONTINUE` first
+/// (`smithy_query(query="shape",shape="OversizeHandling")` → `CONTINUE, MATCH,
+/// NO_MATCH`) — the order its sibling decision enums are declared in
+/// (`smithy_query(query="shape",shape="FallbackBehavior,BodyParsingFallbackBehavior")`
+/// → `MATCH, NO_MATCH` and `MATCH, NO_MATCH, EVALUATE_AS_STRING`).
+///
+/// Keyed by the value SET rather than by the member the violation was found on: an
+/// enum is identified by its own values, so every member and every operation that
+/// takes the same enum states it the same way.
+const STATED_ENUM_VALUE_ORDER: &[&[&str]] = &[&["MATCH", "NO_MATCH", "CONTINUE"]];
 
 /// The envelope this service answers for `violations`, in WAF's clause order and with
 /// every `@pattern` stated as [`full_match_pattern`] does.
@@ -85,14 +110,34 @@ fn stated_clauses(violations: &[Violation]) -> Vec<Violation> {
 }
 
 /// One violation as WAF states it: a `@pattern` failure reports the full-match
-/// expression, and every other kind is the framework's unchanged.
+/// expression, an enum failure lists its value set in WAF's own order, and every
+/// other kind is the framework's unchanged.
 fn as_stated(violation: &Violation) -> Violation {
     match &violation.kind {
         ViolationKind::Pattern(pattern) => Violation {
             kind: ViolationKind::Pattern(full_match_pattern(pattern)),
             ..violation.clone()
         },
+        ViolationKind::EnumValue(allowed) => Violation {
+            kind: ViolationKind::EnumValue(stated_enum_values(allowed)),
+            ..violation.clone()
+        },
         _ => violation.clone(),
+    }
+}
+
+/// `allowed` in the order WAF lists that enum's values: the stated order the set has
+/// one of ([`STATED_ENUM_VALUE_ORDER`]), or the model's own order when it has none.
+fn stated_enum_values(allowed: &[String]) -> Vec<String> {
+    let stated = STATED_ENUM_VALUE_ORDER.iter().find(|order| {
+        order.len() == allowed.len()
+            && order
+                .iter()
+                .all(|value| allowed.iter().any(|declared| declared == value))
+    });
+    match stated {
+        Some(order) => order.iter().map(|value| (*value).to_string()).collect(),
+        None => allowed.to_vec(),
     }
 }
 

@@ -287,17 +287,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // every submitted address is checked against the family the STORED set
         // declares, by the same documented rule `CreateIPSet` applies.
         let ip_address_version = entry.ip_set.ip_address_version.clone();
-        for address in &input.addresses {
-            if let Err(reason) = crate::state::validate_cidr(address, &ip_address_version) {
-                return Err(UpdateIPSetErrorModeled::WAFInvalidParameterException(
-                    crate::state::invalid_parameter_exception(
-                        crate::state::FIELD_IP_ADDRESS,
-                        address,
-                        &reason,
-                    ),
-                )
-                .into());
-            }
+        if let Some(address) =
+            crate::state::refused_ip_set_address(&input.addresses, &ip_address_version)
+        {
+            return Err(UpdateIPSetErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_ip_address_exception(address),
+            )
+            .into());
         }
 
         // The checks above hold an immutable borrow, so the entry is resolved again —

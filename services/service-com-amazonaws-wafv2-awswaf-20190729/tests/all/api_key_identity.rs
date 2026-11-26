@@ -131,10 +131,18 @@ fn domain_sets() -> Vec<DomainSet> {
             ],
         },
         DomainSet {
-            case: "the punctuation TokenDomain's pattern allows",
+            case: "the punctuation a token domain's name may carry",
             orders: vec![
-                vec!["sub_domain.example.com", "path/segment", "hyphen-ated.example.com"],
-                vec!["path/segment", "hyphen-ated.example.com", "sub_domain.example.com"],
+                vec![
+                    "sub_domain.example.com",
+                    "digits0123.example.com",
+                    "hyphen-ated.example.com",
+                ],
+                vec![
+                    "digits0123.example.com",
+                    "hyphen-ated.example.com",
+                    "sub_domain.example.com",
+                ],
             ],
         },
         DomainSet {

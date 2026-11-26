@@ -212,19 +212,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Every entry must be a CIDR block of the declared address family; see
-        // `crate::state::validate_cidr` for the documented rule.
-        for address in &input.addresses {
-            if let Err(reason) = crate::state::validate_cidr(address, &input.ip_address_version) {
-                return Err(CreateIPSetErrorModeled::WAFInvalidParameterException(
-                    crate::state::invalid_parameter_exception(
-                        crate::state::FIELD_IP_ADDRESS,
-                        address,
-                        &reason,
-                    ),
-                )
-                .into());
-            }
+        // Every entry must be a CIDR block of the declared address family, and an
+        // entry that is not is refused with the ONE sentence WAF answers for the
+        // whole class, naming the entry (`crate::state::refused_ip_set_address` for
+        // the documented rule).
+        if let Some(address) = crate::state::refused_ip_set_address(
+            &input.addresses,
+            &input.ip_address_version,
+        ) {
+            return Err(CreateIPSetErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_ip_address_exception(address),
+            )
+            .into());
         }
 
         // A tag key under the prefix AWS reserves for its own system tags is refused
