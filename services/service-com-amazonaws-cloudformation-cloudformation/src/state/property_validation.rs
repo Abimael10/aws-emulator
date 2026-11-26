@@ -55,7 +55,13 @@
 //!   outside it, over the rows this emulator holds
 //!   ([`patterned_properties::PATTERNED_PROPERTIES`]), which is the
 //!   `Property value [<value>] does not match pattern: <pattern>` the stage reports
-//!   ([`patterned_properties::pattern_failure_reason`]).
+//!   ([`patterned_properties::pattern_failure_reason`]);
+//! * a property whose type's REGISTRY SCHEMA states the closed RANGE its numbers lie in,
+//!   carrying a number outside it, over the rows this emulator holds
+//!   ([`ranged_properties::RANGED_PROPERTIES`]), which is the schema validator's own
+//!   `#/<member>: <value> is not less or equal to <maximum>`
+//!   ([`ranged_properties::maximum_failure_reason`]) and its counterpart for the other end of
+//!   the range ([`ranged_properties::minimum_failure_reason`]).
 //!
 //! A resource is judged in that order, because a property that is not there has no value to
 //! hold to a set, a member the type does not have has no set to hold one to and a value of the
@@ -64,8 +70,8 @@
 //! operation would have run into first.
 //!
 //! How much of a JUDGED VALUE a failure says is one rule for the whole stage
-//! ([`reported_value`]): the two questions whose answer names the value — the set its property
-//! publishes and the spelling it admits — report the declaration's own value for a type whose
+//! ([`reported_value`]): the questions whose answer names the value — the set its property
+//! publishes, the spelling it admits and the range its numbers lie in — report the declaration's own value for a type whose
 //! property document is the template's own text, and report it redacted for a type that carries
 //! credentials among its properties ([`CREDENTIAL_PROPERTIES`]), whose document carries
 //! material the template does not state in the clear.
@@ -142,6 +148,10 @@ pub mod structured_properties;
 /// every element is held to the set.
 pub mod enum_properties;
 
+/// The closed RANGE a type's schema states for a property's number, and the sentence that
+/// schema's own validator reports a number outside it with.
+pub mod ranged_properties;
+
 /// One resource type that carries CREDENTIALS among its properties: the members a declaration
 /// supplies and no read of the owning service ever answers, because that service's own model
 /// marks them `@sensitive`.
@@ -184,9 +194,10 @@ pub const REDACTED_VALUE: &str = "<REDACTED>";
 /// judged value itself, or [`REDACTED_VALUE`] for a type whose properties carry credentials
 /// ([`CREDENTIAL_PROPERTIES`]).
 ///
-/// The ONE spelling of that rule for this stage, so the two questions whose answer quotes a
-/// value — the set a property publishes ([`enum_properties`]) and the spelling it admits
-/// ([`patterned_properties`]) — cannot disagree about which values may be said out loud.
+/// The ONE spelling of that rule for this stage, so the questions whose answer quotes a
+/// value — the set a property publishes ([`enum_properties`]), the spelling it admits
+/// ([`patterned_properties`]) and the range its numbers lie in ([`ranged_properties`]) —
+/// cannot disagree about which values may be said out loud.
 pub fn reported_value<'a>(resource_type: &str, judged: &'a str) -> &'a str {
     if carries_credentials(resource_type) {
         return REDACTED_VALUE;
@@ -546,8 +557,11 @@ pub fn member_path(logical_id: &str, property: &[&str]) -> String {
 /// ([`typed_properties`]), then the set it publishes (the one this emulator knows from the
 /// type's property reference, [`CONSTRAINED_PROPERTIES`], and the one its registry schema
 /// states as an `enum`, [`enum_properties`]), and then the pattern it admits
-/// ([`patterned_properties`]), since a value of another type is no value of a published set
-/// and a value outside such a set is not one of its values whatever it is spelled like.
+/// ([`patterned_properties`]) and the numeric range it admits ([`ranged_properties`]), since a
+/// value of another type is no value of a published set and a value outside such a set is not
+/// one of its values whatever it is spelled like — while the spelling a text is held to and the
+/// bound a number is held to are questions about values of two different types, so neither can
+/// stand in for the other.
 pub fn failure(declared: &[StoredResource]) -> Option<PropertyFailure> {
     declared.iter().find_map(|resource| {
         missing_required_property(resource)
@@ -558,6 +572,7 @@ pub fn failure(declared: &[StoredResource]) -> Option<PropertyFailure> {
             .or_else(|| inadmissible_value(resource))
             .or_else(|| enum_properties::value_outside_its_enum(resource))
             .or_else(|| patterned_properties::value_outside_its_pattern(resource))
+            .or_else(|| ranged_properties::value_outside_its_range(resource))
     })
 }
 
