@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCertificateAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCertificateAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCertificateAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +153,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCertificateAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCertificateAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCertificateAssociations"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListCertificateAssociationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the rtbfabric emulator has no state store for this request"
+                        .to_string(),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+        // Reporting only: the sole write is the status transition the clock had
+        // already made due at this instant, owed whether or not anybody listed.
+        store.settle_all(now);
+
+        // The listing is addressed to one responder gateway, exactly as the
+        // single-association reader is, so an id this store holds no responder
+        // gateway for is the not-found every other read of this service answers
+        // with — not an empty page, which would claim the gateway exists and
+        // carries no certificate.
+        if !store.responder_gateways.contains_key(&input.gateway_id) {
+            return Err(
+                ListCertificateAssociationsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // This listing is addressed to one gateway, so it walks only that gateway's
+        // associations: the gateway identifies the walk beside the operation name,
+        // and a cursor into one gateway's enumeration is not an index into
+        // another's. A token any other walk issued is therefore refused rather than
+        // resumed from.
+        let walk = crate::state::Walk::within(Self::NAME, &[input.gateway_id.as_str()]);
+        // Taken off the store before the records this call reports are borrowed:
+        // `PageTokenKey` is `Copy`, so the key travels by value.
+        let token_key = store.page_tokens;
+
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(
+                crate::state::decode_next_token(&token_key, &walk, token, now).map_err(
+                    |refusal| {
+                        crate::state::token_refusal(&refusal, Self::NAME, |message| {
+                            ListCertificateAssociationsErrorModeled::ValidationException(
+                                ValidationException { message },
+                            )
+                        })
+                    },
+                )?,
+            ),
+            None => None,
+        };
+
+        // `maxResults` is modelled `range(min: 1, max: 10)` with a default of 5, and
+        // the boundary validator refuses anything outside that window before this
+        // handler runs. An in-process caller can still hand over a value the wire
+        // never carries, so the shared page walk is handed the modelled maximum as
+        // the cap it clamps to.
+        let page_size =
+            crate::state::page_size(Some(input.max_results), Some(crate::state::MAX_PAGE_SIZE));
+
+        // Ordered by `acmCertificateArn`, which is what this listing pages by: one
+        // gateway carries one record per certificate, so that order is total over
+        // this gateway's associations and a page boundary is stable across calls.
+        let mut mine: Vec<&crate::state::CertificateAssociation> = store
+            .certificate_associations
+            .values()
+            .filter(|association| association.gateway_id == input.gateway_id)
+            .collect();
+        mine.sort_unstable_by(|left, right| {
+            left.acm_certificate_arn.cmp(&right.acm_certificate_arn)
+        });
+
+        // Where the cursor resumes, where the page ends and whether a token is
+        // handed out is this service's one page walk, shared with every other
+        // listing of it.
+        let (reported, next_token) = crate::state::page_of(
+            &token_key,
+            &walk,
+            &mine,
+            |association: &&crate::state::CertificateAssociation| {
+                association.acm_certificate_arn.as_str()
+            },
+            resume_after.as_deref(),
+            page_size,
+            now,
+        );
+        let page: Vec<CertificateAssociationSummary> =
+            reported.iter().copied().map(summarised).collect();
+
+        Ok(ListCertificateAssociationsOutput {
+            certificate_associations: page,
+            next_token,
+        })
+    }
+}
+
+/// One stored association as the listing summarises it.
+///
+/// Every member is read back out of the record, exactly as
+/// `GetCertificateAssociation` reads it, so a listed entry and that association's
+/// own reading report one resource rather than two renderings of it. The modelled
+/// `CertificateAssociationSummary` declares no `gatewayId` — the request states it
+/// (`smithy_query(query="shape", shape="CertificateAssociationSummary")`).
+fn summarised(
+    association: &crate::state::CertificateAssociation,
+) -> CertificateAssociationSummary {
+    CertificateAssociationSummary {
+        acm_certificate_arn: association.acm_certificate_arn.clone(),
+        status: association.status.clone(),
+        associated_at: Some(crate::state::timestamp(association.associated_at)),
+        updated_at: Some(crate::state::timestamp(association.updated_at)),
     }
 }

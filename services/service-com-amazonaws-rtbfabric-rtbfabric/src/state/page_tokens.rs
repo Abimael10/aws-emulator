@@ -42,12 +42,12 @@ const SCOPE_SEPARATOR: char = '\u{1e}';
 /// the authenticator ahead of the bytes it signs, the scope (the operation name, at most
 /// 64 characters, and the ids the walk is scoped to with their separators — at most a
 /// `GatewayId` of 32 and a `LinkId` of 30, which is what `ListLinkRoutingRules` is
-/// addressed by), the cursor (a `GatewayId` is at most 32, the longest id any listing
-/// pages by), the instant in whole seconds (at most 20 digits) and the two separators.
-/// The model bounds `nextToken`'s length nowhere, so this is what bounds the work a
-/// caller's token can cost: anything longer is refused before it is decoded.
+/// addressed by), the cursor (an `AcmCertificateArn` is at most 256, the longest value
+/// any listing pages by), the instant in whole seconds (at most 20 digits) and the two
+/// separators. The model bounds `nextToken`'s length nowhere, so this is what bounds the
+/// work a caller's token can cost: anything longer is refused before it is decoded.
 pub const MAX_TOKEN_LENGTH: usize = 2
-    * (::service_common::page_tokens::AUTHENTICATOR_BYTES + 64 + (32 + 30 + 2) + 32 + 20 + 2);
+    * (::service_common::page_tokens::AUTHENTICATOR_BYTES + 64 + (32 + 30 + 2) + 256 + 20 + 2);
 
 /// Which walk a `nextToken` belongs to, as it travels inside the token.
 ///
