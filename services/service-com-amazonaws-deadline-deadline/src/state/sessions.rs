@@ -242,6 +242,16 @@ pub struct Session {
     pub step_id: Option<String>,
 }
 
+/// Where this service's agent writes the logs of the sessions a queue's jobs run in: one log
+/// group per queue.
+///
+/// Computed from the ids of the farm and the queue, and nothing else — every reader of a
+/// session's log destination derives it here, so a session's `logConfiguration` and the
+/// `logGroupName` a worker is told to write its job's logs to are the same group.
+pub fn session_log_group_name(farm_id: &str, queue_id: &str) -> String {
+    format!("/aws/deadline/{farm_id}/{queue_id}")
+}
+
 impl Session {
     /// A fresh session of `worker_id` on `job_id`, holding no action yet.
     pub fn new(
@@ -334,7 +344,7 @@ impl Session {
                 [
                     (
                         "logGroupName".to_string(),
-                        format!("/aws/deadline/{}/{}", self.farm_id, self.queue_id),
+                        session_log_group_name(&self.farm_id, &self.queue_id),
                     ),
                     ("logStreamName".to_string(), self.session_id.clone()),
                 ]

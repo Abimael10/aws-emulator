@@ -43,6 +43,10 @@ pub use sessions::*;
 mod scheduling;
 pub use scheduling::*;
 
+/// The job entities a worker reads while it runs the work it was assigned.
+mod job_entities;
+pub use job_entities::*;
+
 /// Which resource a `resourceArn` names, and the tags that resource carries.
 mod tags;
 pub use tags::*;

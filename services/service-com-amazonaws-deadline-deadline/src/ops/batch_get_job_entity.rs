@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetJobEntity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetJobEntity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers a WORKER's batch of job-entity identifiers: one entity per identifier naming an
+//! entity of a job this worker holds an assignment on, and one `errors` entry per identifier
+//! naming a job it holds no assignment on or a part of one this service does not hold. The
+//! call answers HTTP 200 even when every identifier failed, so a caller reads `errors` as
+//! well as `entities`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetJobEntity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What each entity is built from, and the rule that decides which identifiers a worker may
+//! read, live on the store ([`crate::state::JobEntitySource`]); this handler resolves the
+//! path's farm, fleet and worker, reads the store ONCE, and then builds each answer with the
+//! store guard given up — the job templates the entities are read out of are caller-supplied
+//! text, so they are never parsed while another request of this service waits on the lock.
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +122,62 @@ impl From<BatchGetJobEntityErrorModeled> for BatchGetJobEntityError {
     }
 }
 
+/// The job the identifier names, whichever kind of entity it asks for.
+///
+/// Every member of `JobEntityIdentifiersUnion` carries the `jobId` of the job its entity
+/// belongs to, which is what the worker's assignment is checked against.
+fn job_id_of(identifier: &JobEntityIdentifiersUnion) -> &str {
+    match identifier {
+        JobEntityIdentifiersUnion::jobDetails(identifier) => &identifier.job_id,
+        JobEntityIdentifiersUnion::jobAttachmentDetails(identifier) => &identifier.job_id,
+        JobEntityIdentifiersUnion::stepDetails(identifier) => &identifier.job_id,
+        JobEntityIdentifiersUnion::environmentDetails(identifier) => &identifier.job_id,
+    }
+}
+
+/// One identifier's failure as the entry its own entity kind reports it in.
+///
+/// Each kind carries its own ids beside the code and the sentence, so the entry names exactly
+/// what was asked for.
+fn error_entry(
+    identifier: &JobEntityIdentifiersUnion,
+    failure: crate::state::JobEntityFailure,
+) -> GetJobEntityError {
+    let crate::state::JobEntityFailure { code, message } = failure;
+    match identifier {
+        JobEntityIdentifiersUnion::jobDetails(identifier) => {
+            GetJobEntityError::jobDetails(JobDetailsError {
+                job_id: identifier.job_id.clone(),
+                code,
+                message,
+            })
+        }
+        JobEntityIdentifiersUnion::jobAttachmentDetails(identifier) => {
+            GetJobEntityError::jobAttachmentDetails(JobAttachmentDetailsError {
+                job_id: identifier.job_id.clone(),
+                code,
+                message,
+            })
+        }
+        JobEntityIdentifiersUnion::stepDetails(identifier) => {
+            GetJobEntityError::stepDetails(StepDetailsError {
+                job_id: identifier.job_id.clone(),
+                step_id: identifier.step_id.clone(),
+                code,
+                message,
+            })
+        }
+        JobEntityIdentifiersUnion::environmentDetails(identifier) => {
+            GetJobEntityError::environmentDetails(EnvironmentDetailsError {
+                job_id: identifier.job_id.clone(),
+                environment_id: identifier.environment_id.clone(),
+                code,
+                message,
+            })
+        }
+    }
+}
+
 /// The `BatchGetJobEntity` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -156,18 +214,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetJobEntity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetJobEntityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetJobEntity"))
+        // A report: the worker is told what the job it was assigned says, and nothing about
+        // the job, the session or the worker is changed by reading it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchGetJobEntityErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        // One pass over the store: every level of the path the worker itself is reached
+        // through, then what each distinct job the batch names holds for its entities. The
+        // guard is given up at the end of this block, before any template is parsed.
+        let mut sources: ::std::collections::HashMap<String, Option<crate::state::JobEntitySource>> =
+            ::std::collections::HashMap::new();
+        {
+            let store = state.lock();
+            if store.farm(&input.farm_id).is_none() {
+                return Err(BatchGetJobEntityErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+                )
+                .into());
+            }
+            if store.fleet(&input.farm_id, &input.fleet_id).is_none() {
+                return Err(BatchGetJobEntityErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::RESOURCE_TYPE_FLEET, &input.fleet_id),
+                )
+                .into());
+            }
+            if store
+                .worker(&input.farm_id, &input.fleet_id, &input.worker_id)
+                .is_none()
+            {
+                return Err(BatchGetJobEntityErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::RESOURCE_TYPE_WORKER, &input.worker_id),
+                )
+                .into());
+            }
+            for identifier in &input.identifiers {
+                let job_id = job_id_of(identifier);
+                if !sources.contains_key(job_id) {
+                    sources.insert(
+                        job_id.to_string(),
+                        store.assigned_job_entity_source(
+                            &input.farm_id,
+                            &input.worker_id,
+                            job_id,
+                        ),
+                    );
+                }
+            }
+        }
+
+        // The store guard is given up: each job's template is parsed once here, however many
+        // of the batch's identifiers name entities of it.
+        let documents: ::std::collections::HashMap<String, Option<::serde_json::Value>> = sources
+            .iter()
+            .map(|(job_id, source)| {
+                (
+                    job_id.clone(),
+                    source
+                        .as_ref()
+                        .and_then(crate::state::JobEntitySource::document),
+                )
+            })
+            .collect();
+
+        let mut entities = Vec::new();
+        let mut errors = Vec::new();
+        // One answer per identifier, in the order asked for: each identifier's outcome is
+        // reported on its own, so an entity a worker may not read never hides the ones it may.
+        for identifier in &input.identifiers {
+            let job_id = job_id_of(identifier);
+            let document = documents.get(job_id).and_then(Option::as_ref);
+            let source = match sources.get(job_id).and_then(Option::as_ref) {
+                Some(source) => source,
+                None => {
+                    errors.push(error_entry(
+                        identifier,
+                        crate::state::job_entity_not_assigned(job_id),
+                    ));
+                    continue;
+                }
+            };
+            let entity = match identifier {
+                JobEntityIdentifiersUnion::jobDetails(_) => {
+                    crate::state::job_details_entity(source, document).map(JobEntity::jobDetails)
+                }
+                JobEntityIdentifiersUnion::jobAttachmentDetails(_) => {
+                    crate::state::job_attachment_details_entity(source)
+                        .map(JobEntity::jobAttachmentDetails)
+                }
+                JobEntityIdentifiersUnion::stepDetails(identifier) => {
+                    crate::state::step_details_entity(source, document, &identifier.step_id)
+                        .map(JobEntity::stepDetails)
+                }
+                JobEntityIdentifiersUnion::environmentDetails(identifier) => {
+                    crate::state::environment_details_entity(
+                        source,
+                        document,
+                        &identifier.environment_id,
+                    )
+                    .map(JobEntity::environmentDetails)
+                }
+            };
+            match entity {
+                Ok(entity) => entities.push(entity),
+                Err(failure) => errors.push(error_entry(identifier, failure)),
+            }
+        }
+
+        Ok(BatchGetJobEntityOutput { entities, errors })
     }
 }
