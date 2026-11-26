@@ -39,8 +39,9 @@ httpdate = "1"
 # `service_principal_calls`: the directory of the calls this service makes AS the CloudFront
 # service principal, which the service serving one reads; `in_band_tls` and
 # `data_plane_addressing`: the ONE reading of a data-plane connection whose encryption is
-# negotiated in band and of the `host:port` a published endpoint carries, which a
-# distribution's edge listener is announced and served through.
+# negotiated in band — including the server name a viewer's hello asks for, which decides
+# which handshakes an edge address completes — and of the `host:port` a published endpoint
+# carries, which a distribution's edge listener is announced and served through.
 service-common = { path = "../common" }
 # The account's own Service Quotas: how many Anycast static IP lists this account is entitled
 # to hold is an ADJUSTABLE quota whose AWS default is zero, so `CreateAnycastIpList` reads the

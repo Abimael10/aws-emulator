@@ -4312,6 +4312,13 @@ pub use continuous_deployment::*;
 mod edge_endpoint;
 pub use edge_endpoint::*;
 
+/// WHICH server names a connection group's routing endpoint presents a certificate for, and so
+/// which viewer handshakes it completes — the one thing about that refusal that is CloudFront's
+/// own rather than the shared reading of an in-band TLS connection. A SUBMODULE for the same
+/// reason [`functions`] is one; it is reached by [`edge_endpoint`] alone, so nothing of it is
+/// re-exported.
+mod edge_server_name;
+
 /// The absolute URI this service ANNOUNCES for a resource it has just created: the host it
 /// is rooted on is the endpoint the request reached, and the path beneath it is the
 /// resource's own. A SUBMODULE for the same reason [`functions`] is one; `pub use` keeps

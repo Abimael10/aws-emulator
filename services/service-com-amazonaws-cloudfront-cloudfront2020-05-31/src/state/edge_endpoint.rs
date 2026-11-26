@@ -28,6 +28,13 @@
 //! give it ([`super::ComAmazonawsCloudfrontCloudfront20200531State::allocate_domain_name`]) —
 //! the honest answer where this emulator has nothing to dial.
 //!
+//! WHICH viewers an address admits over TLS is the address's own
+//! ([`EdgeTarget::presents_a_certificate_for`]): a handshake completes only for a server name
+//! the address presents a certificate for, and every other name is refused in the handshake
+//! itself. A connection group's certificates are its TENANTS' own — the routing endpoint is
+//! only the address their domains are pointed at — so a viewer that addresses the routing
+//! endpoint itself gets no TLS session there at all.
+//!
 //! What makes the published name REACH its distribution is that the emulator answers on it
 //! wherever a request states it: the edge resolves a viewer request by the name the
 //! distribution publishes in the `Host` a client states, and in the first path segment where a
@@ -196,6 +203,17 @@ trait EdgeTarget: Send + Sync + 'static {
     /// this machine.
     fn routes_host(&self, host: &str) -> bool;
 
+    /// Whether this address presents a certificate for `server_name` — the name a viewer's
+    /// TLS hello asked for, `None` when it asked for none.
+    ///
+    /// The edge terminates a viewer's TLS under a certificate for the name that viewer asked
+    /// for, so this decides which handshakes complete at all: a name no certificate of this
+    /// address covers is refused during the handshake
+    /// ([`::service_common::in_band_tls::negotiated_scheme_for_covered_names`]) and the
+    /// connection carries no HTTP. It says nothing about the `http://` half of the address,
+    /// where no certificate is presented and no name is asked for.
+    fn presents_a_certificate_for(&self, server_name: Option<&str>) -> bool;
+
     /// This service's own records, which is where everything this address decides is read
     /// from.
     fn records(&self) -> &::engine::ServiceState<super::ComAmazonawsCloudfrontCloudfront20200531State>;
@@ -320,6 +338,25 @@ impl EdgeTarget for ServedDistribution {
             .is_some_and(|distribution| crate::service::edge::serves_host(distribution, host))
     }
 
+    /// A distribution's own address is reached under the names that distribution is SERVED
+    /// on — the name CloudFront assigned it, in CloudFront's own zone, and the alternate
+    /// domain names its `ViewerCertificate` names, read through the one rule the data plane
+    /// resolves a host by ([`Self::routes_host`]) — plus the addresses of the interface the
+    /// listener is bound on ([`host_allowed`]), which this emulator's own certificate covers.
+    ///
+    /// A client that asks for NO name is served: it is answered under the certificate of the
+    /// address it dialled, as a client that dials an address rather than a name is.
+    ///
+    /// Every other name is refused in the handshake, which is what a viewer that points its
+    /// own domain at a distribution without naming it among the distribution's alternate
+    /// domain names gets: no certificate covers that name, so there is no session.
+    fn presents_a_certificate_for(&self, server_name: Option<&str>) -> bool {
+        server_name.is_none_or(|name| {
+            host_allowed(::service_common::data_plane_addressing::host_only(name))
+                || self.routes_host(name)
+        })
+    }
+
     fn records(
         &self,
     ) -> &::engine::ServiceState<super::ComAmazonawsCloudfrontCloudfront20200531State> {
@@ -353,37 +390,55 @@ struct ServedConnectionGroup {
     announced: Mutex<BTreeSet<String>>,
 }
 
-impl EdgeTarget for ServedConnectionGroup {
-    /// The distribution of the tenant `host` names: the tenant this service routes that
-    /// domain to (`distribution_tenant_by_domain`, which answers only for a domain whose
-    /// certificate is validated), provided it is routed through THIS group and its own
-    /// `Enabled` says it serves traffic — "whether the distribution tenant is enabled".
+impl ServedConnectionGroup {
+    /// `read` applied to the tenant this group routes `name` to, or `None` for a name it
+    /// routes nowhere: the ONE lookup both the handshake and the request served afterwards go
+    /// through ([`super::edge_server_name::routed_tenant`], where the rule is stated).
     ///
-    /// The host is read AS ADDRESSED first and then without its port, the same order
-    /// [`crate::service::edge`] reads a distribution's published name in: a domain this
-    /// emulator published for a resource carries a PORT, which is part of the name a viewer
-    /// was handed, while a customer's own domain does not and is addressed with whatever
-    /// port the viewer dialled.
+    /// The record is read under the lock and only what the caller asks for leaves it, so a
+    /// viewer request copies no more of a tenant than it needs.
+    fn with_routed_tenant<Read, Answer>(&self, name: &str, read: Read) -> Option<Answer>
+    where
+        Read: FnOnce(&super::StoredDistributionTenant) -> Answer,
+    {
+        let group = self.group.get()?;
+        let store = self.state.lock();
+        super::edge_server_name::routed_tenant(&store, group, name).map(read)
+    }
+}
+
+impl EdgeTarget for ServedConnectionGroup {
+    /// The distribution of the tenant `host` names: the tenant this group routes that domain
+    /// to ([`Self::with_routed_tenant`], which answers only for a domain CloudFront can
+    /// already serve and only for a tenant of THIS group), provided its own `Enabled` says it
+    /// serves traffic — "whether the distribution tenant is enabled".
     ///
     /// `None` for every other host, so one group's address never serves another group's
     /// tenant and a disabled tenant serves nothing.
     fn distribution_of(&self, host: Option<&str>) -> Option<String> {
-        let group = self.group.get()?;
-        let addressed = host?;
-        let store = self.state.lock();
-        let tenant = store
-            .distribution_tenant_by_domain(addressed)
-            .or_else(|| {
-                store.distribution_tenant_by_domain(
-                    ::service_common::data_plane_addressing::host_only(addressed),
-                )
-            })?;
-        (&tenant.connection_group_id == group && tenant.enabled)
-            .then(|| tenant.distribution_id.clone())
+        self.with_routed_tenant(host?, |tenant| {
+            tenant.enabled.then(|| tenant.distribution_id.clone())
+        })
+        .flatten()
     }
 
     fn routes_host(&self, host: &str) -> bool {
         self.distribution_of(Some(host)).is_some()
+    }
+
+    /// The certificates a connection group's routing endpoint serves are the TENANTS' own:
+    /// each tenant brings the domain its viewers reach it at and the certificate that domain
+    /// is served under, and the routing endpoint is only the address those domains are
+    /// pointed at. So the names covered here are the domains of the tenants this group
+    /// routes, and nothing else — a viewer that asks for the routing endpoint itself, for a
+    /// domain this group routes nowhere, or for no name at all, asks for a name no
+    /// certificate here covers.
+    ///
+    /// Whether the tenant currently SERVES traffic is not part of it: `Enabled` is "whether
+    /// the distribution tenant is enabled", which decides what the request is answered,
+    /// while the certificate covers the domain either way.
+    fn presents_a_certificate_for(&self, server_name: Option<&str>) -> bool {
+        server_name.is_some_and(|name| self.with_routed_tenant(name, |_tenant| ()).is_some())
     }
 
     fn records(
@@ -595,7 +650,10 @@ impl ::emulator_server::NativeHandler for EdgeFrontDoor {
 /// request from this service's own data plane.
 ///
 /// The encryption is negotiated in band first ([`::service_common::in_band_tls`]), so one
-/// address serves the `http://` and the `https://` a viewer may dial. HTTP/1.1 only, as
+/// address serves the `http://` and the `https://` a viewer may dial — and the `https://`
+/// only for a server name this address presents a certificate for
+/// ([`EdgeTarget::presents_a_certificate_for`]), every other name being refused in the
+/// handshake. HTTP/1.1 only, as
 /// the emulator's own front door offers: every request is fully buffered, so nothing
 /// relies on HTTP/2 streaming. The header-read deadline and the body ceiling are the
 /// core's, so a viewer that dribbles a request line or sends more than one connection may
@@ -611,7 +669,14 @@ async fn serve_connection(
     // request it is handed ([`forwarded`]), which is where the edge reads the viewer's
     // scheme from.
     let Some((conn, encrypted)) =
-        ::service_common::in_band_tls::negotiated_scheme(conn, upgrader).await
+        ::service_common::in_band_tls::negotiated_scheme_for_covered_names(conn, upgrader, {
+            // WHICH server names this address presents a certificate for is the address's own
+            // ([`EdgeTarget::presents_a_certificate_for`]); the handshake refusal for every
+            // other name is the shared reading's.
+            let named = Arc::clone(&target);
+            move |server_name| named.presents_a_certificate_for(server_name)
+        })
+        .await
     else {
         return;
     };

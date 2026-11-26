@@ -43,12 +43,17 @@ use crate::published_edge_address::dial_as;
 
 /// The element the origin's answer carries, which is how a row tells an origin answer from
 /// an answer the edge — or the address itself — produced.
-const ORIGIN_DOCUMENT: &str = "DistributionList";
+///
+/// `pub(crate)` so a sibling suite that dials a published routing endpoint recognises an
+/// origin answer by the same element rather than naming a second one.
+pub(crate) const ORIGIN_DOCUMENT: &str = "DistributionList";
 
 /// The path a viewer fetches through a published address. The origin below is this service's
 /// own control-plane endpoint, so this is an object the origin really serves and what comes
 /// back is the origin's own answer.
-fn viewer_path() -> String {
+///
+/// `pub(crate)` for the same reason [`ORIGIN_DOCUMENT`] is.
+pub(crate) fn viewer_path() -> String {
     format!("/{API_VERSION}/distribution")
 }
 
@@ -58,11 +63,14 @@ fn viewer_path() -> String {
 
 /// One `CreateConnectionGroup` request a row submits: the members it names, and nothing
 /// else.
-struct Create {
-    case: &'static str,
-    name: &'static str,
+///
+/// `pub(crate)` so a sibling suite that needs a group whose routing endpoint it DIALS
+/// describes the create the same way rather than growing a copy of this.
+pub(crate) struct Create {
+    pub(crate) case: &'static str,
+    pub(crate) name: &'static str,
     /// The optional members the request states, already in XML.
-    members: &'static str,
+    pub(crate) members: &'static str,
 }
 
 /// The creates every assertion below runs over: a request naming no optional member at all,
@@ -109,7 +117,12 @@ fn group_member(answer: &Answer, member: &str, case: &str) -> String {
 }
 
 /// Create the connection group `create` describes and answer `(Id, RoutingEndpoint, ETag)`.
-async fn created_group(router: &MultiServiceRouter, create: &Create) -> (String, String, String) {
+///
+/// `pub(crate)` for the same reason [`Create`] is.
+pub(crate) async fn created_group(
+    router: &MultiServiceRouter,
+    create: &Create,
+) -> (String, String, String) {
     let answer = create_connection_group(router, &create.xml()).await;
     assert_eq!(
         answer.status, 201,
@@ -247,7 +260,13 @@ async fn the_default_connection_group_publishes_a_dialable_address() {
 /// `ConnectionMode` `tenant-only` selects "a multi-tenant distribution with distribution
 /// tenants"; such a distribution has no traffic domain of its own, which is exactly why its
 /// viewers arrive through a connection group's routing endpoint.
-async fn multi_tenant_distribution(router: &MultiServiceRouter, reference: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite that dials a published routing endpoint stages the same
+/// topology rather than growing a copy of it.
+pub(crate) async fn multi_tenant_distribution(
+    router: &MultiServiceRouter,
+    reference: &str,
+) -> String {
     let body = format!(
         "<DistributionConfig xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
          <CallerReference>{reference}</CallerReference>\

@@ -2247,9 +2247,8 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// that is given no address of its own takes its endpoint from here rather than from a
     /// second rendering of the mint. A group this emulator opened a listener for publishes that
     /// listener's `host:port` instead ([`Self::minted_routing_endpoint`]): a viewer reaches a
-    /// TENANT by the domain IT addressed, so the group's own member is the address that viewer
-    /// dials, which is a reading of `RoutingEndpoint` the open issue
-    /// `20261117T114529Z-acm-cloudfront-s3` owns rather than this one.
+    /// TENANT by the domain IT addressed, so the group's own member is the address that
+    /// viewer points the tenant's domain at and dials.
     pub fn allocate_domain_name(&mut self) -> String {
         let label = self.mint(ID_BODY_LEN).to_lowercase();
         format!("d{label}{CLOUDFRONT_DOMAIN_SUFFIX}")
