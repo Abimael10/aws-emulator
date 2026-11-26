@@ -154,7 +154,9 @@ pub(crate) async fn create_distribution(
 /// under the principal KIND it names it by: `AWS` for the IAM principal of CloudFront's own
 /// account, `CanonicalUser` for the `S3CanonicalUserId` the identity was minted with. Both
 /// are spellings AWS publishes for an origin access identity.
-fn identity_policy(kind: &str, principal: &str, resource: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite whose bucket grants an identity writes the one document.
+pub(crate) fn identity_policy(kind: &str, principal: &str, resource: &str) -> String {
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\
          \"Sid\":\"AllowTheOriginAccessIdentity\",\"Effect\":\"Allow\",\
@@ -165,7 +167,9 @@ fn identity_policy(kind: &str, principal: &str, resource: &str) -> String {
 
 /// The IAM principal an origin access identity is named by in a bucket policy, as the Amazon
 /// S3 User Guide writes it.
-fn identity_principal(id: &str) -> String {
+///
+/// `pub(crate)` so every suite that grants an identity names it the one way.
+pub(crate) fn identity_principal(id: &str) -> String {
     format!("arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity {id}")
 }
 

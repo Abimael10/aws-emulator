@@ -128,7 +128,9 @@ async fn create_cache_policy(
 }
 
 /// `cloudfront:CreateInvalidation` for `paths` under `distribution`.
-async fn create_invalidation(
+///
+/// `pub(crate)` so a sibling suite submitting invalidation batches submits them the one way.
+pub(crate) async fn create_invalidation(
     router: &MultiServiceRouter,
     distribution: &str,
     caller_reference: &str,
@@ -154,7 +156,9 @@ async fn create_invalidation(
 }
 
 /// `cloudfront:GetInvalidation`.
-async fn get_invalidation(
+///
+/// `pub(crate)` so a sibling suite reads a batch's status off the one surface.
+pub(crate) async fn get_invalidation(
     router: &MultiServiceRouter,
     distribution: &str,
     invalidation: &str,
