@@ -344,6 +344,9 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
             "PublicIp",
             "VpcId",
         ],
+        // Source: `AWS::EC2::SpotFleet`'s own "Return values" section — "Id: the ID of the Spot
+        // Fleet", which is also what its `Ref` returns.
+        EC2_SPOT_FLEET => &["Id"],
         ECS_SERVICE => &["Name"],
         // "Fn::GetAtt … Id: the ID of the task set" — the `ecs-svc/` identifier Amazon ECS
         // mints, which is the only handle every call on a task set takes. (`Ref` returns the
@@ -1444,6 +1447,11 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // the `i-` id, and "Ref returns the ID of the instance", so the identifier in force is
         // the one that service answered the launch with.
         || resource_type == EC2_INSTANCE
+        // A SPOT FLEET REQUEST is a sixth: `RequestSpotFleet` takes no identifier either — the
+        // declaration states the configuration the fleet is to hold capacity under — Amazon EC2
+        // assigns the `sfr-` id, and "Ref returns the Spot Fleet request ID", so the identifier
+        // in force is the one that service answered the request with.
+        || resource_type == EC2_SPOT_FLEET
         // An Amazon SES receipt rule is one more, for the same reason read from the other
         // side: "Ref returns the receipt rule name", and a declaration states that name
         // inside the type's `Rule` property rather than through a name property of its own,
@@ -3034,6 +3042,15 @@ pub const AUTOSCALING_GROUP: &str = "AWS::AutoScaling::AutoScalingGroup";
 /// identifier in force is the one that service answered the launch with
 /// (`crate::state::provisioning`'s instance provider).
 pub const EC2_INSTANCE: &str = "AWS::EC2::Instance";
+
+/// `AWS::EC2::SpotFleet`: a Spot Fleet request of Amazon EC2. Its identity is read the same way
+/// again — `RequestSpotFleet` takes no identifier, Amazon EC2 assigns the `sfr-…` identifier and
+/// "Ref returns the Spot Fleet request ID" — so a declaration of one carries an identifier of
+/// that form rather than a generated name, and [`identity_is_service_assigned`] names the type
+/// because the identifier in force is the one that service answered the request with
+/// (`crate::state::provisioning`'s Spot Fleet provider). Its one `Fn::GetAtt` attribute ("Id:
+/// the ID of the Spot Fleet") is that same identifier.
+pub const EC2_SPOT_FLEET: &str = "AWS::EC2::SpotFleet";
 
 /// The identifier Amazon EC2 assigns a declared resource of one of the VPC-network types
 /// above: `<prefix>-` plus [`EC2_ID_HEX_DIGITS`] lowercase hexadecimal characters, derived

@@ -1534,6 +1534,15 @@ pub const MQ_ARN_NAMESPACE: &str = "mq";
 /// shape of the identifier a declaration reports BEFORE its create answers.
 pub(super) const MQ_BROKER_ID_PREFIX: &str = "b-";
 
+/// What an Amazon EC2 Spot Fleet request id begins with (`sfr-` followed by 128 bits in the
+/// 8-4-4-4-12 grouping that service's own ids carry,
+/// `sfr-73fbd2ce-aa30-494c-8788-1cee4ffcbc91`).
+///
+/// The id built on it here is a PLACEHOLDER for the same reason the broker's is: the id a
+/// requested fleet carries is the one Amazon EC2 minted, which the deployment adopts over this
+/// one ([`identity_is_service_assigned`] names the type).
+pub(super) const SPOT_FLEET_REQUEST_ID_PREFIX: &str = "sfr-";
+
 /// The type of an Amazon MQ CONFIGURATION: the engine configuration document a broker of
 /// that service can be given, declared in the same `AmazonMQ` namespace the broker is.
 ///

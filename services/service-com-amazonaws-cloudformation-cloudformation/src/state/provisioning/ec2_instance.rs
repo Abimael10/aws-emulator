@@ -185,23 +185,29 @@ const INSTANCE_LIST_MEMBERS: &[(&str, &str)] = &[
 /// The three constructors below are the three cases the catalogues need: a member spelled the
 /// same on the type and on the call, a member the call takes under another name, and a member
 /// that is a nested structure.
+///
+/// `pub(super)` because the arm that requests an `AWS::EC2::SpotFleet`
+/// ([`super::ec2_spot_fleet`]) reads its own declaration against a catalogue of the same
+/// service's shapes — a block device mapping of a Spot Fleet launch specification IS this
+/// call's own ([`BLOCK_DEVICE_MAPPING_MEMBERS`]) — so the type, its constructors and that
+/// catalogue are shared rather than spelled a second way.
 #[derive(Debug)]
-struct StructureMember {
+pub(super) struct StructureMember {
     /// The member as the resource type publishes it.
-    property: &'static str,
+    pub(super) property: &'static str,
     /// The member as the call takes it, which is also its `ec2QueryName`.
-    sent: &'static str,
+    pub(super) sent: &'static str,
     /// The members of the nested structure this member is, empty for a scalar one.
-    nested: &'static [StructureMember],
+    pub(super) nested: &'static [StructureMember],
     /// The text the member travels as whatever the declaration states it, for the one member
     /// whose published FORM is not the value the call takes: `BlockDeviceMapping$NoDevice` is
     /// "specify an empty string" on the call, where the type publishes it as an empty
     /// structure.
-    fixed: Option<&'static str>,
+    pub(super) fixed: Option<&'static str>,
 }
 
 /// A member spelled identically on the resource type and on the call.
-const fn sent_as_itself(property: &'static str) -> StructureMember {
+pub(super) const fn sent_as_itself(property: &'static str) -> StructureMember {
     StructureMember {
         property,
         sent: property,
@@ -211,7 +217,7 @@ const fn sent_as_itself(property: &'static str) -> StructureMember {
 }
 
 /// A member the call takes under a DIFFERENT name than the type publishes it under.
-const fn sent_as(property: &'static str, sent: &'static str) -> StructureMember {
+pub(super) const fn sent_as(property: &'static str, sent: &'static str) -> StructureMember {
     StructureMember {
         property,
         sent,
@@ -221,7 +227,7 @@ const fn sent_as(property: &'static str, sent: &'static str) -> StructureMember 
 }
 
 /// A member that is itself a structure, whose own members are `nested`.
-const fn sent_as_structure(
+pub(super) const fn sent_as_structure(
     property: &'static str,
     nested: &'static [StructureMember],
 ) -> StructureMember {
@@ -252,7 +258,7 @@ const EBS_BLOCK_DEVICE_MEMBERS: &[StructureMember] = &[
 ///
 /// `NoDevice` is the one member whose form differs: the type publishes it as an empty
 /// structure and the call takes "an empty string", so it travels as that string.
-const BLOCK_DEVICE_MAPPING_MEMBERS: &[StructureMember] = &[
+pub(super) const BLOCK_DEVICE_MAPPING_MEMBERS: &[StructureMember] = &[
     sent_as_itself("DeviceName"),
     sent_as_structure("Ebs", EBS_BLOCK_DEVICE_MEMBERS),
     StructureMember {

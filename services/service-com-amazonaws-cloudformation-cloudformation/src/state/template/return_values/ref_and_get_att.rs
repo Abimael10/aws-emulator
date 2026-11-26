@@ -1653,6 +1653,20 @@ pub(crate) fn return_values(
                 attributes,
             )
         }
+        // A SPOT FLEET REQUEST, whose identity Amazon EC2 assigns the same way once more — "Ref
+        // returns the Spot Fleet request ID" — but in a form of its own: that service draws an
+        // `sfr-` identifier with a UUID after it (`sfr-73fbd2ce-aa30-494c-8788-1cee4ffcbc91`)
+        // rather than the hexadecimal run the network identifiers carry, so the stand-in is
+        // built by the UUID derivation ([`generated_uuid`]). The type's one published attribute
+        // IS that id, and the request re-points both at what EC2 answered.
+        EC2_SPOT_FLEET => {
+            let id = format!(
+                "{SPOT_FLEET_REQUEST_ID_PREFIX}{}",
+                generated_uuid(resource_type, name)
+            );
+            attributes.insert("Id".to_string(), id.clone());
+            (id, attributes)
+        }
         // The three Amazon EFS types, whose identity that service MINTS and whose published
         // return values are built around it ([`crate::state::provisioning::efs_resources`]
         // creates each one and re-points these stand-ins at what Amazon EFS answered).

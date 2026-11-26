@@ -309,6 +309,9 @@ pub(super) mod dynamodb_table;
 /// `AWS::EC2::Instance`: the instance a stack declares, launched in Amazon EC2 itself
 /// ([`ec2_instance`]).
 mod ec2_instance;
+/// `AWS::EC2::SpotFleet`: the Spot Fleet request a stack declares, made in Amazon EC2 itself
+/// ([`ec2_spot_fleet`]).
+mod ec2_spot_fleet;
 /// The three `AWS::EFS::*` types an Amazon EFS estate is declared with — the file system, an
 /// access point of one and the mount target a VPC reaches it through: created in Amazon EFS
 /// itself ([`efs_resources`]). Visible to the rest of this service's state because the types'
@@ -1375,6 +1378,9 @@ pub(super) enum Owner {
     /// launches for the resource, which is a resource of that service's own rather than part
     /// of the VPC network above.
     Ec2Instance,
+    /// `AWS::EC2::SpotFleet`, whose arms are [`ec2_spot_fleet`]'s: the Spot Fleet request
+    /// Amazon EC2 makes for the resource, which holds the capacity the declaration asked for.
+    Ec2SpotFleet,
     /// One of the three Amazon Cognito Identity types [`cognito_identity_pool`] creates: the
     /// identity pool, the role attachment that binds the pool's IAM roles to it, and the
     /// principal-tag attribute map of one of its providers. Which of them it is travels with
@@ -1542,6 +1548,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if resource_type == ec2_instance::EC2_INSTANCE {
         return Some(Owner::Ec2Instance);
+    }
+    if resource_type == ec2_spot_fleet::EC2_SPOT_FLEET {
+        return Some(Owner::Ec2SpotFleet);
     }
     if resource_type == super::template::ECS_TASK_DEFINITION {
         return Some(Owner::EcsTaskDefinition);

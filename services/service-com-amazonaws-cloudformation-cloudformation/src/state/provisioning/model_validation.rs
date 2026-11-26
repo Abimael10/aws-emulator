@@ -121,6 +121,13 @@ pub(super) const REQUIRED_PROPERTIES: &[RequiredProperties] = &[
         resource_type: super::appsync_domain_names::APPSYNC_DOMAIN_NAME_API_ASSOCIATION,
         required: &["ApiId", "DomainName"],
     },
+    // `AWS::EC2::SpotFleet` IS one Spot Fleet request, so the configuration that request is
+    // made from is published "Required: Yes" and is the member `RequestSpotFleet` declares
+    // required; the type declares no name CloudFormation could generate.
+    RequiredProperties {
+        resource_type: crate::state::template::EC2_SPOT_FLEET,
+        required: &[super::ec2_spot_fleet::SPOT_FLEET_REQUEST_CONFIG_DATA],
+    },
     // `AWS::EFS::AccessPoint` is a view INTO one file system, which `CreateAccessPoint`
     // declares required and the type publishes "Required: Yes"; a MOUNT TARGET is the file
     // system reached from one subnet, and `CreateMountTarget` declares both members required.

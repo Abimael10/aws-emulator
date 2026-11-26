@@ -115,6 +115,10 @@ impl Owner {
             Self::Ec2Instance => {
                 ec2_instance::create(ctx, region, resource, propagated).await
             }
+            // A Spot Fleet request takes no tags of its own from CloudFormation: the type
+            // publishes no `Tags` property at all — a fleet's tags are stated inside its
+            // configuration — so no tag is propagated to one ([`ec2_spot_fleet::create`]).
+            Self::Ec2SpotFleet => ec2_spot_fleet::create(ctx, region, resource).await,
             // A task-definition revision IS taggable: its `Tags` property is the tag list
             // `RegisterTaskDefinition` takes, so the revision carries the tags CloudFormation
             // gives the resource beside its own.
@@ -407,6 +411,12 @@ impl Owner {
             Self::Ec2Instance => {
                 ec2_instance::readiness(ctx, region, physical_resource_id).await
             }
+            // `RequestSpotFleet` answers the request `submitted`, in which the fleet has placed
+            // nothing, so this arm waits for Amazon EC2 to report it `active`
+            // ([`ec2_spot_fleet::readiness`]).
+            Self::Ec2SpotFleet => {
+                ec2_spot_fleet::readiness(ctx, region, physical_resource_id).await
+            }
             // A pool exists, its role configuration is in force, and a provider's
             // principal-tag attribute map is set, from the moment the owning service's own
             // call answers.
@@ -636,6 +646,9 @@ impl Owner {
             Self::Ec2Instance => {
                 ec2_instance::ready_attributes(ctx, region, physical_resource_id).await
             }
+            // A Spot Fleet request's `Id` is the one its own request answered with, so there is
+            // nothing left to read once the fleet is up.
+            Self::Ec2SpotFleet => Ok(BTreeMap::new()),
             // A pool's `Name` is the one its own create answered with, and neither a role
             // attachment nor a principal-tag attribute map publishes an attribute this
             // emulator computes, so there is nothing left to read once the resource is up.
@@ -805,6 +818,12 @@ impl Owner {
             // for Amazon EC2 to report it `terminated` ([`ec2_instance::removal`]).
             Self::Ec2Instance => {
                 ec2_instance::removal(ctx, region, physical_resource_id).await
+            }
+            // `CancelSpotFleetRequests` moves the request into a cancelled state and that
+            // service keeps the cancelled request on record, so this arm waits for the
+            // cancellation to be in force ([`ec2_spot_fleet::removal`]).
+            Self::Ec2SpotFleet => {
+                ec2_spot_fleet::removal(ctx, region, physical_resource_id).await
             }
             // `DeleteIdentityPool` takes the pool away as it answers, and the calls that
             // clear a pool's roles and put a provider back on the default principal-tag
@@ -1044,6 +1063,10 @@ impl Owner {
             // machine it runs as are either create-only or applied by stopping the instance,
             // which this deployment does not do.
             Self::Ec2Instance => ec2_instance::update(ctx, region, resource, declared).await,
+            // A Spot Fleet request takes the capacities `ModifySpotFleetRequest` changes on the
+            // fleet that exists; a change to any other member of its configuration is one no
+            // call of that service carries ([`ec2_spot_fleet::update`]).
+            Self::Ec2SpotFleet => ec2_spot_fleet::update(ctx, region, resource, declared).await,
             Self::CognitoIdentityPool(kind) => {
                 cognito_identity_pool::update(ctx, region, kind, resource, declared).await
             }
@@ -1271,6 +1294,9 @@ impl Owner {
             Self::Ec2Instance => {
                 ec2_instance::retag(ctx, region, resource, declared, propagated).await
             }
+            // A Spot Fleet request is not taggable by CloudFormation at all: the type publishes
+            // no `Tags` property, so nothing is asked about its tags.
+            Self::Ec2SpotFleet => Ok(()),
             // A pool's tags are replaced by its own update call, which carries the
             // declaration's whole configuration, so nothing is asked about them here.
             Self::CognitoIdentityPool(_) => Ok(()),
@@ -1462,6 +1488,11 @@ impl Owner {
             // that this teardown does not make, so a `Snapshot` deletion policy on one
             // terminates the instance with no image or snapshot invented for it.
             Self::Ec2Instance => ec2_instance::delete(ctx, region, resource).await,
+            // Nor of a SPOT FLEET: the cancellation takes the fleet's capacity down with it and
+            // there is no snapshot call for a fleet, so a `Snapshot` deletion policy on one
+            // cancels the request with no snapshot invented for it
+            // ([`ec2_spot_fleet::delete`]).
+            Self::Ec2SpotFleet => ec2_spot_fleet::delete(ctx, region, resource).await,
             // Amazon Cognito Identity takes no snapshot of a pool on the way out: there is no
             // such call, so a `Snapshot` deletion policy on any of these types deletes the
             // resource with no snapshot invented for it.
@@ -1687,11 +1718,12 @@ impl Owner {
             // the resource to be replaced, and Amazon ECS publishes no call that edits one —
             // so nothing of it can have drifted from its declaration.
             Self::EcsTaskDefinition => return Ok(ActualConfiguration::Unchecked),
-            // No read of either type's configuration is served here, so nothing is asked of
+            // No read of these types' configuration is served here, so nothing is asked of
             // any service for one: the VPC-network types' every property is part of their
-            // identity or of the call that made them, and an INSTANCE's were all set by the
-            // launch, so neither has an arm that reports a configuration to compare.
-            Self::Ec2VpcNetwork(_) | Self::Ec2Instance => {
+            // identity or of the call that made them, an INSTANCE's were all set by the
+            // launch, and a SPOT FLEET's are the configuration its own request carried, so
+            // none has an arm that reports a configuration to compare.
+            Self::Ec2VpcNetwork(_) | Self::Ec2Instance | Self::Ec2SpotFleet => {
                 return Ok(ActualConfiguration::Unchecked)
             }
             Self::CognitoIdentityPool(kind) => {
@@ -1855,7 +1887,9 @@ impl Owner {
             // Amazon ECS's does the same.
             Self::EcsTaskDefinition => message.to_string(),
             // Amazon EC2's does the same.
-            Self::Ec2VpcNetwork(_) | Self::Ec2Instance => message.to_string(),
+            Self::Ec2VpcNetwork(_) | Self::Ec2Instance | Self::Ec2SpotFleet => {
+                message.to_string()
+            }
             // Amazon Cognito Identity's and Amazon Cognito user pools' do the same.
             Self::CognitoIdentityPool(_) | Self::CognitoUserPool(_) => message.to_string(),
             // A nested stack is provisioned by CloudFormation itself rather than by a provider
