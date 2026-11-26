@@ -843,7 +843,7 @@ pub struct CachedRoute {
 #[derive(Debug, Clone)]
 pub struct SnappedPosition {
     /// The point on the road nearest the submitted position, at the coordinate precision
-    /// the network's geometry carries ([`round_to_network_precision`]).
+    /// this API expresses a position in ([`at_api_precision`]).
     pub position: Position,
     /// Distance from the submitted position to [`SnappedPosition::position`], in metres.
     /// It is the whole of what makes the match a good one or a poor one: a position on the
@@ -1012,10 +1012,13 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
             let (position, offset_m) = nearest_point_on_polyline(pos, &segment.polyline);
             if best.as_ref().is_none_or(|current| offset_m < current.offset_m) {
                 best = Some(SnappedPosition {
-                    // The point is read off the network, so it is carried at the
-                    // network's own precision rather than with the artefacts of the
-                    // projection that located it.
-                    position: round_to_network_precision(position),
+                    // The point is read off the network, so it is carried at the precision
+                    // this API expresses a position in rather than with the artefacts of
+                    // the projection that located it. That precision is the API's own and
+                    // not the coarser one the polyline FORMAT encodes a vertex at: a
+                    // matched point is reported in a `Position` member, which carries every
+                    // digit of it ([`at_api_precision`]).
+                    position: at_api_precision(position),
                     offset_m,
                     road: segment.travelled(),
                 });
@@ -1546,17 +1549,36 @@ fn nearest_point_on_segment(pos: Position, a: Position, b: Position) -> Position
     [(ax + dx * t) / mx, (ay + dy * t) / my]
 }
 
-/// `position` at the coordinate precision the network's geometry carries
+/// `position` at the coordinate precision the network's GEOMETRY carries
 /// ([`POLYLINE_PRECISION`] digits, ~0.1 m).
 ///
-/// A position READ OFF the network is located by projecting into metres and back, so the
-/// arithmetic leaves digits far below that precision on it. They are not part of the
-/// network: the same road vertex reached two ways would otherwise be reported as two
-/// places. A position the CALLER supplied is never put through this — it is carried as it
-/// was sent, down to the precision this API expresses a coordinate in
-/// ([`position_to_vec`]).
+/// A VERTEX of a reported line — a junction two roads meet in, a shape point of a road, a
+/// sample along one — is located by projecting into metres and back, so the arithmetic
+/// leaves digits far below that precision on it. They are not part of the network: the same
+/// road vertex reached two ways would otherwise be reported as two places, and the line's
+/// own encoding carries this precision anyway.
+///
+/// A position the service RESOLVED for a caller is not one of them: a matched point is
+/// reported in a `Position` member of its own, so it is carried at this API's own precision
+/// ([`at_api_precision`]). Neither is a position the CALLER supplied — that is carried as it
+/// was sent ([`echoed_position`]).
 pub fn round_to_network_precision(position: Position) -> Position {
     round_to_digits(position, POLYLINE_PRECISION)
+}
+
+/// `position` at the coordinate precision this API expresses a position in
+/// ([`POSITION_PRECISION`] digits, ~1 cm) — what a position READ OFF the network is
+/// reported at.
+///
+/// A matched point is reported in a `Position` member, which is a list of `Double` and so
+/// carries every digit of it; the coarser [`round_to_network_precision`] is the precision
+/// the polyline FORMAT encodes a vertex at, and quantizing a matched point onto it throws
+/// away a tenth of a metre of a position this service resolved. The match is a projection
+/// ALONG a carriageway, so the coordinate it did not move is the submitted one: quantizing
+/// it also moves the point along the road it was matched onto, away from where the caller
+/// said it was.
+pub fn at_api_precision(position: Position) -> Position {
+    round_to_digits(position, POSITION_PRECISION)
 }
 
 /// `position` with each coordinate rounded to `digits` decimal places.

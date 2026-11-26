@@ -429,10 +429,10 @@ enum Placement {
 /// A trace is matched as a whole: a point with no road of its own inside `radius_m` is
 /// still a point of a trace that runs along roads, so it is placed on the stretch of that
 /// path its neighbours in the trace establish ([`state::road_path_between`]) — a position
-/// on a road of the network, carried at the network's own precision like every other
-/// position read off it. A point with a neighbour on one side only is placed on the road
-/// that neighbour matched; only a trace that matched nothing at all leaves a point
-/// unplaced.
+/// on a road of the network, carried at this API's own coordinate precision like every
+/// other position this service resolved. A point with a neighbour on one side only is
+/// placed on the road that neighbour matched; only a trace that matched nothing at all
+/// leaves a point unplaced.
 ///
 /// The stretch weighed is the ONE between the two neighbours, so the work per point is
 /// fixed whatever the trace's length.
@@ -452,7 +452,7 @@ fn place(
                 (None, None) => return Placement::Unplaced,
             };
             let (on_path, offset_m) = state::nearest_point_on_polyline(position, &stretch);
-            (state::round_to_network_precision(on_path), offset_m)
+            (state::at_api_precision(on_path), offset_m)
         }
     };
     if offset_m <= radius_m {

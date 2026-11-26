@@ -30,7 +30,15 @@
 //!   confidence orders them by how far each lay from its road;
 //! * `SnappedGeometry` is "interpolated geometry for the snapped route": it runs along the
 //!   roads between consecutive snapped points, so it carries a vertex wherever the road
-//!   changes and is never a shortcut through the blocks between them.
+//!   changes and is never a shortcut through the blocks between them;
+//! * a position the service RESOLVED against the network is reported at the precision this
+//!   API expresses a position in — a match moves the coordinate ACROSS the road it matched
+//!   onto and leaves the one running along it where the caller put it, down to the last
+//!   digit the API carries, rather than quantizing it onto the coarser grid the polyline
+//!   FORMAT encodes a geometry vertex at;
+//! * a trace point whose own road lies inside the radius allowed is matched ON ITS OWN, so
+//!   its snapped position, its echo and its score are the same wherever it sits in the
+//!   trace and however often it is asked for.
 
 use serde_json::{json, Value};
 
@@ -935,4 +943,284 @@ fn as_position(value: &Value) -> Option<[f64; 2]> {
         [longitude, latitude] => Some([longitude.as_f64()?, latitude.as_f64()?]),
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// The precision a resolved position is reported at
+// ---------------------------------------------------------------------------
+
+/// `value` at the coordinate precision this API expresses a position in: a whole number of
+/// ten-millionths of a degree (`POSITION_PRECISION` in `src/state.rs`).
+fn at_the_apis_precision(value: f64) -> f64 {
+    let scale = 10_f64.powi(POSITION_PRECISION);
+    (value * scale).round() / scale
+}
+
+/// A match is a projection ALONG a carriageway: it moves the coordinate ACROSS the road it
+/// matched onto and leaves the one that runs along that road where the caller put it. So the
+/// point the service resolves is reported at the precision this API expresses a position in
+/// — a ten-millionth of a degree, which is what a `Position` member of `Double`s carries —
+/// and never quantized onto the coarser grid the polyline FORMAT encodes a geometry VERTEX
+/// at: a step onto that grid moves the resolved point a tenth of a metre ALONG its road,
+/// away from where the caller said it was, and reports digits of the request's own
+/// coordinate that the answer then disagrees with its echo about.
+///
+/// Rows span how many decimals the caller wrote (four, as a GPS trace is written; six; the
+/// seven this API expresses; and more than it can carry), which axis the match moves the
+/// point along, the place, and the hemisphere. Every coordinate of every row carries a
+/// non-zero seventh decimal where the row is written to seven or more, so whichever axis the
+/// match leaves alone is one the coarser grid would have truncated.
+#[tokio::test]
+async fn a_resolved_position_keeps_the_digits_of_the_coordinate_the_match_did_not_move() {
+    let router = routes_service();
+    // name, the submitted position. A row written beside a road running east-west — its
+    // latitude a fifth of the grid spacing off that carriageway, its longitude midway between
+    // the roads running north-south — is matched ACROSS latitude; one written beside a road
+    // running north-south is matched across longitude; the four-decimal row is written the way
+    // a caller writes a position, and is matched across whichever axis its nearest road runs.
+    let cases: [(&str, [f64; 2]); 6] = [
+        (
+            "seven decimals, beside a road running east-west",
+            [between_roads(-122.3321) + 0.000_000_1, on_a_road(47.606) + 0.000_100_1],
+        ),
+        (
+            "seven decimals, beside a road running north-south",
+            [on_a_road(-122.3405) + 0.000_020_1, between_roads(47.6097) + 0.000_000_1],
+        ),
+        (
+            "more decimals than this API carries",
+            [
+                between_roads(-123.1017) + 0.000_000_149,
+                on_a_road(49.2823) + 0.000_100_149,
+            ],
+        ),
+        (
+            "six decimals, the precision the network's geometry carries",
+            [between_roads(-123.1067), on_a_road(49.2834) + 0.000_1],
+        ),
+        (
+            "four decimals, as a GPS trace is written",
+            [-122.3366, 47.6101],
+        ),
+        (
+            "seven decimals, east of the meridian and south of the equator",
+            [between_roads(151.2093) + 0.000_000_1, on_a_road(-33.8688) + 0.000_100_1],
+        ),
+    ];
+
+    for (case, submitted) in cases {
+        for (member, resolved) in resolved_positions(&router, submitted, case).await {
+            let case = &format!("{case} / {member}");
+            for coordinate in resolved {
+                assert_eq!(
+                    at_the_apis_precision(coordinate),
+                    coordinate,
+                    "case {case:?}: a position this service resolved is reported on the \
+                     ten-millionth-of-a-degree grid this API expresses a position on, got \
+                     {resolved:?}"
+                );
+            }
+            // The match moved the point, so it is a point of the network and not the
+            // submitted one.
+            let moved_m = great_circle_m(submitted, resolved);
+            assert!(
+                moved_m > 0.5,
+                "case {case:?}: no carriageway of this network runs at the decimals the row is \
+                 written in, so the match moved the point, got {moved_m:.3} m to {resolved:?}"
+            );
+            // One axis runs ALONG the matched road and is left where the caller put it, down
+            // to the last digit this API carries; the other is the carriageway's own.
+            let kept: Vec<usize> = (0..2)
+                .filter(|&axis| resolved[axis] == at_the_apis_precision(submitted[axis]))
+                .collect();
+            assert_eq!(
+                kept.len(),
+                1,
+                "case {case:?}: a match moves the point ACROSS one road, so exactly one \
+                 coordinate is the submitted one at this API's precision, got {resolved:?} for \
+                 {submitted:?}"
+            );
+            let across = 1 - kept[0];
+            assert!(
+                on_a_road_line(resolved[across]),
+                "case {case:?}: the coordinate the match moved is the one the matched road runs \
+                 at, got {resolved:?}"
+            );
+        }
+    }
+}
+
+/// Every position this service reports as the one it RESOLVED for `submitted`: a trace
+/// point's `SnappedPosition`, a leg's departure `Place.Position`, and the `SnappedOrigin` an
+/// isoline was measured from.
+async fn resolved_positions(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    submitted: [f64; 2],
+    case: &str,
+) -> Vec<(&'static str, [f64; 2])> {
+    // A second place a few hundred metres off, for the requests that need two.
+    let other = [submitted[0] + 0.004, submitted[1] + 0.004];
+
+    let (status, snapped, _) = post(
+        router,
+        SNAP,
+        &json!({
+            "TracePoints": [{ "Position": submitted }, { "Position": other }],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "case {case:?}: expected 200, got {status} with {snapped:?}");
+    let snapped_position = position(&snapped["SnappedTracePoints"][0]["SnappedPosition"], case);
+
+    let (status, route, _) = post(
+        router,
+        ROUTES,
+        &json!({ "Origin": submitted, "Destination": other }),
+    )
+    .await;
+    assert_eq!(status, 200, "case {case:?}: expected 200, got {status} with {route:?}");
+    let place = position(
+        &route["Routes"][0]["Legs"][0]["VehicleLegDetails"]["Departure"]["Place"]["Position"],
+        case,
+    );
+
+    let (status, isoline, _) = post(
+        router,
+        ISOLINES,
+        &json!({ "Origin": submitted, "Thresholds": { "Distance": [1_000] } }),
+    )
+    .await;
+    assert_eq!(status, 200, "case {case:?}: expected 200, got {status} with {isoline:?}");
+    let anchor = position(&isoline["SnappedOrigin"], case);
+
+    vec![
+        ("SnappedTracePoints[0].SnappedPosition", snapped_position),
+        ("Legs[0].VehicleLegDetails.Departure.Place.Position", place),
+        ("SnappedOrigin", anchor),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// A match belongs to its own point
+// ---------------------------------------------------------------------------
+
+/// A point whose own road lies inside the radius the request allowed is matched ON ITS OWN:
+/// `SnappedPosition`, `OriginalPosition` and `Confidence` are read off that match and off
+/// nothing else, so submitting the same point at another index, in a longer trace, beside
+/// other points, or a second time answers with the very same three values. A score drawn
+/// from the request as a whole — a seed, a counter, the point's index — moves with the trace
+/// around it, and a client that thresholds on it then keeps a different set of points for
+/// every trace it sends.
+///
+/// Rows span the index the point is submitted at, the length of the trace, which points
+/// surround it, asking twice over one service and asking a service that has answered nothing
+/// else — across three places of two hemispheres and two travel modes.
+#[tokio::test]
+async fn one_point_is_matched_and_scored_the_same_wherever_it_sits_in_the_trace() {
+    // The anchors: a fifth of the grid spacing off a road running east-west and midway
+    // between the roads running north-south, so each has a road of its own well inside the
+    // default radius.
+    let anchors: [(&str, [f64; 2]); 3] = [
+        ("Seattle", [between_roads(-122.3321), on_a_road(47.606) + 0.000_1]),
+        ("Vancouver", [between_roads(-123.1017), on_a_road(49.2823) + 0.000_1]),
+        ("Sydney", [between_roads(151.2093), on_a_road(-33.8688) + 0.000_1]),
+    ];
+
+    for (place, point) in anchors {
+        for mode in ["Car", "Truck"] {
+            let case = &format!("{place}, {mode}");
+            // A few other points of the same neighbourhood, to surround the anchor with.
+            let near = |lon: f64, lat: f64| [point[0] + lon, point[1] + lat];
+            // name, the trace, the index the anchor sits at.
+            let traces: [(&str, Vec<[f64; 2]>, usize); 4] = [
+                ("first of two", vec![point, near(0.0012, 0.0008)], 0),
+                ("last of two", vec![near(-0.0016, -0.0011), point], 1),
+                (
+                    "in the middle of five",
+                    vec![
+                        near(-0.0021, -0.0014),
+                        near(-0.0009, -0.0007),
+                        point,
+                        near(0.0008, 0.0006),
+                        near(0.0019, 0.0013),
+                    ],
+                    2,
+                ),
+                (
+                    "between two points far enough off to be matched elsewhere",
+                    vec![near(-0.0043, 0.0031), point, near(0.0038, -0.0027)],
+                    1,
+                ),
+            ];
+
+            let mut answers: Vec<(String, Value)> = Vec::new();
+            let router = routes_service();
+            for (shape, trace, index) in &traces {
+                // Twice over the same service: the second answer has the first's work behind
+                // it, and must still be the same answer.
+                for round in ["first time", "second time"] {
+                    let snapped =
+                        snap_point(&router, trace, *index, mode, &format!("{case} / {shape} / {round}")).await;
+                    answers.push((format!("{shape}, {round}"), snapped));
+                }
+            }
+            // And a service that has answered nothing else at all.
+            let fresh = routes_service();
+            let (shape, trace, index) = &traces[0];
+            answers.push((
+                format!("{shape}, on a service of its own"),
+                snap_point(&fresh, trace, *index, mode, &format!("{case} / {shape} / fresh service")).await,
+            ));
+
+            let (first_shape, first) = answers[0].clone();
+            for (shape, answer) in &answers {
+                assert_eq!(
+                    answer, &first,
+                    "case {case:?}: the point {point:?} is matched on its own, so {shape} reports \
+                     the match {first_shape} reported, got {answer:?} against {first:?}"
+                );
+            }
+            // The row is a real match, scored on it: the point lies off the carriageway, so
+            // it was moved onto one and its score is below the certain match a point on the
+            // road itself scores.
+            let confidence = first["Confidence"]
+                .as_f64()
+                .unwrap_or_else(|| panic!("case {case:?}: Confidence is required, got {first:?}"));
+            assert!(
+                (0.0..1.0).contains(&confidence),
+                "case {case:?}: the point lies off the carriageway, so its match is not the \
+                 certain one, got {confidence}"
+            );
+        }
+    }
+}
+
+/// The snapped trace point at `index` of `trace`, as the answer carries it.
+async fn snap_point(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    trace: &[[f64; 2]],
+    index: usize,
+    mode: &str,
+    case: &str,
+) -> Value {
+    let (status, answer, _) = post(
+        router,
+        SNAP,
+        &json!({
+            "TracePoints": trace.iter().map(|point| json!({ "Position": point })).collect::<Vec<Value>>(),
+            "TravelMode": mode,
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "case {case:?}: expected 200, got {status} with {answer:?}");
+    let points = answer["SnappedTracePoints"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: SnappedTracePoints is required, got {answer:?}"))
+        .clone();
+    assert_eq!(
+        points.len(),
+        trace.len(),
+        "case {case:?}: one snapped point per trace point, got {points:?}"
+    );
+    points[index].clone()
 }

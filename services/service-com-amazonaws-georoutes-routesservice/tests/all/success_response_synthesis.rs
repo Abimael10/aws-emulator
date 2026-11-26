@@ -7,8 +7,9 @@
 //!
 //! * `PricingBucket` is the tier the OPERATION's queries are charged in: one value per
 //!   operation, the same for every request that operation serves;
-//! * a position READ OFF the road network is reported at the network's own coordinate
-//!   precision, while a position the CALLER supplied is reported as submitted;
+//! * a position the service RESOLVED against the road network is reported at the
+//!   coordinate precision this API expresses a position in, while a position the CALLER
+//!   supplied is reported as submitted;
 //! * `SnapToRoads` scores a match on the match itself — how far the point had to move to
 //!   reach its road — and never on the `SnapRadius` the
 //!   caller allowed;
@@ -25,7 +26,9 @@
 
 use serde_json::{json, Value};
 
-use crate::road_graph_metrics::{between_roads, on_a_road, on_a_road_line, ROAD_SPACING_DEG};
+use crate::road_graph_metrics::{
+    between_roads, on_a_road, on_a_road_line, POSITION_PRECISION, ROAD_SPACING_DEG,
+};
 use crate::routing::{
     great_circle_m, int, position, post, routes_service, MATRIX, OPTIMIZE, ROUTES, SNAP,
 };
@@ -33,15 +36,16 @@ use crate::routing::{
 /// The path `CalculateIsolines` is bound to.
 const ISOLINES: &str = "/v2/isolines";
 
-/// Precision of the coordinates the network's geometry carries, in decimal digits, as
-/// documented on `POLYLINE_PRECISION` in `src/state.rs`.
-const NETWORK_PRECISION_DIGITS: i32 = 6;
-
-/// Whether `value` carries no more than the network's coordinate precision, which is what
-/// a position read off the network must be reported at: rounding it to that precision
-/// leaves it unchanged.
-fn at_network_precision(value: f64) -> bool {
-    let scale = 10_f64.powi(NETWORK_PRECISION_DIGITS);
+/// Whether `value` carries no more than the coordinate precision this API expresses a
+/// position in (`POSITION_PRECISION`, a ten-millionth of a degree), which is what a
+/// position the service resolved against the network must be reported at: rounding it to
+/// that precision leaves it unchanged.
+///
+/// It is the API's own precision and not the coarser one the polyline FORMAT encodes a
+/// vertex at: a resolved position is reported in a `Position` member, a list of `Double`,
+/// and AWS answers one with as many as seven decimals.
+fn at_the_apis_position_precision(value: f64) -> bool {
+    let scale = 10_f64.powi(POSITION_PRECISION);
     (value * scale).round() / scale == value
 }
 
@@ -176,9 +180,10 @@ async fn each_operation_is_charged_in_its_own_pricing_tier() {
 // Positions: the caller's, and the network's
 // ---------------------------------------------------------------------------
 
-/// A position READ OFF the road network is reported at the network's coordinate precision
-/// and lies on a road of it; a position the CALLER supplied is echoed exactly as it was
-/// submitted, however many digits it carried.
+/// A position the service RESOLVED against the road network is reported at the coordinate
+/// precision this API expresses a position in and lies on a road of the network; a position
+/// the CALLER supplied is echoed exactly as it was submitted, however many digits it
+/// carried.
 ///
 /// A matched position is the submitted one moved onto the network, so it "may differ from
 /// the requested" position — and does differ whenever the submitted position lay on no road
@@ -189,7 +194,7 @@ async fn each_operation_is_charged_in_its_own_pricing_tier() {
 /// already on a road line), both hemispheres and both signs of longitude, and the three
 /// operations that report a matched position for a position the request supplied.
 #[tokio::test]
-async fn a_position_of_the_network_is_reported_at_the_networks_precision() {
+async fn a_position_of_the_network_is_reported_at_the_apis_position_precision() {
     let router = routes_service();
     // name, the two positions submitted.
     let cases: [(&str, [f64; 2], [f64; 2]); 5] = [
@@ -241,8 +246,9 @@ async fn a_position_of_the_network_is_reported_at_the_networks_precision() {
             );
             let matched = position(&point["SnappedPosition"], case);
             assert!(
-                matched.iter().copied().all(at_network_precision),
-                "case {case:?}: a matched position carries the network's precision, got {matched:?}"
+                matched.iter().copied().all(at_the_apis_position_precision),
+                "case {case:?}: a matched position carries this API's position precision, got \
+                 {matched:?}"
             );
             assert!(
                 matched.iter().copied().any(on_a_road_line),
@@ -268,9 +274,9 @@ async fn a_position_of_the_network_is_reported_at_the_networks_precision() {
             );
             let reported = position(&place["Position"], case);
             assert!(
-                reported.iter().copied().all(at_network_precision),
-                "case {case:?}: Position is read off the network, so it carries the network's \
-                 precision, got {reported:?}"
+                reported.iter().copied().all(at_the_apis_position_precision),
+                "case {case:?}: Position is the point the network resolved, so it carries this \
+                 API's position precision, got {reported:?}"
             );
             assert!(
                 reported.iter().copied().any(on_a_road_line),
@@ -300,9 +306,9 @@ async fn a_position_of_the_network_is_reported_at_the_networks_precision() {
             assert_eq!(status, 200, "case {case:?}: expected 200, got {status} with {answer:?}");
             let matched = position(&answer[reported_member], case);
             assert!(
-                matched.iter().copied().all(at_network_precision),
-                "case {case:?}: {reported_member} is read off the network, so it carries the \
-                 network's precision, got {matched:?}"
+                matched.iter().copied().all(at_the_apis_position_precision),
+                "case {case:?}: {reported_member} is the point the network resolved, so it \
+                 carries this API's position precision, got {matched:?}"
             );
             assert!(
                 matched.iter().copied().any(on_a_road_line),
@@ -461,9 +467,9 @@ async fn a_matched_position_is_a_coordinate_of_the_network_and_not_the_submitted
                  got {moved:.3} m to {matched:?}"
             );
             assert!(
-                matched.iter().copied().all(at_network_precision),
-                "case {case:?}: the point is read off the network, so it carries the network's \
-                 own precision, got {matched:?}"
+                matched.iter().copied().all(at_the_apis_position_precision),
+                "case {case:?}: the point is the one the network resolved, so it carries this \
+                 API's position precision, got {matched:?}"
             );
             for digits in 3..=7 {
                 let quantized = [round_to(submitted[0], digits), round_to(submitted[1], digits)];
