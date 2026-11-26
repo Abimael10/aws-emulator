@@ -246,6 +246,14 @@ pub struct Domain {
     /// The configuration changes scheduled on this domain, keyed by their action id
     /// — unique per domain, so the id IS the key. See [`ScheduledChange`].
     pub scheduled_actions: BTreeMap<String, ScheduledChange>,
+    /// This domain's cross-cluster REPLICATION arrangement: the peers it replicates
+    /// with and the role it plays with them. `AddReplicationPeer` establishes one,
+    /// `DescribeDomainReplication` reports it, `FailoverReplication` /
+    /// `SwitchoverReplication` move the role and `RemoveReplicationPeer` releases it —
+    /// all from THIS one record, so no two of them can report one arrangement
+    /// differently. Empty for a domain that replicates with nobody. See
+    /// [`replication::DomainReplication`].
+    pub replication: replication::DomainReplication,
     /// The insights this domain holds, keyed by their `InsightId` — unique across
     /// the account's insights, so the id IS the key. See [`InsightRecord`].
     ///

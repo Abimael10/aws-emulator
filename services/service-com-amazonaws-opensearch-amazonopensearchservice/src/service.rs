@@ -89,6 +89,11 @@ pub mod application_ui;
 /// them can report one stored record differently.
 pub mod domain_configuration;
 
+/// The routes of this API the on-disk model does not describe — a domain's cross-cluster
+/// replication family and the comparison of two domains' configuration — served out of the
+/// records this service holds.
+pub mod unmodelled_routes;
+
 /// Whether the request these `parts` came from resolves to this service's signing name
 /// AND addresses a first URI path segment this model publishes
 /// (`crate::ROUTE_PATH_SEGMENTS`).
@@ -153,6 +158,13 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// Held in a field for the same reason as the two above, and because it carries this
     /// service's input schemas, which are indexed once rather than per request.
     unreadable_body: request_layer::UnreadableBody,
+    /// The routes of this API the on-disk model does not describe
+    /// ([`unmodelled_routes`]): a domain's cross-cluster replication family and the
+    /// comparison of two domains' configuration. Held in a field for the same reason as
+    /// the ones above — `override_operation` hands back a reference borrowed from `&self`
+    /// — and holding the SAME shared engine, so these routes read and write the one store
+    /// the modelled operations do.
+    unmodelled_routes: unmodelled_routes::UnmodelledRoutes<Eng>,
 }
 
 /// The auth schemes a credentialed data-plane request is verified under.
@@ -233,6 +245,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 violations: crate::ops::start_migration::stated_input_violations,
             },
             unreadable_body: request_layer::UnreadableBody::new::<Eng>(),
+            unmodelled_routes: unmodelled_routes::UnmodelledRoutes::new(Arc::clone(&engine)),
             engine,
         }
     }
@@ -368,6 +381,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             && domain_rest::carries_sigv4_credential(req)
         {
             return Some(&self.credentialed_data_plane);
+        }
+        // A request addressing one of the routes this API serves that the on-disk model does
+        // not describe (see [`unmodelled_routes`]) is named as an operation for the same
+        // reason the credentialed data plane is: the router verifies the SigV4 credential
+        // only for what it names an operation for, and these are ordinary AWS API calls,
+        // signed like every other call to this endpoint. Without this they resolved through
+        // the generated routing table, which can name no operation the model does not
+        // carry, and the protocol default answered `501 NotImplemented` for a class of
+        // request that is a permanent CLIENT error.
+        if unmodelled_routes::route(req.method(), req.uri()).is_some() {
+            return Some(&self.unmodelled_routes);
         }
         // A body value whose JSON class the modelled member it is bound to cannot be read
         // from never becomes an input at all, so it is answered by the deserialization

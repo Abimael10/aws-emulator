@@ -180,6 +180,9 @@ mod domains;
 /// The ADDRESS one domain's own data plane is published at: the listener this emulator opens
 /// for it, and the handle that keeps that port open.
 pub mod domain_plane;
+/// A domain's cross-cluster REPLICATION arrangement: the peers it replicates with, the role
+/// it plays with them, and the refusal of a call on a domain that replicates with nobody.
+pub mod replication;
 /// The store every operation reaches this service's records through, and the ids it mints.
 mod store;
 
@@ -251,6 +254,7 @@ pub use package_catalog::*;
 pub use packages::*;
 pub use projections::*;
 pub use refusals::*;
+pub use replication::*;
 pub use reserved_instance_offerings::*;
 pub use reserved_instances::*;
 pub use snapshots::*;
@@ -2716,10 +2720,15 @@ pub fn epoch_millis(at: SystemTime) -> i64 {
 /// process will ever serve the call.
 pub fn state_unavailable<E>() -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::NotImplemented(crate::scaffolded::NotImplemented {
-        message: "the com-amazonaws-opensearch-amazonopensearchservice emulator's state store is not reachable from this engine"
-            .to_string(),
+        message: STATE_UNAVAILABLE_MESSAGE.to_string(),
     })
 }
+
+/// The one sentence that answer carries, stated once: a route this service serves outside
+/// the generated operation walk ([`crate::service::unmodelled_routes`]) answers the same
+/// thing for the same condition, so the two cannot word it differently.
+pub const STATE_UNAVAILABLE_MESSAGE: &str =
+    "the com-amazonaws-opensearch-amazonopensearchservice emulator's state store is not reachable from this engine";
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

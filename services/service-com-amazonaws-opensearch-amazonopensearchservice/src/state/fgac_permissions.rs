@@ -23,6 +23,8 @@
 //! Nothing here reaches the clock or the network: every answer is a pure function of the
 //! stored role documents and the request, so the same request decides the same way twice.
 
+use std::collections::BTreeMap;
+
 use ::serde_json::{json, Map, Value};
 use ::service_common::iam_authorization::wildcard_match;
 
@@ -140,6 +142,27 @@ const ACTION_GROUPS: &[(&str, &[&str])] = &[
     ),
     ("search_template", &["indices:data/read/search/template"]),
 ];
+
+/// The default action groups a domain's security plugin PUBLISHES: each group's name and
+/// the action patterns it stands for.
+///
+/// The reading half of [`ACTION_GROUPS`], for a caller that reports the catalogue rather
+/// than resolving one entry of it — the comparison of two domains'
+/// `security_action_groups` ([`crate::service::unmodelled_routes::configuration_comparison`]).
+/// Every domain of this service publishes the same set, because the set is the plugin's
+/// rather than a domain's.
+#[must_use]
+pub fn published_action_groups() -> BTreeMap<String, Vec<String>> {
+    ACTION_GROUPS
+        .iter()
+        .map(|(group, actions)| {
+            (
+                (*group).to_string(),
+                actions.iter().map(|action| (*action).to_string()).collect(),
+            )
+        })
+        .collect()
+}
 
 /// Whether any of `roles` permits `action` on the index `index` names.
 ///
