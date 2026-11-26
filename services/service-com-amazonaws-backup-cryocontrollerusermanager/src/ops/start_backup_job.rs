@@ -275,15 +275,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         } else {
             crate::state::CapturedContents::default()
         };
-        // WHAT SIZE THE BACKUP REPORTS: the size the service that OWNS the resource meters
-        // for it, read at the same instant and over the same hop
-        // (`crate::state::metered_resource_size`). It is that service's own figure, refreshed
-        // on that service's own schedule, rather than a count of the bytes this capture
-        // copied — which is what bounds this emulator's store and nothing else. Asked only
-        // for a backup that will write a point at all.
-        let metered_resource_size = if withheld.is_none() {
-            crate::state::metered_resource_size(ctx.callback(), &region, &input.resource_arn)
-                .await
+        // WHAT SIZE THE BACKUP REPORTS: the figure other services report to AWS Backup for a
+        // protected resource of this TYPE, which is what the model's own enumeration for the
+        // member says decides it (`crate::state::reported_backup_size`) — for a type whose
+        // figure its owning service holds, that service's own, read over the same in-process
+        // hop and at the same instant; for a type no service reports one for, nothing. It is
+        // never a count of the bytes this capture copied, which bounds this emulator's store
+        // and nothing else. Asked only for a backup that will write a point at all.
+        let reported_size = if withheld.is_none() {
+            crate::state::reported_backup_size(ctx.callback(), &region, &input.resource_arn).await
         } else {
             0
         };
@@ -295,7 +295,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             withheld,
             captured_restore_metadata,
             captured_contents,
-            metered_resource_size,
+            reported_size,
         )?;
         crate::state::publish_job_state_changes(ctx, &*self.engine).await;
         // The transition this job is owed falls due on the clock, not on the next
@@ -324,9 +324,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartBackupJob<En
     /// the same capture; it too is stored on the recovery point, and is what a restore
     /// of that point writes back (`crate::state::captured_contents`).
     ///
-    /// `metered_resource_size` is the size that service METERS for the resource, as it
-    /// answered it at the same instant (`crate::state::metered_resource_size`): it is what
-    /// the point and the job report as the size of the backup.
+    /// `reported_size` is the size a backup of this protected resource reports, as the rule
+    /// keyed on the resource's TYPE answered it at the same instant
+    /// (`crate::state::reported_backup_size`): it is what the point and the job report as the
+    /// size of the backup.
     ///
     /// Separate from `handle` so this store's lock lives for exactly this call: the
     /// publication `handle` makes afterwards awaits, and a guard must not be held
@@ -339,7 +340,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartBackupJob<En
         withheld: Option<crate::state::BackupFailure>,
         captured_restore_metadata: ::std::collections::BTreeMap<String, String>,
         captured_contents: crate::state::CapturedContents,
-        metered_resource_size: i64,
+        reported_size: i64,
     ) -> Result<StartBackupJobOutput, StartBackupJobError> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StartBackupJobErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
@@ -572,11 +573,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartBackupJob<En
             creation_date: now,
             settles_at,
             completion_date: None,
-            // The size of a backup is the size of the RESOURCE it was taken of, as the
-            // service that owns it meters it: that service's figure is the one the point
-            // reports, so a resource its own service meters at nothing is backed up at
-            // nothing however many bytes this emulator copied out of it.
-            backup_size_in_bytes: metered_resource_size,
+            // The size of a backup is decided by the TYPE of the resource it was taken of,
+            // as the model's own enumeration for the member states: the figure other
+            // services report to Backup for a resource of that type, and nothing at all for
+            // a type none reports one for. So a backup reports no size of this emulator's
+            // own making, however many bytes it copied out of the resource.
+            backup_size_in_bytes: reported_size,
             lifecycle: input.lifecycle.clone(),
             encryption_key_arn: point_encryption_key_arn,
             is_encrypted: true,

@@ -1,27 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The SIZE of a protected resource, as the service that owns it meters it — the figure a
-//! backup of that resource reports as the size of the backup.
+//! backup reports for a resource type whose backup size is that service's own.
 //!
 //! # The rule this module implements
 //!
-//! `BackupJob$BackupSizeInBytes` is "the size, in bytes, of a backup" and
-//! `RecoveryPointByBackupVault$BackupSizeInBytes` "the size, in bytes, of a backup", which is
-//! the size of the PROTECTED RESOURCE the backup was taken of. Only the service that owns the
-//! resource meters that size, so the figure is read FROM that service when the backup is taken
-//! — over the emulator's own in-process transport
+//! For the resource types whose `BackupSizeInBytes` AWS Backup takes from the service that
+//! OWNS the protected resource ([`super::reported_backup_size`], which decides which types
+//! those are), only that service holds the figure, so it is read FROM that service when the
+//! backup is taken — over the emulator's own in-process transport
 //! ([`smithy_server_runtime::EmbeddedEmulator`]), the hop the backup already asks whether the
 //! resource exists through ([`super::protected_resource_answer`]) — and stored on the recovery
 //! point, never recomputed: a point describes the resource as it WAS.
 //!
 //! It is NOT a count of the bytes the capture copied ([`super::captured_contents`], which
-//! measures what this emulator holds so it can bound its own store). The size a backup reports
-//! is the owning service's own metered figure, which that service refreshes on its own
-//! schedule: for an Amazon DynamoDB table it is `TableDescription$TableSizeBytes`, and
-//! "DynamoDB updates this value approximately every six hours. Recent changes might not be
-//! reflected in this value" (that member's doc) — so a table written to an instant before the
-//! backup is metered at whatever its own service still reports for it, which for a table
-//! written in the same minute is nothing.
+//! measures what this emulator holds so it can bound its own store). It is the owning
+//! service's own metered figure, which that service refreshes on its own schedule: for an
+//! Amazon DynamoDB table it is `TableDescription$TableSizeBytes`, and "DynamoDB updates this
+//! value approximately every six hours. Recent changes might not be reflected in this value"
+//! (that member's doc) — so a table written to an instant before the backup is metered at
+//! whatever its own service still reports for it. That figure is what a DynamoDB table WITH
+//! Backup's advanced features would report, the only DynamoDB case the size rule reports a
+//! size for at all.
 //!
 //! One arm per resource type whose owning service this emulator can ask; a type with no arm
 //! here, and a hop that answers nothing, meter NOTHING rather than a size nobody reported.
@@ -29,7 +29,8 @@
 use smithy_server_runtime::EmbeddedEmulator;
 
 /// The size the service that owns `resource_arn` meters for it, for the recovery point a
-/// backup of it is about to store.
+/// backup of it is about to store — asked only for a resource type whose backup size is that
+/// service's own figure ([`super::reported_backup_size`]).
 ///
 /// Asked with NO store guard held: it makes at most one in-process call and opens no socket.
 /// `0` is "nothing was metered" — see the module docs.

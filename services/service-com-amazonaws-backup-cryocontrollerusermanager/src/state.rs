@@ -128,10 +128,16 @@ pub use restore_execution::*;
 mod captured_contents;
 pub use captured_contents::*;
 
-/// The SIZE the service that owns a protected resource meters for it, which is the size a
-/// backup of that resource reports. Re-exported for the reason given on `events`.
+/// The SIZE the service that owns a protected resource meters for it, read for the resource
+/// types whose backup size is that service's own figure. Re-exported for the reason given on
+/// `events`.
 mod metered_resource_size;
 pub use metered_resource_size::*;
+
+/// The SIZE a backup reports, which the TYPE of the protected resource it was taken of
+/// decides. Re-exported for the reason given on `events`.
+mod reported_backup_size;
+pub use reported_backup_size::*;
 
 /// What a restore's `Metadata` has to carry for the type of resource it restores, which a
 /// start that carries less is refused for, and the pairs a stored recovery point reports as

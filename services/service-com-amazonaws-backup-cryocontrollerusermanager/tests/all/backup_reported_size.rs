@@ -4,29 +4,33 @@
 //!
 //! The rule under test:
 //!
-//! > `BackupJob$BackupSizeInBytes` and `RecoveryPointByBackupVault$BackupSizeInBytes` are
-//! > "the size, in bytes, of a backup", which is the size of the PROTECTED RESOURCE the
-//! > backup was taken of as the service that OWNS it meters it — not a count of the bytes
-//! > the backup copied. So the figure a backup reports is the one that service answers for
-//! > the resource at the instant the backup is taken (for a DynamoDB table,
-//! > `TableDescription$TableSizeBytes`, which "DynamoDB updates approximately every six
-//! > hours", so a table written to an instant before the backup is metered at whatever its
-//! > own service still reports), it is stored once on the recovery point, and every read of
-//! > that backup — the job, the point and the vault's listing — reports that one value. A
-//! > settled job has moved the whole backup, so its `BytesTransferred` is that same figure.
+//! > `BackupJob$BackupSizeInBytes` is "the size, in bytes, of a backup (recovery point)", and
+//! > the member's own documentation states what decides it: the value "can render differently
+//! > depending on the resource type as Backup pulls in data information from other Amazon Web
+//! > Services services. For example, the value returned may show a value of `0`". So the
+//! > figure follows the TYPE of the protected resource — it is one other services report to
+//! > Backup — and never a count of the bytes this emulator stored for the resource. The
+//! > enumeration that documentation gives reports no figure at all for an Amazon Aurora,
+//! > Amazon DocumentDB or Amazon Neptune cluster, an Amazon RDS instance, an Amazon FSx file
+//! > system, or an Amazon DynamoDB table without Backup's advanced features (which nothing in
+//! > this emulator turns on). A job that settled has moved the whole backup, so its
+//! > `BytesTransferred` is that same figure, and the job, the account's job listing, the
+//! > recovery point and the vault's listing of it all report the one value settled when the
+//! > backup was taken.
 //!
-//! The rows differ along what the rule generalises over: how much data the protected
-//! resource holds when the backup is taken (none, a few small items, one item of a few
-//! kilobytes) and whether the owning service has METERED that data (a table written through
-//! its own wire, whose metered figure its six-hour schedule has not moved yet, and a table
-//! DynamoDB's own restore created already holding its items, whose figures are metered when
-//! it is created) — so no row can pass on a figure this emulator counted for itself, and no
-//! row can pass on a constant.
+//! The rows differ along what the rule generalises over:
+//!
+//! * how much the protected resource holds when the backup is taken — nothing, a few small
+//!   items, one item of a few kilobytes — so no row can pass on a figure counted over what
+//!   the emulator stored;
+//! * the TYPE of the protected resource, one row per entry of the rule's own catalog
+//!   (including the four types this emulator's own issue never cited), so no row can pass on
+//!   a case keyed to one recorded request.
 //!
 //! Every case drives real HTTP through the router, so what is asserted is the wire behaviour
 //! a `backup` and a `dynamodb` SDK client see. The Backup-and-DynamoDB emulator and the
 //! DynamoDB wire are [`crate::restore_job`]'s, the settled-point setup is
-//! [`crate::recovery_point_deletion`]'s, and the vault calls are
+//! [`crate::recovery_point_deletion`]'s, and the vault, job and wait helpers are
 //! [`crate::vault_and_backup_job`]'s; this suite adds no second copy of any of them.
 
 use std::time::Duration;
@@ -36,10 +40,16 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::recovery_point_deletion::completed_point;
 use crate::restore_job::{dynamodb, emulator};
-use crate::vault_and_backup_job::{call, create_vault, error_code, string_at};
+use crate::vault_and_backup_job::{
+    call, create_vault, error_code, router, settled_backup_job, start_job, string_at, ACCOUNT,
+    REGION,
+};
 
 /// `TableStatus` of a table that is usable (model enum `TableStatus`).
 const ACTIVE: &str = "ACTIVE";
+
+/// The figure the rule gives a backup whose resource type no service reports a size for.
+const NO_SIZE: i64 = 0;
 
 /// How long a wait for one of those conditions runs in all, and how long each look waits
 /// before the next: far past the span the emulator's own clock owes a table or a job, so a
@@ -47,20 +57,20 @@ const ACTIVE: &str = "ACTIVE";
 const POLL_DEADLINE: Duration = Duration::from_secs(60);
 const POLL_WAIT: Duration = Duration::from_millis(100);
 
-/// One row: what the protected resource holds when the backup is taken.
-struct Row {
+/// One content row: what the protected resource holds when the backup is taken.
+struct Holding {
     case: &'static str,
     /// The items put into the table before the backup, as `PutItem` takes them.
     items: Vec<Value>,
 }
 
-fn rows() -> Vec<Row> {
+fn holdings() -> Vec<Holding> {
     vec![
-        Row {
+        Holding {
             case: "a table holding nothing",
             items: Vec::new(),
         },
-        Row {
+        Holding {
             case: "a table holding a few small items",
             items: vec![
                 json!({"pk": {"S": "order-1"}, "total": {"N": "42"}}),
@@ -68,7 +78,7 @@ fn rows() -> Vec<Row> {
                 json!({"pk": {"S": "order-3"}, "owner": {"S": "alice"}}),
             ],
         },
-        Row {
+        Holding {
             case: "a table holding one item of a few kilobytes",
             items: vec![json!({
                 "pk": {"S": "order-large"},
@@ -76,6 +86,48 @@ fn rows() -> Vec<Row> {
             })],
         },
     ]
+}
+
+/// One protected-resource-type row: an ARN of that type, and the type the service reads off
+/// it.
+///
+/// SOURCE of the types and of the figure each is expected to carry: the enumeration in the
+/// model's documentation for `BackupJob$BackupSizeInBytes`
+/// (`smithy_query(query="doc", shape="BackupJob", member="BackupSizeInBytes",
+/// model_path="services/service-com-amazonaws-backup-cryocontrollerusermanager/smithy-model/com-amazonaws-backup-cryocontrollerusermanager.json")`),
+/// which names each of these types as one no size is populated for.
+fn typed_resources() -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "Aurora",
+            format!("arn:aws:rds:{REGION}:{ACCOUNT}:cluster:ledger-cluster"),
+        ),
+        (
+            "DocumentDB",
+            format!("arn:aws:docdb:{REGION}:{ACCOUNT}:cluster:catalog-cluster"),
+        ),
+        (
+            "DynamoDB",
+            format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/orders"),
+        ),
+        (
+            "FSx",
+            format!("arn:aws:fsx:{REGION}:{ACCOUNT}:file-system/fs-0123456789abcdef0"),
+        ),
+        (
+            "Neptune",
+            format!("arn:aws:neptune:{REGION}:{ACCOUNT}:cluster:graph-cluster"),
+        ),
+        (
+            "RDS",
+            format!("arn:aws:rds:{REGION}:{ACCOUNT}:db:orders"),
+        ),
+    ]
+}
+
+/// The role a job is started under, as the sibling suites name it.
+fn backup_role() -> String {
+    format!("arn:aws:iam::{ACCOUNT}:role/service-role/AWSBackupDefaultServiceRole")
 }
 
 /// Create the table `name` through DynamoDB's own wire, wait until that service reports it
@@ -143,16 +195,14 @@ async fn active_table(router: &MultiServiceRouter, case: &str, name: &str) -> Va
     }
 }
 
-/// The size the owning service meters for the table `name`: `TableSizeBytes` as DynamoDB
-/// itself reports it.
-async fn metered_size(router: &MultiServiceRouter, case: &str, name: &str) -> i64 {
-    let table = active_table(router, case, name).await;
-    table
+/// What the table's OWN service reports about its stored bytes (`TableSizeBytes`), carried
+/// into the failure messages: the figure the backup's own size must not be taken from.
+async fn table_size_bytes(router: &MultiServiceRouter, case: &str, name: &str) -> i64 {
+    active_table(router, case, name)
+        .await
         .get("TableSizeBytes")
         .and_then(Value::as_i64)
-        .unwrap_or_else(|| {
-            panic!("case {case:?}: DynamoDB must report a TableSizeBytes for {name}, got {table}")
-        })
+        .unwrap_or_default()
 }
 
 /// The `BackupSizeInBytes` of a member of one answer, with the case named on failure.
@@ -216,65 +266,92 @@ async fn listed_point(
         })
 }
 
-/// RULE: the size a backup reports is the size the owning service meters for the resource,
-/// and every read of that backup reports that one figure.
+/// Assert that every read of the backup that wrote `point_arn` reports `NO_SIZE`: the job and
+/// the bytes it transferred, the account's job listing, the recovery point and the vault's
+/// listing of it.
+async fn assert_backup_reports_no_size(
+    router: &MultiServiceRouter,
+    case: &str,
+    vault: &str,
+    point_arn: &str,
+    counted: &str,
+) {
+    let listed_job = job_of_point(router, case, point_arn).await;
+    let job_id = string_at(&listed_job, "BackupJobId");
+    let described_job = settled_backup_job(router, case, &job_id).await;
+    assert_eq!(
+        reported_size(case, "the backup job", &described_job),
+        NO_SIZE,
+        "case {case:?}: DescribeBackupJob must report {NO_SIZE} bytes backed up for this \
+         resource type, not {counted}, got {described_job}"
+    );
+    assert_eq!(
+        described_job.get("BytesTransferred").and_then(Value::as_i64),
+        Some(NO_SIZE),
+        "case {case:?}: a settled job has moved the whole backup, whose reported size is \
+         {NO_SIZE}, not {counted}, got {described_job}"
+    );
+    assert_eq!(
+        reported_size(case, "the account's job listing", &listed_job),
+        NO_SIZE,
+        "case {case:?}: ListBackupJobs must report the same {NO_SIZE}, got {listed_job}"
+    );
+
+    let (status, read) = call(
+        router,
+        "GET",
+        &format!("/backup-vaults/{vault}/recovery-points/{point_arn}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: DescribeRecoveryPoint must answer 200, got {status} {read:?}"
+    );
+    assert_eq!(
+        reported_size(case, "the recovery point", &read),
+        NO_SIZE,
+        "case {case:?}: the point the backup wrote must report {NO_SIZE}, not {counted}, got \
+         {read}"
+    );
+
+    let listed = listed_point(router, case, vault, point_arn).await;
+    assert_eq!(
+        reported_size(case, "the vault's listing", &listed),
+        NO_SIZE,
+        "case {case:?}: the vault's listing must report the same {NO_SIZE}, got {listed}"
+    );
+}
+
+/// RULE, over how much the protected resource holds: a backup of a plain Amazon DynamoDB
+/// table reports no size at all, whatever that table holds and whatever its own service
+/// reports about its stored bytes — so the figure is not counted over the backed-up data.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_backup_reports_the_size_the_owning_service_meters_for_the_resource() {
-    for (index, row) in rows().into_iter().enumerate() {
-        let case = row.case;
+async fn a_backup_of_a_plain_dynamodb_table_reports_no_size_whatever_it_holds() {
+    for (index, holding) in holdings().into_iter().enumerate() {
+        let case = holding.case;
         let router = emulator();
-        let vault = format!("metered-size-{index}");
-        let table = format!("metered-table-{index}");
+        let vault = format!("reported-size-{index}");
+        let table = format!("reported-size-table-{index}");
         let (status, created) = create_vault(&router, &vault, "{}").await;
         assert_eq!(
             status, 200,
             "case {case:?}: setup CreateBackupVault must succeed, got {status} {created:?}"
         );
-        let table_arn = table_holding(&router, case, &table, &row.items).await;
-        let metered = metered_size(&router, case, &table).await;
+        let table_arn = table_holding(&router, case, &table, &holding.items).await;
+        // What the table's own service says about its stored bytes, and what this emulator
+        // holds for it, are both quantities the reported size must NOT be taken from; the
+        // figure appears in the failure messages so a regression names what it was taken from.
+        let counted = format!(
+            "the {} bytes DynamoDB reports stored for the table",
+            table_size_bytes(&router, case, &table).await
+        );
 
         let point_arn = completed_point(&router, &vault, &table_arn).await;
-        let (status, read) = call(
-            &router,
-            "GET",
-            &format!("/backup-vaults/{vault}/recovery-points/{point_arn}"),
-            None,
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: DescribeRecoveryPoint must answer 200, got {status} {read:?}"
-        );
-        assert_eq!(
-            reported_size(case, "the recovery point", &read),
-            metered,
-            "case {case:?}: the point must report the size DynamoDB meters for the table \
-             ({metered}), got {read}"
-        );
+        assert_backup_reports_no_size(&router, case, &vault, &point_arn, &counted).await;
 
-        let job = job_of_point(&router, case, &point_arn).await;
-        assert_eq!(
-            reported_size(case, "the backup job", &job),
-            metered,
-            "case {case:?}: the job must report the same figure ({metered}), got {job}"
-        );
-        assert_eq!(
-            job.get("BytesTransferred").and_then(Value::as_i64),
-            Some(metered),
-            "case {case:?}: a settled job has moved the whole backup, so it reports \
-             {metered} bytes transferred, got {job}"
-        );
-
-        let listed = listed_point(&router, case, &vault, &point_arn).await;
-        assert_eq!(
-            reported_size(case, "the vault's listing", &listed),
-            metered,
-            "case {case:?}: the vault's listing must report the same figure ({metered}), got \
-             {listed}"
-        );
-
-        // The figure was settled by the backup: a later write to the protected resource
-        // does not move what the stored point reports.
+        // The figure was settled by the backup: a later write to the protected resource does
+        // not move what the stored point reports.
         let (status, written) = dynamodb(
             &router,
             "PutItem",
@@ -288,128 +365,57 @@ async fn a_backup_reports_the_size_the_owning_service_meters_for_the_resource() 
             status, 200,
             "case {case:?}: the later PutItem must succeed, got {status} {written:?}"
         );
-        let (status, reread) = call(
+        assert_backup_reports_no_size(&router, case, &vault, &point_arn, &counted).await;
+    }
+}
+
+/// RULE, over the TYPE of the protected resource: each type the rule's catalog names reports
+/// no size, so the figure follows the resource's type rather than the one resource the
+/// recorded request named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_reported_size_follows_the_protected_resources_type() {
+    for (resource_type, resource_arn) in typed_resources() {
+        let case = resource_type;
+        // Backup alone: a resource of these types belongs to a service this emulator is not
+        // asked about here, so what is under test is the TYPE the ARN carries.
+        let router = router();
+        let vault = format!("typed-size-{}", resource_type.to_lowercase());
+        let (status, created) = create_vault(&router, &vault, "{}").await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: setup CreateBackupVault must succeed, got {status} {created:?}"
+        );
+        let (status, started) = start_job(
             &router,
-            "GET",
-            &format!("/backup-vaults/{vault}/recovery-points/{point_arn}"),
-            None,
+            &json!({
+                "BackupVaultName": vault,
+                "ResourceArn": resource_arn,
+                "IamRoleArn": backup_role(),
+            })
+            .to_string(),
         )
         .await;
         assert_eq!(
             status, 200,
-            "case {case:?}: the re-read must answer 200, got {status} {reread:?}"
+            "case {case:?}: StartBackupJob for {resource_arn} must succeed, got {status} \
+             {started:?}"
         );
+        let point_arn = string_at(&started, "RecoveryPointArn");
+        let job_id = string_at(&started, "BackupJobId");
+        let described_job = settled_backup_job(&router, case, &job_id).await;
         assert_eq!(
-            reported_size(case, "the re-read point", &reread),
-            metered,
-            "case {case:?}: a write after the backup leaves the stored figure alone, got \
-             {reread}"
+            string_at(&described_job, "ResourceType"),
+            resource_type,
+            "case {case:?}: the job must report the resource type read off {resource_arn}, \
+             got {described_job}"
         );
-    }
-}
-
-/// RULE, on a resource the owning service HAS metered: the backup reports that service's
-/// figure, which is then not none — so the figure is read from the owning service rather
-/// than counted here or fixed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_backup_of_a_metered_resource_reports_that_services_figure() {
-    let case = "a table DynamoDB restored from its own backup, already holding its items";
-    let router = emulator();
-    let vault = "metered-size-restored";
-    let (status, created) = create_vault(&router, vault, "{}").await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: setup CreateBackupVault must succeed, got {status} {created:?}"
-    );
-    let source = "metered-source";
-    let restored = "metered-restored";
-    table_holding(
-        &router,
-        case,
-        source,
-        &[
-            json!({"pk": {"S": "order-1"}, "blob": {"S": "x".repeat(1_024)}}),
-            json!({"pk": {"S": "order-2"}, "blob": {"S": "x".repeat(1_024)}}),
-        ],
-    )
-    .await;
-
-    // DynamoDB's own restore creates the table ALREADY holding the data, so that service
-    // meters it then and there rather than on its refresh schedule.
-    let (status, backed_up) = dynamodb(
-        &router,
-        "CreateBackup",
-        json!({"TableName": source, "BackupName": "metered-source-backup"}),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: setup CreateBackup must succeed, got {status} {backed_up:?}"
-    );
-    let backup_arn = string_at(
-        backed_up
-            .get("BackupDetails")
-            .unwrap_or(&Value::Null),
-        "BackupArn",
-    );
-    // The restore is asked for until that service accepts it: a backup of its own is
-    // CREATING for a span before it can be restored from.
-    let deadline = std::time::Instant::now() + POLL_DEADLINE;
-    loop {
-        let (status, answer) = dynamodb(
+        assert_backup_reports_no_size(
             &router,
-            "RestoreTableFromBackup",
-            json!({"BackupArn": backup_arn, "TargetTableName": restored}),
+            case,
+            &vault,
+            &point_arn,
+            "a figure of this emulator's own",
         )
         .await;
-        if status == 200 {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "case {case:?}: RestoreTableFromBackup must be accepted within {POLL_DEADLINE:?}, \
-             got {status} {answer:?}"
-        );
-        ::tokio::time::sleep(POLL_WAIT).await;
     }
-
-    let restored_table = active_table(&router, case, restored).await;
-    let metered = metered_size(&router, case, restored).await;
-    assert!(
-        metered > 0,
-        "case {case:?}: DynamoDB must meter the restored table's own data, got {metered}"
-    );
-
-    // The backup of THAT table reports the figure its own service meters.
-    let restored_arn = string_at(&restored_table, "TableArn");
-    let restored_point = completed_point(&router, vault, &restored_arn).await;
-    let (status, read) = call(
-        &router,
-        "GET",
-        &format!("/backup-vaults/{vault}/recovery-points/{restored_point}"),
-        None,
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: DescribeRecoveryPoint must answer 200, got {status} {read:?}"
-    );
-    assert_eq!(
-        reported_size(case, "the recovery point", &read),
-        metered,
-        "case {case:?}: the backup must report the {metered} bytes DynamoDB meters for the \
-         restored table, got {read}"
-    );
-    let job = job_of_point(&router, case, &restored_point).await;
-    assert_eq!(
-        reported_size(case, "the backup job", &job),
-        metered,
-        "case {case:?}: the job must report the same figure ({metered}), got {job}"
-    );
-    assert_eq!(
-        job.get("BytesTransferred").and_then(Value::as_i64),
-        Some(metered),
-        "case {case:?}: a settled job has moved the whole backup, so it reports {metered} \
-         bytes transferred, got {job}"
-    );
 }
