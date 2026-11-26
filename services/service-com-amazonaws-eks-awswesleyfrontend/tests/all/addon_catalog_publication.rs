@@ -31,9 +31,7 @@
 //! (`tests/all/wire.rs`), and the add-on calls are the ones the add-on suites
 //! beside this one already drive.
 
-use service_com_amazonaws_eks_awswesleyfrontend::state::{
-    ComAmazonawsEksAwswesleyfrontendState, DEFAULT_KUBERNETES_VERSION,
-};
+use service_com_amazonaws_eks_awswesleyfrontend::state::ComAmazonawsEksAwswesleyfrontendState;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::addon_lifecycle::{create_addon, describe_addon};
@@ -291,7 +289,6 @@ async fn every_published_addon_is_discoverable_by_name() {
             listed[0]
         );
         let mut defaulted = false;
-        let mut offered_for_the_default_version = false;
         for build in &builds {
             let case = format!("{addon_name}/{}", string_member(build, "addonVersion"));
             let compatibilities = compatibilities_of(build);
@@ -307,19 +304,18 @@ async fn every_published_addon_is_discoverable_by_name() {
                     "case {case}: a compatibility names one cluster version, got \
                      {compatibility:?}"
                 );
-                offered_for_the_default_version |= cluster_version == DEFAULT_KUBERNETES_VERSION;
                 defaulted |= compatibility["defaultVersion"].as_bool() == Some(true);
             }
         }
-        // One build is the add-on's default — the one an install that names no
-        // version is given — for every add-on Amazon EKS still offers on the
-        // Kubernetes version it creates clusters at by default. An add-on whose
-        // publisher has stopped publishing before that version is still listed
-        // with the builds it has while Amazon EKS defaults to none of them.
-        assert_eq!(
-            defaulted, offered_for_the_default_version,
-            "case {addon_name}: expected a default build exactly when the add-on is offered \
-             for {DEFAULT_KUBERNETES_VERSION}, got {:?}",
+        // Every Kubernetes version an add-on publishes a build for has a default
+        // build — the one an install on a cluster of that version that names no
+        // version is given — so every published add-on marks one, including an
+        // add-on whose publisher has stopped publishing before the version Amazon
+        // EKS creates clusters at by default.
+        assert!(
+            defaulted,
+            "case {addon_name}: expected a default build for the versions the add-on publishes \
+             builds for, got {:?}",
             listed[0]["addonVersions"]
         );
     }

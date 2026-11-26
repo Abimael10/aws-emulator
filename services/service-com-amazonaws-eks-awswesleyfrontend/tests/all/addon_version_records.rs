@@ -425,39 +425,41 @@ async fn a_builds_compatibilities_are_one_entry_per_supported_minor_newest_first
 }
 
 // ---------------------------------------------------------------------------
-// RULE: `defaultVersion` marks the add-on's DEFAULT build — the newest published
-// build the add-on is offered at for the Kubernetes version Amazon EKS creates
-// clusters at by default — on EVERY compatibility row that build carries and on
-// no row of any other build, and an install that names no version is given that
-// same build.
+// RULE: `defaultVersion` marks, on each compatibility row, whether that build is
+// the DEFAULT build for the Kubernetes version the row names — the newest
+// published build of the add-on that supports it — so every version an add-on
+// publishes a build for has exactly one default build, and an install on a
+// cluster of that version that names no version is given that same build.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn the_default_build_is_the_one_offered_for_the_default_cluster_version() {
+async fn the_default_build_is_the_newest_build_published_for_each_cluster_version() {
     let router = emulator();
     let catalog = addons(&whole_catalog(&router).await);
-    let default_version = default_cluster_version(&router).await;
 
     for addon in &catalog {
         let addon_name = string_member(addon, "addonName");
         let builds = versions_of(addon);
-        // The builds are reported newest first, so the first one offered for the
-        // default Kubernetes version is the add-on's default build; an add-on
-        // whose published builds stop before that version has none.
-        let default_build = builds
-            .iter()
-            .find(|build| supported_minors(build).contains(&default_version))
-            .map(|build| string_member(build, "addonVersion"));
+        // The builds are reported newest first, so the first one that supports a
+        // Kubernetes version is that version's default build.
+        let default_for = |minor: &str| {
+            builds
+                .iter()
+                .find(|build| supported_minors(build).iter().any(|named| named == minor))
+                .map(|build| string_member(build, "addonVersion"))
+        };
         for build in &builds {
             let version = string_member(build, "addonVersion");
-            let case = format!("{addon_name}/{version}");
-            let expected = default_build.as_ref() == Some(&version);
+            let minors = supported_minors(build);
             let flags = default_flags(build);
+            let expected: Vec<bool> = minors
+                .iter()
+                .map(|minor| default_for(minor).as_ref() == Some(&version))
+                .collect();
             assert_eq!(
-                flags,
-                vec![expected; flags.len()],
-                "case {case}: expected defaultVersion {expected} on every row — the build \
-                 offered for {default_version} is {default_build:?}"
+                flags, expected,
+                "case {addon_name}/{version}: expected defaultVersion {expected:?} over \
+                 {minors:?} — the newest build published for each of them — got {flags:?}"
             );
         }
     }
@@ -482,22 +484,12 @@ async fn the_default_build_is_the_one_offered_for_the_default_cluster_version() 
                 .filter(|build| default_flags(build).iter().any(|flag| *flag))
                 .map(|build| string_member(build, "addonVersion"))
                 .collect();
-            assert!(
-                defaults.len() <= 1,
-                "case {case}: at most one build is the add-on's default, got {defaults:?}"
+            assert_eq!(
+                defaults,
+                vec![string_member(&builds[0], "addonVersion")],
+                "case {case}: the newest build published for a Kubernetes version is that \
+                 version's default build, got {defaults:?}"
             );
-            // The default build is reported as such exactly when it is one of the
-            // builds that support the version asked for, and it is then the
-            // newest of them: the flag is decided against every published build,
-            // not against the ones this answer carries.
-            if *minor == default_version {
-                assert_eq!(
-                    defaults,
-                    vec![string_member(&builds[0], "addonVersion")],
-                    "case {case}: the newest build offered for the default Kubernetes version is \
-                     the default build, got {defaults:?}"
-                );
-            }
         }
     }
 
@@ -696,9 +688,12 @@ async fn an_install_is_held_to_the_document_the_catalog_publishes() {
     // Rows differ in the add-on — so in the FORM its published document takes,
     // the `$ref`-into-definitions one and the root-declared one — and, within an
     // add-on, in how the document stands against the published one: a key it does
-    // not declare, a key whose declared type the value is not, and the keys the
-    // document does declare. The refused rows of an add-on come first, so the
-    // accepted one is the install the cluster keeps.
+    // not declare, a key whose declared type the value is not, the same two INSIDE
+    // an object-valued key whose own keys the document declares, and the keys the
+    // document does declare (at its root, inside such an object, and inside an
+    // object the document declares no key of, which takes the chart's own values).
+    // The refused rows of an add-on come first, so the accepted one is the install
+    // the cluster keeps.
     #[allow(clippy::type_complexity)]
     let addons_under_test: &[(&str, &[(&str, fn() -> serde_json::Value, u16)])] = &[
         (
@@ -741,12 +736,33 @@ async fn an_install_is_held_to_the_document_the_catalog_publishes() {
                     400,
                 ),
                 (
+                    "a key the component object does not declare",
+                    || {
+                        serde_json::json!({
+                            "controller": { "notAKeyTheComponentTakes": true }
+                        })
+                    },
+                    400,
+                ),
+                (
+                    "a declared key of the component set to another type",
+                    || serde_json::json!({ "controller": { "logLevel": "verbose" } }),
+                    400,
+                ),
+                (
                     "the add-on's own keys",
                     || {
                         serde_json::json!({
                             "useFIPS": true,
                             "node": { "replicaCount": 2, "logLevel": 4 },
-                            "controller": { "deleteAccessPointRootDir": true, "logLevel": 4 },
+                            "controller": {
+                                "deleteAccessPointRootDir": true,
+                                "logLevel": 4,
+                                // An object the published document declares no key
+                                // of: the chart's own values go inside it, so it
+                                // is not closed.
+                                "nodeSelector": { "topology.kubernetes.io/zone": "us-west-2a" },
+                            },
                         })
                     },
                     200,

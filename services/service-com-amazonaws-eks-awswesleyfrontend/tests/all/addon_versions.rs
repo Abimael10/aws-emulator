@@ -24,13 +24,13 @@
 //! published version calendar (`DescribeClusterVersions`), so the suites keep
 //! asserting the rule as the published tables grow.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
     self, addon_schema_not_found_message, ADDON_ANY_PLATFORM_VERSION, ADDON_OWNER_AWS,
     ADDON_OWNER_COMMUNITY, ADDON_OWNER_MARKETPLACE, ADDON_PUBLISHER_EKS,
-    ADDON_PUBLISHER_SAGEMAKER, CLUSTER_ACTIVATION_DELAY, DEFAULT_KUBERNETES_VERSION,
+    ADDON_PUBLISHER_SAGEMAKER, CLUSTER_ACTIVATION_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -399,21 +399,22 @@ async fn the_published_catalog_is_reported_from_state() {
                  Kubernetes version, got {defaulted:?}"
             );
         }
-        // The add-on's DEFAULT build is the one Amazon EKS installs unasked, so
-        // an add-on still offered for the Kubernetes version Amazon EKS creates
-        // clusters at by default has one — while an add-on whose publisher has
-        // stopped publishing before that version is still listed with the builds
-        // it has and Amazon EKS defaults to none of them.
-        let offered_for_the_default_version = versions_of(addon).iter().any(|build| {
-            compatibilities_of(build).iter().any(|compatibility| {
-                string_member(compatibility, "clusterVersion") == DEFAULT_KUBERNETES_VERSION
-            })
-        });
+        // Every Kubernetes version the add-on publishes a build for has a DEFAULT
+        // build — the one Amazon EKS installs unasked on a cluster of that version
+        // — so an add-on whose publisher has stopped publishing still has a
+        // default for the versions its last builds support, and no version it
+        // publishes no build for has one.
+        let mut published_for: BTreeSet<String> = BTreeSet::new();
+        for build in versions_of(addon) {
+            for compatibility in compatibilities_of(&build) {
+                published_for.insert(string_member(&compatibility, "clusterVersion"));
+            }
+        }
+        let defaulted_for: BTreeSet<String> = defaults.keys().cloned().collect();
         assert_eq!(
-            !defaults.is_empty(),
-            offered_for_the_default_version,
-            "case {case}: expected a default build exactly when the add-on is offered for \
-             {DEFAULT_KUBERNETES_VERSION}, got {addon:?}"
+            defaulted_for, published_for,
+            "case {case}: expected one default build for every Kubernetes version the add-on \
+             publishes a build for, got {defaulted_for:?} against {published_for:?}"
         );
     }
 
@@ -667,23 +668,12 @@ async fn filters_narrow_the_listing() {
                     defaults.push(string_member(build, "addonVersion"));
                 }
             }
-            assert!(
-                defaults.len() <= 1,
-                "case {case}: at most one build is the add-on's default, got {defaults:?}"
+            assert_eq!(
+                defaults,
+                vec![string_member(&builds[0], "addonVersion")],
+                "case {case}: exactly one build is the default for a Kubernetes version, and in \
+                 a listing filtered to it that is the newest build reported, got {defaults:?}"
             );
-            // A listing filtered to the Kubernetes version Amazon EKS creates
-            // clusters at by default always carries the add-on's default build —
-            // that is the version the build is published for — while a listing
-            // filtered to an older version carries it only when the default
-            // build is published for that version too.
-            if *cluster_version == DEFAULT_KUBERNETES_VERSION {
-                assert_eq!(
-                    defaults.len(),
-                    1,
-                    "case {case}: expected the add-on's default build in a listing filtered to \
-                     the default Kubernetes version, got {defaults:?}"
-                );
-            }
         }
     }
 

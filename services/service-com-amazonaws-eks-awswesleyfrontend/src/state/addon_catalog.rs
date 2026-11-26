@@ -1585,11 +1585,12 @@ pub struct AddonCompatibilityRecord {
 impl AddonCompatibilityRecord {
     /// This row as the modelled `Compatibility` shape.
     ///
-    /// `default_version` is whether the build this row belongs to is the
-    /// add-on's DEFAULT build, the one Amazon EKS installs when the caller names
-    /// no version. It is NOT stored on the row: which build that is depends on
-    /// which builds the clock has reached, so it is decided per read (see
-    /// [`AddonCatalogRecord::default_build`]) and cannot go stale.
+    /// `is_default_version` is whether the build this row belongs to is the
+    /// DEFAULT build for the Kubernetes version this row names — the build Amazon
+    /// EKS installs on a cluster of that version when the caller names no
+    /// version. It is NOT stored on the row: which build that is depends on which
+    /// builds the clock has reached, so it is decided per read (see
+    /// [`AddonCatalogRecord::default_build_for`]) and cannot go stale.
     pub fn to_compatibility(&self, default_version: bool) -> Compatibility {
         Compatibility {
             cluster_version: Some(self.cluster_version.clone()),
@@ -1672,10 +1673,20 @@ impl AddonCatalogVersionRecord {
     /// compatibility row this build carries, because being the build Amazon EKS
     /// installs unasked is a property of the BUILD and not of one of the
     /// Kubernetes versions it supports.
+    /// `is_default_for` answers, for ONE Kubernetes version this build supports,
+    /// whether this build is the DEFAULT build for that version — the question the
+    /// add-on as a whole decides, since it is about the other builds of the same
+    /// add-on (see [`AddonCatalogRecord::to_addon_version_infos`]). It is asked
+    /// per compatibility row, because `Compatibility$defaultVersion` sits INSIDE
+    /// the compatibility of one cluster version: "the supported default version"
+    /// is the build a caller who names none is given FOR THAT VERSION, so a build
+    /// that is the newest one published for an older cluster version is that
+    /// version's default even where a newer build is the default for the versions
+    /// it supports.
     pub fn to_addon_version_info(
         &self,
         cluster_version: Option<&str>,
-        is_default: bool,
+        is_default_for: impl Fn(&str) -> bool,
     ) -> AddonVersionInfo {
         AddonVersionInfo {
             addon_version: Some(self.addon_version.clone()),
@@ -1690,7 +1701,7 @@ impl AddonCatalogVersionRecord {
                     .filter(|entry| {
                         cluster_version.is_none_or(|wanted| wanted == entry.cluster_version)
                     })
-                    .map(|entry| entry.to_compatibility(is_default))
+                    .map(|entry| entry.to_compatibility(is_default_for(&entry.cluster_version)))
                     .collect(),
             ),
             requires_configuration: self.requires_configuration(),
@@ -1782,25 +1793,38 @@ impl AddonCatalogRecord {
         }
     }
 
-    /// The DEFAULT build of this add-on at `now`: the build an install that
-    /// names no `addonVersion` is given, and the one every compatibility row of
-    /// which reports `defaultVersion` — or `None` for an add-on Amazon EKS
-    /// defaults to no build of.
+    /// The DEFAULT build of this add-on for ONE Kubernetes version at `now`: the
+    /// build an install on a cluster of that version that names no `addonVersion`
+    /// is given, and the one whose compatibility row for that version reports
+    /// `defaultVersion` — or `None` for a Kubernetes version this add-on publishes
+    /// no build for.
     ///
-    /// It is the newest published build the add-on is OFFERED at for the
-    /// Kubernetes version Amazon EKS creates clusters at by default
-    /// ([`DEFAULT_KUBERNETES_VERSION`]): "the supported default version" is the
-    /// build a caller who names none is given, and the cluster a caller who
-    /// names no Kubernetes version is given is one of that version, so the two
-    /// defaults are one pair. An add-on whose published builds stop before that
-    /// version — a publisher that has stopped publishing — is still listed with
-    /// the builds it has while Amazon EKS defaults to none of them: a caller
-    /// installing it on an older cluster names the build it wants, which
+    /// It is the NEWEST published build that supports the version:
+    /// `Compatibility$defaultVersion` is "the supported default version" and sits
+    /// inside the compatibility of ONE cluster version, so the question it answers
+    /// is per version — which build a caller running THAT version is given unasked
+    /// — and the answer is the newest build published for it. An add-on whose
+    /// publisher has stopped publishing therefore still has a default build for
+    /// the versions its last builds support, and an add-on whose newest build
+    /// dropped an older version defaults, on that version, to the newest build
+    /// that kept it. One source for the listing and for the install, which is why
     /// [`ComAmazonawsEksAwswesleyfrontendState::default_addon_version`] resolves
-    /// for that cluster's own version.
-    pub fn default_build(&self, now: SystemTime) -> Option<&AddonCatalogVersionRecord> {
+    /// through here.
+    pub fn default_build_for(
+        &self,
+        now: SystemTime,
+        cluster_version: &str,
+    ) -> Option<&AddonCatalogVersionRecord> {
         self.published_versions(now)
-            .find(|build| build.supports(DEFAULT_KUBERNETES_VERSION))
+            .find(|build| build.supports(cluster_version))
+    }
+
+    /// The DEFAULT build of this add-on for the Kubernetes version Amazon EKS
+    /// creates clusters at when the caller names none
+    /// ([`DEFAULT_KUBERNETES_VERSION`]) — the build an install on such a cluster
+    /// is given. See [`Self::default_build_for`].
+    pub fn default_build(&self, now: SystemTime) -> Option<&AddonCatalogVersionRecord> {
+        self.default_build_for(now, DEFAULT_KUBERNETES_VERSION)
     }
 
     /// The builds of this add-on a listing reports at `now`, newest first — the
@@ -1810,27 +1834,31 @@ impl AddonCatalogRecord {
     /// filtered to: only the builds that support it are reported, each with its
     /// compatibility for that version alone.
     ///
-    /// Every compatibility of the add-on's DEFAULT build ([`Self::default_build`])
-    /// is marked `defaultVersion`, and every compatibility of every other build
-    /// is not: the flag names the build Amazon EKS installs unasked, so it
-    /// belongs to that build rather than to one of the Kubernetes versions it
-    /// supports. Whichever version the listing is filtered to, the flag is the
-    /// same one the unfiltered listing reports, because it is decided against
-    /// every published build of the add-on rather than against the ones this
-    /// answer carries.
+    /// A compatibility is marked `defaultVersion` when its build is the default
+    /// build for the Kubernetes version that row names
+    /// ([`Self::default_build_for`]), so exactly one build of the add-on carries
+    /// the flag for any one version it publishes a build for, and a caller reading
+    /// the flag for the version its cluster runs is given the build `CreateAddon`
+    /// would install there. The flag is decided against every PUBLISHED build of
+    /// the add-on rather than against the ones this answer carries, so a listing
+    /// filtered to one cluster version reports the same flag for that version as
+    /// the unfiltered listing does.
     pub fn to_addon_version_infos(
         &self,
         now: SystemTime,
         cluster_version: Option<&str>,
     ) -> Vec<AddonVersionInfo> {
-        let default_build = self
-            .default_build(now)
-            .map(|build| build.addon_version.as_str());
         self.published_versions(now)
             .filter(|build| cluster_version.is_none_or(|wanted| build.supports(wanted)))
             .map(|build| {
-                let is_default = default_build == Some(build.addon_version.as_str());
-                build.to_addon_version_info(cluster_version, is_default)
+                // ONE place decides which build is a version's default, so the
+                // flag this listing reports and the build an install resolves
+                // cannot drift apart.
+                let is_default_for = |version: &str| {
+                    self.default_build_for(now, version)
+                        .is_some_and(|newest| newest.addon_version == build.addon_version)
+                };
+                build.to_addon_version_info(cluster_version, is_default_for)
             })
             .collect()
     }
@@ -1916,8 +1944,10 @@ impl AddonCatalogRecord {
     ///   object's own keys ([`nested_configuration_properties`]);
     /// * the ones the add-on publishes ROOT-DECLARED ([`ADDON_ROOT_DECLARED_SCHEMAS`])
     ///   declare the add-on's keys at the document ROOT, under `properties`, with
-    ///   each object-valued key's own keys declared inline under it and no
-    ///   `definitions` section at all, beside the `description` of what the
+    ///   each object-valued key's own keys declared inline under it and closed
+    ///   there the way the root is, and no `definitions` section at all — so no
+    ///   node of such a document carries a definition title
+    ///   ([`inline_object_declaration`]) — beside the `description` of what the
     ///   document configures.
     ///
     /// Either way a client that loads the document into a validator walks the
@@ -1953,23 +1983,28 @@ impl AddonCatalogRecord {
         }
         if let Some((service_account, _)) = self.pod_identity.first().filter(|_| !own_keys_only) {
             let title = schema_definition_title("serviceAccount");
-            let declared = ::serde_json::json!({
-                "type": "object",
-                "title": title,
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "default": service_account,
-                        "description":
-                            "The Kubernetes service account the add-on runs as.",
-                    },
+            let declared_keys = ::serde_json::json!({
+                "name": {
+                    "type": "string",
+                    "default": service_account,
+                    "description": "The Kubernetes service account the add-on runs as.",
                 },
             });
             if references_definitions {
-                definitions.insert(title.clone(), declared);
+                definitions.insert(
+                    title.clone(),
+                    ::serde_json::json!({
+                        "type": "object",
+                        "title": title,
+                        "properties": declared_keys,
+                    }),
+                );
                 properties.insert("serviceAccount".to_string(), definition_ref(&title));
             } else {
-                properties.insert("serviceAccount".to_string(), declared);
+                properties.insert(
+                    "serviceAccount".to_string(),
+                    inline_object_declaration(declared_keys),
+                );
             }
         }
         // The keys THIS BUILD's document declares at its root, and the keys each
@@ -1987,7 +2022,10 @@ impl AddonCatalogRecord {
                         .or_insert_with(|| object_definition(&title, &nested));
                     properties.insert(property.clone(), definition_ref(&title));
                 } else {
-                    properties.insert(property.clone(), object_definition(&title, &nested));
+                    properties.insert(
+                        property.clone(),
+                        inline_object_declaration(declared_object_keys(&nested)),
+                    );
                 }
             } else {
                 let mut declared = ::serde_json::json!({ "type": json_type });
@@ -2231,22 +2269,54 @@ fn definition_ref(title: &str) -> ::serde_json::Value {
 ///
 /// A key whose own keys the catalog publishes declares them; one whose keys it
 /// does not declares none, and such an object carries whatever the chart's own
-/// values take — which is why `additionalProperties` is not closed here the way
-/// it is on the root type, and why no key inside one is published as required:
-/// only the ROOT bounds the keys a document may set, and only the build's own
-/// required configuration is a key a document cannot leave out.
+/// values take. No key inside one is published as required: only the build's own
+/// required configuration is a key a document cannot leave out. See
+/// [`inline_object_declaration`] for the same object in a document that declares
+/// its keys at the root.
 fn object_definition(title: &str, properties: &[AddonSchemaProperty]) -> ::serde_json::Value {
+    ::serde_json::json!({
+        "type": "object",
+        "title": title,
+        "properties": declared_object_keys(properties),
+    })
+}
+
+/// The keys an object-valued configuration key declares, each with the JSON type
+/// that key takes, as the `properties` of a schema node.
+fn declared_object_keys(properties: &[AddonSchemaProperty]) -> ::serde_json::Value {
     let declared: ::serde_json::Map<String, ::serde_json::Value> = properties
         .iter()
         .map(|(property, json_type)| {
             ((*property).to_string(), ::serde_json::json!({ "type": json_type }))
         })
         .collect();
-    ::serde_json::json!({
+    ::serde_json::Value::Object(declared)
+}
+
+/// One object-valued configuration key as a document that declares its keys at
+/// its ROOT declares it ([`ADDON_ROOT_DECLARED_SCHEMAS`]): the object's own keys,
+/// declared INLINE under it.
+///
+/// Such a document carries no `definitions` section, so there is no definition
+/// for the key to name or to be titled after: the node declares the object's keys
+/// and nothing else. And the set of them is CLOSED, exactly as the document's root
+/// is — a key the object does not declare is not a key the add-on takes there, so
+/// a `configurationValues` document that sets one does not satisfy the schema —
+/// while an object whose own keys this catalog publishes NONE of carries whatever
+/// the chart's values take and is left open, because closing it around an empty
+/// set would refuse every value a caller writes inside it.
+fn inline_object_declaration(declared_keys: ::serde_json::Value) -> ::serde_json::Value {
+    let closed = declared_keys
+        .as_object()
+        .is_some_and(|declared| !declared.is_empty());
+    let mut node = ::serde_json::json!({
         "type": "object",
-        "title": title,
-        "properties": ::serde_json::Value::Object(declared),
-    })
+        "properties": declared_keys,
+    });
+    if closed {
+        node["additionalProperties"] = ::serde_json::json!(false);
+    }
+    node
 }
 
 /// The schema node `schema` stands for: the definition it references, or
@@ -3110,15 +3180,14 @@ type SeededBuild = (
 /// older row the add-on has been offered for whose support — standard or extended
 /// — had not ended by then ([`build_compatibilities`]).
 ///
-/// Which build is the DEFAULT is not seeded: it is the newest PUBLISHED build
-/// the add-on is offered at for the Kubernetes version Amazon EKS creates
-/// clusters at by default, decided per read against the clock
-/// ([`AddonCatalogRecord::default_build`]), so the catalog names at most ONE
-/// default build per add-on and none at all for an add-on whose published builds
-/// stop before that version. `CreateAddon` resolves an absent `addonVersion`
-/// against the cluster's OWN Kubernetes version
-/// ([`ComAmazonawsEksAwswesleyfrontendState::default_addon_version`]), which on a
-/// cluster of the default version is that same build.
+/// Which build is the DEFAULT is not seeded: for each Kubernetes version it is
+/// the newest PUBLISHED build of the add-on that supports that version, decided
+/// per read against the clock ([`AddonCatalogRecord::default_build_for`]), so the
+/// catalog names at most ONE default build per add-on per Kubernetes version and
+/// none at all for a version it publishes no build for. `CreateAddon` resolves an
+/// absent `addonVersion` against the cluster's OWN Kubernetes version
+/// ([`ComAmazonawsEksAwswesleyfrontendState::default_addon_version`]), which is
+/// that same build.
 ///
 /// The versions an add-on is offered for start at its OWN first calendar row
 /// ([`first_published_row`]), so the compatible cluster-version set an add-on

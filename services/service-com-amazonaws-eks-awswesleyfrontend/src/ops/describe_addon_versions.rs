@@ -30,8 +30,9 @@
 //!   kept build's compatibility for that version alone, so an add-on with no
 //!   build for it drops out of the listing entirely. Which build a reported
 //!   compatibility flags `defaultVersion` does not depend on this filter: it is
-//!   the add-on's DEFAULT build, decided against every published build of it
-//!   (`crate::state::AddonCatalogRecord::default_build`).
+//!   the default build for the Kubernetes version that compatibility names,
+//!   decided against every published build of the add-on
+//!   (`crate::state::AddonCatalogRecord::default_build_for`).
 //! * `types` / `publishers` / `owners` — keep the add-ons whose own `type`,
 //!   `publisher` or `owner` is one of the values given; several values in one
 //!   member widen it, and the members combine.

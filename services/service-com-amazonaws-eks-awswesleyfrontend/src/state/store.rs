@@ -636,29 +636,19 @@ impl ComAmazonawsEksAwswesleyfrontendState {
     /// caller names none — or `None` when this catalog publishes no build of
     /// that add-on for that Kubernetes version.
     ///
-    /// It is the add-on's DEFAULT build ([`AddonCatalogRecord::default_build`]),
-    /// the one the listing a caller reads marks `defaultVersion`, whenever that
-    /// build is offered for the cluster's Kubernetes version; for a cluster of a
-    /// version the default build is not published for it is the NEWEST published
-    /// build that supports that version, which is what the add-on has to offer
-    /// that cluster. Both come out of the same published catalog
-    /// ([`AddonCatalogRecord::published_versions`]), so an install resolves a
-    /// build the listing offers for that version and nothing else.
+    /// It is the build the LISTING marks `defaultVersion` on that version's
+    /// compatibility row ([`AddonCatalogRecord::default_build_for`]): the NEWEST
+    /// published build that supports it, which is what the add-on has to offer
+    /// that cluster. One source for both, so an install resolves the build the
+    /// listing publishes as that version's default and nothing else.
     pub fn default_addon_version(
         &self,
         addon_name: &str,
         kubernetes_version: &str,
         now: SystemTime,
     ) -> Option<String> {
-        let addon = self.published_addon(addon_name, now)?;
-        addon
-            .default_build(now)
-            .filter(|build| build.supports(kubernetes_version))
-            .or_else(|| {
-                addon
-                    .published_versions(now)
-                    .find(|build| build.supports(kubernetes_version))
-            })
+        self.published_addon(addon_name, now)?
+            .default_build_for(now, kubernetes_version)
             .map(|build| build.addon_version.clone())
     }
 

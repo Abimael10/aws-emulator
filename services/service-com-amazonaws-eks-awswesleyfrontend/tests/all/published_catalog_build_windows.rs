@@ -10,9 +10,9 @@
 //!    Amazon EKS publishes THAT BUILD for**, from the oldest through the newest,
 //!    as one unbroken run of published calendar rows — a version whose own
 //!    support has since ended included, because a cluster still running it
-//!    installs that build and reads this listing to find it. Only the NEWEST
-//!    published build is the default for each of those versions, and the add-on
-//!    drops out of a listing filtered to a version outside its window.
+//!    installs that build and reads this listing to find it. The default build for
+//!    each of those versions is the NEWEST published build that supports it, and
+//!    the add-on drops out of a listing filtered to a version outside its window.
 //! 2. **A published configuration document declares the add-on's OWN keys**: an
 //!    add-on whose chart configures its components separately declares the
 //!    components and nothing else at its root, with each component's placement
@@ -34,9 +34,7 @@
 
 use std::collections::BTreeSet;
 
-use service_com_amazonaws_eks_awswesleyfrontend::state::{
-    ADDON_ANY_PLATFORM_VERSION, DEFAULT_KUBERNETES_VERSION,
-};
+use service_com_amazonaws_eks_awswesleyfrontend::state::ADDON_ANY_PLATFORM_VERSION;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::addon_catalog_publication::{configuration_schema, resolved, schema_root};
@@ -271,12 +269,14 @@ async fn a_cited_build_names_every_kubernetes_version_it_is_published_for() {
                     "case {build_case} on {minor}: expected every platform version of it, got {:?}",
                     entry["platformVersions"]
                 );
-                // The add-on's DEFAULT build is the newest published build it is
-                // offered at for the Kubernetes version Amazon EKS creates
-                // clusters at by default, and every row of THAT build carries the
-                // flag: an add-on whose published window ends before that version
-                // is the default for none.
-                let expected = position == 0 && window.iter().any(|row| row == DEFAULT_KUBERNETES_VERSION);
+                // The DEFAULT build for a Kubernetes version is the newest
+                // published build that supports it. Every build of an add-on whose
+                // table the catalog cites covers the same window, so the newest of
+                // them is the default for every row of it and the older ones for
+                // none — including an add-on whose window ended before the version
+                // Amazon EKS creates clusters at by default, which still has a
+                // default build for the versions it does publish builds for.
+                let expected = position == 0;
                 assert_eq!(
                     entry["defaultVersion"],
                     serde_json::json!(expected),

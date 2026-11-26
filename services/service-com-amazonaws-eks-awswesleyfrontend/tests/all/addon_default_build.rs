@@ -7,17 +7,19 @@
 //!
 //! The RULE under test: **`AddonInfo$addonVersions` is the add-on's own published
 //! build table, one `AddonVersionInfo` per published build, and
-//! `Compatibility$defaultVersion` marks the add-on's DEFAULT build — the newest
-//! published build the add-on is offered at for the Kubernetes version Amazon EKS
-//! creates clusters at by default — on EVERY compatibility row that build
-//! carries, and on no row of any other build. An add-on whose published builds
-//! stop before that Kubernetes version is still listed with the builds it has
-//! while Amazon EKS defaults to none of them.**
+//! `Compatibility$defaultVersion` marks, on each compatibility row, whether that
+//! build is the DEFAULT build for the Kubernetes version the row names — the
+//! newest published build of the add-on that supports that version. So every
+//! Kubernetes version an add-on publishes a build for has exactly ONE default
+//! build, an add-on whose publisher stopped publishing before the version Amazon
+//! EKS creates clusters at by default still has a default build for the versions
+//! its last builds support, and an add-on whose newest build dropped an older
+//! version defaults, on that version, to the newest build that kept it.**
 //!
-//! So the flag belongs to the BUILD, not to one of the Kubernetes versions it
-//! supports: a listing filtered to one cluster version reports the same flag the
-//! unfiltered listing does, and a caller resolving "the default version" reads
-//! one answer rather than several.
+//! So the flag answers "which build would an install on a cluster of THIS version
+//! be given" — the question `CreateAddon` resolves when the caller names no
+//! `addonVersion` — and a listing filtered to one cluster version reports the
+//! same flag for that version as the unfiltered listing does.
 //!
 //! The rows differ along what the rule generalises over: every add-on the catalog
 //! publishes (the ones Amazon EKS builds, the upstream projects it curates, the
@@ -99,42 +101,32 @@ fn supported_minors(build: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-/// Each compatibility's `defaultVersion` flag, in the order reported.
-fn default_flags(build: &serde_json::Value) -> Vec<bool> {
-    compatibilities_of(build)
+/// The builds of one reported add-on that are flagged `defaultVersion` for one
+/// Kubernetes version — the version a row names, so a build is counted only for
+/// the rows it carries.
+fn flagged_for(addon: &serde_json::Value, minor: &str) -> Vec<String> {
+    versions_of(addon)
         .iter()
-        .map(|entry| entry["defaultVersion"].as_bool().unwrap_or(false))
+        .filter(|build| {
+            compatibilities_of(build).iter().any(|entry| {
+                string_member(entry, "clusterVersion") == minor
+                    && entry["defaultVersion"].as_bool() == Some(true)
+            })
+        })
+        .map(|build| string_member(build, "addonVersion"))
         .collect()
 }
 
-/// The builds of one reported add-on whose every compatibility row is flagged
-/// `defaultVersion`, and the ones with a row flagged but not every row — the
-/// second list is what the rule forbids.
-fn flagged_builds(addon: &serde_json::Value) -> (Vec<String>, Vec<String>) {
-    let mut whole = Vec::new();
-    let mut partial = Vec::new();
-    for build in versions_of(addon) {
-        let flags = default_flags(&build);
-        let version = string_member(&build, "addonVersion");
-        if flags.iter().all(|flag| *flag) {
-            whole.push(version);
-        } else if flags.iter().any(|flag| *flag) {
-            partial.push(version);
-        }
-    }
-    (whole, partial)
-}
-
 // ---------------------------------------------------------------------------
-// RULE: at most ONE build of an add-on is the default, every compatibility row
-// of that build is flagged and no row of any other build is — and the flagged
-// build is exactly the newest published build offered for the default Kubernetes
-// version, so an add-on whose published line stops before it has no default
-// build at all.
+// RULE: for every Kubernetes version an add-on publishes a build for, exactly ONE
+// of its builds is flagged on that version's row — the newest published build
+// that supports it — and no row of any other build is, so an add-on whose
+// published line ended before the default Kubernetes version still has a default
+// build for the versions it does publish builds for.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn the_default_build_is_the_newest_build_offered_for_the_default_cluster_version() {
+async fn the_default_build_for_a_cluster_version_is_the_newest_published_for_it() {
     let router = emulator();
     let default_version = default_cluster_version(&router).await;
     let catalog = addons(&whole_catalog(&router).await);
@@ -145,7 +137,8 @@ async fn the_default_build_is_the_newest_build_offered_for_the_default_cluster_v
 
     // Both classes must be exercised, or the case says nothing about either: the
     // add-ons still offered for the default Kubernetes version, and the ones
-    // whose published line ended before it.
+    // whose published line ended before it — which have a default build of their
+    // own for the versions they do publish builds for.
     let mut offered_for_default = 0_usize;
     let mut ended_before_default = 0_usize;
     for addon in &catalog {
@@ -155,25 +148,29 @@ async fn the_default_build_is_the_newest_build_offered_for_the_default_cluster_v
             !builds.is_empty(),
             "case {addon_name}: a published add-on reports its builds, got {addon:?}"
         );
-        // The builds are reported newest first, so the FIRST one that is offered
-        // for the default Kubernetes version is the default build.
-        let expected = builds
-            .iter()
-            .find(|build| supported_minors(build).contains(&default_version))
-            .map(|build| string_member(build, "addonVersion"));
-        let (flagged, partial) = flagged_builds(addon);
-        assert!(
-            partial.is_empty(),
-            "case {addon_name}: the flag marks the BUILD, so every row of a default build \
-             carries it, got {partial:?} flagged on some rows only"
-        );
-        assert_eq!(
-            flagged,
-            expected.clone().into_iter().collect::<Vec<String>>(),
-            "case {addon_name}: expected {expected:?} flagged as the build Amazon EKS installs \
-             on a cluster of {default_version}, got {flagged:?}"
-        );
-        if expected.is_some() {
+        // Every Kubernetes version any build of the add-on supports, and the
+        // builds are reported newest first, so the FIRST build that supports one
+        // is that version's default build.
+        let mut published_for: BTreeSet<String> = BTreeSet::new();
+        for build in &builds {
+            published_for.extend(supported_minors(build));
+        }
+        for minor in &published_for {
+            let expected = builds
+                .iter()
+                .find(|build| supported_minors(build).iter().any(|named| named == minor))
+                .map(|build| string_member(build, "addonVersion"))
+                .into_iter()
+                .collect::<Vec<String>>();
+            assert_eq!(
+                flagged_for(addon, minor),
+                expected,
+                "case {addon_name} on {minor}: expected the newest build published for that \
+                 version flagged and no other, got {:?}",
+                addon["addonVersions"]
+            );
+        }
+        if published_for.contains(&default_version) {
             offered_for_default += 1;
         } else {
             ended_before_default += 1;
@@ -194,9 +191,7 @@ async fn the_default_build_is_the_newest_build_offered_for_the_default_cluster_v
 // ---------------------------------------------------------------------------
 // RULE: the flag is decided against every published build of the add-on, not
 // against the builds one answer carries — so a listing filtered to a cluster
-// version reports the same flag the unfiltered listing does, and a filtered
-// listing of an add-on whose line ended before the default version flags
-// nothing at all.
+// version reports, for that version, the same flag the unfiltered listing does.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -204,17 +199,11 @@ async fn a_filtered_listing_reports_the_same_default_build_as_the_whole_catalog(
     let router = emulator();
     let calendar = published_calendar(&router).await;
     let catalog = addons(&whole_catalog(&router).await);
-    // What the unfiltered catalog says: per add-on, the build flagged as the
-    // default, if any.
-    let unfiltered: BTreeMap<String, Option<String>> = catalog
+    // What the unfiltered catalog says: per add-on and Kubernetes version, the
+    // build flagged as that version's default.
+    let unfiltered: BTreeMap<String, serde_json::Value> = catalog
         .iter()
-        .map(|addon| {
-            let (flagged, _) = flagged_builds(addon);
-            (
-                string_member(addon, "addonName"),
-                flagged.first().cloned(),
-            )
-        })
+        .map(|addon| (string_member(addon, "addonName"), addon.clone()))
         .collect();
 
     for minor in &calendar {
@@ -228,27 +217,22 @@ async fn a_filtered_listing_reports_the_same_default_build_as_the_whole_catalog(
         for addon in addons(&answer) {
             let addon_name = string_member(&addon, "addonName");
             let case = format!("{addon_name} on {minor}");
-            let (flagged, partial) = flagged_builds(&addon);
-            assert!(
-                partial.is_empty(),
-                "case {case}: a filtered listing reports one row per build, flagged as the \
-                 whole build is, got {partial:?}"
-            );
-            let published = unfiltered.get(&addon_name).cloned().flatten();
-            // The filtered answer carries the default build only when it is one
-            // of the builds that support the version asked for.
-            let reported: Vec<String> = versions_of(&addon)
-                .iter()
-                .map(|build| string_member(build, "addonVersion"))
-                .collect();
-            let expected: Vec<String> = published
-                .filter(|version| reported.contains(version))
-                .into_iter()
-                .collect();
+            let published = unfiltered
+                .get(&addon_name)
+                .unwrap_or_else(|| panic!("case {case}: the whole catalog must publish it"));
             assert_eq!(
-                flagged, expected,
-                "case {case}: expected the catalog's default build {expected:?} flagged, got \
-                 {flagged:?}"
+                flagged_for(&addon, minor),
+                flagged_for(published, minor),
+                "case {case}: expected the catalog's own default build for that version, got \
+                 {:?}",
+                addon["addonVersions"]
+            );
+            assert_eq!(
+                flagged_for(&addon, minor).len(),
+                1,
+                "case {case}: a listing filtered to a version the add-on publishes a build for \
+                 flags that version's default build, got {:?}",
+                addon["addonVersions"]
             );
         }
     }
