@@ -275,6 +275,9 @@ pub struct ContainerLaunch {
     /// Where the session records what this container's run CONSUMES, the one the store holds
     /// for it ([`ContainerRun::consumption`]).
     consumption: Arc<ContainerConsumption>,
+    /// Whether the task this container belongs to is one a SERVICE maintains, so nothing is
+    /// waiting for its program to END ([`ContainerShell::maintained_by_a_service`]).
+    maintained_by_a_service: bool,
 }
 
 impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
@@ -544,6 +547,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     process: ContainerProcess::of(Some(stored), task),
                     layer,
                     consumption,
+                    // The service the scheduler placed this task for, read off the task
+                    // itself: a task of a service is one that service maintains RUNNING, so
+                    // nothing is waiting for its containers' programs to end.
+                    maintained_by_a_service: task.service_name.is_some(),
                 });
             }
             for started in started {
@@ -976,6 +983,12 @@ async fn run_container<Eng: Send + Sync + 'static>(
     // ([`super::container_http_client`]), for a task this emulator holds an address for.
     if let Some(http) = http {
         shell = shell.with_http_client(http);
+    }
+    // Whether anything is waiting for this container's program to END, which is what decides
+    // the shell spelling of a program that is nothing but a wait
+    // ([`ContainerShell::maintained_by_a_service`]).
+    if launch.maintained_by_a_service {
+        shell = shell.maintained_by_a_service();
     }
     let outcome = shell.run(program).await;
     // What is known about a run that produced no status of its own, which is what such a

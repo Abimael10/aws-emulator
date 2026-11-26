@@ -184,10 +184,10 @@
 //! does not spend them out of this emulator's wall clock: the wait is taken as STATED and what
 //! the program does next — its next command, or its own end — follows at once
 //! ([`ContainerShell::states_a_wait_rather_than_spending_it`]). Otherwise a container's own
-//! words would decide how long this emulator takes to answer everything that waits on its
-//! task — the AWS Batch job whose dependents are held until this container ends, the
-//! deployment whose stabilisation is watched, the client polling the task — and the bound on
-//! that has to be the emulator's, like every bound above.
+//! words would decide how long this emulator takes to answer whatever is waiting for that
+//! program to END — the standalone task whose terminal status a client polls for, the AWS
+//! Batch job whose dependents are held until this container ends — and the bound on that has
+//! to be the emulator's, like every bound above.
 //!
 //! The wait a container has nothing to end it but something OUTSIDE the program is another
 //! thing entirely: a wait with no end of its own (`sleep infinity`, a foreground server), or
@@ -198,6 +198,17 @@
 //! (`["sleep", "3600"]`): there is no work for those seconds to be the account of, so they are
 //! the span the container runs for, and spending them holds nothing up — the container is
 //! simply still there while every call about its task is answered.
+//!
+//! Which leaves the SHELL spelling of that same program (`["sh", "-c", "sleep 3600"]`). A
+//! shell program states how long it took, because that program did something: so the seconds
+//! are stated wherever something is waiting for it to END, and spent where nothing is — which
+//! is a container whose task a SERVICE maintains ([`ContainerShell::maintained_by_a_service`]).
+//! A service "runs and maintains your desired number of tasks from a specified task
+//! definition" (`CreateService`), so the end of such a container is not a verdict a caller
+//! polls for: it is the task leaving the set the service holds, which the scheduler replaces.
+//! Stating the wait there would turn a container whose program says it runs for an hour into a
+//! container that exits at once, and so a service that can never hold its count into one
+//! replacing a task that keeps exiting.
 
 use std::collections::BTreeMap;
 use std::pin::Pin;
@@ -574,6 +585,59 @@ impl ContainerProgram {
         }
         Some(Self::Argv(argv))
     }
+
+    /// Whether this program is nothing but a WAIT — the container was given no work at all,
+    /// only the seconds it is to be there for.
+    ///
+    /// Both forms one program can be written in answer the same way: the argument vector an
+    /// image exec's whose utility is the wait (`["sleep", "3600"]`), and the shell program that
+    /// holds nothing but that one command (`sh -c "sleep 3600"`). A shell program is read off
+    /// the grammar rather than off its text — one complete command, one and-or list, one
+    /// pipeline, one simple command, whose command word is the wait — so a program that does
+    /// anything else, anywhere, is not one of these however it is written.
+    ///
+    /// What it decides, together with WHO is waiting for the program to end: the seconds such a
+    /// program names are the span the container RUNS FOR rather than an account of work it did
+    /// ([`ContainerShell::run`]).
+    #[must_use]
+    pub fn is_only_a_wait(&self) -> bool {
+        match self {
+            Self::Argv(argv) => argv.first().is_some_and(|name| name == SLEEP_COMMAND),
+            Self::Script(text) => script_is_only_a_wait(text),
+        }
+    }
+}
+
+/// [`ContainerProgram::is_only_a_wait`] for a shell program, over the grammar the session
+/// itself runs it by ([`ContainerShell::run_text`]): a program outside the bounds that parse is
+/// given, or one that does not parse at all, is not a program this reading says anything about.
+fn script_is_only_a_wait(text: &str) -> bool {
+    if !within_parse_bounds(text) {
+        return false;
+    }
+    let Ok(tokens) = ::brush_parser::tokenize_str(text) else {
+        return false;
+    };
+    let options = ::brush_parser::ParserOptions::default();
+    let Ok(program) = ::brush_parser::parse_tokens(&tokens, &options) else {
+        return false;
+    };
+    let [complete_command] = program.complete_commands.as_slice() else {
+        return false;
+    };
+    let [item] = complete_command.0.as_slice() else {
+        return false;
+    };
+    if !item.0.additional.is_empty() {
+        return false;
+    }
+    let [::brush_parser::ast::Command::Simple(simple)] = item.0.first.seq.as_slice() else {
+        return false;
+    };
+    simple
+        .word_or_name
+        .as_ref()
+        .is_some_and(|word| word.value == SLEEP_COMMAND)
 }
 
 /// What a container's run ended as.
@@ -823,6 +887,9 @@ pub struct ContainerShell {
     /// interactive session of an execute-command call runs in the pseudo-terminal its client
     /// states the size of ([`ContainerShell::resize_terminal`]).
     terminal: Option<TerminalSize>,
+    /// Whether the container whose program this session performs belongs to a task a SERVICE
+    /// maintains, so nothing is waiting for that program to END ([`Self::run`]).
+    maintained_by_a_service: bool,
 }
 
 impl ContainerShell {
@@ -886,7 +953,18 @@ impl ContainerShell {
             consumption: Arc::new(ContainerConsumption::new()),
             executing_since: Instant::now(),
             terminal: None,
+            maintained_by_a_service: false,
         }
+    }
+
+    /// This session performing the program of a container whose task a SERVICE maintains:
+    /// nothing is waiting for that program to end, which is what lets a program that is
+    /// nothing but a wait be the span the container runs for however it is written (see the
+    /// module docs).
+    #[must_use]
+    pub fn maintained_by_a_service(mut self) -> Self {
+        self.maintained_by_a_service = true;
+        self
     }
 
     /// This session as the PROCESS its container's launch resolved: the user it runs as, the
@@ -992,6 +1070,20 @@ impl ContainerShell {
     /// the signal's number). A run a bound of this emulator ended instead is
     /// [`ContainerOutcome::Abandoned`], which claims nothing about the container.
     pub async fn run(&mut self, program: &ContainerProgram) -> ContainerOutcome {
+        // Whether the container was given nothing to do but WAIT, which is what decides
+        // whether the seconds its wait names are spent or merely stated
+        // ([`Self::states_a_wait_rather_than_spending_it`]). For the vector an image exec's,
+        // that is the whole of it: such a container holds no program that did anything for
+        // those seconds to be the account of. A SHELL program did something, so its seconds
+        // are its own account of how long it took — except where nothing is waiting for that
+        // program to end at all, which is a container whose task a service maintains
+        // ([`Self::maintained_by_a_service`]).
+        self.program_is_a_wait = match program {
+            ContainerProgram::Argv(_) => program.is_only_a_wait(),
+            ContainerProgram::Script(_) => {
+                self.maintained_by_a_service && program.is_only_a_wait()
+            }
+        };
         let mut status = match program {
             ContainerProgram::Script(text) => self.run_text(text).await,
             ContainerProgram::Argv(argv) => self.run_argv(argv).await,
@@ -1490,10 +1582,6 @@ impl ContainerShell {
     /// Run the argument vector of a container whose image exec's it directly: its first
     /// word is the utility and the rest are its arguments, with no shell to expand or split
     /// them.
-    ///
-    /// Such a vector is the container's WHOLE program, so a vector whose utility is the wait
-    /// is a container given nothing to do but wait: the seconds it names are spent rather
-    /// than stated ([`Self::states_a_wait_rather_than_spending_it`]).
     async fn run_argv(&mut self, argv: &[String]) -> i32 {
         let Some((name, arguments)) = argv.split_first() else {
             return EXIT_SUCCESS;
@@ -1501,7 +1589,6 @@ impl ContainerShell {
         if !self.take_command_budget().await {
             return EXIT_COMMAND_NOT_FOUND;
         }
-        self.program_is_a_wait = name == SLEEP_COMMAND;
         // A vector the image exec's carries no redirection of its own: there is no shell to
         // read one.
         let redirections = Redirections::default();
@@ -1604,18 +1691,20 @@ impl ContainerShell {
     ///
     /// It is, wherever that wait stands in a program that does something ELSE: the seconds in
     /// a `sleep` are then that program's own account of how long it took, and spending them
-    /// would let it decide how long this emulator takes to answer everything waiting on the
-    /// task — the job whose terminal status a client polls for, the dependents held until this
-    /// container ends, the deployment whose stabilisation is watched. So the wait is taken as
-    /// stated and what the program does next — its next command, or its own end carrying the
-    /// status that wait answered — follows at once, which is what the container then reports.
+    /// would let it decide how long this emulator takes to answer whatever is waiting for that
+    /// program to END — the standalone task whose terminal status a client polls for, the
+    /// dependents held until this container ends. So the wait is taken as stated and what the
+    /// program does next — its next command, or its own end carrying the status that wait
+    /// answered — follows at once, which is what the container then reports.
     ///
     /// It is NOT, where the wait is the WHOLE PROGRAM ([`Self::program_is_a_wait`]): the
     /// container was given nothing to do but wait, so there is no work for those seconds to be
     /// the account of — they are the span the container RUNS FOR, which is what
     /// `Task$lastStatus` reports of a task while its containers are up. Spending them holds
     /// nothing up that this emulator owes anyone: the container is simply still there, as it is
-    /// for a wait with no end at all, and every call about its task is answered throughout.
+    /// for a wait with no end at all, and every call about its task is answered throughout. For
+    /// the SHELL spelling of such a program that is so where nothing is waiting for the program
+    /// to end at all ([`Self::maintained_by_a_service`]); [`Self::run`] holds that reading.
     ///
     /// It is NOT either, inside a LOOP the program is going round: a wait there states no
     /// duration of the program's own work, because what ends the loop is something else — the
