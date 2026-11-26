@@ -173,13 +173,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A key the resource already carries is EDITED, so only new keys grow the set.
         // The ceiling is checked on the set the write would LEAVE BEHIND and refused
-        // before anything is written: a rejected call changes no tag.
-        let resulting = crate::state::tag_count_after_merge(stored, &input.tags);
-        if resulting > crate::state::MAX_TAGS_PER_RESOURCE {
-            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
-                crate::state::tag_quota_exceeded(kind, &resource_id),
-            )
-            .into());
+        // before anything is written: a rejected call changes no tag. The question is the
+        // one every path that writes tags asks (`crate::state::tag_quota_violation`).
+        if let Some(refusal) =
+            crate::state::tag_quota_violation(kind, &resource_id, stored, &input.tags)
+        {
+            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(refusal).into());
         }
 
         for (key, value) in input.tags {

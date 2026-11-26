@@ -241,15 +241,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // checked, below, once the cluster this create is scoped to has resolved.
 
         // A resource holds at most `MAX_TAGS_PER_RESOURCE` tags on EVERY path that writes
-        // them, so a create carrying more is refused the way a `TagResource` past the
-        // ceiling is; `RequestTagMap`'s modelled maximum bounds one request, not the
-        // resource.
-        let requested_tags = input.tags.as_ref().map_or(0, std::collections::HashMap::len);
-        if requested_tags > crate::state::MAX_TAGS_PER_RESOURCE {
-            return Err(CreateQueueErrorModeled::ServiceQuotaExceededException(
-                crate::state::tag_quota_exceeded(crate::state::QUEUE, &input.queue_name),
-            )
-            .into());
+        // them, so a create carrying more is refused by the same question a `TagResource`
+        // past the ceiling is refused by (`crate::state::tag_quota_violation`);
+        // `RequestTagMap`'s modelled maximum bounds one request, not the resource.
+        if let Some(refusal) = crate::state::created_tag_quota_violation(
+            crate::state::QUEUE,
+            &input.queue_name,
+            input.tags.as_ref(),
+        ) {
+            return Err(CreateQueueErrorModeled::ServiceQuotaExceededException(refusal).into());
         }
 
         let mut state = state.lock();

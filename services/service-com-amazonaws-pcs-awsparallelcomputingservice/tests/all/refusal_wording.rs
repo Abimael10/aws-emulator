@@ -55,6 +55,11 @@
 #[path = "refusal_wording/quota_sentences.rs"]
 mod quota_sentences;
 
+// What the TAG-count ceiling answers, from every path that writes tags, is its own suite,
+// declared the same way.
+#[path = "refusal_wording/tag_ceiling.rs"]
+mod tag_ceiling;
+
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};

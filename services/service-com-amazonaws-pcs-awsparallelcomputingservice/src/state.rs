@@ -38,8 +38,9 @@
 //!   `TagValue` `@length(..256)`, both enforced at the boundary before a handler runs.
 //! * tag COUNT — a resource's stored tag set is capped at [`MAX_TAGS_PER_RESOURCE`]
 //!   ([`tag_quota_exceeded`]) on every path that writes tags, a create carrying `tags`
-//!   as much as a later `TagResource`; `RequestTagMap`'s modelled
-//!   `@length(min: 1, max: 200)` bounds one request only.
+//!   as much as a later `TagResource`; both ask [`tag_quota_violation`], the one place
+//!   the comparison and the refusal live, so no writing path can drift from another.
+//!   `RequestTagMap`'s modelled `@length(min: 1, max: 200)` bounds one request only.
 //! * the idempotency index — [`MAX_REMEMBERED_CLIENT_TOKENS`] entries, evicted
 //!   oldest-first, and an entry a removed cluster leaves nothing to answer from is
 //!   dropped with it ([`ComAmazonawsPcsAwsparallelcomputingserviceState::settle`]), so a
@@ -230,10 +231,11 @@ pub const MAX_STORED_LIST_ENTRIES: usize = 200;
 pub const MIN_SUBNET_IDS: usize = 1;
 
 /// The most tags one PCS resource holds, matching AWS's resource-tagging limit of 50
-/// tags per resource. Checked on every path that writes tags — the `tags` a create
-/// carries, and the set a `TagResource` would LEAVE BEHIND, so repeated tag writes cannot
-/// grow a record past it either — and the overflowing call is refused with the modelled
-/// `ServiceQuotaExceededException` ([`tag_quota_exceeded`]) and persists nothing.
+/// tags per resource. Checked through [`tag_quota_violation`] on every path that writes
+/// tags — the `tags` a create carries, and the set a `TagResource` would LEAVE BEHIND, so
+/// repeated tag writes cannot grow a record past it either — and the overflowing call is
+/// refused with the modelled `ServiceQuotaExceededException` ([`tag_quota_exceeded`]) and
+/// persists nothing.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// The most `@idempotencyToken` values remembered at once. Beyond this the oldest entry
@@ -1954,6 +1956,36 @@ pub fn tag_count_after_merge(
             .keys()
             .filter(|key| !stored.contains_key(*key))
             .count()
+}
+
+/// The refusal a tag write earns, or `None` when the write fits: the
+/// [`MAX_TAGS_PER_RESOURCE`] ceiling is compared against the set the write would LEAVE
+/// BEHIND ([`tag_count_after_merge`]) and the refusal is built here, so every path that
+/// writes tags asks the one question and none can drift from another.
+///
+/// `stored` is the set the resource holds now and `requested` the tags the call writes
+/// into it.
+pub fn tag_quota_violation(
+    kind: ResourceKind,
+    resource_id: &str,
+    stored: &HashMap<String, String>,
+    requested: &HashMap<String, String>,
+) -> Option<ServiceQuotaExceededException> {
+    (tag_count_after_merge(stored, requested) > MAX_TAGS_PER_RESOURCE)
+        .then(|| tag_quota_exceeded(kind, resource_id))
+}
+
+/// The refusal a CREATE carrying `tags` earns, asked of [`tag_quota_violation`] like every
+/// other tag write: a create starts the resource from no stored tags, so the set it would
+/// leave behind is the keys of its own `tags` map, and a create carrying no `tags` member
+/// writes into that empty set nothing at all.
+pub fn created_tag_quota_violation(
+    kind: ResourceKind,
+    resource_id: &str,
+    tags: Option<&HashMap<String, String>>,
+) -> Option<ServiceQuotaExceededException> {
+    let none = HashMap::new();
+    tag_quota_violation(kind, resource_id, &none, tags.unwrap_or(&none))
 }
 
 /// The page size a list serves for this `maxResults`.
