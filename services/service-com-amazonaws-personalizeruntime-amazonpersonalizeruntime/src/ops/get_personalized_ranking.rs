@@ -287,28 +287,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .map_err(deny)?;
 
-        // 4. Score the WHOLE catalog for this request, and settle each entry's
-        //    share of the certainty over it. The reported score of an item is the
-        //    model's certainty for the (campaign, userId, context, item) tuple, so the
-        //    denominator is the catalog — never the entries this `inputList` happened
-        //    to name, nor the ones the request's `filterArn` kept. Re-ranking the same
-        //    user over a longer list, or with a filter, therefore reports an item with
-        //    the same score, and a ranking of part of the catalog sums to at most 1.0.
+        // 4. Score the WHOLE catalog for this request, settle each entry's share of the
+        //    certainty over it, apply the request's filter and order what is left by
+        //    score descending — the four steps in THAT order, applied through the one
+        //    shared pipeline ([`scoring::ranked_by`]) the sibling operations report
+        //    their own catalogs under, so the order is stated once for all of them and
+        //    no operation can drift from it.
+        //
+        //    The denominator is the catalog — never the entries this `inputList`
+        //    happened to name, nor the ones the request's `filterArn` kept: the reported
+        //    score of an item is the model's certainty for the (campaign, userId,
+        //    context, item) tuple. Re-ranking the same user over a longer list, or with
+        //    a filter, therefore reports an item with the same score, and a ranking of
+        //    part of the catalog sums to at most 1.0.
+        //
+        //    What this operation fills differently is the ONE per-operation part of that
+        //    order, the tie-break key: it re-ranks a list the CALLER sent, so an equal
+        //    pair keeps the position the caller sent it in, where an operation choosing
+        //    its own list settles a tie by the entry's own id. An entry the request named
+        //    nowhere takes the position after the last one it did, and is left out of the
+        //    reported ranking in step 5.
         let seed = scoring::Seed::with_context(
             &campaign.arn,
             &input.user_id,
             input.context.as_ref(),
         );
-        let mut catalog_shares: Vec<f64> = catalog
-            .iter()
-            .map(|item| seed.relevance(item.base_score, &item.item_id))
-            .collect();
-        scoring::normalize(&mut catalog_shares);
+        let listed = listed_positions(&input.input_list);
+        let unlisted_position = input.input_list.len();
+        let ranked = scoring::ranked_by(
+            catalog.iter(),
+            &seed,
+            request_filter.as_ref(),
+            &recorded,
+            |item| {
+                listed
+                    .get(item.item_id.as_str())
+                    .copied()
+                    .unwrap_or(unlisted_position)
+            },
+        );
 
-        // 5. Report the entries `inputList` names, and collect the ones the catalog
-        //    does not hold. An entry with no catalog record carries no stored
-        //    attributes, so the request's filter decides on an empty attribute set: an
-        //    INCLUDE filter cannot keep it, an EXCLUDE filter cannot remove it.
+        // 5. Report, out of that ranking, the entries `inputList` names — this handler
+        //    answers with the REQUEST'S OWN list re-ordered, so the ranking over the
+        //    whole catalog is what it selects from rather than what it reports.
         //
         //    Each DISTINCT id is reported once. An id the caller listed again names the
         //    same entry, and an entry's reported score is its share of the one unit of
@@ -316,66 +337,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //    would hand out that share twice and the ranking would sum past 1.0. The
         //    FIRST occurrence is the one kept, so repetition changes neither which ids
         //    come back nor the order a tie between them resolves in.
-        let no_attributes: BTreeMap<String, String> = BTreeMap::new();
-        let mut ranked: Vec<(usize, f64, usize)> = Vec::new();
-        let mut appended: Vec<String> = Vec::new();
         let mut reported: BTreeSet<&str> = BTreeSet::new();
-        for (position, item_id) in input.input_list.iter().enumerate() {
+        let mut personalized_ranking: Vec<PredictedItem> = Vec::new();
+        for &(item, score) in &ranked {
+            if !listed.contains_key(item.item_id.as_str()) {
+                continue;
+            }
+            if !reported.insert(item.item_id.as_str()) {
+                continue;
+            }
+            personalized_ranking.push(PredictedItem {
+                item_id: Some(item.item_id.clone()),
+                score: Some(score),
+                promotion_name: None,
+                metadata: registry::metadata_for(&item.attributes, metadata_columns.as_deref()),
+                reason: None,
+            });
+        }
+
+        // 6. "If an item was not included in the training dataset, the item is appended
+        //    to the end of the reranked list" — with no relevance score for the user, so
+        //    the list stays ordered by score descending, and in the order the caller
+        //    listed those ids in. An entry with no catalog record carries no stored
+        //    attributes, so the request's filter decides on an empty attribute set: an
+        //    INCLUDE filter cannot keep it, an EXCLUDE filter cannot remove it.
+        //
+        //    Whether `metadata` is reported is a fact about the REQUEST, so an appended
+        //    entry is reported through the same helper, with the empty attribute set it
+        //    stores: a request that asked for metadata gets the member on every entry,
+        //    holding only the requested columns the entry actually carries — none, here.
+        let no_attributes: BTreeMap<String, String> = BTreeMap::new();
+        for item_id in &input.input_list {
+            if catalog.iter().any(|item| &item.item_id == item_id) {
+                continue;
+            }
             if !reported.insert(item_id.as_str()) {
                 continue;
             }
-            match catalog.iter().position(|item| &item.item_id == item_id) {
-                Some(index) => {
-                    let item = &catalog[index];
-                    if request_filter.as_ref().is_some_and(|filter| {
-                        !filter.retains(recorded.facts(&item.item_id, &item.attributes))
-                    }) {
-                        continue;
-                    }
-                    ranked.push((index, catalog_shares[index], position));
-                }
-                None => {
-                    if request_filter.as_ref().is_some_and(|filter| {
-                        !filter.retains(recorded.facts(item_id, &no_attributes))
-                    }) {
-                        continue;
-                    }
-                    appended.push(item_id.clone());
-                }
+            if request_filter
+                .as_ref()
+                .is_some_and(|filter| !filter.retains(recorded.facts(item_id, &no_attributes)))
+            {
+                continue;
             }
+            personalized_ranking.push(PredictedItem {
+                item_id: Some(item_id.clone()),
+                score: Some(0.0),
+                promotion_name: None,
+                metadata: registry::metadata_for(&no_attributes, metadata_columns.as_deref()),
+                reason: None,
+            });
         }
-        // Score descending through the one comparator all three operations share;
-        // `inputList` order is this operation's tie-break key, so an equal pair keeps
-        // the order the caller sent and the ranking stays stable across identical calls.
-        ranked.sort_by(|left, right| scoring::by_score_desc((left.2, left.1), (right.2, right.1)));
-
-        let mut personalized_ranking: Vec<PredictedItem> = ranked
-            .iter()
-            .map(|(index, score, _)| {
-                let item = &catalog[*index];
-                PredictedItem {
-                    item_id: Some(item.item_id.clone()),
-                    score: Some(*score),
-                    promotion_name: None,
-                    metadata: registry::metadata_for(&item.attributes, metadata_columns.as_deref()),
-                    reason: None,
-                }
-            })
-            .collect();
-        // "If an item was not included in the training dataset, the item is appended
-        // to the end of the reranked list" — with no relevance score for the user, so
-        // the list stays ordered by score descending.
-        // Whether `metadata` is reported is a fact about the REQUEST, so an appended
-        // entry is reported through the same helper, with the empty attribute set it
-        // stores: a request that asked for metadata gets the member on every entry,
-        // holding only the requested columns the entry actually carries — none, here.
-        personalized_ranking.extend(appended.into_iter().map(|item_id| PredictedItem {
-            item_id: Some(item_id),
-            score: Some(0.0),
-            promotion_name: None,
-            metadata: registry::metadata_for(&no_attributes, metadata_columns.as_deref()),
-            reason: None,
-        }));
 
         let recommendation_id = guard.issue_recommendation_id(&campaign.arn, now);
         Ok(GetPersonalizedRankingOutput {
@@ -383,6 +395,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             recommendation_id: Some(recommendation_id),
         })
     }
+}
+
+/// The DISTINCT ids `inputList` names, each with the position of its FIRST occurrence —
+/// this operation's tie-break key, and the set of ids it reports.
+///
+/// The first occurrence is the one that counts: an id the caller listed again names the
+/// same catalog entry, so the repeat may move neither which ids come back nor the order
+/// a tie between them resolves in.
+fn listed_positions(input_list: &[String]) -> BTreeMap<&str, usize> {
+    let mut listed: BTreeMap<&str, usize> = BTreeMap::new();
+    for (position, item_id) in input_list.iter().enumerate() {
+        listed.entry(item_id.as_str()).or_insert(position);
+    }
+    listed
 }
 
 /// Every resource ARN this request NAMES.

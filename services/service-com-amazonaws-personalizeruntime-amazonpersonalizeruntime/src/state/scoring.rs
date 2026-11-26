@@ -5,8 +5,9 @@
 //! Each stored catalog entry's prediction score is composed here ([`Seed`]), each
 //! entry's share of the reported certainty is settled here ([`normalize`]), and the
 //! order in which those two and the request's filter are applied to a whole catalog is
-//! stated once here as well ([`ranked`]), so the operations that report a catalog of
-//! their own choosing cannot drift apart on it.
+//! stated once here as well ([`ranked`], and [`ranked_by`] for an operation that settles
+//! a TIED pair by a key of its own), so the operations that report a catalog of their own
+//! choosing cannot drift apart on it.
 //!
 //! # Why a hash, and why no clock or randomness
 //!
@@ -309,7 +310,8 @@ impl CatalogEntry for Action {
 /// `catalog` scored for `seed`, each entry's share settled over the WHOLE scored
 /// catalog, then the request's `filter` applied, then ordered by score descending —
 /// the ORDER in which an operation that chooses its own list applies the three rules
-/// above, stated once.
+/// above, stated once ([`ranked_by`]) and entered here with the entry's own id as the
+/// key a tied pair is settled by.
 ///
 /// The order is the rule, not an implementation detail of one operation: the
 /// denominator behind a reported score is the whole scored catalog, so normalization
@@ -331,6 +333,28 @@ pub fn ranked<'a, Entry: CatalogEntry + 'a>(
     filter: Option<&BoundFilter>,
     recorded: &RecordedInteractions,
 ) -> Vec<(&'a Entry, f64)> {
+    ranked_by(catalog, seed, filter, recorded, |entry: &'a Entry| {
+        entry.entry_id()
+    })
+}
+
+/// [`ranked`] with the ONE part of the order that is per-operation handed in: the
+/// tie-break key an equal pair is settled by.
+///
+/// The four steps above — score, settle each entry's share over the WHOLE scored
+/// catalog, apply the request's filter, order by score descending — are the rule, and
+/// they live here. The key is the seam, exactly the seam the shared comparator already
+/// takes ([`by_score_desc`]): the entry's own id where the operation chooses the list,
+/// the caller's list position where it re-ranks a list the caller sent. So an operation
+/// that reports a list of its own choosing selects its entries OUT of what this
+/// returns, and no operation restates the order.
+pub fn ranked_by<'a, Entry: CatalogEntry + 'a, Key: Ord>(
+    catalog: impl IntoIterator<Item = &'a Entry>,
+    seed: &Seed<'_>,
+    filter: Option<&BoundFilter>,
+    recorded: &RecordedInteractions,
+    tie_break: impl Fn(&'a Entry) -> Key,
+) -> Vec<(&'a Entry, f64)> {
     let mut ranked: Vec<(&'a Entry, f64)> = catalog
         .into_iter()
         .map(|entry| {
@@ -344,11 +368,8 @@ pub fn ranked<'a, Entry: CatalogEntry + 'a>(
             filter.retains(recorded.facts(entry.entry_id(), entry.attributes()))
         })
     });
-    ranked.sort_by(|(left, left_score), (right, right_score)| {
-        by_score_desc(
-            (left.entry_id(), *left_score),
-            (right.entry_id(), *right_score),
-        )
+    ranked.sort_by(|&(left, left_score), &(right, right_score)| {
+        by_score_desc((tie_break(left), left_score), (tie_break(right), right_score))
     });
     ranked
 }
