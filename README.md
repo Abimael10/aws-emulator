@@ -132,6 +132,10 @@ You might build a tool that includes the emulator, such as a test framework that
 
 We don't accept pull requests: AI agents keep the emulator up to date with AWS, with regular updates. See [CONTRIBUTING.md](.github/CONTRIBUTING.md) for details.
 
+## Fidelity tests
+
+The fidelity tests for AWS Emulator are in the [AWS Emulator Evaluation Suite](https://github.com/aws/aws-emulator-evaluation-suite).
+
 ## License
 
 This software is licensed under the CC0 1.0 Universal (CC0-1.0) License, except the code in the `vendor/` directory, which is under the Apache License 2.0. See [LICENSE](LICENSE) for details, and [vendor/README.md](vendor/README.md) for the license of the code in `vendor/`.

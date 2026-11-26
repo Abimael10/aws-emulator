@@ -71,17 +71,36 @@ fn service_test_layout_violations(tests_dir: &Path) -> Vec<Vec<String>> {
     }
 }
 
-/// The declaration a suite under `tests/all/` needs in a hand-declared `tests/all.rs`.
+/// The steps that migrate a hand-declared crate to the automod layout, one line each.
 ///
-/// `tests/all.rs` is a test target's crate root, so a bare `mod <stem>;` resolves to
-/// `tests/<stem>.rs` — which rule 1 refuses — and fails with `E0583`. Hence `#[path]`.
+/// A hand-declared crate's violations are remedied by migrating rather than by adding a
+/// `mod` line to `tests/all.rs`, because the merge gate refuses any fix that edits or
+/// adds a service crate's `tests/all.rs`; a remedy that told the reader to declare the
+/// suite there would be one the gate rejects. The wording follows the gate's own
+/// migration guidance so both readers get one instruction.
 ///
-/// Two lines rather than one `\n`-joined string: cargo scans build-script stdout line by
-/// line, so an embedded newline would drop the `mod` line from the reported error.
-fn module_declaration(stem: &str) -> [String; 2] {
-    [
-        format!("    #[path = \"all/{stem}.rs\"]"),
-        format!("    mod {stem};"),
+/// `automod = { workspace = true }` always resolves where these messages can appear:
+/// this build-support version reaches a tenant only through a re-vendor, which also
+/// renders the root `Cargo.toml` with `automod` under `[workspace.dependencies]`. So no
+/// check of the root manifest is needed here.
+///
+/// One element per line because cargo scans build-script stdout line by line, and an
+/// embedded newline would end the `cargo::error=` directive mid-remedy.
+fn automod_migration_steps() -> Vec<String> {
+    vec![
+        "Do not add a `mod` line to tests/all.rs: the merge gate refuses a fix that edits it. \
+         Migrate this crate to the automod layout instead, as its own commit before your fix:"
+            .to_string(),
+        "    git rm tests/all.rs".to_string(),
+        "    # create tests/all/main.rs containing exactly this line (comments allowed):"
+            .to_string(),
+        "    automod::dir!(\"tests/all\");".to_string(),
+        "    # add under [dev-dependencies] in this crate's Cargo.toml:".to_string(),
+        "    automod = { workspace = true }".to_string(),
+        "    # keep every suite file under tests/all/ where it is: automod declares one \
+         `mod <name>;` per tests/all/<name>.rs, so module paths and test names do not change \
+         and no `mod` line is needed."
+            .to_string(),
     ]
 }
 
@@ -91,14 +110,16 @@ fn module_declaration(stem: &str) -> [String; 2] {
 /// Rule 1: no top-level `tests/*.rs` other than `all.rs`.
 /// Rule 2: every suite under `tests/all/` is declared in `tests/all.rs`, or it compiles
 /// nowhere.
+///
+/// Both rules stay, so an undeclared suite in an unmigrated crate never silently stops
+/// running. Each remedy is the migration in [`automod_migration_steps`].
 fn hand_declared_layout_violations(tests_dir: &Path) -> Vec<Vec<String>> {
     let all_rs = tests_dir.join("all.rs");
     let declared = declared_modules(&fs::read_to_string(&all_rs).unwrap_or_default());
     let mut violations: Vec<Vec<String>> = Vec::new();
 
     for stem in stray_top_level_suites(tests_dir) {
-        let declaration = module_declaration(&stem);
-        violations.push(vec![
+        let mut lines = vec![
             format!(
                 "tests/{stem}.rs is a top-level integration test, but this crate has already \
                  adopted the single-target layout (tests/all.rs exists)."
@@ -107,30 +128,29 @@ fn hand_declared_layout_violations(tests_dir: &Path) -> Vec<Vec<String>> {
              crate plus its entire dependency closure. Suites under tests/all/ share one binary."
                 .to_string(),
             "This is a FILE LAYOUT rule. No change to the test's code can satisfy it - do not \
-             edit the test. Move the file and declare it:"
+             edit the test."
                 .to_string(),
-            format!("    git mv tests/{stem}.rs tests/all/{stem}.rs"),
-            "    # then add to tests/all.rs, keeping the list sorted:".to_string(),
-            declaration[0].clone(),
-            declaration[1].clone(),
-        ]);
+        ];
+        lines.extend(automod_migration_steps());
+        lines.push(format!(
+            "    git mv tests/{stem}.rs tests/all/{stem}.rs   # move this suite into tests/all/"
+        ));
+        violations.push(lines);
     }
 
     for stem in suites_under_all(&tests_dir.join("all")) {
         if !declared.contains(&stem) {
-            let declaration = module_declaration(&stem);
-            violations.push(vec![
+            let mut lines = vec![
                 format!(
                     "the suite `{stem}` under tests/all/ is not declared in tests/all.rs, so it \
                      is compiled nowhere and its tests NEVER RUN."
                 ),
                 "This is a FILE LAYOUT rule. No change to the test's code can satisfy it - do \
-                 not edit the test. Add the declaration:"
+                 not edit the test."
                     .to_string(),
-                "    # in tests/all.rs, keeping the list sorted:".to_string(),
-                declaration[0].clone(),
-                declaration[1].clone(),
-            ]);
+            ];
+            lines.extend(automod_migration_steps());
+            violations.push(lines);
         }
     }
     violations
@@ -1761,27 +1781,6 @@ mod tests {
     }
 
     #[test]
-    fn the_prescribed_declaration_points_into_tests_all_and_satisfies_the_orphan_rule() {
-        let prescribed = module_declaration("state_roundtrip");
-        assert!(
-            prescribed[0].contains("#[path = \"all/state_roundtrip.rs\"]"),
-            "without `#[path]` the declaration resolves to tests/state_roundtrip.rs, which \
-             rule 1 refuses, and fails with E0583. Got: {}",
-            prescribed[0]
-        );
-        assert!(
-            prescribed.iter().all(|line| !line.contains('\n')),
-            "a newline would end the cargo::error= directive and drop the rest of the message"
-        );
-        assert_eq!(
-            declared_modules(&prescribed.join("\n")),
-            vec!["state_roundtrip".to_string()],
-            "pasting the prescription verbatim must satisfy rule 2, or the checker still \
-             reports the suite as an orphan"
-        );
-    }
-
-    #[test]
     fn an_empty_all_rs_declares_nothing_and_a_missing_one_reads_as_empty() {
         assert!(declared_modules("").is_empty());
         assert!(declared_modules("//! only a doc comment\n").is_empty());
@@ -2157,7 +2156,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hand_declared_service_crate_keeps_the_declaration_rules() {
+    fn a_hand_declared_service_crate_keeps_the_declaration_rules_and_prescribes_migration() {
         let root = crate_with_tests(
             "service-hand-declared",
             &["all.rs", "stray.rs", "all/declared.rs", "all/forgotten.rs"],
@@ -2169,18 +2168,68 @@ mod tests {
             "tests/stray.rs is a top-level integration test, but this crate has already adopted \
              the single-target layout (tests/all.rs exists)."
         ));
+        assert_eq!(violations[0][3..10], automod_migration_steps()[..]);
         assert_eq!(
-            violations[0][3],
-            "    git mv tests/stray.rs tests/all/stray.rs"
+            violations[0][10],
+            "    git mv tests/stray.rs tests/all/stray.rs   # move this suite into tests/all/"
         );
-        assert_eq!(violations[0][5], "    #[path = \"all/stray.rs\"]");
-        assert_eq!(violations[0][6], "    mod stray;");
+        assert_eq!(violations[0].len(), 11, "{:?}", violations[0]);
         assert_eq!(
             violations[1][0],
             "the suite `forgotten` under tests/all/ is not declared in tests/all.rs, so it is \
              compiled nowhere and its tests NEVER RUN."
         );
-        assert_eq!(violations[1][4], "    mod forgotten;");
+        assert_eq!(violations[1][2..], automod_migration_steps()[..]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hand_declared_remedies_migrate_the_crate_instead_of_declaring_in_all_rs() {
+        // The merge gate refuses a fix that edits a service crate's tests/all.rs, so a
+        // remedy that declared the suite there would send the fixer into a refusal.
+        let root = crate_with_tests(
+            "service-hand-declared-remedy",
+            &["all.rs", "stray.rs", "all/forgotten.rs"],
+        );
+        let violations = service_test_layout_violations(&root.join("tests"));
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        for violation in &violations {
+            assert!(
+                violation
+                    .iter()
+                    .all(|line| !line.contains("#[path") && !line.contains("add to tests/all.rs")
+                        && !line.contains("in tests/all.rs, keeping")),
+                "no hand-declared remedy may prescribe a declaration in tests/all.rs: {violation:?}"
+            );
+            assert!(
+                violation
+                    .iter()
+                    .any(|line| line == "    automod::dir!(\"tests/all\");"),
+                "{violation:?}"
+            );
+            assert!(
+                violation
+                    .iter()
+                    .any(|line| line == "    automod = { workspace = true }"),
+                "{violation:?}"
+            );
+            assert!(
+                violation
+                    .iter()
+                    .any(|line| line == "    git rm tests/all.rs"),
+                "{violation:?}"
+            );
+            assert!(
+                violation.iter().any(|line| line.starts_with(
+                    "Do not add a `mod` line to tests/all.rs: the merge gate refuses"
+                )),
+                "{violation:?}"
+            );
+            assert!(
+                violation.iter().all(|line| !line.contains('\n')),
+                "one cargo::error per line"
+            );
+        }
         let _ = fs::remove_dir_all(&root);
     }
 
