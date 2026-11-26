@@ -16,6 +16,10 @@
 //! `name` another test already holds is a 409 `ConflictException`, since an
 //! `ABTestName` is unique within an account.
 //!
+//! A rename normalises the new name on this write path as the create does, so the name
+//! every later read reports is the normalised spelling, and the uniqueness this
+//! operation holds a rename to is case-insensitive.
+//!
 //! `clientToken` is an `@idempotencyToken` on an `@idempotent` operation, so a replayed
 //! token answers with the update it already applied rather than applying it a second
 //! time.
@@ -266,11 +270,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !crate::state::names_one_control_and_one_treatment(variants) {
                 return Err(validation(crate::state::variant_pair_required_message()));
             }
-            let weight = crate::state::total_variant_weight(variants);
-            if weight != crate::state::TOTAL_VARIANT_WEIGHT {
-                return Err(validation(crate::state::variant_weight_total_message(
-                    weight,
-                )));
+            if crate::state::total_variant_weight(variants) != crate::state::TOTAL_VARIANT_WEIGHT
+            {
+                return Err(validation(crate::state::variant_weight_total_message()));
             }
         }
 
@@ -300,14 +302,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An `ABTestName` is unique within an account, so a rename onto a name another
         // test holds is the conflict the model declares; renaming a test to the name it
-        // already has changes nothing and conflicts with nothing.
+        // already has changes nothing and conflicts with nothing. Both comparisons are
+        // made on the NORMALISED name a test is held under, so a rename that only
+        // changes the case of this test's own name is still a rename to the same name,
+        // and one onto the case-variant of another test's name is still a conflict.
         if let Some(renamed) = input.name.as_deref() {
-            if renamed != current_name && store.ab_test_named(renamed).is_some() {
+            if crate::state::normalize_ab_test_name(renamed) != current_name
+                && store.ab_test_named(renamed).is_some()
+            {
                 return Err(UpdateABTestErrorModeled::ConflictException(
                     ConflictException {
-                        message: Some(format!(
-                            "An A/B test with the name {renamed} already exists"
-                        )),
+                        message: Some(crate::state::ab_test_name_conflict_message(renamed)),
                     },
                 )
                 .into());
@@ -321,7 +326,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // optional on this operation, and an absent member is "not updated" rather
         // than "cleared".
         if let Some(name) = input.name {
-            test.name = name;
+            // Normalised on this write path as it is on the create's, so a rename cannot
+            // leave a name stored in a spelling a later lookup would not find.
+            test.name = crate::state::normalize_ab_test_name(&name);
         }
         if let Some(description) = input.description {
             test.description = Some(description);

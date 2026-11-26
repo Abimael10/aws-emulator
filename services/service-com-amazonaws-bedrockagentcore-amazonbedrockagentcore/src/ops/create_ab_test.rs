@@ -16,6 +16,10 @@
 //! account") is a `ConflictException`, and variants that are not one control and one
 //! treatment whose weights sum to 100 are a `ValidationException`.
 //!
+//! An A/B test's `name` is case-insensitive: the name is normalised on the write path,
+//! so the stored record, this call's own response and every later read report the
+//! normalised spelling, and the account-uniqueness check above is case-insensitive too.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -250,11 +254,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &crate::state::variant_pair_required_message(),
             ));
         }
-        let weight = crate::state::total_variant_weight(&input.variants);
-        if weight != crate::state::TOTAL_VARIANT_WEIGHT {
-            return Err(variants_refused(&crate::state::variant_weight_total_message(
-                weight,
-            )));
+        if crate::state::total_variant_weight(&input.variants)
+            != crate::state::TOTAL_VARIANT_WEIGHT
+        {
+            return Err(variants_refused(
+                &crate::state::variant_weight_total_message(),
+            ));
         }
 
         let mut store = state.lock();
@@ -270,13 +275,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `name` "must be unique within your account", and this emulator serves one
-        // account, so a name another test already holds is the documented conflict.
-        if store.ab_tests.values().any(|held| held.name == input.name) {
+        // account, so a name another test already holds is the documented conflict. The
+        // lookup is the store's, so it compares the NORMALISED name a test is held under
+        // and a name differing from a held one only in case is the same name; the
+        // refusal quotes the name as this request spelled it.
+        if store.ab_test_named(&input.name).is_some() {
             return Err(CreateABTestErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "An A/B test with the name {} already exists",
-                    input.name
-                )),
+                message: Some(crate::state::ab_test_name_conflict_message(&input.name)),
             })
             .into());
         }

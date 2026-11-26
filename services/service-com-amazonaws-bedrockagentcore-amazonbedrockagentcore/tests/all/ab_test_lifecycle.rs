@@ -179,7 +179,9 @@ async fn a_created_ab_test_reads_back_through_get() {
         for (reported, expected) in [
             ("abTestId", json!(ab_test_id)),
             ("abTestArn", json!(ab_test_arn)),
-            ("name", json!(case.name)),
+            // The name is held in its normalised (lower-cased) form, whatever case the
+            // create asked for — see the `ab_test_name_case` suite.
+            ("name", json!(case.name.to_ascii_lowercase())),
             ("gatewayArn", json!(case.gateway_arn)),
             ("roleArn", json!(ROLE_ARN)),
             ("variants", member(&body, "variants").clone()),

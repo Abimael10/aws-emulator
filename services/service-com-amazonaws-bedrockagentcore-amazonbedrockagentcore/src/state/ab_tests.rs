@@ -11,6 +11,11 @@
 //! with one sentence ([`ab_test_not_found_message`]). `ListABTests` reports the
 //! tests held here and nothing else, so a test that was never created is never listed.
 //!
+//! A test's `name` is held CASE-INSENSITIVELY: whatever case the request used, the name
+//! this plane stores, reports and looks a test up by is that name mapped to lower case
+//! ([`normalize_ab_test_name`]), so two names differing only in case are one name within
+//! the account.
+//!
 //! A test's `status` is read off the CLOCK rather than stored: `CreateABTest` answers
 //! 202 Accepted, so a freshly created test is still `CREATING` and becomes `ACTIVE`
 //! once [`AB_TEST_PROVISIONING_SPAN`] has passed, with no call needed to make it so,
@@ -104,11 +109,37 @@ pub fn variant_pair_required_message() -> String {
 }
 
 /// How this service words the `ValidationException` a request whose variant weights do
-/// not add up to [`TOTAL_VARIANT_WEIGHT`] is refused with, reporting the total the
-/// REQUEST's own weights came to. Shared by the create and the update for the same
-/// reason as [`variant_pair_required_message`].
-pub fn variant_weight_total_message(weight: i64) -> String {
-    format!("Variant weights must sum to {TOTAL_VARIANT_WEIGHT}, but they sum to {weight}")
+/// not add up to [`TOTAL_VARIANT_WEIGHT`] is refused with. Shared by the create and the
+/// update for the same reason as [`variant_pair_required_message`].
+///
+/// The whole sentence is FIXED text: the condition is "the weights do not sum to 100",
+/// which the required total already states, so the total a particular request came to is
+/// not part of how the service words it.
+pub fn variant_weight_total_message() -> String {
+    format!("Variant weights must sum to {TOTAL_VARIANT_WEIGHT}")
+}
+
+/// How this service words the `ConflictException` a create or a rename is refused with
+/// when another A/B test already holds the name: the fixed sentence with the name QUOTED,
+/// spelled as the REQUEST spelled it rather than in the normalised form the store holds
+/// ([`normalize_ab_test_name`]), so the caller sees the name it asked for.
+///
+/// One sentence for both callers, so the same condition cannot be worded two ways.
+pub fn ab_test_name_conflict_message(name: &str) -> String {
+    format!("AB test with name '{name}' already exists")
+}
+
+/// The form an `ABTestName` is held in: an A/B test's name is case-insensitive, so the
+/// name a create or a rename supplies is mapped to lower case ONCE on the write path and
+/// that is the spelling the test is stored under, reported by and looked up by.
+///
+/// `ABTestName`'s pattern (`^[a-zA-Z][a-zA-Z0-9_]{0,47}$`) admits upper case on input and
+/// only ASCII letters, digits and `_`, so ASCII case folding is the whole of it. Because
+/// the stored name is the normalised one, the "must be unique within your account"
+/// uniqueness this plane enforces ([`ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState::ab_test_named`])
+/// is case-insensitive too: two names differing only in case are one name.
+pub fn normalize_ab_test_name(name: &str) -> String {
+    name.to_ascii_lowercase()
 }
 
 /// The weight every variant's share of the traffic is a percentage of: `Variant$weight`
@@ -132,6 +163,8 @@ pub struct ABTestRecord {
     pub ab_test_id: String,
     /// Minted by [`ab_test_arn`] for the region the creating request was signed for.
     pub ab_test_arn: String,
+    /// Held in the normalised form every write path maps a supplied name to
+    /// ([`normalize_ab_test_name`]), which is the spelling every read reports.
     pub name: String,
     pub description: Option<String>,
     pub gateway_arn: String,
@@ -187,6 +220,10 @@ impl ABTestRecord {
         enable_on_create: bool,
         created_at: SystemTime,
     ) -> Self {
+        // Normalised HERE rather than in the handler, so no write path can store a name
+        // in a spelling a later lookup would not find, and the id minted from the name
+        // carries the same spelling the test reports.
+        let name = normalize_ab_test_name(&name);
         let ab_test_id = mint_ab_test_id(&name, created_at, seq);
         Self {
             ab_test_arn: ab_test_arn(region, &ab_test_id),
@@ -417,10 +454,14 @@ impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
     }
 
     /// The A/B test whose `name` is `name`, or `None` when no test holds it. An
-    /// `ABTestName` "must be unique within your account", so this is what a rename
-    /// checks before taking one.
+    /// `ABTestName` "must be unique within your account", so this is what a create and a
+    /// rename check before taking one.
+    ///
+    /// The name asked for is normalised before the comparison, and every stored name is
+    /// already normalised, so the lookup is case-insensitive ([`normalize_ab_test_name`]).
     pub fn ab_test_named(&self, name: &str) -> Option<&ABTestRecord> {
-        self.ab_tests.values().find(|held| held.name == name)
+        let wanted = normalize_ab_test_name(name);
+        self.ab_tests.values().find(|held| held.name == wanted)
     }
 
     /// Remove the A/B test a delete addressed and hand it back, or the sentence naming
