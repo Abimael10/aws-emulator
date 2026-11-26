@@ -36,7 +36,7 @@ use sqlparser::ast::{
 
 /// The schema PostgreSQL creates every database with and resolves an unqualified name in
 /// first, and so the schema the engine's own objects are reported in.
-pub(super) const PUBLIC_SCHEMA: &str = "public";
+pub(crate) const PUBLIC_SCHEMA: &str = "public";
 
 /// The schema whose relations describe the database itself — "a schema named
 /// `information_schema` ... containing views that describe the objects of the current
@@ -47,6 +47,20 @@ const INFORMATION_SCHEMA: &str = "information_schema";
 /// run against this data plane's DEFAULT database reports: a request that names no
 /// `database` addresses the cluster's own default one, and PostgreSQL's is `postgres`.
 const DEFAULT_DATABASE: &str = "postgres";
+
+/// The name the database a statement runs against is REPORTED under: the name the request's
+/// own `database` member named, and the database PostgreSQL creates in every cluster for a
+/// request that named none.
+///
+/// The ONE reading of it, so the catalog's `table_catalog` and the server's own
+/// `current_database()` ([`crate::state::dialect_builtins`]) report one name.
+pub(crate) fn catalog_name(database: &str) -> &str {
+    if database.is_empty() {
+        DEFAULT_DATABASE
+    } else {
+        database
+    }
+}
 
 /// The engine's own schema table, which every catalog relation below is read out of: it
 /// carries one row per table, view, index and trigger the database holds.
@@ -64,11 +78,7 @@ const ENGINE_OBJECT_PREFIX: &str = "sqlite_";
 /// the levels an operator chain asks for — exactly as the delimiting walk beside it is
 /// bounded ([`super::names`]).
 pub(super) fn resolve_schemas(statement: &mut sqlparser::ast::Statement, database: &str) {
-    let named = if database.is_empty() {
-        DEFAULT_DATABASE
-    } else {
-        database
-    };
+    let named = catalog_name(database);
     // The database's name is CALLER-SUPPLIED text and the relations below report it as a
     // value, so it is written as ONE string literal whatever it holds: the standard
     // doubling of a quote, so a name carrying one states that character rather than ending

@@ -1399,6 +1399,7 @@ async fn register_session(database: &Arc<InstanceDatabase>, facts: &SessionFacts
         let _ = super::server_statements::open_extension_catalog(&database, &session);
         let _ = database.execute(&name, PG_STAT_SSL_SCHEMA, &[]);
         let _ = super::pg_server::ensure_catalogs(&database, &name);
+        let _ = super::pg_information_schema::ensure_views(&database, &name);
         let _ = database.execute(
             &name,
             "INSERT OR REPLACE INTO pg_stat_ssl (pid, ssl, version, cipher) \

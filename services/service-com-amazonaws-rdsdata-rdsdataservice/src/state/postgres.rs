@@ -86,6 +86,8 @@ mod names;
 
 /// The schema a name is resolved in, and the catalog relations that describe the database.
 mod catalog;
+pub(crate) use catalog::catalog_name;
+pub(crate) use catalog::PUBLIC_SCHEMA;
 
 /// The precision a type with no length limit reports: the largest length the
 /// member can carry, which is what a client reads as "unlimited".
@@ -391,6 +393,8 @@ const SQLSTATE_IN_FAILED_TRANSACTION: &str = "25P02";
 const SQLSTATE_SYNTAX_ERROR: &str = "42601";
 const SQLSTATE_UNDEFINED_TABLE: &str = "42P01";
 const SQLSTATE_UNDEFINED_COLUMN: &str = "42703";
+/// And the one a function nothing defines is refused under (class 42, undefined function).
+const SQLSTATE_UNDEFINED_FUNCTION: &str = "42883";
 /// And the two the DATABASE namespace has: a database that is already there, and a
 /// name no database of the cluster answers to.
 const SQLSTATE_DUPLICATE_DATABASE: &str = "42P04";
@@ -465,6 +469,17 @@ pub(super) fn postgresql_diagnostic(
         } => postgresql_error(
             &format!("column \"{column}\" of relation \"{table}\" does not exist"),
             SQLSTATE_UNDEFINED_COLUMN,
+        ),
+        // "function <name>() does not exist": PostgreSQL names the function the statement
+        // called. The name is folded to lower case, because an undelimited identifier is
+        // folded there — "key words and unquoted identifiers are case insensitive … folded
+        // to lower case" — and the engine's own answer carries it as the statement wrote it.
+        Condition::UndefinedFunction { function } => postgresql_error(
+            &format!(
+                "function {}() does not exist",
+                function.to_ascii_lowercase()
+            ),
+            SQLSTATE_UNDEFINED_FUNCTION,
         ),
     })
 }
@@ -951,6 +966,9 @@ pub fn plan(sql: &str, catalog: &Catalog<'_>) -> Result<Plan, SqlError> {
     // what is happening — so it is rewritten here, while the catalog is at hand and
     // before the rewrite below replaces the cast.
     plan_array_output(&mut statement, catalog);
+    // The SESSION VALUES the statement names, substituted for what this session carries: the
+    // value of `current_user` comes from the call that was admitted, never from the statement.
+    plan_session_values(&mut statement, catalog);
     normalise(&mut statement);
     // An upsert the caller wrote in MySQL's spelling is the same upsert the engine
     // spells with the conflicting key named, which only the table's own declaration
@@ -1468,6 +1486,12 @@ pub struct Catalog<'a> {
     /// The DATABASE the statement runs against, which is the catalog name the relations
     /// describing it report ([`catalog`]).
     pub database: &'a str,
+    /// The ENGINE the addressed cluster RUNS, which is what decides the dialect a session
+    /// value is written in and which family defines it at all.
+    pub engine: super::EngineFamily,
+    /// The database USER the call authenticated as, which is the identity the engine reports
+    /// for the session ([`plan_session_values`]). Empty where no call has resolved one.
+    pub user: &'a str,
     /// The columns of the key a table's own declaration says a duplicate-key
     /// condition is raised against (see [`plan_upsert`]).
     pub key_columns: &'a dyn Fn(&str) -> Vec<String>,
@@ -1724,6 +1748,106 @@ fn rendered(statement: &Statement) -> (String, Vec<String>) {
     }
 }
 
+/// Substitute the SESSION VALUES a statement names for what this session carries.
+///
+/// A statement may ask the server who and where it is — "which user am I", "which catalog am
+/// I in" — and the answer comes from the CONNECTION rather than from the statement: the
+/// database user the call authenticated as, and the database it addressed. Both engines spell
+/// most of them as KEYWORDS of the SQL standard (`CURRENT_USER`, `SESSION_USER`), which the
+/// parse reads as the identifier they are, so they are replaced here with the value this
+/// session holds — written as a string literal, so the engine returns it as the text the
+/// server would.
+///
+/// Only a word the SESSION answers is replaced: a column, an alias or a table of the caller's
+/// own that happens to share one of those names is the identifier it is, which is why a name
+/// the caller DELIMITED is left exactly as written and why the `USER` of `CREATE USER` is not
+/// reached (a statement's keywords are not expressions). The functions the ENGINE itself
+/// answers — the clock and `current_database()` — are deliberately absent from this:
+/// [`crate::state::dialect_builtins`] defines them on the connection, so a statement that
+/// calls one is planned and run like any other.
+///
+/// A value only the OTHER family's engine answers is not substituted either, so the statement
+/// keeps the name it wrote and the engine refuses it as the undefined thing it is on this
+/// cluster's engine.
+///
+/// DEPTH: bounded before the tree exists, exactly as [`cast_values`] states.
+fn plan_session_values(statement: &mut Statement, catalog: &Catalog<'_>) {
+    let _ = visit_expressions_mut(statement, |expr| {
+        let substituted = match &*expr {
+            // The keyword forms, which the parse reads as a bare identifier.
+            Expr::Identifier(name) if name.quote_style.is_none() => {
+                session_value(catalog, &name.value.to_ascii_lowercase(), false)
+            }
+            // ... and the forms written as a call, which the parse reads as a function of
+            // that name. A call carrying ARGUMENTS is not one of these: they take none.
+            Expr::Function(function) => match &function.args {
+                FunctionArguments::None => session_value(
+                    catalog,
+                    &function.name.to_string().to_ascii_lowercase(),
+                    false,
+                ),
+                FunctionArguments::List(list) if list.args.is_empty() => session_value(
+                    catalog,
+                    &function.name.to_string().to_ascii_lowercase(),
+                    true,
+                ),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(value) = substituted {
+            if let Some(built) = parse_expression(&format!("'{}'", value.replace('\'', "''"))) {
+                *expr = built;
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
+/// The value the session answers for `named`, or `None` for a name the session does not
+/// answer — on the engine this cluster runs.
+///
+/// `called` says whether the name was written with an argument list, which is what separates
+/// the two spellings: `USER` is a function of the MySQL grammar and an identifier otherwise,
+/// so a bare `USER` is only the session's identity on the family whose grammar has it as a
+/// keyword.
+///
+/// Sources: the PostgreSQL documentation's "System Information Functions and Operators" —
+/// `current_user` ("user name of current execution context"), `session_user` ("session user
+/// name"), `user` ("equivalent to current_user"), `current_catalog` ("name of current
+/// database") and `current_schema` — and the MySQL Reference Manual's "Information
+/// Functions": `CURRENT_USER`, which "returns the user name and host name combination for the
+/// MySQL account that the server used to authenticate", and `USER()`/`SESSION_USER()`, which
+/// report the account the client authenticated as.
+fn session_value(catalog: &Catalog<'_>, named: &str, called: bool) -> Option<String> {
+    if catalog.user.is_empty() {
+        return None;
+    }
+    let mysql = catalog.engine == super::EngineFamily::MySql;
+    match named {
+        // A MySQL privilege is granted to an ACCOUNT, `user@host-pattern`, which is what that
+        // family reports for the session's identity; the account the master user holds is
+        // granted to any host.
+        "current_user" | "current_role" if mysql => {
+            Some(format!("{}@{MYSQL_ANY_HOST}", catalog.user))
+        }
+        "user" | "session_user" if mysql => {
+            // `USER` and `SESSION_USER` are FUNCTIONS of the MySQL grammar rather than
+            // keywords of it, so a bare `USER` is the identifier it is there.
+            called.then(|| format!("{}@{MYSQL_ANY_HOST}", catalog.user))
+        }
+        "current_user" | "session_user" | "user" | "current_role" => {
+            Some(catalog.user.to_string())
+        }
+        "current_catalog" if !mysql => Some(catalog::catalog_name(catalog.database).to_string()),
+        "current_schema" if !mysql && !called => Some(PUBLIC_SCHEMA.to_string()),
+        _ => None,
+    }
+}
+
+/// The host pattern of the account Amazon RDS grants the master user: `%`, "any host".
+const MYSQL_ANY_HOST: &str = "%";
+
 /// Rewrite the statement into the form the engine's grammar accepts: the same
 /// statement, spelled the way the engine spells it.
 ///
@@ -1805,13 +1929,6 @@ fn normalise(statement: &mut Statement) {
                     *expr = built;
                 }
             }
-            // `now()` is the statement's own clock reading, which the engine
-            // spells as the standard keyword.
-            Expr::Function(function) if is_now(&function.name.to_string()) => {
-                if let Some(built) = parse_expression("CURRENT_TIMESTAMP") {
-                    *expr = built;
-                }
-            }
             // A case-insensitive match, in the engine's spelling of it.
             Expr::ILike {
                 negated,
@@ -1835,11 +1952,6 @@ fn normalise(statement: &mut Statement) {
         }
         ControlFlow::<()>::Continue(())
     });
-}
-
-/// Whether a function call is PostgreSQL's reading of the statement's clock.
-fn is_now(name: &str) -> bool {
-    name.eq_ignore_ascii_case("now")
 }
 
 /// The data plane's own reader of the INPUT FORMAT a binary value is written in,
@@ -2184,6 +2296,22 @@ fn leftmost_projection(body: &SetExpr) -> Option<&[SelectItem]> {
     }
 }
 
+/// The type a call of one of the engines' own DATE AND TIME built-ins answers in, or `None`
+/// for a function that is not one of them.
+///
+/// The functions and what each one READS are [`::service_common::sql_dialect_time`], which is
+/// also where the engine behind this data plane is given them: `columnMetadata` therefore
+/// reports the type of the value the engine really computed.
+fn clock_reading_type(name: &str) -> Option<PgType> {
+    use ::service_common::sql_dialect_time::Reading;
+    Some(match ::service_common::sql_dialect_time::reading_of(name)? {
+        Reading::Timestamp => pg_type("timestamptz"),
+        Reading::Date => pg_type("date"),
+        Reading::Time => pg_type("time"),
+        Reading::EpochSeconds => pg_type("int8"),
+    })
+}
+
 /// The type one selected expression has, when its own form says.
 fn selected_type(item: &SelectItem, catalog: &Catalog<'_>) -> Option<PgType> {
     match item {
@@ -2210,9 +2338,11 @@ fn expression_type(expr: &Expr, catalog: &Catalog<'_>) -> Option<PgType> {
         Expr::Nested(inner) => expression_type(inner, catalog),
         Expr::UnaryOp { expr, .. } => expression_type(expr, catalog),
         Expr::Value(value) => literal_type(&value.value),
-        // A clock reading is a timestamp with a time zone.
-        Expr::Function(function) if is_now(&function.name.to_string()) => {
-            Some(pg_type("timestamptz"))
+        // A clock built-in answers in the type ITS OWN reading has: a whole timestamp with
+        // the time zone it was read at, a date, a time of day, or the seconds since the epoch
+        // ([`::service_common::sql_dialect_time`], the one table of those built-ins).
+        Expr::Function(function) if clock_reading_type(&function.name.to_string()).is_some() => {
+            clock_reading_type(&function.name.to_string())
         }
         Expr::Function(function) => function_type(function, catalog),
         // An arithmetic over values of two types answers in the type that holds the
@@ -2348,6 +2478,14 @@ fn is_arithmetic(op: &BinaryOperator) -> bool {
 /// (`crate::state::Database::require_readable_values`). Read off the parse BEFORE the
 /// rewrite, which replaces a cast's PostgreSQL type with the engine type that holds
 /// its values.
+///
+/// DEPTH: the walk descends the statement tree, which [`read_as`] has already bounded
+/// BEFORE a tree exists at all ([`require_bounded_levels`]): a chain the parse builds
+/// iteratively — combined queries, and the operators and casts that each add a level —
+/// is counted on the TOKENS and refused past [`MAX_SET_OPERATIONS`] /
+/// [`MAX_CHAINED_LEVELS`], and the nesting the parse DOES recurse through is capped by
+/// [`MAX_PARSE_DEPTH`]. So no statement that reaches this walk, or any other walk in
+/// this module, carries a depth a request chose.
 fn cast_values(statement: &Statement) -> Vec<(String, PgType)> {
     let mut cast = Vec::new();
     let _ = visit_expressions(statement, |expr| {
@@ -2374,6 +2512,8 @@ fn cast_values(statement: &Statement) -> Vec<(String, PgType)> {
 /// type <type>" — rather than reading as much of it as it can and answering with a
 /// value the caller never wrote. Read off the PARSE, before anything runs, because the
 /// statement's own text is what names both the value and the type.
+///
+/// DEPTH: bounded before the tree exists, exactly as [`cast_values`] above states.
 fn require_valid_literals(statement: &Statement) -> Result<(), SqlError> {
     let mut refusal = None;
     let _ = visit_expressions(statement, |expr| {

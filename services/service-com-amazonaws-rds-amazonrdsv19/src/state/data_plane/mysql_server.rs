@@ -98,12 +98,10 @@ pub fn catalogs_named(facts: &SessionFacts, tokens: &[Token]) -> Vec<&'static st
 }
 
 /// Whether the word at `at` is qualified by the schema the catalogs live in: the two tokens
-/// before it are `information_schema` and a period.
+/// before it are `information_schema` and a period ([`super::dialect::qualified_by_schema`],
+/// the one reading of that qualification).
 fn qualified_by_the_catalog_schema(tokens: &[Token], at: usize) -> bool {
-    let period = at.checked_sub(1).and_then(|before| tokens.get(before));
-    let schema = at.checked_sub(2).and_then(|before| tokens.get(before));
-    matches!(period, Some(Token::Period))
-        && matches!(schema, Some(Token::Word(word)) if word.value.eq_ignore_ascii_case(CATALOG_DATABASE))
+    super::dialect::qualified_by_schema(tokens, at, CATALOG_DATABASE)
 }
 
 /// Rebuild the catalogs `named` from the state `facts` carries, so a statement that reads

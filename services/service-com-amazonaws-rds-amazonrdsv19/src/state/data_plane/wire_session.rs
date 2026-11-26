@@ -2066,6 +2066,10 @@ pub fn streamed_rows(
     if !named.is_empty() {
         super::pg_server::refresh_catalogs(database, facts, &named)?;
     }
+    // ... and the catalog VIEWS a copy reads out of `information_schema`, rebuilt the same
+    // way a statement that reads one has them rebuilt.
+    let views = super::pg_information_schema::views_named(facts, &tokens);
+    super::pg_information_schema::refresh_views(database, facts, &views)?;
     // A copy out only READS its source — but the source of the query form is the client's own
     // statement, and PostgreSQL takes a data-modifying one there (`COPY (INSERT … RETURNING …)
     // TO STDOUT`). Such a statement is refused on a session whose transaction serves no
@@ -2236,6 +2240,11 @@ pub(super) fn run_statement_at(
     if !named.is_empty() {
         super::pg_server::refresh_catalogs(database, facts, &named)?;
     }
+    // ... and the SQL-standard catalog VIEWS of the database, for the same reason: what a
+    // statement reads out of `information_schema` is the database as it is at this instant
+    // ([`super::pg_information_schema`]).
+    let views = super::pg_information_schema::views_named(facts, &tokens);
+    super::pg_information_schema::refresh_views(database, facts, &views)?;
     let named = super::mysql_server::catalogs_named(facts, &tokens);
     super::mysql_server::refresh_catalogs(database, facts, &named)?;
     // Where the statement's own names put it, and the statement as the engine reads it.

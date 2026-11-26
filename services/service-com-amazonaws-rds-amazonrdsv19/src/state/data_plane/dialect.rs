@@ -212,9 +212,25 @@ fn render_at(facts: &SessionFacts, tokens: &[Token], depth: usize) -> String {
     // Whether the auto-increment column being declared is still waiting for the PRIMARY KEY
     // its counter is declared with, which the client may write after the keyword.
     let mut counter_pending = false;
+    // WHAT the column definition being emitted has already said about its key: whether its
+    // last significant token was `PRIMARY`, and WHERE in `out` the `KEY` of its `PRIMARY KEY`
+    // was emitted. Both are carried along as the pass goes and reset where a definition ends,
+    // so the auto-increment rewriting below answers from them in constant time: deriving the
+    // same two facts by re-reading what has been emitted, once per token, would cost the
+    // SQUARE of the statement's length for a statement that carries neither a comma nor a
+    // parenthesis after the keyword.
+    let mut after_primary = false;
+    let mut primary_key_at: Option<usize> = None;
     while index < tokens.len() {
         let token = &tokens[index];
         let text = token.to_string();
+        // A rewriting below may take back pieces this pass has already emitted (a cast takes
+        // the expression before the `::`, a dropped clause takes its separating comma), and
+        // then nothing of the definition those pieces held is still where it was — so the
+        // position carried above is forgotten rather than used against a shorter output.
+        if primary_key_at.is_some_and(|at| at >= out.len()) {
+            primary_key_at = None;
+        }
         // The column list is closed: the table is declared, and what follows is the
         // options.
         if Some(index) == column_list_close {
@@ -271,13 +287,42 @@ fn render_at(facts: &SessionFacts, tokens: &[Token], depth: usize) -> String {
                     index += 2;
                     continue;
                 }
+                // `information_schema.<view>`: the SQL-standard catalog views, which are
+                // views OF THE DATABASE this session is on and are held as relations of the
+                // server's own catalog ([`super::pg_information_schema`]) — so the qualified
+                // name is resolved to the relation holding that view. A view of the standard
+                // this server does not serve is left exactly as the client wrote it, which
+                // the engine answers as the relation the database holds none of.
+                if facts.wire == EngineWire::Postgres
+                    && lowered == super::pg_information_schema::CATALOG_SCHEMA
+                    && matches!(tokens.get(index + 1), Some(Token::Period))
+                {
+                    let held = tokens.get(index + 2).and_then(|token| match token {
+                        Token::Word(view) => super::pg_information_schema::held_as(&view.value),
+                        _ => None,
+                    });
+                    if let Some(held) = held {
+                        out.push(held);
+                        index += 3;
+                        continue;
+                    }
+                }
                 // A MySQL auto-increment column is the engine's own rowid column, which it
                 // declares by the column's TYPE rather than with a keyword — and whose
                 // KEYS come from a counter of its own, which the engine keeps for a column
                 // declared `AUTOINCREMENT`.
                 if facts.wire == EngineWire::MySql && lowered == "auto_increment" {
                     widen_to_rowid_type(&mut out);
-                    counter_pending = !declare_the_counter(&mut out);
+                    // The PRIMARY KEY this definition has ALREADY declared, where it has one:
+                    // the engine takes the counter as part of that key — "the value of an
+                    // AUTO_INCREMENT column is not reused" after the row holding it is
+                    // deleted, which is what the engine's `AUTOINCREMENT` adds — so the
+                    // keyword goes right after it. A position no piece of the output holds any
+                    // more is no key to declare it on, and the counter waits for the next one.
+                    match primary_key_at.take().filter(|at| *at < out.len()) {
+                        Some(at) => out.insert(at + 1, " AUTOINCREMENT".to_string()),
+                        None => counter_pending = true,
+                    }
                     // The key the client declared as a clause of its own is declared here
                     // instead, because that is where the engine declares the counter.
                     if counter_pending && auto_increment_key_clause.is_some() {
@@ -358,17 +403,55 @@ fn render_at(facts: &SessionFacts, tokens: &[Token], depth: usize) -> String {
             }
             _ => out.push(text),
         }
-        // The PRIMARY KEY the auto-increment column was waiting for, which the client may
-        // write anywhere in that column's definition: the counter is declared with it, and a
-        // definition that ends without one declares none.
-        if counter_pending
-            && (matches!(token, Token::Comma) || declare_the_counter(&mut out))
-        {
-            counter_pending = false;
+        // What this definition has said about its key, read off the token just emitted: a
+        // `PRIMARY KEY` is the key the engine declares the counter on, a comma or a
+        // parenthesis begins a definition that has said nothing yet, and whitespace says
+        // nothing either way.
+        match token {
+            Token::Whitespace(_) => {}
+            Token::Word(word) if word.value.eq_ignore_ascii_case("primary") => {
+                after_primary = true;
+            }
+            Token::Word(word) if word.value.eq_ignore_ascii_case("key") && after_primary => {
+                after_primary = false;
+                // The PRIMARY KEY the auto-increment column was waiting for, which the
+                // client may write after the keyword: the counter is declared with it.
+                if counter_pending {
+                    out.push(" AUTOINCREMENT".to_string());
+                    counter_pending = false;
+                } else if primary_key_at.is_none() {
+                    primary_key_at = out.len().checked_sub(1);
+                }
+            }
+            Token::Comma | Token::LParen => {
+                after_primary = false;
+                primary_key_at = None;
+                // A definition that ended without the key it was waiting for declares no
+                // counter at all.
+                counter_pending = false;
+            }
+            _ => after_primary = false,
         }
         index += 1;
     }
     out.concat()
+}
+
+/// Whether the word at `at` is qualified by the schema a name is being read in: the two
+/// tokens before it are that schema's name and a period.
+///
+/// The ONE reading of that qualification, for every catalog module that serves a schema's
+/// relations ([`super::mysql_server`]'s and [`super::pg_information_schema`]'s), so the two
+/// cannot drift on how a client reaches one.
+#[must_use]
+pub fn qualified_by_schema(tokens: &[Token], at: usize, schema: &str) -> bool {
+    let period = at.checked_sub(1).and_then(|before| tokens.get(before));
+    let qualifier = at.checked_sub(2).and_then(|before| tokens.get(before));
+    matches!(period, Some(Token::Period))
+        && matches!(
+            qualifier,
+            Some(Token::Word(word)) if word.value.eq_ignore_ascii_case(schema)
+        )
 }
 
 /// The schema PostgreSQL's system catalogs live in, which is on every session's search path
@@ -699,36 +782,6 @@ fn mysql_auto_increment_key_clause(
         });
     }
     None
-}
-
-/// Declare the engine's own COUNTER on the primary key of the column definition being
-/// emitted, answering whether that definition carries one at all.
-///
-/// The engine takes `AUTOINCREMENT` as part of a column's `PRIMARY KEY`, so the keyword is
-/// inserted right after it rather than appended: what it adds is that the counter never hands
-/// out a key it has handed out before, which is what MySQL's own counter does — "the value of
-/// an AUTO_INCREMENT column is not reused" after the row holding it is deleted.
-fn declare_the_counter(out: &mut Vec<String>) -> bool {
-    let from = out
-        .iter()
-        .rposition(|piece| {
-            let piece = piece.trim();
-            piece == "," || piece == "("
-        })
-        .map_or(0, |at| at + 1);
-    let mut primary = false;
-    for at in from..out.len() {
-        let piece = out[at].trim();
-        if piece.is_empty() {
-            continue;
-        }
-        if piece.eq_ignore_ascii_case("key") && primary {
-            out.insert(at + 1, " AUTOINCREMENT".to_string());
-            return true;
-        }
-        primary = piece.eq_ignore_ascii_case("primary");
-    }
-    false
 }
 
 /// How the engine declares the table-constraint clause whose significant tokens are at

@@ -34,6 +34,8 @@ const ER_DUP_KEY: u16 = 1022;
 const ER_BAD_NULL_ERROR: u16 = 1048;
 const ER_NO_SUCH_TABLE: u16 = 1146;
 const ER_BAD_FIELD_ERROR: u16 = 1054;
+/// ... the one a function the server does not have raises (`ER_SP_DOES_NOT_EXIST`) ...
+const ER_SP_DOES_NOT_EXIST: u16 = 1305;
 /// ... and the two a row another transaction holds raises: the wait for it ran out, and
 /// waiting for it would have closed a cycle.
 const ER_LOCK_WAIT_TIMEOUT: u16 = 1205;
@@ -45,6 +47,9 @@ const ER_LOCK_DEADLOCK: u16 = 1213;
 const SQLSTATE_INTEGRITY_CONSTRAINT: &str = "23000";
 const SQLSTATE_BASE_TABLE_NOT_FOUND: &str = "42S02";
 const SQLSTATE_COLUMN_NOT_FOUND: &str = "42S22";
+/// ... and `42000` for a routine the server does not have, as its reference lists for
+/// `ER_SP_DOES_NOT_EXIST`.
+const SQLSTATE_SYNTAX_OR_ACCESS_ERROR: &str = "42000";
 /// And the two the lock conditions carry: `HY000` for the wait that ran out and `40001`
 /// (serialization failure) for the deadlock the server broke.
 const SQLSTATE_GENERAL_ERROR: &str = "HY000";
@@ -145,6 +150,16 @@ pub(super) fn mysql_diagnostic(engine_message: &str, about: &About<'_>) -> Optio
             ),
             ER_BAD_FIELD_ERROR,
             SQLSTATE_COLUMN_NOT_FOUND,
+        ),
+        // "FUNCTION <database>.<name> does not exist": MySQL qualifies the routine by the
+        // schema it looked for it in, which is the database the statement ran against.
+        Condition::UndefinedFunction { function } => mysql_error(
+            &format!(
+                "FUNCTION {} does not exist",
+                qualified(about.database, &function)
+            ),
+            ER_SP_DOES_NOT_EXIST,
+            SQLSTATE_SYNTAX_OR_ACCESS_ERROR,
         ),
     })
 }
@@ -310,6 +325,12 @@ mod tests {
                 "table ledger has no column named missing",
                 Some("Unknown column 'missing' in 'field list'; Error code: 1054; \
                       SQLState: 42S22"),
+            ),
+            (
+                "a function the engine does not define",
+                "no such function: CLOCK_TIMESTAMP",
+                Some("FUNCTION appdb.CLOCK_TIMESTAMP does not exist; Error code: 1305; \
+                      SQLState: 42000"),
             ),
             ("a condition this front end does not word", "interrupted", None),
         ];

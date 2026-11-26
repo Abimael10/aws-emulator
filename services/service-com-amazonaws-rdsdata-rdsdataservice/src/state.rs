@@ -131,6 +131,10 @@ pub mod postgres;
 /// once, for both of the wordings that condition reaches a caller in.
 mod condition;
 
+/// The BUILT-IN FUNCTIONS of the engine a cluster RUNS, given to the engine behind this data
+/// plane: its clock and the database a statement runs against.
+mod dialect_builtins;
+
 /// How an Aurora MySQL cluster words an error its database raised: the other wording of
 /// those same conditions.
 mod mysql;
@@ -367,6 +371,13 @@ const SCHEMA_INTROSPECTION_PRAGMAS: &[&str] = &["table_info", "table_xinfo", "da
 /// `repeat(string, count)` ("Repeats string the specified number of times"), so
 /// [`Database::open`] defines it and it is named here like any other function caller SQL
 /// may call. It computes over its arguments and nothing else.
+///
+/// The DATE AND TIME built-ins of the two engines are not named here either: they belong to
+/// the dialect of the engine the addressed cluster RUNS rather than to this list, so they are
+/// defined from the one table every surface of a cluster reads
+/// ([`::service_common::sql_dialect_time`]) and admitted by name from it
+/// ([`confine_to_data_plane`]) — as are the system-information built-ins beside them
+/// ([`dialect_builtins`]).
 ///
 /// DELIBERATELY ABSENT, so they are denied by the default arm: `load_extension`
 /// (the engine's own code loader), the `sqlite3` shell's file functions
@@ -701,6 +712,10 @@ pub struct Cluster {
     /// call that NAMES none addresses, which is the name those rows belong to on the
     /// cluster ([`Self::backing_for`]).
     default_database: Option<String>,
+    /// The database USER the calls on this cluster authenticate as, as the secret they
+    /// quote holds it ([`preconditions::Admitted`]): the identity the engine reports for the
+    /// session a statement runs in.
+    login: Option<String>,
 }
 
 /// Which database engine a DB cluster runs, as far as this data plane is concerned.
@@ -721,6 +736,17 @@ pub enum EngineFamily {
 }
 
 impl EngineFamily {
+    /// The DIALECT family this engine belongs to, which is what decides the built-in
+    /// functions a statement running on it has
+    /// ([`::service_common::sql_dialect_time`]).
+    #[must_use]
+    pub fn dialect(self) -> ::service_common::sql_dialect_time::SqlEngineFamily {
+        match self {
+            Self::PostgreSql => ::service_common::sql_dialect_time::SqlEngineFamily::PostgreSql,
+            Self::MySql => ::service_common::sql_dialect_time::SqlEngineFamily::MySql,
+        }
+    }
+
     /// The family an `Engine` names, and `None` for a name that is neither family's —
     /// which says nothing about the cluster.
     #[must_use]
@@ -756,18 +782,19 @@ impl Cluster {
     pub fn runs_engine(&mut self, engine: EngineFamily) {
         self.engine = engine;
         for database in self.databases.values_mut() {
-            database.engine = engine;
+            database.runs_engine(engine);
         }
         for transaction in self.transactions.values_mut() {
             if let Some(pending) = transaction.pending.as_mut() {
-                pending.engine = engine;
+                pending.runs_engine(engine);
             }
         }
     }
 
     /// Record everything the precondition chain RESOLVED about this cluster from the control
-    /// plane that owns it: the engine it runs ([`Self::runs_engine`]) and the volume its
-    /// databases live in ([`Self::serves_volume`]).
+    /// plane that owns it: the engine it runs ([`Self::runs_engine`]), the volume its
+    /// databases live in ([`Self::serves_volume`]) and the user the call authenticated as
+    /// ([`Self::serves_login`]).
     ///
     /// Called by every operation that reaches the data plane, before it runs: the cluster is
     /// another service's resource, so what this service holds for it follows what that
@@ -778,6 +805,27 @@ impl Cluster {
             admitted.volume.clone(),
             admitted.default_database.clone(),
         );
+        self.serves_login(admitted.login.clone());
+    }
+
+    /// Record the database USER the calls on this cluster authenticate as, which is the
+    /// identity a statement of theirs runs under.
+    ///
+    /// Kept only when the call RESOLVED one, for the reason [`Self::serves_volume`] gives:
+    /// a call that reached no secret says nothing about who the session is.
+    pub fn serves_login(&mut self, login: Option<String>) {
+        let Some(login) = login else {
+            return;
+        };
+        self.login = Some(login.clone());
+        for database in self.databases.values_mut() {
+            database.serves_login(&login);
+        }
+        for transaction in self.transactions.values_mut() {
+            if let Some(pending) = transaction.pending.as_mut() {
+                pending.serves_login(&login);
+            }
+        }
     }
 
     /// The committed database `name` holds, created empty on first use — up to
@@ -800,10 +848,13 @@ impl Cluster {
             // diagnostics are worded as, and lives in the cluster's own storage, which is
             // what every surface of the cluster addresses.
             let backing = self.backing_for(name);
-            self.databases.insert(
-                name.to_string(),
-                Database::open(name, self.engine, backing.as_deref())?,
-            );
+            let mut database = Database::open(name, self.engine, backing.as_deref())?;
+            // And its statements run as the user the calls on this cluster authenticate as,
+            // which is the session identity the engine reports.
+            if let Some(login) = self.login.as_deref() {
+                database.serves_login(login);
+            }
+            self.databases.insert(name.to_string(), database);
         }
         Ok(self
             .databases
@@ -1739,6 +1790,10 @@ pub struct Database {
     /// The ENGINE the cluster holding this database runs, which is what an error the
     /// database raises is worded as ([`Self::in_the_engines_words`]).
     engine: EngineFamily,
+    /// The database USER the calls on this database authenticate as, as the secret they
+    /// quote holds it: the identity the engine reports for the session a statement runs in
+    /// ([`Self::serves_login`]). Empty until a call has resolved one.
+    user: String,
     /// Whether this database is held in the BACKING of the cluster's own volume — the
     /// storage every surface of that cluster addresses
     /// ([`::service_common::cluster_sql_volumes`]) — as opposed to a database of this
@@ -2022,6 +2077,17 @@ impl Database {
         )
         .map_err(SqlError::unavailable)?;
 
+        // And the BUILT-IN FUNCTIONS of the engine THIS CLUSTER RUNS, which the engine behind
+        // this data plane has none of: a client asking an Aurora MySQL cluster for its own
+        // clock (`UTC_TIMESTAMP(6)`, `NOW()`, `CURDATE()`) or an Aurora PostgreSQL one for its
+        // (`now()`, `clock_timestamp()`), and either for the database it is running against,
+        // calls a built-in of that engine's own reference, so the statement is RUN
+        // ([`dialect_builtins`]). A function the OTHER family defines is refused there as the
+        // engine refuses a function it does not have — worded for the caller by
+        // [`Self::in_the_engines_words`].
+        dialect_builtins::register_engine_builtins(&conn, engine, name)
+            .map_err(SqlError::unavailable)?;
+
         // Default deny on every SQL action, installed LAST so the settings above
         // (which are themselves pragmas) are not refused by it.
         conn.authorizer(Some(confine_to_data_plane))
@@ -2033,10 +2099,45 @@ impl Database {
             version: next_version(),
             declared: false,
             engine,
+            user: String::new(),
             backed: backing.is_some(),
             changed: Arc::new(Mutex::new(Vec::new())),
             created: Arc::new(Mutex::new(HashSet::new())),
         })
+    }
+
+    /// Record which ENGINE the cluster holding this database runs, and give its connection
+    /// that engine's own built-in functions.
+    ///
+    /// The engine is resolved from the control plane that owns the cluster, which may answer
+    /// AFTER this database was opened ([`Cluster::resolved`]), so the functions a statement
+    /// here can call are re-defined with it: the family's own built-ins, and the other
+    /// family's refused as the engine refuses a function it does not have
+    /// ([`dialect_builtins`]). Defining a function again replaces the previous definition, so
+    /// the connection carries exactly one family's at a time.
+    pub fn runs_engine(&mut self, engine: EngineFamily) {
+        if self.engine == engine {
+            return;
+        }
+        self.engine = engine;
+        if let Err(error) =
+            dialect_builtins::register_engine_builtins(&self.conn, engine, &self.name)
+        {
+            // Only reachable if the engine refuses to define a function at all, which leaves
+            // the previous family's definitions in place; the statement's own answer is then
+            // the engine's, which is what every other best-effort path here reports too.
+            ::tracing::warn!(
+                %error,
+                "the cluster's engine functions could not be re-defined on a database"
+            );
+        }
+    }
+
+    /// Record the database USER the calls on this database authenticate as, which is the
+    /// identity the engine reports for the session a statement of theirs runs in
+    /// (`current_user` and the rest, [`postgres::Catalog`]).
+    pub fn serves_login(&mut self, user: &str) {
+        self.user = user.to_string();
     }
 
     /// Have the engine report every row this database's statements CHANGE
@@ -2171,6 +2272,8 @@ impl Database {
         // A PRIVATE copy: the transaction writes into a database of its own, which no other
         // reader and no other surface of the cluster can see until it is installed.
         let mut copy = Self::open(&self.name, self.engine, None)?;
+        // The copy answers for the same session the database it was taken from does.
+        copy.serves_login(&self.user);
         // And the engine reports every row it writes into that copy, which is what the rows
         // the transaction HOLDS are taken from.
         copy.record_what_changes()?;
@@ -2466,6 +2569,8 @@ impl Database {
         let plan = {
             let catalog = postgres::Catalog {
                 database: &self.name,
+                engine: self.engine,
+                user: &self.user,
                 key_columns: &|table: &str| conflict_key_columns(&self.conn, table),
                 column_type: &|column: &str| declared_column_type(&self.conn, column),
             };
@@ -3542,6 +3647,12 @@ fn confine_to_data_plane(context: AuthContext<'_>) -> Authorization {
                 || function_name.eq_ignore_ascii_case(postgres::binary_input_reader())
                 || function_name.eq_ignore_ascii_case(postgres::float_input_reader())
                 || function_name.eq_ignore_ascii_case(postgres::array_output_writer())
+                // The BUILT-INS of the engine the addressed cluster runs, named by the one
+                // module that defines them ([`dialect_builtins`]): each computes over the
+                // clock or over the database the call addressed and nothing else, and the ones
+                // the cluster's own family does not define are refused by that definition
+                // rather than by this list.
+                || dialect_builtins::is_engine_builtin(function_name)
             {
                 Authorization::Allow
             } else {

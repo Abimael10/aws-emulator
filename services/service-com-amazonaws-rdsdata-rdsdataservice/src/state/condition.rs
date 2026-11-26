@@ -30,6 +30,10 @@ pub(super) enum Condition {
         table: Option<String>,
         column: String,
     },
+    /// A function the statement CALLS that the engine the cluster runs does not define —
+    /// one no dialect of it has, and one belonging to the OTHER engine family
+    /// ([`::service_common::sql_dialect_time`]).
+    UndefinedFunction { function: String },
 }
 
 /// How the SQL engine behind this front end introduces each condition in its own
@@ -38,6 +42,10 @@ const ENGINE_UNIQUE_VIOLATION: &str = "UNIQUE constraint failed: ";
 const ENGINE_NOT_NULL_VIOLATION: &str = "NOT NULL constraint failed: ";
 const ENGINE_UNDEFINED_TABLE: &str = "no such table: ";
 const ENGINE_UNDEFINED_COLUMN: &str = "no such column: ";
+/// How it introduces a function it does not have, which is also the sentence a call of the
+/// other engine family's function is refused with
+/// ([`::service_common::sql_dialect_time::UNDEFINED_FUNCTION_PREFIX`]).
+const ENGINE_UNDEFINED_FUNCTION: &str = ::service_common::sql_dialect_time::UNDEFINED_FUNCTION_PREFIX;
 /// The engine's other spelling of an undefined column, which names the table too: "table
 /// <table> has no column named <column>".
 const ENGINE_UNDEFINED_COLUMN_OF: &str = "table ";
@@ -73,6 +81,11 @@ pub(super) fn condition_of(engine_message: &str) -> Option<Condition> {
         return Some(Condition::UndefinedColumn {
             table: None,
             column: named_in(column),
+        });
+    }
+    if let Some(function) = engine_message.strip_prefix(ENGINE_UNDEFINED_FUNCTION) {
+        return Some(Condition::UndefinedFunction {
+            function: named_in(function),
         });
     }
     if let Some((table, column)) = engine_message
@@ -185,6 +198,21 @@ mod tests {
                 Some(Condition::UndefinedColumn {
                     table: Some("ledger".to_string()),
                     column: "missing".to_string(),
+                }),
+            ),
+            (
+                "a function the engine does not define",
+                "no such function: TO_TIMESTAMP",
+                Some(Condition::UndefinedFunction {
+                    function: "TO_TIMESTAMP".to_string(),
+                }),
+            ),
+            (
+                "a function the engine does not define, with the statement it was parsing \
+                 appended",
+                "no such function: UTC_TIMESTAMP in SELECT UTC_TIMESTAMP(6) at offset 7",
+                Some(Condition::UndefinedFunction {
+                    function: "UTC_TIMESTAMP".to_string(),
                 }),
             ),
             (

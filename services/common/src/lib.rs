@@ -923,6 +923,10 @@ pub mod success_body_members;
 /// The ONE list of SQL functions caller SQL may call, for every data plane that runs it on
 /// the in-process SQLite engine.
 pub mod sqlite_confinement;
+/// The DATE AND TIME functions each SQL engine family defines, for every data plane that
+/// runs a client's statement on the in-process SQLite engine — so the surfaces of one DB
+/// cluster cannot disagree about which built-ins that cluster has.
+pub mod sql_dialect_time;
 /// The ONE backing database each database of a DB cluster is held in, for every surface of
 /// that cluster — the engine endpoints its clients dial and the HTTP front door its Data API
 /// calls arrive at, which address one cluster and therefore one database.

@@ -1715,21 +1715,10 @@ pub fn is_postgres_only_function(function: &str) -> bool {
 /// A timestamp in the text form PostgreSQL renders `timestamp with time zone` in: the date
 /// and time to microseconds, separated by a space, with the UTC offset the server runs at.
 ///
-/// The calendar is the SDK timestamp type's: `aws_smithy_types::DateTime` holds the instant
-/// and renders it as RFC 3339, which is the same fields in the same order — this only
-/// re-spells the two separators PostgreSQL writes differently (a space instead of `T`, and
-/// the offset instead of `Z`) and pads the fractional seconds to the six digits it always
-/// prints.
+/// The ONE rendering of that form in this emulator
+/// ([`::service_common::sql_dialect_time::postgres_timestamp_text`]), so the values this
+/// server prints and the values the clock functions compute are the same instant written the
+/// same way.
 pub fn timestamptz_text(epoch_seconds: f64) -> String {
-    let at = ::aws_smithy_types::DateTime::from_secs_f64(epoch_seconds);
-    let Ok(rendered) = at.fmt(::aws_smithy_types::date_time::Format::DateTime) else {
-        // Only reachable for an instant outside the range the format covers at all, which
-        // no clock of this emulator produces.
-        return epoch_seconds.to_string();
-    };
-    let (date, rest) = rendered.split_once('T').unwrap_or((rendered.as_str(), ""));
-    let time = rest.trim_end_matches('Z');
-    let (clock, fraction) = time.split_once('.').unwrap_or((time, ""));
-    let micros = format!("{fraction:0<6}");
-    format!("{date} {clock}.{}+00", &micros[..6])
+    ::service_common::sql_dialect_time::postgres_timestamp_text(epoch_seconds)
 }

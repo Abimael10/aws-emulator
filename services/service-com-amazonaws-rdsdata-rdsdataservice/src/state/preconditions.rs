@@ -217,6 +217,11 @@ pub async fn admit<Eng: Send + Sync + 'static>(
         default_database: cluster
             .as_ref()
             .and_then(|cluster| cluster.database_name.clone()),
+        // WHO the statement runs as: the database user the SECRET holds, which is the
+        // identity the call authenticated with and so the user the engine reports for the
+        // session. `None` where no secret answered, which leaves what a previous call
+        // resolved alone.
+        login: credentials.and_then(|credentials| credentials.username),
     })
 }
 
@@ -237,6 +242,10 @@ pub struct Admitted {
     /// call that names none addresses — so it is the name that call's rows belong to on the
     /// cluster.
     pub default_database: Option<String>,
+    /// The database USER the call authenticated as: the `username` the secret holds, which
+    /// the login was admitted against. It is what the engine reports as the session's own
+    /// identity (`current_user`), and `None` where no secret answered.
+    pub login: Option<String>,
 }
 
 /// Refuse a `transactionId` that cannot be a transaction id of the resource the call

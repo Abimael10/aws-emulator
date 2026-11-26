@@ -111,6 +111,9 @@ pub mod pg_binary;
 pub mod pg_code_block;
 pub mod pg_copy;
 pub mod pg_grants;
+/// The SQL-standard `information_schema` views of a PostgreSQL database: what a driver, an
+/// ORM or a migration tool reads the shape of the database out of.
+pub mod pg_information_schema;
 pub mod pg_numeric;
 pub mod pg_server;
 pub mod pg_sessions;
