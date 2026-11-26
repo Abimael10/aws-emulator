@@ -402,36 +402,36 @@ pub struct ImportedModel {
 ///
 /// The sentence beside it is for the step in front of both: a document that parsed and
 /// declares no version ([`UNDETERMINED_VERSION`]). A caller has to be able to tell "nothing
-/// here says what this is" from "this is no valid definition", which is what the body that
-/// never parsed at all is answered as too ([`UNPARSEABLE_DEFINITION`]).
+/// here says what this is" from "this is no valid definition", and from a body that is no
+/// document at all, which the reader of the declared specification states in its own words
+/// ([`DeclaredSpecification::unreadable_sentence`]).
 ///
 /// The emulator's own resource guards keep their own wording instead, because they are this
 /// emulator's bounds rather than anything the service publishes, and a caller has to be able
 /// to tell the two apart.
 pub const INVALID_DEFINITION: &str = "Invalid OpenAPI input.";
 
-/// The refusal for a body that is not a DOCUMENT at all: one no reader could parse, in
-/// either spelling.
+/// The refusal the OpenAPI Specification's reader — the one a body declaring `openapi`
+/// selects — states for a body it could not read as a document at all.
 ///
-/// The parse is the FIRST of the three steps an import reads a body in (see
-/// [`INVALID_DEFINITION`]), and a body that fails it yields no document — so nothing of what
-/// those bytes happen to contain has been read, no version member among them, and the
-/// refusal can state no more than that the input is no API definition. That is the SAME
-/// thing the last step has to state about a document that parsed and is no valid definition
-/// of the format it declares, and API Gateway states both with the one fixed sentence
-/// [`INVALID_DEFINITION`] carries — entirely fixed text, trailing period included, naming
-/// the specification as the specification names itself and carrying nothing from the
-/// request: not the position the reading stopped at, and not the parser's own complaint.
-/// Keeping the two steps' refusals as separate names is what lets the reader say WHICH step
-/// failed while answering a caller the one sentence the service answers.
+/// The parse is the SECOND of the three steps an import reads a body in (see
+/// [`INVALID_DEFINITION`]), and a body that fails it yields no document: nothing of what
+/// those bytes carry has been read, so the refusal states no more than that the input is no
+/// definition of the specification it says it is written in. The sentence is entirely fixed
+/// text, naming that specification by the acronym it names itself by and carrying nothing
+/// from the request — not the position the reading stopped at, and not the parser's own
+/// complaint — and it carries no trailing period.
+pub const UNPARSEABLE_OAS_DEFINITION: &str = "Invalid OAS input";
+
+/// The refusal Swagger's reader — the one a body declaring `swagger` selects — states for a
+/// body it could not read as a document at all.
 ///
-/// It is the sentence for a body the reading could not finish — a truncated document, an
-/// unterminated collection or scalar, text that is no document — that DID write one of the
-/// two version members: the format it is written in is settled, so what is left to state is
-/// that these bytes are no document of it. A body that did not finish AND writes neither
-/// member declares no version at all and earns [`UNDETERMINED_VERSION`] instead, because
-/// detection is the step that answers first ([`declares_version_in_text`]).
-pub const UNPARSEABLE_DEFINITION: &str = INVALID_DEFINITION;
+/// It is the same step as [`UNPARSEABLE_OAS_DEFINITION`] and says the same thing about the
+/// body; what differs is WHICH reader says it, because the version member the body declares
+/// is what picks the reader, and the pre-3.0 reader states the sentence
+/// [`INVALID_DEFINITION`] carries — trailing period included — rather than naming the
+/// specification by its later acronym.
+pub const UNPARSEABLE_SWAGGER_DEFINITION: &str = INVALID_DEFINITION;
 
 /// The refusal for a document that PARSED and declares no OAS/Swagger version.
 ///
@@ -445,12 +445,12 @@ pub const UNPARSEABLE_DEFINITION: &str = INVALID_DEFINITION;
 /// Detection is what the reader does FIRST, so it does not wait for the document to read:
 /// a body that is not a readable document at all, and that writes neither member, declares
 /// no version either and earns this same sentence — bytes that are not text among them
-/// ([`declares_version_in_text`]). A body that writes one of the two members has its format
-/// settled, and is refused by whichever step then failed instead: as no readable document
-/// ([`UNPARSEABLE_DEFINITION`]) or as no valid definition of that format
-/// ([`INVALID_DEFINITION`]), which are the one sentence. A caller has to be able to tell
-/// "nothing here says what this is" from "this is no valid definition of the format it says
-/// it is".
+/// ([`declared_specification_in_text`]). A body that writes one of the two members has its
+/// format settled, and is refused by whichever step then failed instead: as no readable
+/// document, in the words of the reader that member selected
+/// ([`DeclaredSpecification::unreadable_sentence`]), or as no valid definition of that format
+/// ([`INVALID_DEFINITION`]). A caller has to be able to tell "nothing here says what this
+/// is" from "this is no valid definition of the format it says it is".
 ///
 /// Whatever the document carries BESIDE those two members — an `info`, paths, a member
 /// whose name merely resembles the version field — and whichever shape it parsed to, it
@@ -960,15 +960,44 @@ fn guard_yaml_nesting(body: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The root members an OpenAPI/Swagger document declares the format it is written in in:
-/// `openapi` from 3.0 on, `swagger` before it.
+/// Which specification a definition says it is written in, as its root version member
+/// names it: `openapi` from 3.0 on, `swagger` before it.
 ///
-/// Which one of them a document carries is the first thing read of it, and whether either
-/// is there is what separates a body whose format could not be determined
-/// ([`UNDETERMINED_VERSION`]) from one whose format IS settled and that is then refused by
-/// the step that failed: as no document ([`UNPARSEABLE_DEFINITION`]) or as no valid
-/// definition of that format ([`INVALID_DEFINITION`]).
-const VERSION_MEMBERS: [&str; 2] = ["openapi", "swagger"];
+/// Reading that member is the first thing an import does, because which of the two
+/// specifications a body declares is what picks the reader the rest of it is read by — and
+/// a reader states the refusal for a body it cannot read in the terms it names its own
+/// specification by ([`DeclaredSpecification::unreadable_sentence`]). A body declaring
+/// neither member picks no reader at all and is refused as the version that could not be
+/// determined ([`UNDETERMINED_VERSION`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeclaredSpecification {
+    /// The OpenAPI Specification, 3.0 on, declared as the root member `openapi`.
+    Oas,
+    /// Swagger, 2.0 and before, declared as the root member `swagger`.
+    Swagger,
+}
+
+impl DeclaredSpecification {
+    /// The sentence this specification's reader states about a body that is no DOCUMENT of
+    /// it at all: one it could not finish reading, in either spelling.
+    ///
+    /// The two readers say the same thing about such a body and word it differently, each
+    /// naming the specification it reads as that specification names itself, so WHICH member
+    /// the body declared is what the caller is answered in.
+    fn unreadable_sentence(self) -> &'static str {
+        match self {
+            Self::Oas => UNPARSEABLE_OAS_DEFINITION,
+            Self::Swagger => UNPARSEABLE_SWAGGER_DEFINITION,
+        }
+    }
+}
+
+/// The root members an OpenAPI/Swagger document declares the format it is written in in,
+/// each with the specification it names ([`DeclaredSpecification`]).
+const VERSION_MEMBERS: [(&str, DeclaredSpecification); 2] = [
+    ("openapi", DeclaredSpecification::Oas),
+    ("swagger", DeclaredSpecification::Swagger),
+];
 
 /// Whether `node` declares the format it is written in, which is one of
 /// [`VERSION_MEMBERS`] at its root. A node that is no mapping carries no member at all, so
@@ -976,59 +1005,77 @@ const VERSION_MEMBERS: [&str; 2] = ["openapi", "swagger"];
 fn declares_version(node: &Node) -> bool {
     VERSION_MEMBERS
         .iter()
-        .any(|member| node.member(member).is_some())
+        .any(|(member, _)| node.member(member).is_some())
 }
 
-/// Whether `text` — the body as the bytes it was sent as — writes one of
-/// [`VERSION_MEMBERS`] as a member.
+/// Which specification `text` — the body as the bytes it was sent as — declares, as one of
+/// [`VERSION_MEMBERS`] written as a member.
 ///
 /// Version detection is the FIRST step of an import and does not wait for the document to
 /// be read, so it has to answer for a body no reader could finish as well: nothing of such
 /// a body's structure is known, so the name is looked for wherever it stands, as the KEY a
 /// mapping writes — the name, the quotes a spelling may wrap it in, then the colon both
 /// spellings separate a key from its value with. A name that is only part of a longer one
-/// (`swaggerVersion`) is no member of that name and is not one of these.
-fn declares_version_in_text(text: &str) -> bool {
-    VERSION_MEMBERS.iter().any(|member| {
-        text.match_indices(member).any(|(at, _)| {
-            let before_is_name = text[..at]
-                .chars()
-                .next_back()
-                .is_some_and(|last| last.is_alphanumeric() || matches!(last, '_' | '-' | '.'));
-            let after = text[at + member.len()..]
-                .trim_start_matches(['"', '\'', '\\', ' ', '\t']);
-            !before_is_name && after.starts_with(':')
+/// (`swaggerVersion`) is no member of that name and is not one of these. A body writing
+/// both members declares the one it writes FIRST, which is the one a reader scanning those
+/// bytes meets.
+fn declared_specification_in_text(text: &str) -> Option<DeclaredSpecification> {
+    VERSION_MEMBERS
+        .iter()
+        .filter_map(|(member, specification)| {
+            let (at, _) = text.match_indices(member).find(|(at, _)| {
+                let before_is_name = text[..*at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|last| last.is_alphanumeric() || matches!(last, '_' | '-' | '.'));
+                let after =
+                    text[at + member.len()..].trim_start_matches(['"', '\'', '\\', ' ', '\t']);
+                !before_is_name && after.starts_with(':')
+            })?;
+            Some((at, *specification))
         })
-    })
+        .min_by_key(|(at, _)| *at)
+        .map(|(_, specification)| specification)
 }
 
 /// The refusal for a body the reader could not finish: the version detection in front of
 /// the reading answers first, so a body that writes neither version member is refused as
-/// the version that could not be determined, and only one whose format IS settled is
-/// refused as the input that is no document.
+/// the version that could not be determined, and one whose format IS settled is refused as
+/// the input that is no document — in the words of the reader that format selected.
 fn unreadable_refusal(text: &str) -> String {
-    if declares_version_in_text(text) {
-        UNPARSEABLE_DEFINITION.to_string()
-    } else {
-        UNDETERMINED_VERSION.to_string()
+    match declared_specification_in_text(text) {
+        Some(specification) => specification.unreadable_sentence().to_string(),
+        None => UNDETERMINED_VERSION.to_string(),
     }
 }
 
+/// Why the YAML reader yielded no document.
+enum YamlRefusal {
+    /// The reading did not finish, so there is no document at all: which sentence that
+    /// earns is settled over the body itself ([`unreadable_refusal`]), because the version
+    /// detection in front of the reading is what picks the reader that states it.
+    Unreadable,
+    /// One of this emulator's own bounds on an untrusted body refused it, with its own
+    /// wording.
+    Stated(String),
+}
+
 /// The YAML spelling of a definition, read through the bounded event reader.
-fn parse_yaml(text: &str) -> Result<Node, String> {
-    guard_yaml_nesting(text)?;
+fn parse_yaml(text: &str) -> Result<Node, YamlRefusal> {
+    guard_yaml_nesting(text).map_err(YamlRefusal::Stated)?;
     let mut builder = DefinitionBuilder::default();
     let read = ::yaml_rust2::parser::Parser::new_from_str(text).load(&mut builder, true);
     if let Some(refusal) = builder.refused {
-        return Err(format!("Unable to parse API definition: {refusal}"));
+        return Err(YamlRefusal::Stated(format!(
+            "Unable to parse API definition: {refusal}"
+        )));
     }
     // A body the parser stopped on, and a document whose collections never close, are the
     // same case: the reader did not finish the document, so there is no document — and the
-    // refusal says that and not where the reading stopped. Which of the two sentences in
-    // front of the reading that is, is settled by the caller over the body itself
-    // ([`unreadable_refusal`]).
+    // refusal says that and not where the reading stopped. Which sentence that is, is
+    // settled by the caller over the body itself ([`unreadable_refusal`]).
     if read.is_err() || !builder.open.is_empty() {
-        return Err(UNPARSEABLE_DEFINITION.to_string());
+        return Err(YamlRefusal::Unreadable);
     }
     Ok(builder.root.unwrap_or_default())
 }
@@ -1066,9 +1113,10 @@ pub fn parse_definition(body: &[u8], scope: &ImportScope) -> Result<ImportedDefi
             body.len()
         ));
     }
-    // Bytes that are not text are a body no reader could parse in either spelling; which of
-    // the two refusals in front of the reading that earns is settled over what of the body
-    // IS text, because a body writing neither version member declares no format.
+    // Bytes that are not text are a body no reader could parse in either spelling; which
+    // refusal in front of the reading that earns is settled over what of the body IS text,
+    // because a body writing neither version member declares no format and one that writes
+    // a member is answered by the reader that member selects.
     let text = match std::str::from_utf8(body) {
         Ok(text) => text,
         Err(_) => return Err(unreadable_refusal(&String::from_utf8_lossy(body))),
@@ -1088,13 +1136,10 @@ pub fn parse_definition(body: &[u8], scope: &ImportScope) -> Result<ImportedDefi
         Err(_) => match parse_yaml(text) {
             Ok(document) => document,
             // The reading did not finish, so there is no document to detect a version in:
-            // the body itself decides which of the two sentences in front of the reading
-            // it earns. This emulator's own bounds on an untrusted body keep their own
-            // wording.
-            Err(refusal) if refusal == UNPARSEABLE_DEFINITION => {
-                return Err(unreadable_refusal(text))
-            }
-            Err(refusal) => return Err(refusal),
+            // the body itself decides which sentence it earns, and which reader states it.
+            // This emulator's own bounds on an untrusted body keep their own wording.
+            Err(YamlRefusal::Unreadable) => return Err(unreadable_refusal(text)),
+            Err(YamlRefusal::Stated(refusal)) => return Err(refusal),
         },
     };
     read_definition(&document, scope)

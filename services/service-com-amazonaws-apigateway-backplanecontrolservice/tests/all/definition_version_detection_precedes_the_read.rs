@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Which of the three sentences an imported API definition is refused with, as a client
-//! sees it: the step that failed picks the sentence, and version detection is the step
-//! that answers FIRST.
+//! sees it: the step that failed picks the sentence, version detection is the step that
+//! answers FIRST, and the version member a body declares picks the reader whose words the
+//! refusal is stated in.
 //!
 //! One rule is pinned here, over the cross product of what a body does and does not
 //! declare: which of the two formats a definition is written in is settled out of the two
@@ -10,9 +11,9 @@
 //! `swagger` before it), and that detection answers in front of the reading — so a body
 //! that declares neither member is refused as the version that could not be determined,
 //! whether it parsed or not, and a body that DOES declare one is refused by whichever
-//! later step failed: as no readable document, or as no valid definition of the format it
-//! names. Both operations that take a definition payload are asserted on every row, since
-//! they read a body through one reader.
+//! later step failed: as no readable document, in the words of the reader that member
+//! selected, or as no valid definition of the format it names. Both operations that take a
+//! definition payload are asserted on every row, since they read a body through one reader.
 //!
 //! Every assertion drives the real wire path — a `restJson1` HTTP request through the
 //! multi-service router into the mounted service — rather than calling a handler directly.
@@ -28,11 +29,18 @@ const BAD_REQUEST: &str = "BadRequestException";
 /// Source: `crate::ops::put_rest_api::UNDETERMINED_VERSION`.
 const UNDETERMINED_VERSION: &str = "Unable to determine OAS/Swagger version";
 
-/// The sentence for a body whose format IS declared and that is no document — the same
-/// fixed sentence a document that is no valid definition earns, trailing period included.
+/// The sentence for a body whose format IS declared as the OpenAPI Specification and that
+/// is no document: stated by the reader that `openapi` selects, which names that
+/// specification by its own acronym and ends with no period.
 ///
-/// Source: `crate::ops::put_rest_api::UNPARSEABLE_DEFINITION`.
-const UNPARSEABLE_DEFINITION: &str = "Invalid OpenAPI input.";
+/// Source: `crate::ops::put_rest_api::UNPARSEABLE_OAS_DEFINITION`.
+const UNPARSEABLE_OAS_DEFINITION: &str = "Invalid OAS input";
+
+/// The same refusal, stated by the reader `swagger` selects: the pre-3.0 reader words it as
+/// the sentence an invalid definition earns, trailing period included.
+///
+/// Source: `crate::ops::put_rest_api::UNPARSEABLE_SWAGGER_DEFINITION`.
+const UNPARSEABLE_SWAGGER_DEFINITION: &str = "Invalid OpenAPI input.";
 
 /// The sentence for a document that read whole under the format it declares and is no
 /// valid definition of it.
@@ -88,7 +96,7 @@ async fn the_version_member_decides_which_refusal_a_definition_earns() {
         (
             "an openapi document cut off mid-member",
             "{\"openapi\": \"3.0.1\", \"info\": {\"title\": \"x\"",
-            UNPARSEABLE_DEFINITION,
+            UNPARSEABLE_OAS_DEFINITION,
         ),
         // The same prefix with the version member taken out: nothing says what this is.
         (
@@ -100,7 +108,7 @@ async fn the_version_member_decides_which_refusal_a_definition_earns() {
         (
             "a swagger document written as YAML whose flow mapping never closes",
             "swagger: '2.0'\npaths: {\"/pets\": {\n",
-            UNPARSEABLE_DEFINITION,
+            UNPARSEABLE_SWAGGER_DEFINITION,
         ),
         (
             "the same YAML prefix declaring no version",

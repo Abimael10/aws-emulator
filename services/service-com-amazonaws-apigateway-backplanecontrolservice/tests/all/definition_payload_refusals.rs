@@ -60,12 +60,19 @@ const UNDETERMINED_VERSION: &str = "Unable to determine OAS/Swagger version";
 /// Source: `crate::ops::put_rest_api::INVALID_DEFINITION`.
 const INVALID_DEFINITION: &str = "Invalid OpenAPI input.";
 
-/// The sentence both definition imports state for a body that is no DOCUMENT at all: one no
-/// reader could parse in either spelling — the same fixed sentence a document that parsed and
-/// is no valid definition earns, trailing period included.
+/// The sentence the OpenAPI Specification's reader — the one a body declaring `openapi`
+/// selects — states for a body that is no DOCUMENT at all: one it could not finish reading,
+/// in either spelling.
 ///
-/// Source: `crate::ops::put_rest_api::UNPARSEABLE_DEFINITION`.
-const UNPARSEABLE_DEFINITION: &str = "Invalid OpenAPI input.";
+/// Source: `crate::ops::put_rest_api::UNPARSEABLE_OAS_DEFINITION`.
+const UNPARSEABLE_OAS_DEFINITION: &str = "Invalid OAS input";
+
+/// The same refusal as [`UNPARSEABLE_OAS_DEFINITION`], stated by Swagger's reader — the one
+/// a body declaring `swagger` selects — which words it as the sentence an invalid definition
+/// earns, trailing period included.
+///
+/// Source: `crate::ops::put_rest_api::UNPARSEABLE_SWAGGER_DEFINITION`.
+const UNPARSEABLE_SWAGGER_DEFINITION: &str = "Invalid OpenAPI input.";
 
 /// The `message` an answer carries, or a panic naming the case.
 fn message(answer: &Answer, case: &str) -> String {
@@ -402,17 +409,19 @@ async fn a_document_that_read_whole_and_is_no_definition_keeps_the_invalid_input
 /// RULE: which of the two formats a definition is written in is settled out of the two root
 /// members a document states its version in, and that detection answers in FRONT of the
 /// reading — so a body the reader could not finish is refused as no document only when it
-/// did write one of the two members, and one writing neither is refused as the version that
-/// could not be determined, exactly as a document that parsed and declares neither is.
+/// did write one of the two members, in the words of the reader that member selects, and one
+/// writing neither is refused as the version that could not be determined, exactly as a
+/// document that parsed and declares neither is.
 ///
 /// Rows differ along WHERE the body stops being parseable (a flow mapping, a flow sequence
 /// or a quoted scalar that never closes, a document cut off mid-member, text that is no
 /// document at all), along the spelling the body starts out as (JSON and YAML), along
 /// whether the truncated prefix carries a version member — the PAIRED rows are the same
-/// prefix with and without it, which is what shows which sentence it decides — and along
-/// whether the body is text in the first place. The control rows are the two neighbouring
-/// classes: a document that PARSED and declares no version, which earns the same
-/// version-detection sentence, and a well-formed document, which is served.
+/// prefix with and without it, which is what shows which sentence it decides — along WHICH
+/// of the two members it carries, and along whether the body is text in the first place. The
+/// control rows are the two neighbouring classes: a document that PARSED and declares no
+/// version, which earns the same version-detection sentence, and a well-formed document,
+/// which is served.
 #[tokio::test]
 async fn a_body_the_reader_could_not_finish_is_refused_as_no_document() {
     let gateway = Gateway::new();
@@ -425,7 +434,7 @@ async fn a_body_the_reader_could_not_finish_is_refused_as_no_document() {
         (
             "a JSON object cut off mid-member",
             b"{\"openapi\": \"3.0.1\", \"info\": {\"title\": \"cut off\" NOT A DOCUMENT !!!".to_vec(),
-            UNPARSEABLE_DEFINITION,
+            UNPARSEABLE_OAS_DEFINITION,
         ),
         (
             "the same object cut off with no version member",
@@ -435,7 +444,7 @@ async fn a_body_the_reader_could_not_finish_is_refused_as_no_document() {
         (
             "an unterminated flow mapping",
             b"{\"openapi\": \"3.0.1\", \"paths\": {".to_vec(),
-            UNPARSEABLE_DEFINITION,
+            UNPARSEABLE_OAS_DEFINITION,
         ),
         (
             "the same flow mapping with no version member",
@@ -445,7 +454,7 @@ async fn a_body_the_reader_could_not_finish_is_refused_as_no_document() {
         (
             "an unterminated flow sequence",
             b"{\"swagger\": \"2.0\", \"schemes\": [\"https\"".to_vec(),
-            UNPARSEABLE_DEFINITION,
+            UNPARSEABLE_SWAGGER_DEFINITION,
         ),
         (
             "the same flow sequence with no version member",
@@ -455,7 +464,7 @@ async fn a_body_the_reader_could_not_finish_is_refused_as_no_document() {
         (
             "an unterminated quoted scalar, written as YAML",
             b"openapi: \"3.0.1\ninfo:\n  title: x\n".to_vec(),
-            UNPARSEABLE_DEFINITION,
+            UNPARSEABLE_OAS_DEFINITION,
         ),
         (
             "an unterminated quoted scalar whose key is not a version member",
@@ -465,7 +474,7 @@ async fn a_body_the_reader_could_not_finish_is_refused_as_no_document() {
         (
             "a YAML document whose flow mapping never closes",
             b"swagger: '2.0'\npaths: {\"/pets\": {\n".to_vec(),
-            UNPARSEABLE_DEFINITION,
+            UNPARSEABLE_SWAGGER_DEFINITION,
         ),
         (
             "the same YAML document with no version member",
@@ -480,7 +489,7 @@ async fn a_body_the_reader_could_not_finish_is_refused_as_no_document() {
         (
             "a version-looking name written as a member inside a string value",
             b"{\"info\": {\"description\": \"see \\\"openapi\\\": 3\"}, \"paths\": {".to_vec(),
-            UNPARSEABLE_DEFINITION,
+            UNPARSEABLE_OAS_DEFINITION,
         ),
         (
             "bytes that are not text",
