@@ -5,11 +5,13 @@
 //!
 //! The rules under test:
 //!
-//! * A start against a monitor this account holds mints a `QueryId` and records the query
-//!   in the non-terminal `QUEUED` state, whatever that monitor holds: how many resources
-//!   it has decides what the query RETURNS, never whether it may be started. The clock
+//! * A start against a monitor this account holds that monitors at least one resource
+//!   mints a `QueryId` and records the query in the non-terminal `QUEUED` state. The clock
 //!   then carries the query to `RUNNING` and `SUCCEEDED`, which is what `GetQueryStatus`
 //!   reports and what `StopQuery` cancels.
+//! * A monitor that monitors no resource collects no data for a query of any type to run
+//!   against, so a start naming one is refused with `BadRequestException` (400), records
+//!   no query and leaves the monitor itself untouched.
 //! * A `MonitorName` this account does not hold, and a time period that ends before it
 //!   starts, are refused (400) and record no query.
 //! * A `QueryId` no query of the named monitor carries is refused by both readers with the
@@ -29,13 +31,14 @@ use service_com_amazonaws_internetmonitor_internetmonitor20210603::ops::types::{
 };
 use service_com_amazonaws_internetmonitor_internetmonitor20210603::state::{
     invalid_resource_id_message, monitor_resource_path, service_state, QueryRecord,
-    INVALID_QUERY_ID_MESSAGE, INVALID_REQUEST_BODY_MESSAGE, QUERY_STATUS_CANCELED,
-    QUERY_STATUS_QUEUED, QUERY_STATUS_RUNNING, QUERY_STATUS_SUCCEEDED, QUERY_STEP_DELAY,
+    INVALID_QUERY_ID_MESSAGE, INVALID_REQUEST_BODY_MESSAGE, MONITOR_STATE_ACTIVE,
+    QUERY_STATUS_CANCELED, QUERY_STATUS_QUEUED, QUERY_STATUS_RUNNING, QUERY_STATUS_SUCCEEDED,
+    QUERY_STEP_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::monitor_lifecycle::{
-    call, create_monitor, emulator, emulator_on, error_code, error_message,
+    call, create_monitor, emulator, emulator_on, error_code, error_message, settled_monitor,
 };
 
 /// A resource ARN a monitor can monitor: a VPC, one of the resource kinds the model names
@@ -180,25 +183,31 @@ struct StartCase {
 }
 
 // ---------------------------------------------------------------------------------------
-// What a monitor holds decides what a query RETURNS, never whether it may be started
+// A query is started only against a monitor that monitors at least one resource
 // ---------------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn start_query_accepts_a_monitor_whatever_it_holds() {
+async fn start_query_accepts_a_monitor_that_monitors_resources() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let router = emulator_on(Arc::clone(&engine));
-    create_monitor(&router, json!({ "MonitorName": "resourceless-monitor" })).await;
-    monitor_with_resources(&router, "resourceful-monitor").await;
+    monitor_with_resources(&router, "one-resource-monitor").await;
+    create_monitor(
+        &router,
+        json!({
+            "MonitorName": "many-resource-monitor",
+            "Resources": [vpc_arn("bbbb0001"), vpc_arn("bbbb0002"), vpc_arn("bbbb0003")],
+        }),
+    )
+    .await;
 
-    // Rows differ along how much the monitor holds — nothing at all, and one resource —
-    // because that is what the dropped admission rule keyed on; and every `QueryType` the
-    // model declares, so the rule is checked over the whole catalog rather than the one
-    // type a recording happened to use
+    // Rows differ along how many resources the monitor holds — one, and several — and
+    // along every `QueryType` the model declares, so the rule is checked over the whole
+    // catalog rather than the one type a recording happened to use
     // (`smithy_query(query="shape",shape="QueryType")`, re-exported as
     // `QUERY_TYPE_VALUES`).
     let now = SystemTime::now();
     let mut minted: Vec<(String, String)> = Vec::new();
-    for monitor in ["resourceless-monitor", "resourceful-monitor"] {
+    for monitor in ["one-resource-monitor", "many-resource-monitor"] {
         for query_type in QUERY_TYPE_VALUES {
             let case = format!("{monitor} asked for {query_type}");
             let (status, started) =
@@ -233,6 +242,113 @@ async fn start_query_accepts_a_monitor_whatever_it_holds() {
         distinct.len(),
         minted.len(),
         "each start must mint its own QueryId, got {minted:?}"
+    );
+}
+
+#[tokio::test]
+async fn start_query_refuses_a_monitor_that_monitors_no_resource() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(Arc::clone(&engine));
+
+    // Each row is a monitor that monitors nothing, reached a different way: a create that
+    // sent no `Resources` member at all, one that sent the member empty, and one whose only
+    // resource `UpdateMonitor` took away. A resource set is a set, so emptiness is the
+    // property the rule reads, however the monitor came to be empty.
+    create_monitor(&router, json!({ "MonitorName": "no-member-monitor" })).await;
+    create_monitor(&router, json!({ "MonitorName": "empty-list-monitor", "Resources": [] })).await;
+    monitor_with_resources(&router, "emptied-monitor").await;
+    let (status, emptied) = call(
+        &router,
+        "PATCH",
+        "/v20210603/Monitors/emptied-monitor",
+        Some(json!({ "ResourcesToRemove": [vpc_arn("aaaa0001")] })),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "emptying a monitor: expected 200, got {status} with {emptied}"
+    );
+
+    let now = SystemTime::now();
+    for monitor in ["no-member-monitor", "empty-list-monitor", "emptied-monitor"] {
+        // The monitor the start is refused for is a settled, ACTIVE one: it is what it
+        // monitors, not where it is in its own lifecycle, that the refusal turns on.
+        settled_monitor(&router, monitor, monitor, MONITOR_STATE_ACTIVE).await;
+
+        for query_type in QUERY_TYPE_VALUES {
+            let case = format!("{monitor} asked for {query_type}");
+            let (status, refused) =
+                start_query(&router, monitor, start_body(query_type, now)).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected 400, got {status} with {refused}"
+            );
+            assert_eq!(
+                error_code(&refused),
+                "BadRequestException",
+                "case {case:?}: expected BadRequestException, got {refused}"
+            );
+            assert_eq!(
+                error_message(&refused),
+                INVALID_REQUEST_BODY_MESSAGE,
+                "case {case:?}: expected message {INVALID_REQUEST_BODY_MESSAGE:?}, got {refused}"
+            );
+            assert!(
+                refused.get("QueryId").is_none(),
+                "case {case:?}: a refused start must mint no QueryId, got {refused}"
+            );
+        }
+
+        // The refusal is reached before anything is recorded, and it leaves the monitor
+        // itself where it was: it still reads back ACTIVE.
+        let recorded: Vec<String> = {
+            let state = service_state(&*engine).expect("the monitor store");
+            let store = state.lock();
+            store
+                .queries
+                .values()
+                .filter(|query| query.monitor_name == monitor)
+                .map(|query| query.query_id.clone())
+                .collect()
+        };
+        assert!(
+            recorded.is_empty(),
+            "case {monitor:?}: a refused start must record no query, got {recorded:?}"
+        );
+        let got = settled_monitor(&router, monitor, monitor, MONITOR_STATE_ACTIVE).await;
+        assert_eq!(
+            got["Resources"],
+            json!([]),
+            "case {monitor:?}: the monitor must still monitor nothing, got {got}"
+        );
+    }
+
+    // The same monitor, once it monitors a resource, serves the very query that was
+    // refused: the rule reads the resource set at the time of the start and nothing else.
+    let (status, updated) = call(
+        &router,
+        "PATCH",
+        "/v20210603/Monitors/no-member-monitor",
+        Some(json!({ "ResourcesToAdd": [vpc_arn("cccc0001")] })),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "giving the monitor a resource: expected 200, got {status} with {updated}"
+    );
+    let (status, started) = start_query(
+        &router,
+        "no-member-monitor",
+        start_body(QUERY_TYPE_VALUES[0], now),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a monitor that now holds a resource: expected 200, got {status} with {started}"
+    );
+    assert!(
+        started["QueryId"].as_str().is_some_and(|id| !id.is_empty()),
+        "a served start must mint a QueryId, got {started}"
     );
 }
 

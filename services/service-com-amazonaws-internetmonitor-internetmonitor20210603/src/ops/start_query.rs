@@ -9,8 +9,9 @@
 //! and `StopQuery` cancels it.
 //!
 //! A `MonitorName` this account does not hold is refused with `ValidationException` (400)
-//! and nothing is recorded; the monitor's own contents condition nothing, since what a
-//! monitor holds decides what a query RETURNS rather than whether it may be started.
+//! and nothing is recorded. A monitor that monitors no resource collects no data, so there
+//! is no repository for any query type to run against: such a start is refused with
+//! `BadRequestException` (400) before a `QueryId` is minted or a query recorded.
 //!
 //! ## Shape of an operation
 //!
@@ -218,15 +219,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // queryable resource at all. The wording extends the form this service uses for a
         // resource id it cannot resolve (recorded for a health event) to the monitor's own
         // resource path; it is that form applied here, not a separately recorded message.
-        //
-        // The monitor's own contents condition nothing: how many resources it holds, and
-        // so how much data a query can return, decides what the RESULTS are, never whether
-        // the query may be started.
-        if !store.monitors.contains_key(&input.monitor_name) {
+        let Some(monitor) = store.monitors.get(&input.monitor_name) else {
             return Err(StartQueryErrorModeled::ValidationException(ValidationException {
                 message: Some(crate::state::invalid_resource_id_message(
                     &crate::state::monitor_resource_path(&input.monitor_name),
                 )),
+            })
+            .into());
+        };
+
+        // The query interface returns "data for a specific query type" that the monitor
+        // itself collected, and a monitor that monitors no resource collects none: there is
+        // no repository for a query of ANY type to run against, so the start is refused as
+        // an input-validation failure before a `QueryId` is minted or a query recorded. The
+        // monitor is only read here, so its own configuration state is untouched.
+        if monitor.resources.is_empty() {
+            return Err(StartQueryErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::INVALID_REQUEST_BODY_MESSAGE.to_string()),
             })
             .into());
         }
