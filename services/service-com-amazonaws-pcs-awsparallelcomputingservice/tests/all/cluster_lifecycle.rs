@@ -21,6 +21,11 @@
 #[path = "cluster_lifecycle/settles_on_the_next_request.rs"]
 mod settles_on_the_next_request;
 
+// What a chain of lifecycle waits COSTS a polling client, and the teardown legs it only
+// reaches once each of them has settled, are their own suite, declared the same way.
+#[path = "cluster_lifecycle/teardown_tail_is_reachable.rs"]
+mod teardown_tail_is_reachable;
+
 // The associations a stored queue carries are their own suite, declared the same way.
 #[path = "cluster_lifecycle/queue_associations.rs"]
 mod queue_associations;

@@ -39,8 +39,10 @@ use super::{
 /// when that reader answers the modelled `ResourceNotFoundException` because the resource
 /// is gone.
 ///
-/// Exactly one request, so a suite can count what a workflow costs a polling client.
-async fn observe(
+/// Exactly one request, so a suite can count what a workflow costs a polling client —
+/// which is what the sibling suite `teardown_tail_is_reachable` polls through, so this
+/// reader is the ONE answer to "what does a probe see" the two cannot disagree about.
+pub(crate) async fn observe(
     router: &MultiServiceRouter,
     case: &str,
     operation: &str,
