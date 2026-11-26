@@ -303,8 +303,9 @@ async fn a_nested_resource_carries_its_parents_region() {
              {authorization:?}"
         );
         assert_nested_under(case, &authorization, &bundle);
-        // The URL an OAuth authorization reports is the endpoint of the Region
-        // it lives in, which is the Region its ARN carries.
+        // The address an OAuth authorization reports for its consent step names
+        // THIS emulator's endpoint, never an AWS endpoint host of any Region —
+        // see `app_authorization_auth_url`, which owns that rule.
         if let Some(url) = authorization_answer
             .body
             .get("appAuthorization")
@@ -312,9 +313,9 @@ async fn a_nested_resource_carries_its_parents_region() {
             .and_then(Value::as_str)
         {
             assert!(
-                url.starts_with(&format!("https://appfabric.{bundle_region}.")),
-                "case {case:?}: expected the consent URL at the {bundle_region:?} endpoint, got \
-                 {url:?}"
+                url.starts_with(smithy_server_runtime::UNSERVED_URL_BASE),
+                "case {case:?}: expected the consent address at this emulator's own endpoint, \
+                 got {url:?}"
             );
         }
 

@@ -27,6 +27,11 @@ sha2 = { workspace = true }
 # Renders a digest as hex, rather than this crate hand-coding the encoding — see
 # `crate::state::render_credential`.
 hex = { workspace = true }
+# `html-escape`: the consent page a fetch of an app authorization's published
+# `authUrl` renders writes the stored application and tenant names into a
+# document, and those are caller-supplied strings — see
+# `crate::state::oauth_consent_page`.
+html-escape = "0.2"
 # Two shared readers: `addresses_modeled_http_route` — the one reader that answers
 # which operation a request ADDRESSES (the method and URI pattern of that
 # operation's own `@http` binding) for a request the REST router's route lookup

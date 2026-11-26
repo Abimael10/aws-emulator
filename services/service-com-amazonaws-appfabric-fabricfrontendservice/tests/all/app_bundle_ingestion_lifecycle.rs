@@ -83,6 +83,14 @@ pub(crate) struct Answer {
     pub(crate) body: Value,
 }
 
+/// What an UNSIGNED fetch of a published address answered: the status, the media
+/// type it announced, and the document itself (never a JSON envelope).
+pub(crate) struct Fetched {
+    pub(crate) status: u16,
+    pub(crate) content_type: String,
+    pub(crate) document: String,
+}
+
 impl Answer {
     /// The wire error code (`__type`) of an error envelope, or `""`.
     pub(crate) fn error_code(&self) -> &str {
@@ -141,6 +149,31 @@ impl Emulator {
             serde_json::from_slice(&bytes).unwrap_or(Value::Null)
         };
         Answer { status, body }
+    }
+
+    /// An UNSIGNED fetch of `uri`, the way a browser, probe or test opens a URL
+    /// this emulator PUBLISHED: no credential scope, no target header, and the
+    /// raw document rather than a JSON envelope.
+    pub(crate) async fn fetch(&self, method: &str, uri: &str) -> Fetched {
+        let request = http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Bytes::new())
+            .expect("a well-formed request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let document = String::from_utf8_lossy(&response.into_body()).into_owned();
+        Fetched {
+            status,
+            content_type,
+            document,
+        }
     }
 
     pub(crate) async fn create_app_bundle(&self, body: Value) -> Answer {

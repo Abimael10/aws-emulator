@@ -38,10 +38,11 @@
 //! A new authorization is `PendingConnect`; `ConnectAppAuthorization` is what
 //! moves it to `Connected`, so the clock owes no transition here.
 //!
-//! An authorization whose `authType` is the OAuth2 one also reports the URL its
-//! consent step runs at (`authUrl`), derived from the stored record by
-//! [`crate::state::AppAuthorizationRecord::auth_url`]; one authorized by an API
-//! key has no consent step and reports none.
+//! An authorization whose `authType` is the OAuth2 one also reports the address
+//! its consent step is performed at (`authUrl`), composed here from the endpoint
+//! this emulator is served at and stored on the record
+//! ([`crate::state::oauth_consent_url`]) so every later read reports the same
+//! bytes; one authorized by an API key has no consent step and reports none.
 //!
 //! The `tags` the request carries are stored as the MAP they are (see
 //! [`crate::state::tag_set`]), so a key the list repeats is held once with the
@@ -377,6 +378,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let sequence = store.next_sequence();
         let created_at = ::std::time::SystemTime::now();
         let id = crate::state::new_uuid();
+        // The address the consent step of an OAuth2 grant is performed at, which
+        // this authorization reports as its `authUrl` from here on: composed ONCE,
+        // here, from the endpoint THIS emulator is served at (`ctx.endpoint()`) and
+        // this authorization's own path, and then stored — so every later read
+        // serializes the bytes this call reported rather than re-composing them,
+        // and the address leads back to the emulator that published it. An
+        // authorization authorized by an API key has no consent step, so it stores
+        // no address and reports none.
+        let auth_url = (input.auth_type == crate::state::AUTH_TYPE_OAUTH2).then(|| {
+            crate::state::oauth_consent_url(ctx.endpoint().as_str(), &bundle_key, &id)
+        });
         // An authorization's ARN nests under the bundle that owns it, the way
         // AppFabric's own resource chain nests them — and it therefore carries
         // the Region that bundle lives in, not the Region this create call
@@ -434,6 +446,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A new authorization has run no connect handshake, so the clock
             // owes it no outcome of one.
             validation_fails_at: None,
+            auth_url,
         };
         bundle.app_authorizations.insert(id.clone(), record);
         // Read the response back out of the store, so what the caller sees is

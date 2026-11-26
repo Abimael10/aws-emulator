@@ -55,12 +55,24 @@
 //! refusal body cannot carry. The wording of each clause still lives in this file (see
 //! [`constraint_clause`]), so one place decides how a violation reads and one place
 //! decides which members the answer carries.
+//!
+//! ## The one address of this service no modelled operation describes
+//!
+//! An `oauth2` app authorization reports the address its OAuth consent step is performed
+//! at (`AppAuthorization$authUrl`), and this emulator publishes that address on its OWN
+//! endpoint ([`crate::state::oauth_consent_url`]) because AWS performs that step on the
+//! application's own host, which this emulator neither owns nor answers on. So `can_handle`
+//! also claims a fetch of exactly that path and `override_routing_error` answers it with
+//! the stored authorization's page, unauthenticated and as a web page rather than a
+//! modelled API envelope — which is how that address is opened. [`oauth_consent`]
+//! documents what it serves.
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
 
+pub mod oauth_consent;
 pub mod request_validation;
 
 /// The error code this service answers an input-constraint violation with: the
@@ -129,6 +141,10 @@ fn constraint_envelope(violations: &[Violation]) -> Option<String> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The SHARED engine, kept beside the entry because the one address this service
+    /// serves outside the modelled surface ([`oauth_consent`]) is answered from the store
+    /// without an operation context to reach it through.
+    engine: Arc<Eng>,
     /// States a refused request of ANY of this service's operations in the modelled
     /// `ValidationException`; see [`request_validation`].
     request_validation: request_validation::RequestValidation,
@@ -143,7 +159,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
             request_validation: request_validation::RequestValidation::new::<Eng>(),
             protocol: ::service_common::date_time_json::DateTimeRestJson::new(),
         }
@@ -162,10 +179,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Claim a request whose resolved route key is this service's signing
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+        if let Some(key) = smithy_server_runtime::resolve_route_key(parts) {
+            return key == self.entry.identity().signing_name();
         }
+        // And a fetch of the CONSENT PAGE of an app authorization: the address this
+        // service hands back in `authUrl` is opened by whatever browser, probe or test
+        // holds it — anonymously, with no credential scope and no target header naming
+        // this service, only the path this service itself minted under the plane segment
+        // that is this service's alone. Without this the router answers `404
+        // UnknownService` for a URL this service published. See [`oauth_consent`].
+        oauth_consent::claimed(parts)
     }
 
     fn override_operation(
@@ -238,8 +261,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
         // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
         // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        //
+        // The one address this service serves that no modelled operation describes: the
+        // consent page of a stored app authorization, which `authUrl` publishes for a
+        // person to follow. It is answered here because the router consults this seam
+        // before it authenticates anything, which is how AWS serves the application's own
+        // consent host — unauthenticated, and as a web page rather than a modelled API
+        // call.
+        oauth_consent::answer(&*self.engine, req)
     }
 
     fn override_framework_error(

@@ -22,6 +22,11 @@ use crate::ops::types::{
     UserAccessResultItem, UserAccessTaskItem, ValidationException, ValidationExceptionField,
 };
 
+/// The address an `oauth2` authorization's consent step is served at, and the page that
+/// answers there.
+mod oauth_consent;
+pub use oauth_consent::*;
+
 /// The ARN namespace (and sigv4 signing name) this service's ARNs carry, from
 /// the model's `aws.api#service` trait (`arnNamespace: appfabric`).
 pub const ARN_SERVICE: &str = "appfabric";
@@ -29,11 +34,6 @@ pub const ARN_SERVICE: &str = "appfabric";
 /// The region an ARN is built in when the request carries no SigV4 credential
 /// scope to read one from — the region every generated emulator defaults to.
 pub const DEFAULT_REGION: &str = "us-east-1";
-
-/// The DNS suffix of the partition this emulator serves, which the model's
-/// endpoint rule set leaves as the `aws` partition's
-/// (`https://appfabric.{Region}.{PartitionResult#dnsSuffix}`).
-pub const DNS_SUFFIX: &str = "amazonaws.com";
 
 /// The two values the model's `IngestionState` enum carries
 /// (`INGESTION_STATE_VALUES` in the generated types): an ingestion is created
@@ -457,13 +457,13 @@ pub struct AppAuthorizationRecord {
     pub app_bundle_arn: String,
     /// The bare UUID of the app bundle that owns this authorization — the key
     /// the bundle is stored under, and the form of `appBundleIdentifier` the
-    /// authorization's own URLs are built with (see
-    /// [`AppAuthorizationRecord::auth_url`]).
+    /// authorization's own addresses are built with (see
+    /// [`oauth_consent_url`]).
     pub app_bundle_id: String,
     /// The Region this authorization lives in: the one the app bundle that owns
     /// it lives in (see [`AppBundleRecord::region`]), which is the one its
-    /// [`arn`](Self::arn) carries and the one whose service endpoint its URLs
-    /// name — not whichever Region's endpoint the create call was signed for.
+    /// [`arn`](Self::arn) carries — not whichever Region's endpoint the create
+    /// call was signed for.
     pub region: String,
     pub app: String,
     pub tenant_identifier: String,
@@ -500,6 +500,17 @@ pub struct AppAuthorizationRecord {
     /// is owed. Stored rather than slept for, so a read reports the outcome the
     /// clock already owes.
     pub validation_fails_at: Option<SystemTime>,
+    /// The URL this authorization REPORTS as its `authUrl`, as the create call
+    /// that minted it composed it ([`oauth_consent_url`]), and `None` for an
+    /// authorization whose `authType` has no consent step to report one for.
+    ///
+    /// STORED rather than composed per read: `authUrl` is an address a caller
+    /// holds on to between the create call and the consent step, so what every
+    /// later read serializes has to be the same bytes the create call reported,
+    /// whatever endpoint that later read arrives at. Nothing but a create writes
+    /// it: an update that rotates a credential does not move the consent
+    /// address.
+    pub auth_url: Option<String>,
 }
 
 impl AppAuthorizationRecord {
@@ -614,25 +625,15 @@ impl AppAuthorizationRecord {
         }
     }
 
-    /// The URL this authorization reports as its `authUrl` ("The application URL
-    /// for the OAuth flow"), or `None` when its `authType` has no OAuth flow to
-    /// report one for.
-    ///
-    /// An `oauth2` authorization is granted through a consent step, and the code
-    /// that step hands back is what `ConnectAppAuthorization` takes in its
-    /// `authRequest` ("after permission is granted in the application OAuth
-    /// page"), so the URL this reports is where that flow continues — see
-    /// [`oauth_flow_url`]. An `apiKey` authorization carries its credential
-    /// already and has no consent step, so it reports no URL.
-    pub fn auth_url(&self) -> Option<String> {
-        if self.is_oauth2() {
-            Some(oauth_flow_url(&self.region, &self.app_bundle_id, &self.id))
-        } else {
-            None
-        }
-    }
-
     /// The modelled `AppAuthorization` for this record, as `now` reads it.
+    ///
+    /// `authUrl` ("The application URL for the OAuth flow") is read back out of
+    /// the record VERBATIM, never re-composed here: the create call that minted
+    /// the authorization is what composed the address of its consent step (see
+    /// the [`auth_url`](Self::auth_url) field and [`oauth_consent_url`]), so the
+    /// bytes a create reported are the bytes every later read reports, and an
+    /// `apiKey` authorization \u2014 which carries its credential already and has no
+    /// consent step \u2014 stored none and reports none.
     pub fn to_app_authorization(&self, now: SystemTime) -> AppAuthorization {
         AppAuthorization {
             app_authorization_arn: self.arn.clone(),
@@ -644,7 +645,7 @@ impl AppAuthorizationRecord {
             created_at: ::aws_smithy_types::DateTime::from(self.created_at),
             updated_at: ::aws_smithy_types::DateTime::from(self.changed_at(now)),
             persona: Some(APP_AUTHORIZATION_PERSONA_ADMIN.to_string()),
-            auth_url: self.auth_url(),
+            auth_url: self.auth_url.clone(),
         }
     }
 
@@ -1507,31 +1508,6 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
 /// This service's ARN for `resource`, e.g. `appbundle/<uuid>`.
 pub fn appfabric_arn(region: &str, resource: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, resource)
-}
-
-/// The service endpoint host for `region`, as the model's own endpoint rule set
-/// renders it (`https://appfabric.{Region}.{PartitionResult#dnsSuffix}`) in the
-/// `aws` partition — the host a caller addresses this service at.
-pub fn endpoint_host(region: &str) -> String {
-    format!("{ARN_SERVICE}.{region}.{DNS_SUFFIX}")
-}
-
-/// The URL the OAuth flow of ONE app authorization continues at.
-///
-/// Built from the two halves the model states: the service endpoint for the
-/// authorization's Region ([`endpoint_host`]) and the `ConnectAppAuthorization`
-/// HTTP URI the model binds
-/// (`/appbundles/{appBundleIdentifier}/appauthorizations/{appAuthorizationIdentifier}/connect`),
-/// over the bare UUIDs the bundle and the authorization are stored under. It is
-/// therefore derived from stored state rather than from the request, stable
-/// across reads for as long as the authorization exists, and a URL this emulator
-/// itself answers rather than one no endpoint serves. It carries no credential
-/// material: the consent step's own secrets are the caller's.
-pub fn oauth_flow_url(region: &str, app_bundle_id: &str, authorization_id: &str) -> String {
-    format!(
-        "https://{}/appbundles/{app_bundle_id}/appauthorizations/{authorization_id}/connect",
-        endpoint_host(region)
-    )
 }
 
 /// The KMS key ARN a `customerManagedKeyIdentifier` denotes.
