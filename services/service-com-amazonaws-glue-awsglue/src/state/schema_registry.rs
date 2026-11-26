@@ -665,6 +665,10 @@ pub struct SchemaVersionEntry {
     pub status: String,
     /// When the version was registered, reported as `CreatedTime`.
     pub created_time: SystemTime,
+    /// The metadata key value pairs put on THIS version, in put order
+    /// ([`super::schema_version_metadata`]): a version a delete removes takes its metadata
+    /// with it, and two versions of one schema set carry their own.
+    pub metadata: Vec<SchemaVersionMetadataEntry>,
 }
 
 impl SchemaVersionEntry {
@@ -682,6 +686,9 @@ impl SchemaVersionEntry {
             definition,
             status: status.to_string(),
             created_time: now,
+            // Metadata is put onto a version by its own operations, so a registration
+            // stores none.
+            metadata: Vec::new(),
         }
     }
 }

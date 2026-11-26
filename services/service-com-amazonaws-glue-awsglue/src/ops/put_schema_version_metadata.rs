@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutSchemaVersionMetadata
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutSchemaVersionMetadata`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutSchemaVersionMetadata::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Writes one metadata key value pair onto a schema version the registry already holds: the
+//! version is addressed either by its own `SchemaVersionId` or by a `SchemaId` plus which of
+//! that schema set's versions is meant
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::locate_schema_version`]), and the pair is
+//! stored on that version ([`crate::state::SchemaVersionEntry::put_metadata`]), so a later
+//! `QuerySchemaVersionMetadata` observes exactly what was put.
+//!
+//! A pair is addressed by BOTH its members, so the same key takes further values — "a
+//! maximum of 10 key value pairs will be allowed per schema version. They can be added over
+//! one or more calls" — and the value a key REPORTS is the one most recently put under it,
+//! the one before it becoming another value of the same key. A pair the version already
+//! holds is therefore a collision (`AlreadyExistsException`) and nothing is written, and a
+//! put onto a version already holding
+//! [`crate::state::MAX_METADATA_PAIRS_PER_SCHEMA_VERSION`] pairs is refused with
+//! `ResourceNumberLimitExceededException` rather than replacing one.
 //!
 //! ## Shape of an operation
 //!
@@ -106,12 +115,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 // here — hence the `PutSchemaVersionMetadataError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.glue#PutSchemaVersionMetadata")]
+//
+// `InternalServiceException` is widened in through `extra_errors`: it is a shape this
+// SERVICE models, and the rest of the schema-registry surface declares, but this operation's
+// own `errors` list does not — and an unreachable store is a server fault rather than
+// anything the caller could act on.
+#[smithy_macros::operation_error(
+    "com.amazonaws.glue#PutSchemaVersionMetadata",
+    extra_errors = ["InternalServiceException"]
+)]
 #[derive(Debug)]
 pub enum PutSchemaVersionMetadataErrorModeled {
     AccessDeniedException(AccessDeniedException),
     AlreadyExistsException(AlreadyExistsException),
     EntityNotFoundException(EntityNotFoundException),
+    InternalServiceException(InternalServiceException),
     InvalidInputException(InvalidInputException),
     ResourceNumberLimitExceededException(ResourceNumberLimitExceededException),
 }
@@ -167,18 +185,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutSchemaVersionMetadata` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutSchemaVersionMetadataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutSchemaVersionMetadata"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable());
+        };
+        // The schema set's ARN is minted for the Region the call is served in, the way every
+        // other schema-registry operation mints it.
+        let region = crate::state::request_region(ctx.parts());
+
+        // A pair is addressed by BOTH its members, so a `MetadataKeyValue` carrying one of
+        // them names no pair to put. The model names both members of the wrapper optional,
+        // which is why this is answered here rather than at the request boundary.
+        let Some((metadata_key, metadata_value)) =
+            crate::state::metadata_pair_members(&input.metadata_key_value)
+        else {
+            return Err(invalid_input(
+                crate::state::messages::METADATA_PAIR_REQUIRES_BOTH.to_string(),
+            ));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The version this put is onto is resolved first: a request that addresses none is a
+        // bad parameter, and one addressing a version this endpoint does not hold is a miss.
+        // The ONE resolution every schema-version metadata operation shares.
+        let located = match store.locate_schema_version(
+            input.schema_id.as_ref(),
+            input.schema_version_number.as_ref(),
+            input.schema_version_id.as_deref(),
+            &region,
+        ) {
+            Ok(located) => located,
+            Err(fault) => return Err(refusal(fault)),
+        };
+        let schema_arn = located.schema_arn(&region);
+        let Some(version) = store.schema_version_mut(&located) else {
+            // The location was resolved from this same store under this same lock, so the
+            // version it names is held; nothing a caller sent can reach this.
+            return Err(store_unavailable());
+        };
+
+        // A pair the version already holds is a collision, and a refused put must leave the
+        // version's metadata exactly as it was — so both answers come before anything is
+        // written.
+        if version.metadata_pair(metadata_key, metadata_value).is_some() {
+            return Err(
+                PutSchemaVersionMetadataErrorModeled::AlreadyExistsException(
+                    AlreadyExistsException {
+                        message: Some(
+                            crate::state::messages::schema_version_metadata_already_exists(
+                                metadata_key,
+                                metadata_value,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "A maximum of 10 key value pairs will be allowed per schema version": the pair
+        // past that is refused rather than displacing one the version holds.
+        if !version.can_store_metadata_pair() {
+            return Err(
+                PutSchemaVersionMetadataErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(
+                            crate::state::messages::SCHEMA_VERSION_METADATA_LIMIT_EXCEEDED
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        version.put_metadata(metadata_key, metadata_value, now);
+        let output = PutSchemaVersionMetadataOutput {
+            // The pair stored is what the answer reports.
+            metadata_key: Some(metadata_key.to_string()),
+            metadata_value: Some(metadata_value.to_string()),
+            // The identity of what was written to, read off the stored records rather than
+            // off the request: a put that addressed the version by its own id reports the
+            // same schema set as one that addressed it by name.
+            schema_arn: Some(schema_arn),
+            registry_name: Some(located.registry_name.clone()),
+            schema_name: Some(located.schema_name.clone()),
+            version_number: Some(located.version_number),
+            schema_version_id: Some(located.version_id.clone()),
+            latest_version: located.latest_version,
+        };
+        ::tracing::info!(
+            operation = "PutSchemaVersionMetadata",
+            registry = %located.registry_name,
+            schema = %located.schema_name,
+            version = located.version_number,
+            metadata_key,
+            "put a metadata key value pair on a Glue schema version"
+        );
+        Ok(output)
     }
+}
+
+/// This operation's modelled refusal for a request it cannot act on: "The input provided
+/// was not valid."
+fn invalid_input(message: String) -> PutSchemaVersionMetadataError {
+    PutSchemaVersionMetadataErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        from_federation_source: None,
+    })
+    .into()
+}
+
+/// The refusal a request addressing no schema version this store holds earns, in this
+/// operation's own error channel: a request that addresses none at all is a bad parameter,
+/// and one addressing a version this endpoint does not hold is a miss.
+fn refusal(fault: crate::state::SchemaVersionFault) -> PutSchemaVersionMetadataError {
+    match fault {
+        crate::state::SchemaVersionFault::Invalid(message) => invalid_input(message),
+        crate::state::SchemaVersionFault::Missing(message) => {
+            PutSchemaVersionMetadataErrorModeled::EntityNotFoundException(EntityNotFoundException {
+                message: Some(message),
+                from_federation_source: None,
+            })
+            .into()
+        }
+    }
+}
+
+/// An unreachable store, reported as the server fault it is rather than as a client error
+/// the caller could act on.
+fn store_unavailable() -> PutSchemaVersionMetadataError {
+    PutSchemaVersionMetadataErrorModeled::InternalServiceException(InternalServiceException {
+        message: Some("the Glue schema registry store is unavailable".into()),
+    })
+    .into()
 }

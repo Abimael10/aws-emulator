@@ -312,6 +312,7 @@ mod schema_definition_canonical;
 mod schema_definition_json;
 mod schema_definition_protobuf;
 mod schema_registry;
+mod schema_version_metadata;
 mod scheduled_triggers;
 mod security_configurations;
 mod sessions;
@@ -372,6 +373,7 @@ pub use schema_definition_canonical::*;
 pub use schema_definition_json::*;
 pub use schema_definition_protobuf::*;
 pub use schema_registry::*;
+pub use schema_version_metadata::*;
 pub use scheduled_triggers::*;
 pub use security_configurations::*;
 pub use sessions::*;
@@ -436,6 +438,7 @@ use crate::ops::types::{
     LineageConfiguration,
     Node, NotificationProperty, Partition, PartitionInput, Predecessor, Predicate,
     PrincipalPermissions,
+    MetadataKeyValuePair,
     ProfileConfiguration,
     RLSProperties,
     RecrawlPolicy, RegistryId, S3Target, Schedule,

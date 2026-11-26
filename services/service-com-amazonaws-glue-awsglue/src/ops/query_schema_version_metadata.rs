@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op QuerySchemaVersionMetadata
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `QuerySchemaVersionMetadata`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`QuerySchemaVersionMetadata::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Reports the metadata key value pairs held on ONE schema version: the version is addressed
+//! exactly as a put addresses one
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::locate_schema_version`]) and the pairs
+//! stored on it are grouped per key
+//! ([`crate::state::SchemaVersionEntry::metadata_views`]) into the `MetadataInfoMap` — each
+//! key reporting the value most recently put under it, the time THAT pair was put, and the
+//! values it replaced as "other metadata belonging to the same metadata key".
+//!
+//! Reporting only: nothing is written, so two reads of an untouched version answer the same.
+//! "Search key-value pairs for metadata, if they are not provided all the metadata
+//! information will be fetched" — a `MetadataList` keeps the pairs that satisfy one of its
+//! entries, each of which may name a key, a value or the pair, and a request carrying none
+//! reports every pair the version holds. The map is then paged in key order, under an opaque
+//! continuation token bound to this listing of this version
+//! ([`crate::state::pagination`]).
 //!
 //! ## Shape of an operation
 //!
@@ -96,11 +105,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 // here — hence the `QuerySchemaVersionMetadataError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.glue#QuerySchemaVersionMetadata")]
+//
+// `InternalServiceException` is widened in through `extra_errors`: it is a shape this
+// SERVICE models, and the rest of the schema-registry surface declares, but this operation's
+// own `errors` list does not — and an unreachable store is a server fault rather than
+// anything the caller could act on.
+#[smithy_macros::operation_error(
+    "com.amazonaws.glue#QuerySchemaVersionMetadata",
+    extra_errors = ["InternalServiceException"]
+)]
 #[derive(Debug)]
 pub enum QuerySchemaVersionMetadataErrorModeled {
     AccessDeniedException(AccessDeniedException),
     EntityNotFoundException(EntityNotFoundException),
+    InternalServiceException(InternalServiceException),
     InvalidInputException(InvalidInputException),
 }
 
@@ -155,18 +173,173 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `QuerySchemaVersionMetadata` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(QuerySchemaVersionMetadataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("QuerySchemaVersionMetadata"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable());
+        };
+        // A `SchemaId` naming the schema set by ARN is resolved against the Region the call
+        // is served in, the way every other schema-registry operation resolves one.
+        let region = crate::state::request_region(ctx.parts());
+
+        // "Maximum number of results required per page. If the value is not supplied, this
+        // will be defaulted to 25 per page." The clamp re-states the modelled range here so
+        // the page size is never 0 even if the boundary validator ever stops enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(DEFAULT_PAGE_SIZE))
+            .unwrap_or(DEFAULT_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+        // "Search key-value pairs for metadata": both members of a search pair are optional,
+        // so one may name a key, a value or the pair itself, and a pair is kept when it
+        // satisfies at least one of them.
+        let search: Vec<crate::state::MetadataSearchPair<'_>> = input
+            .metadata_list
+            .iter()
+            .flatten()
+            .map(|pair| crate::state::MetadataSearchPair {
+                key: pair.metadata_key.as_deref().filter(|key| !key.is_empty()),
+                value: pair.metadata_value.as_deref().filter(|value| !value.is_empty()),
+            })
+            .collect();
+
+        // Reporting only: the stored pairs are projected out and nothing is written.
+        let store = state.lock();
+        // The version this read is of is resolved first: a request that addresses none is a
+        // bad parameter, and one addressing a version this endpoint does not hold is a miss.
+        // The ONE resolution every schema-version metadata operation shares.
+        let located = match store.locate_schema_version(
+            input.schema_id.as_ref(),
+            input.schema_version_number.as_ref(),
+            input.schema_version_id.as_deref(),
+            &region,
+        ) {
+            Ok(located) => located,
+            Err(fault) => return Err(refusal(fault)),
+        };
+        let Some(version) = store.schema_version(&located) else {
+            // The location was resolved from this same store under this same lock, so the
+            // version it names is held; nothing a caller sent can reach this.
+            return Err(store_unavailable());
+        };
+
+        let views = version.metadata_views(&search);
+        // The keys are in key order, and the token names the key the next page resumes
+        // AFTER, so a page resumes at the first key sorting strictly after it — which stays
+        // correct across pairs put or removed between two calls. The token is opaque and
+        // bound to THIS listing of THIS version ([`crate::state::pagination`]), so a value
+        // this store did not mint for it names no position and is refused rather than
+        // resolved against a key that happens to sort somewhere.
+        let token_scope = crate::state::listing_scope(Self::NAME, &[&located.version_id]);
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) =
+                    crate::state::decode_page_token(&store.page_token_key, &token_scope, token)
+                else {
+                    return Err(invalid_input(
+                        crate::state::messages::INVALID_PAGINATION_TOKEN.to_string(),
+                    ));
+                };
+                views.partition_point(|view| view.key <= cursor.as_str())
+            }
+            None => 0,
+        };
+        // Taken with `skip`/`take` rather than by slicing, so a cursor the request chose can
+        // never index outside the set.
+        let page: Vec<&crate::state::SchemaVersionMetadataView<'_>> =
+            views.iter().skip(start).take(page_size).collect();
+        let end = start.saturating_add(page.len());
+        // "A continuation token … returned if the current segment of the list is not the
+        // last": it names the last key of the page, taken from the page itself so there is
+        // no index arithmetic to underflow on an empty page.
+        let next_token = if end < views.len() {
+            page.last().map(|view| {
+                crate::state::encode_page_token(&store.page_token_key, &token_scope, view.key)
+            })
+        } else {
+            None
+        };
+
+        Ok(QuerySchemaVersionMetadataOutput {
+            // "A map of a metadata key and associated values": the member is the map, empty
+            // for a version holding no pair the search keeps, rather than an absent member.
+            metadata_info_map: Some(
+                page.iter()
+                    .map(|view| {
+                        (
+                            view.key.to_string(),
+                            MetadataInfo {
+                                metadata_value: Some(view.current.value.clone()),
+                                // "The time at which the entry was created": the entry is
+                                // the pair whose value the key reports, so the time is that
+                                // pair's own.
+                                created_time: Some(crate::state::to_timestamp_string(
+                                    view.current.created_time,
+                                )),
+                                // "Other metadata belonging to the same metadata key", in
+                                // put order — the empty list for a key holding one value,
+                                // because the member reports what else the key holds.
+                                other_metadata_value_list: Some(
+                                    view.others
+                                        .iter()
+                                        .map(|other| OtherMetadataValueListItem {
+                                            metadata_value: Some(other.value.clone()),
+                                            created_time: Some(
+                                                crate::state::to_timestamp_string(
+                                                    other.created_time,
+                                                ),
+                                            ),
+                                        })
+                                        .collect(),
+                                ),
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            schema_version_id: Some(located.version_id.clone()),
+            next_token,
+        })
     }
+}
+
+/// The page a request naming no `MaxResults` is served: "if the value is not supplied, this
+/// will be defaulted to 25 per page" (`QuerySchemaVersionMetadataInput$MaxResults`).
+const DEFAULT_PAGE_SIZE: i32 = 25;
+
+/// The largest page this read will serve, from the modelled
+/// `QuerySchemaVersionMetadataMaxResults` (range 1..50).
+const MAX_PAGE_SIZE: i32 = 50;
+
+/// This operation's modelled refusal for a request it cannot act on: "The input provided
+/// was not valid."
+fn invalid_input(message: String) -> QuerySchemaVersionMetadataError {
+    QuerySchemaVersionMetadataErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        from_federation_source: None,
+    })
+    .into()
+}
+
+/// The refusal a request addressing no schema version this store holds earns, in this
+/// operation's own error channel: a request that addresses none at all is a bad parameter,
+/// and one addressing a version this endpoint does not hold is a miss.
+fn refusal(fault: crate::state::SchemaVersionFault) -> QuerySchemaVersionMetadataError {
+    match fault {
+        crate::state::SchemaVersionFault::Invalid(message) => invalid_input(message),
+        crate::state::SchemaVersionFault::Missing(message) => {
+            QuerySchemaVersionMetadataErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(message),
+                    from_federation_source: None,
+                },
+            )
+            .into()
+        }
+    }
+}
+
+/// An unreachable store, reported as the server fault it is rather than as a client error
+/// the caller could act on.
+fn store_unavailable() -> QuerySchemaVersionMetadataError {
+    QuerySchemaVersionMetadataErrorModeled::InternalServiceException(InternalServiceException {
+        message: Some("the Glue schema registry store is unavailable".into()),
+    })
+    .into()
 }

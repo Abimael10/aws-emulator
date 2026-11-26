@@ -1906,6 +1906,56 @@ pub fn schema_already_exists(schema_name: &str) -> String {
     format!("Schema already exists. SchemaName: {schema_name}")
 }
 
+/// A `PutSchemaVersionMetadata` or `RemoveSchemaVersionMetadata` whose `MetadataKeyValue`
+/// does not carry both of its members.
+///
+/// NOT recorded: the model names both members of the wrapper optional, but a pair is
+/// addressed by BOTH of them — "a metadata key" and "a metadata key's corresponding value"
+/// (`MetadataKeyValuePair`) — so a wrapper naming one of them addresses no pair to put or
+/// remove. Stated in the fixed words every schema-registry wrapper refusal uses
+/// ([`super::SCHEMA_VERSION_REQUIRES_ID_OR_NUMBER`]), interpolating nothing.
+pub const METADATA_PAIR_REQUIRES_BOTH: &str =
+    "MetadataKey and MetadataValue have to be provided.";
+
+/// `PutSchemaVersionMetadata` for a key value pair the addressed schema version already
+/// holds.
+///
+/// NOT recorded: the sentence follows the template of the recorded create collision above
+/// ([`schema_already_exists`]) — the fixed collision sentence, then the MEMBERS the request
+/// addressed the pair by, spelled as the model spells them. Both are variable, because a
+/// pair is addressed by both of them: putting another value under a key the version already
+/// has is not a collision.
+pub fn schema_version_metadata_already_exists(
+    metadata_key: &str,
+    metadata_value: &str,
+) -> String {
+    format!(
+        "Metadata key value pair already exists. MetadataKey: {metadata_key}, MetadataValue: \
+         {metadata_value}"
+    )
+}
+
+/// `RemoveSchemaVersionMetadata` for a key value pair the addressed schema version does not
+/// hold.
+///
+/// RECORDED template: the fixed sentence, then the ADDRESS the refusal reports it for — the
+/// label `SchemaVersionId` and the id of the version the request resolved to, followed by the
+/// separator the service renders after it whether or not anything follows. What is missing is
+/// the metadata of that version, so the pair the request named is not echoed back.
+pub fn schema_version_metadata_not_found(schema_version_id: &str) -> String {
+    format!("Metadata is not found for the schema version. SchemaVersionId: {schema_version_id} ")
+}
+
+/// `PutSchemaVersionMetadata` against a schema version already holding as many metadata key
+/// value pairs as one version may hold — the documented maximum of ten
+/// ([`super::MAX_METADATA_PAIRS_PER_SCHEMA_VERSION`]).
+///
+/// RECORDED constant, and the whole message: the service states the limit as a resource limit
+/// of the metadata surface in FIXED words, naming neither the number, the version nor the
+/// pair that was refused.
+pub const SCHEMA_VERSION_METADATA_LIMIT_EXCEEDED: &str =
+    "Your resource limits for Schema Version Metadata have been exceeded.";
+
 /// A column statistics task run lookup (`GetColumnStatisticsTaskRun`) for an id no
 /// run in this account has. NOT recorded: the sentence follows the per-resource
 /// template of the recorded crawler miss above, built from the requested id, which is
