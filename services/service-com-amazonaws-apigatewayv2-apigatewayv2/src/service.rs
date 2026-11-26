@@ -130,6 +130,11 @@
 //! delivers, and is pinned by `tests/all/empty_answer_framing.rs`.
 
 mod connections_endpoint;
+// What a `ContentHandlingStrategy` the enum does not declare names when a request carries
+// one: no payload conversion, so the member is read as carrying no value. Applied at the
+// protocol seam below, which is where the reading has to happen; that module states the
+// whole rule.
+mod content_handling_strategy;
 mod data_plane;
 mod invoke;
 mod jwt;
@@ -425,9 +430,16 @@ impl<Eng: Send + Sync + 'static> ServerProtocol for EmulatedService<Eng> {
         request: &'a RtRequest,
         input_schema: &Schema,
     ) -> Result<Box<dyn aws_smithy_schema::serde::ShapeDeserializer + 'a>, ProtocolError> {
-        self.entry
+        // The model's own codec, reading a content-handling member the way this service
+        // reads one: a strategy its enum does not declare names no conversion, so the member
+        // is read as carrying no value rather than refused before a handler runs. See
+        // [`content_handling_strategy`]; every other member is read and judged exactly as
+        // the model declares it.
+        let inner = self
+            .entry
             .protocol()
-            .deserialize_input(request, input_schema)
+            .deserialize_input(request, input_schema)?;
+        Ok(content_handling_strategy::reading(inner))
     }
 
     fn serialize_output(
