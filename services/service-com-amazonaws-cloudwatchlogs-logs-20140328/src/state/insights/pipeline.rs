@@ -21,9 +21,9 @@
 //!   joins — is reported as a column of the result ([`declare_fields`]), so a pipeline that
 //!   creates fields and projects nothing further answers the fields it created and not the
 //!   default columns it never asked for;
-//! * `stats` aggregates the records into one row per group — only the records every grouping
-//!   key is DEFINED on, so one carrying no value for a key joins no group — and `pattern`
-//!   groups them by the shape of their messages;
+//! * `stats` aggregates the records into one row per group — EVERY record of the scan joins
+//!   one, and the records carrying no value for a grouping key form the group whose row omits
+//!   that key — and `pattern` groups them by the shape of their messages;
 //! * `sort`, `limit`/`head` and `dedup` order, bound and deduplicate what is left;
 //! * `lookup` joins the rows of one of this account's lookup tables onto each record;
 //! * `unmask` reveals nothing further here, because this store holds every event's raw
