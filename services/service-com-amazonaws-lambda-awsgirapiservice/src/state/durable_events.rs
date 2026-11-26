@@ -134,6 +134,10 @@ pub struct StatusChange {
     /// The ARN of the function version the execution runs on, qualified by that version —
     /// `$LATEST` included, the form the execution's own ARN carries its function in
     /// ([`super::FunctionRecord::durable_execution_function_arn`]).
+    ///
+    /// It is both what the event's `detail` names the function by and the one entry of the
+    /// envelope's `resources`: the resource a durable-execution status change is ABOUT, at
+    /// the granularity this service publishes it.
     pub function_arn: String,
     /// The name of the function the execution belongs to.
     pub function_name: String,
@@ -396,9 +400,15 @@ async fn publish_batch(
                     .time(::aws_sdk_eventbridge::primitives::DateTime::from_millis(
                         epoch_millis(change.at),
                     ))
-                    // The resource the event is about, which is how EventBridge carries the
-                    // identity of what moved beside the detail.
-                    .resources(change.durable_execution_arn.clone())
+                    // The resource the event is ABOUT, at the granularity this service
+                    // publishes it: the FUNCTION the execution runs on, by the ARN of the
+                    // version it runs ([`StatusChange::function_arn`], the same value the
+                    // `detail` names the function by) — so a rule keyed on
+                    // `{"resources": ["<function ARN>:<version>"]}` receives every
+                    // durable-execution status change of that function. The execution's own
+                    // identity is carried in the `detail`
+                    // (`durableExecutionArn` / `durableExecutionName`) rather than here.
+                    .resources(change.function_arn.clone())
                     .detail(change.detail().to_string())
                     .build();
                 request = request.entries(entry);
