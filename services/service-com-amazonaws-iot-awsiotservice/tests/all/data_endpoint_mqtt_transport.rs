@@ -139,8 +139,12 @@ const COLD_MESSAGE: &str = r#"{"marker":"m-cold","temp":4,"extra":"carried"}"#;
 
 /// How a device's connection to the published address is encrypted: the two halves one
 /// announced address serves.
+///
+/// Shared with the sibling suite that drives the broker's retained messages over the same two
+/// halves (`tests/all/retained_message_replay_at_the_data_endpoint.rs`), so the client side of
+/// the handshake is written once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Transport {
+pub(crate) enum Transport {
     /// The connection a client makes in the clear.
     Clear,
     /// The TLS a client of AWS IoT Core's message broker dials the data endpoint with, which
@@ -149,11 +153,11 @@ enum Transport {
 }
 
 /// Both halves of the published address, which is what the legs below span.
-const TRANSPORTS: &[Transport] = &[Transport::Clear, Transport::Tls];
+pub(crate) const TRANSPORTS: &[Transport] = &[Transport::Clear, Transport::Tls];
 
 impl Transport {
     /// How a case names this transport.
-    const fn label(self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Clear => "in the clear",
             Self::Tls => "over TLS",
@@ -162,7 +166,7 @@ impl Transport {
 
     /// The suffix a leg's client ids carry, so the two legs' sessions are distinct clients
     /// rather than one client id taken over twice.
-    const fn client_suffix(self) -> &'static str {
+    pub(crate) const fn client_suffix(self) -> &'static str {
         match self {
             Self::Clear => "clear",
             Self::Tls => "tls",
@@ -170,7 +174,7 @@ impl Transport {
     }
 
     /// Open one connection to `address` over this transport, as a device's own client does.
-    async fn open(self, address: &str) -> Session {
+    pub(crate) async fn open(self, address: &str) -> Session {
         let port = loopback_port(address);
         let dialling = TcpStream::connect((Ipv4Addr::LOCALHOST, port));
         let socket = tokio::time::timeout(EXCHANGE_DEADLINE, dialling)
@@ -278,12 +282,12 @@ impl rustls::client::danger::ServerCertVerifier for AcceptTheEmulatorsCertificat
 
 /// One connection to the published address, whatever its encryption: what a device reads its
 /// packets off and writes them to.
-trait Wire: AsyncRead + AsyncWrite + Unpin + Send {}
+pub(crate) trait Wire: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<Stream: AsyncRead + AsyncWrite + Unpin + Send> Wire for Stream {}
 
 /// See [`Wire`].
-type Session = Box<dyn Wire>;
+pub(crate) type Session = Box<dyn Wire>;
 
 /// One row: the topic the device publishes on, the message it sends, and what each side must
 /// then hold.
@@ -344,11 +348,11 @@ fn rows() -> Vec<Row> {
 
 /// The emulator: the IoT control plane, the IoT data plane, Amazon SQS and IAM on ONE engine —
 /// the shape `core/router/src/lib.rs` mounts them in — served at [`SERVED_AT`].
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
-fn emulator() -> Emulator {
+pub(crate) fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signature verification is the front door's concern, not this suite's: the credential
@@ -384,7 +388,7 @@ fn authorization(signing_name: &str) -> String {
 
 impl Emulator {
     /// One in-process API call through the whole router, as its status and body.
-    async fn send(
+    pub(crate) async fn send(
         &self,
         method: &str,
         path: &str,
@@ -463,7 +467,7 @@ impl Emulator {
 
     /// `GET /endpoint?endpointType=iot:Data-ATS`: the address the control plane publishes for
     /// the account's data endpoint, which is the address a device then dials.
-    async fn discover(&self) -> String {
+    pub(crate) async fn discover(&self) -> String {
         let (status, rendered) = self
             .send(
                 "GET",
@@ -628,7 +632,7 @@ fn same_message(expected: &str, actual: &str) -> bool {
 /// The QoS a number names, as a client's own library reads it. A number outside the three MQTT
 /// defines names no QoS at all, so a filter table carrying one asks for a subscription the
 /// protocol has no word for: it fails here rather than silently becoming QoS 2.
-fn qos_of(number: u8) -> QoS {
+pub(crate) fn qos_of(number: u8) -> QoS {
     match number {
         0 => QoS::AtMostOnce,
         1 => QoS::AtLeastOnce,
@@ -639,7 +643,7 @@ fn qos_of(number: u8) -> QoS {
 
 /// The port a published address names, checked to be on the LOOPBACK interface this emulator's
 /// listeners are bound on — the only host a client of this emulator reaches it at.
-fn loopback_port(address: &str) -> u16 {
+pub(crate) fn loopback_port(address: &str) -> u16 {
     let (host, port) = address
         .rsplit_once(':')
         .unwrap_or_else(|| panic!("the published address {address:?} names no port"));
@@ -652,15 +656,20 @@ fn loopback_port(address: &str) -> u16 {
         .unwrap_or_else(|error| panic!("{address:?} names no port: {error}"))
 }
 
-/// One delivery the broker wrote to a subscriber.
+/// One delivery the broker wrote to a subscriber: the topic it arrived on, the bytes it
+/// carries, the QoS it was made at, and whether it carried the RETAIN flag — which is what
+/// separates a message replayed because a subscription was just made from one published while
+/// the client was already listening.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Delivered {
-    topic: String,
-    payload: Vec<u8>,
+pub(crate) struct Delivered {
+    pub(crate) topic: String,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) qos: u8,
+    pub(crate) retain: bool,
 }
 
 /// A DEVICE: a real connection to the published address, speaking MQTT 3.1.1 on it.
-struct Device {
+pub(crate) struct Device {
     client_id: String,
     session: Session,
     buffer: BytesMut,
@@ -671,7 +680,7 @@ struct Device {
 impl Device {
     /// Dial the published address over `transport` and send the CONNECT, answering with the
     /// connected device — which is what the CONNACK accepting the session says it is.
-    async fn connect(transport: Transport, address: &str, role: &str) -> Self {
+    pub(crate) async fn connect(transport: Transport, address: &str, role: &str) -> Self {
         let client_id = format!("mqtt-transport-{role}-{}", transport.client_suffix());
         let mut device = Self {
             client_id,
@@ -747,7 +756,7 @@ impl Device {
     }
 
     /// Subscribe to `filters`, answering with the QoS granted for each.
-    async fn subscribe(&mut self, filters: &[(&str, u8)]) -> Vec<i32> {
+    pub(crate) async fn subscribe(&mut self, filters: &[(&str, u8)]) -> Vec<i32> {
         let mut subscribe = v4::Subscribe::new(filters[0].0, qos_of(filters[0].1));
         subscribe.pkid = self.take_packet_id();
         for (path, qos) in &filters[1..] {
@@ -783,10 +792,24 @@ impl Device {
     /// that says the broker took it — which is what makes the row's assertions need no span:
     /// the broker performs the rules' actions before it acknowledges the publication.
     async fn publish(&mut self, topic: &str, payload: &str) {
+        self.publish_at(topic, payload.as_bytes(), 1, false).await;
+    }
+
+    /// Publish one message over this device's own connection at `qos`, with the RETAIN flag
+    /// `retain`, waiting for the PUBACK that says the broker took it wherever the QoS asks for
+    /// one — which is what makes a QoS 1 row's assertions need no span: the broker has stored
+    /// and forwarded the publication before it acknowledges it. A QoS 0 publication is
+    /// acknowledged by nothing, so what it did is read where it shows: the store, polled for
+    /// the condition.
+    pub(crate) async fn publish_at(&mut self, topic: &str, payload: &[u8], qos: u8, retain: bool) {
         let packet_id = self.take_packet_id();
-        let mut publish = v4::Publish::new(topic, QoS::AtLeastOnce, payload.as_bytes().to_vec());
+        let mut publish = v4::Publish::new(topic, qos_of(qos), payload.to_vec());
+        publish.retain = retain;
         publish.pkid = packet_id;
         self.write(|buffer| publish.write(buffer)).await;
+        if qos == 0 {
+            return;
+        }
         let answered = self.expect_packet().await;
         let v4::Packet::PubAck(puback) = answered else {
             panic!(
@@ -799,6 +822,34 @@ impl Device {
             "device {}: expected the PUBACK of the publication, got {puback:?}",
             self.client_id
         );
+    }
+
+    /// The next message the broker wrote to this device, as a delivery.
+    pub(crate) async fn next_delivery(&mut self) -> Delivered {
+        let packet = self.expect_packet().await;
+        let v4::Packet::Publish(publish) = packet else {
+            panic!(
+                "device {}: expected a delivery, got {packet:?}",
+                self.client_id
+            );
+        };
+        // A delivery made at a QoS that asks for one is acknowledged, as a client library
+        // acknowledges it, so the broker's own exchange for that message completes.
+        if publish.qos != QoS::AtMostOnce {
+            let pkid = publish.pkid;
+            self.write(|buffer| v4::PubAck::new(pkid).write(buffer))
+                .await;
+        }
+        Delivered {
+            topic: publish.topic,
+            payload: publish.payload.to_vec(),
+            qos: match publish.qos {
+                QoS::AtMostOnce => 0,
+                QoS::AtLeastOnce => 1,
+                QoS::ExactlyOnce => 2,
+            },
+            retain: publish.retain,
+        }
     }
 
     /// The packet identifier the next packet of this device carries: non-zero and distinct
@@ -826,6 +877,12 @@ impl Device {
             let delivered = Delivered {
                 topic: publish.topic,
                 payload: publish.payload.to_vec(),
+                qos: match publish.qos {
+                    QoS::AtMostOnce => 0,
+                    QoS::AtLeastOnce => 1,
+                    QoS::ExactlyOnce => 2,
+                },
+                retain: publish.retain,
             };
             if delivered.topic == SENTINEL_TOPIC
                 && same_message(sentinel, &String::from_utf8_lossy(&delivered.payload))
