@@ -34,7 +34,9 @@
 
 use std::collections::BTreeSet;
 
-use service_com_amazonaws_eks_awswesleyfrontend::state::ADDON_ANY_PLATFORM_VERSION;
+use service_com_amazonaws_eks_awswesleyfrontend::state::{
+    ADDON_ANY_PLATFORM_VERSION, DEFAULT_KUBERNETES_VERSION,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::addon_catalog_publication::{configuration_schema, resolved, schema_root};
@@ -269,14 +271,16 @@ async fn a_cited_build_names_every_kubernetes_version_it_is_published_for() {
                     "case {build_case} on {minor}: expected every platform version of it, got {:?}",
                     entry["platformVersions"]
                 );
-                // Exactly the newest published build is the default for each
-                // version it supports; a superseded build is the default for
-                // none.
+                // The add-on's DEFAULT build is the newest published build it is
+                // offered at for the Kubernetes version Amazon EKS creates
+                // clusters at by default, and every row of THAT build carries the
+                // flag: an add-on whose published window ends before that version
+                // is the default for none.
+                let expected = position == 0 && window.iter().any(|row| row == DEFAULT_KUBERNETES_VERSION);
                 assert_eq!(
                     entry["defaultVersion"],
-                    serde_json::json!(position == 0),
-                    "case {build_case} on {minor}: expected defaultVersion {}, got {:?}",
-                    position == 0,
+                    serde_json::json!(expected),
+                    "case {build_case} on {minor}: expected defaultVersion {expected}, got {:?}",
                     entry["defaultVersion"]
                 );
             }

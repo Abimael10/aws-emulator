@@ -506,15 +506,12 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         // Kubernetes version the calendar carries, so its published history
         // starts at that row rather than at the window the newer add-ons share.
         first_cluster_version: Some(ADDON_CATALOG_OLDEST_CLUSTER_VERSION),
-        // The driver released two new major versions over these Kubernetes
-        // releases, so its published history spans majors 1, 2 and 3: a caller
-        // pinning, upgrading or rolling back to a build of any of them finds it
-        // in the catalog — including the builds of the EARLIER lines Amazon EKS
-        // still publishes for the older cluster versions, which is what a caller
-        // running one of those versions installs and reads a configuration
-        // schema for.
-        releases: &[
-            (1, 4, 0),
+        // The driver's OWN builds are the ones its published table carries
+        // ([`ADDON_PUBLISHED_BUILDS`]); this release line is what the vendor
+        // REBUILDS of the driver ([`ADDON_FIPS_REBUILDS`]) derive their own
+        // builds along, which is why it still spans the majors the project
+        // released over these Kubernetes releases.
+        releases: &[            (1, 4, 0),
             (1, 4, 9),
             (1, 5, 1),
             (1, 5, 4),
@@ -1323,14 +1320,34 @@ pub(super) fn rebuilt_addon(addon_name: &str) -> Option<&'static str> {
 }
 
 /// One build in a published build table: the version the build is published as,
-/// and the OLDEST and the NEWEST Kubernetes version Amazon EKS publishes that
-/// build for. See [`ADDON_PUBLISHED_BUILDS`].
-pub(super) type AddonPublishedBuild = (&'static str, &'static str, &'static str);
+/// the OLDEST and the NEWEST Kubernetes version Amazon EKS publishes that build
+/// for, and the compute Amazon EKS publishes THAT BUILD for — EMPTY for a build
+/// published for the same compute as every other build of the add-on
+/// ([`AddonCatalogSeed::compute_types`]). See [`ADDON_PUBLISHED_BUILDS`].
+///
+/// `computeTypes` is a member of `AddonVersionInfo` rather than of `AddonInfo`:
+/// "the compute type of the add-on VERSION". A project that gains support for a
+/// kind of compute in one of its release lines is therefore published for it
+/// from that line on, and its earlier builds keep the compute they were
+/// published for.
+pub(super) type AddonPublishedBuild = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+);
+
+/// The compute a row of a published build table names when the build is
+/// published for the same compute as every other build of the add-on
+/// ([`AddonCatalogSeed::compute_types`]) — the usual case, since a project
+/// gaining support for a kind of compute is what makes a row name its own.
+pub(super) const ADDON_BUILD_COMPUTE_AS_PUBLISHED: &[&str] = &[];
 
 /// The PUBLISHED build table of an add-on whose own builds this catalog carries,
 /// as `(the add-on's name, its builds OLDEST FIRST as `(the version the build is
 /// published as, the OLDEST Kubernetes version Amazon EKS publishes that build
-/// for, the NEWEST Kubernetes version it publishes that build for)`)`.
+/// for, the NEWEST Kubernetes version it publishes that build for, the compute
+/// that build is published for)`)`.
 ///
 /// `AddonInfo$addonVersions` is the add-on's published release HISTORY, and that
 /// history belongs to the ADD-ON: its project publishes builds on its own
@@ -1362,27 +1379,104 @@ pub(super) type AddonPublishedBuild = (&'static str, &'static str, &'static str)
 /// were still in support when it was published, and none since; the ADOT operator
 /// publishes a short line of builds — two of one release, which is what its
 /// second `-eksbuild` build counts — each offered for every Kubernetes version
-/// the operator supports; and NetApp publishes its Trident operator's own
-/// `YY.MM` line, each build offered over the ten Kubernetes versions the operator
-/// supports, up to the newest version NetApp has published a build for.
+/// the operator supports; NetApp publishes its Trident operator's own `YY.MM`
+/// line, each build offered over the ten Kubernetes versions the operator
+/// supports, up to the newest version NetApp has published a build for; and the
+/// EFS CSI driver is published at the builds of its `1.5` line — offered over
+/// every Kubernetes version from the oldest this catalog carries through the
+/// newest that line was published for, on the EC2 instances of a node group
+/// alone, since the driver gained support for the nodes EKS Auto Mode provisions
+/// in a later line — and then at the builds of its `2` and `3` lines, each
+/// offered over the Kubernetes versions still supported when it was published,
+/// and on both kinds of compute. A client pinning, upgrading or ROLLING BACK the
+/// driver finds every one of those builds in the listing, with the Kubernetes
+/// versions and the compute that build itself was published for.
 pub(super) const ADDON_PUBLISHED_BUILDS: &[(&str, &[AddonPublishedBuild])] = &[
     (
         "accuknox_kubearmor",
-        &[("v0.10.2-eksbuild.1", "1.23", "1.27")],
+        &[("v0.10.2-eksbuild.1", "1.23", "1.27", ADDON_BUILD_COMPUTE_AS_PUBLISHED)],
     ),
     (
         "adot",
         &[
-            ("v0.151.0-eksbuild.1", "1.31", "1.37"),
-            ("v0.151.0-eksbuild.2", "1.31", "1.37"),
-            ("v0.156.0-eksbuild.1", "1.31", "1.37"),
+            (
+                "v0.151.0-eksbuild.1",
+                "1.31",
+                "1.37",
+                ADDON_BUILD_COMPUTE_AS_PUBLISHED,
+            ),
+            (
+                "v0.151.0-eksbuild.2",
+                "1.31",
+                "1.37",
+                ADDON_BUILD_COMPUTE_AS_PUBLISHED,
+            ),
+            (
+                "v0.156.0-eksbuild.1",
+                "1.31",
+                "1.37",
+                ADDON_BUILD_COMPUTE_AS_PUBLISHED,
+            ),
+        ],
+    ),
+    (
+        "aws-efs-csi-driver",
+        &[
+            ("v1.5.8-eksbuild.1", "1.23", "1.33", ADDON_COMPUTE_TYPES_EC2),
+            ("v1.5.9-eksbuild.1", "1.23", "1.33", ADDON_COMPUTE_TYPES_EC2),
+            (
+                "v2.0.7-eksbuild.1",
+                "1.25",
+                "1.35",
+                ADDON_BUILD_COMPUTE_AS_PUBLISHED,
+            ),
+            (
+                "v2.1.9-eksbuild.1",
+                "1.27",
+                "1.36",
+                ADDON_BUILD_COMPUTE_AS_PUBLISHED,
+            ),
+            (
+                "v3.4.1-eksbuild.1",
+                "1.30",
+                "1.37",
+                ADDON_BUILD_COMPUTE_AS_PUBLISHED,
+            ),
+            (
+                "v3.4.2-eksbuild.1",
+                "1.30",
+                "1.37",
+                ADDON_BUILD_COMPUTE_AS_PUBLISHED,
+            ),
+            (
+                "v3.5.1-eksbuild.1",
+                "1.30",
+                "1.37",
+                ADDON_BUILD_COMPUTE_AS_PUBLISHED,
+            ),
+            (
+                "v3.5.2-eksbuild.1",
+                "1.30",
+                "1.37",
+                ADDON_BUILD_COMPUTE_AS_PUBLISHED,
+            ),
         ],
     ),
     (
         "netapp_trident-operator",
         &[
-            ("v26.6.0-eksbuild.1", "1.27", "1.36"),
-            ("v26.6.1-eksbuild.1", "1.27", "1.36"),
+            (
+                "v26.6.0-eksbuild.1",
+                "1.27",
+                "1.36",
+                ADDON_BUILD_COMPUTE_AS_PUBLISHED,
+            ),
+            (
+                "v26.6.1-eksbuild.1",
+                "1.27",
+                "1.36",
+                ADDON_BUILD_COMPUTE_AS_PUBLISHED,
+            ),
         ],
     ),
 ];
@@ -1390,13 +1484,17 @@ pub(super) const ADDON_PUBLISHED_BUILDS: &[(&str, &[AddonPublishedBuild])] = &[
 /// The published build table of the add-on named `addon_name`, or `None` for an
 /// add-on whose builds this catalog derives along its release line. See
 /// [`ADDON_PUBLISHED_BUILDS`].
+///
+/// A table belongs to the add-on it is published UNDER, not to the software it
+/// builds: a vendor rebuilding an add-on ([`ADDON_FIPS_REBUILDS`]) publishes its
+/// own builds, on its own cadence and over the Kubernetes versions it supports
+/// them on, so a rebuild takes a cited table only where this catalog cites one
+/// for the rebuild itself and otherwise keeps deriving along the software's
+/// release line.
 pub(super) fn published_build_table(addon_name: &str) -> Option<&'static [AddonPublishedBuild]> {
-    // A vendor's rebuild of an add-on is the same software, so the builds it is
-    // published at are the rebuilt add-on's own.
-    let published_for = rebuilt_addon(addon_name).unwrap_or(addon_name);
     ADDON_PUBLISHED_BUILDS
         .iter()
-        .find(|(addon, _)| *addon == published_for)
+        .find(|(addon, _)| *addon == addon_name)
         .map(|(_, builds)| *builds)
 }
 
@@ -1487,11 +1585,11 @@ pub struct AddonCompatibilityRecord {
 impl AddonCompatibilityRecord {
     /// This row as the modelled `Compatibility` shape.
     ///
-    /// `default_version` is whether the build this row belongs to is the one
-    /// Amazon EKS installs on a cluster of that Kubernetes version when the
-    /// caller names no version. It is NOT stored on the row: which build that is
-    /// depends on which builds the clock has reached, so it is decided per read
-    /// (see [`AddonCatalogRecord::to_addon_version_infos`]) and cannot go stale.
+    /// `default_version` is whether the build this row belongs to is the
+    /// add-on's DEFAULT build, the one Amazon EKS installs when the caller names
+    /// no version. It is NOT stored on the row: which build that is depends on
+    /// which builds the clock has reached, so it is decided per read (see
+    /// [`AddonCatalogRecord::default_build`]) and cannot go stale.
     pub fn to_compatibility(&self, default_version: bool) -> Compatibility {
         Compatibility {
             cluster_version: Some(self.cluster_version.clone()),
@@ -1567,14 +1665,17 @@ impl AddonCatalogVersionRecord {
     /// filtered to: the reported compatibilities are then the ones for that
     /// version alone, because a filtered listing answers about that version.
     ///
-    /// `is_default_for` answers, for one Kubernetes version this build supports,
-    /// whether this build is the DEFAULT build for it — the question the add-on
-    /// as a whole decides, since it is about the other builds of the same add-on
-    /// (see [`AddonCatalogRecord::to_addon_version_infos`]).
+    /// `is_default` is whether this build is the add-on's DEFAULT build — the
+    /// question the add-on as a whole decides, since it is about the other
+    /// builds of the same add-on (see
+    /// [`AddonCatalogRecord::to_addon_version_infos`]). It is reported on EVERY
+    /// compatibility row this build carries, because being the build Amazon EKS
+    /// installs unasked is a property of the BUILD and not of one of the
+    /// Kubernetes versions it supports.
     pub fn to_addon_version_info(
         &self,
         cluster_version: Option<&str>,
-        is_default_for: impl Fn(&str) -> bool,
+        is_default: bool,
     ) -> AddonVersionInfo {
         AddonVersionInfo {
             addon_version: Some(self.addon_version.clone()),
@@ -1589,7 +1690,7 @@ impl AddonCatalogVersionRecord {
                     .filter(|entry| {
                         cluster_version.is_none_or(|wanted| wanted == entry.cluster_version)
                     })
-                    .map(|entry| entry.to_compatibility(is_default_for(&entry.cluster_version)))
+                    .map(|entry| entry.to_compatibility(is_default))
                     .collect(),
             ),
             requires_configuration: self.requires_configuration(),
@@ -1681,6 +1782,27 @@ impl AddonCatalogRecord {
         }
     }
 
+    /// The DEFAULT build of this add-on at `now`: the build an install that
+    /// names no `addonVersion` is given, and the one every compatibility row of
+    /// which reports `defaultVersion` — or `None` for an add-on Amazon EKS
+    /// defaults to no build of.
+    ///
+    /// It is the newest published build the add-on is OFFERED at for the
+    /// Kubernetes version Amazon EKS creates clusters at by default
+    /// ([`DEFAULT_KUBERNETES_VERSION`]): "the supported default version" is the
+    /// build a caller who names none is given, and the cluster a caller who
+    /// names no Kubernetes version is given is one of that version, so the two
+    /// defaults are one pair. An add-on whose published builds stop before that
+    /// version — a publisher that has stopped publishing — is still listed with
+    /// the builds it has while Amazon EKS defaults to none of them: a caller
+    /// installing it on an older cluster names the build it wants, which
+    /// [`ComAmazonawsEksAwswesleyfrontendState::default_addon_version`] resolves
+    /// for that cluster's own version.
+    pub fn default_build(&self, now: SystemTime) -> Option<&AddonCatalogVersionRecord> {
+        self.published_versions(now)
+            .find(|build| build.supports(DEFAULT_KUBERNETES_VERSION))
+    }
+
     /// The builds of this add-on a listing reports at `now`, newest first — the
     /// modelled `AddonVersionInfo` list of its `AddonInfo`.
     ///
@@ -1688,31 +1810,27 @@ impl AddonCatalogRecord {
     /// filtered to: only the builds that support it are reported, each with its
     /// compatibility for that version alone.
     ///
-    /// Each compatibility's `defaultVersion` marks the build Amazon EKS installs
-    /// on a cluster of that Kubernetes version when the caller names no
-    /// `addonVersion`, which is the NEWEST published build that supports it: a
-    /// superseded build is the default for no Kubernetes version, and whichever
-    /// version the listing is filtered to, the flag is the same one the
-    /// unfiltered listing reports, because it is decided against every published
-    /// build of the add-on rather than against the ones this answer carries.
+    /// Every compatibility of the add-on's DEFAULT build ([`Self::default_build`])
+    /// is marked `defaultVersion`, and every compatibility of every other build
+    /// is not: the flag names the build Amazon EKS installs unasked, so it
+    /// belongs to that build rather than to one of the Kubernetes versions it
+    /// supports. Whichever version the listing is filtered to, the flag is the
+    /// same one the unfiltered listing reports, because it is decided against
+    /// every published build of the add-on rather than against the ones this
+    /// answer carries.
     pub fn to_addon_version_infos(
         &self,
         now: SystemTime,
         cluster_version: Option<&str>,
     ) -> Vec<AddonVersionInfo> {
-        let published: Vec<&AddonCatalogVersionRecord> = self.published_versions(now).collect();
-        published
-            .iter()
-            .enumerate()
-            .filter(|(_, build)| cluster_version.is_none_or(|wanted| build.supports(wanted)))
-            .map(|(position, build)| {
-                // The builds published AFTER this one, which are the ones that
-                // take the default away from it: `published` is newest first, so
-                // they are the ones before it.
-                let newer = &published[..position];
-                build.to_addon_version_info(cluster_version, |minor| {
-                    !newer.iter().any(|newer| newer.supports(minor))
-                })
+        let default_build = self
+            .default_build(now)
+            .map(|build| build.addon_version.as_str());
+        self.published_versions(now)
+            .filter(|build| cluster_version.is_none_or(|wanted| build.supports(wanted)))
+            .map(|build| {
+                let is_default = default_build == Some(build.addon_version.as_str());
+                build.to_addon_version_info(cluster_version, is_default)
             })
             .collect()
     }
@@ -2963,9 +3081,16 @@ fn published_configuration_properties(seed: &AddonCatalogSeed) -> Vec<(String, S
 }
 
 /// One build of one add-on as the seed reaches it: the version it is published
-/// as, the add-on's own release it is of, and the calendar rows of the oldest and
-/// the newest Kubernetes version it is published for.
-type SeededBuild = (String, (u32, u32, u32), usize, usize);
+/// as, the add-on's own release it is of, the calendar rows of the oldest and the
+/// newest Kubernetes version it is published for, and the compute its own
+/// published row names (EMPTY for the add-on's own).
+type SeededBuild = (
+    String,
+    (u32, u32, u32),
+    usize,
+    usize,
+    &'static [&'static str],
+);
 
 /// Build the add-on catalog this service publishes from
 /// [`published_addon_seeds`].
@@ -2985,13 +3110,15 @@ type SeededBuild = (String, (u32, u32, u32), usize, usize);
 /// older row the add-on has been offered for whose support — standard or extended
 /// — had not ended by then ([`build_compatibilities`]).
 ///
-/// Which build is the DEFAULT for a Kubernetes version is not seeded: it is the
-/// newest PUBLISHED build that supports that version, decided per read against
-/// the clock ([`AddonCatalogRecord::to_addon_version_infos`]), so for any
-/// Kubernetes version the catalog names exactly ONE default build per add-on
-/// while every superseded build is offered as a non-default choice. That is what
-/// `CreateAddon` resolves an absent `addonVersion` through
-/// ([`ComAmazonawsEksAwswesleyfrontendState::default_addon_version`]).
+/// Which build is the DEFAULT is not seeded: it is the newest PUBLISHED build
+/// the add-on is offered at for the Kubernetes version Amazon EKS creates
+/// clusters at by default, decided per read against the clock
+/// ([`AddonCatalogRecord::default_build`]), so the catalog names at most ONE
+/// default build per add-on and none at all for an add-on whose published builds
+/// stop before that version. `CreateAddon` resolves an absent `addonVersion`
+/// against the cluster's OWN Kubernetes version
+/// ([`ComAmazonawsEksAwswesleyfrontendState::default_addon_version`]), which on a
+/// cluster of the default version is that same build.
 ///
 /// The versions an add-on is offered for start at its OWN first calendar row
 /// ([`first_published_row`]), so the compatible cluster-version set an add-on
@@ -3007,13 +3134,13 @@ pub(super) fn seed_addon_catalog() -> Vec<AddonCatalogRecord> {
         .map(|seed| {
             let first = first_published_row(seed);
             // The add-on's own published builds, oldest first, as `(the version,
-            // the release it is of, the calendar row it was published
-            // alongside)`.
+            // the release it is of, the calendar rows its window runs between,
+            // the compute the build is published for)`.
             let line: Vec<SeededBuild> =
                 match published_build_table(seed.addon_name) {
                     Some(published) => published
                         .iter()
-                        .map(|(addon_version, oldest, newest)| {
+                        .map(|(addon_version, oldest, newest, compute_types)| {
                             let oldest_row = calendar_row(seed.addon_name, oldest);
                             let newest_row = calendar_row(seed.addon_name, newest);
                             assert!(
@@ -3035,6 +3162,7 @@ pub(super) fn seed_addon_catalog() -> Vec<AddonCatalogRecord> {
                                 published_build_release(seed.addon_name, addon_version),
                                 oldest_row,
                                 newest_row,
+                                *compute_types,
                             )
                         })
                         .collect(),
@@ -3048,6 +3176,9 @@ pub(super) fn seed_addon_catalog() -> Vec<AddonCatalogRecord> {
                                 // which is why its ends are not carried per build.
                                 first,
                                 row,
+                                // And a derived build is published for the compute
+                                // the add-on's own row names.
+                                ADDON_BUILD_COMPUTE_AS_PUBLISHED,
                             )
                         })
                         .collect(),
@@ -3056,30 +3187,38 @@ pub(super) fn seed_addon_catalog() -> Vec<AddonCatalogRecord> {
             let mut versions: Vec<AddonCatalogVersionRecord> = line
                 .into_iter()
                 .map(
-                    |(addon_version, release, oldest_row, row)| AddonCatalogVersionRecord {
-                        addon_version,
-                        release,
-                        published_at: calendar_instant(VERSION_CALENDAR[row].1),
-                        architecture: ADDON_ARCHITECTURES
-                            .iter()
-                            .map(|architecture| (*architecture).to_string())
-                            .collect(),
-                        compute_types: seed
-                            .compute_types
+                    |(addon_version, release, oldest_row, row, compute_types)| {
+                        AddonCatalogVersionRecord {
+                            addon_version,
+                            release,
+                            published_at: calendar_instant(VERSION_CALENDAR[row].1),
+                            architecture: ADDON_ARCHITECTURES
+                                .iter()
+                                .map(|architecture| (*architecture).to_string())
+                                .collect(),
+                            // The compute the BUILD is published for: the one its
+                            // own row names, or the add-on's own where that row
+                            // names none.
+                            compute_types: if compute_types.is_empty() {
+                                seed.compute_types
+                            } else {
+                                compute_types
+                            }
                             .iter()
                             .map(|compute_type| (*compute_type).to_string())
                             .collect(),
-                        compatibilities: if cited {
-                            cited_build_compatibilities(oldest_row, row)
-                        } else {
-                            build_compatibilities(oldest_row, row)
-                        },
-                        required_configuration: seed
-                            .required_configuration
-                            .iter()
-                            .map(|property| (*property).to_string())
-                            .collect(),
-                        requires_iam_permissions: seed.requires_iam_permissions,
+                            compatibilities: if cited {
+                                cited_build_compatibilities(oldest_row, row)
+                            } else {
+                                build_compatibilities(oldest_row, row)
+                            },
+                            required_configuration: seed
+                                .required_configuration
+                                .iter()
+                                .map(|property| (*property).to_string())
+                                .collect(),
+                            requires_iam_permissions: seed.requires_iam_permissions,
+                        }
                     },
                 )
                 .collect();

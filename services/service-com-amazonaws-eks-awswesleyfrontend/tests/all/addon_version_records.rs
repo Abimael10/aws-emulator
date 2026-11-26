@@ -68,15 +68,46 @@ const PUBLISHED_COMPUTE_TYPES: &[&str] = &["ec2", "hybrid", "fargate", "auto"];
 /// Deployment-only add-on offered on every kind of compute, one with a node
 /// component (so not on Fargate), and a vendor's own build offered on EC2 nodes
 /// alone — including add-ons no recorded request named (`coredns`, `kube-proxy`,
-/// `datadog_operator`).
+/// `datadog_operator`). An add-on whose own published builds were offered on
+/// DIFFERENT compute is not a row here: `computeTypes` is a member of
+/// `AddonVersionInfo`, so such an add-on's compute is asserted per build
+/// ([`EXPECTED_BUILD_COMPUTE_TYPES`]).
 const EXPECTED_COMPUTE_TYPES: &[(&str, &[&str])] = &[
     ("adot", ADDON_COMPUTE_TYPES_EVERY_COMPUTE),
     ("coredns", ADDON_COMPUTE_TYPES_EVERY_COMPUTE),
-    ("aws-efs-csi-driver", ADDON_COMPUTE_TYPES_EC2_AUTO),
     ("vpc-cni", ADDON_COMPUTE_TYPES_EC2_AUTO),
     ("kube-proxy", ADDON_COMPUTE_TYPES_EC2_HYBRID_AUTO),
     ("accuknox_kubearmor", ADDON_COMPUTE_TYPES_EC2),
     ("datadog_operator", ADDON_COMPUTE_TYPES_EC2),
+];
+
+/// The compute types the catalog publishes ONE BUILD of one add-on for, where
+/// that add-on's builds were not all published for the same compute.
+///
+/// SOURCE: the `compute_types` column of that BUILD's row in the add-on's
+/// published build table (`crate::state::addon_catalog`'s
+/// `ADDON_PUBLISHED_BUILDS`). `AddonVersionInfo$computeTypes` is "the compute
+/// type of the add-on VERSION", so a project that gained support for a kind of
+/// compute in one of its release lines is published for it from that line on
+/// while its earlier builds keep the compute they were published for: the EFS
+/// CSI driver's `1.5` line runs on the EC2 instances of a node group alone, its
+/// current line on the nodes EKS Auto Mode provisions as well.
+const EXPECTED_BUILD_COMPUTE_TYPES: &[(&str, &str, &[&str])] = &[
+    (
+        "aws-efs-csi-driver",
+        "v1.5.9-eksbuild.1",
+        ADDON_COMPUTE_TYPES_EC2,
+    ),
+    (
+        "aws-efs-csi-driver",
+        "v1.5.8-eksbuild.1",
+        ADDON_COMPUTE_TYPES_EC2,
+    ),
+    (
+        "aws-efs-csi-driver",
+        "v3.5.2-eksbuild.1",
+        ADDON_COMPUTE_TYPES_EC2_AUTO,
+    ),
 ];
 
 /// The Kubernetes versions `DescribeClusterVersions` publishes, in the order the
@@ -200,9 +231,10 @@ fn default_flags(build: &serde_json::Value) -> Vec<bool> {
 }
 
 // ---------------------------------------------------------------------------
-// RULE: every build of an add-on reports the compute types that ADD-ON is
-// published for, which the catalog carries per add-on — so a caller can narrow
-// the catalog to the compute its cluster runs.
+// RULE: every build of an add-on reports the compute types THAT BUILD is
+// published for, which the catalog carries per add-on and, where an add-on's own
+// builds differ, per build — so a caller can narrow the catalog to the compute
+// its cluster runs.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -227,18 +259,37 @@ async fn every_published_build_reports_the_addons_own_compute_types() {
         }
     }
 
+    // And where an add-on's own builds were published for different compute, each
+    // build reports its own: the member belongs to the VERSION.
+    for (addon_name, addon_version, expected) in EXPECTED_BUILD_COMPUTE_TYPES {
+        let addon = catalog
+            .iter()
+            .find(|addon| string_member(addon, "addonName") == *addon_name)
+            .unwrap_or_else(|| panic!("case {addon_name:?}: the catalog must publish this add-on"));
+        let build = versions_of(addon)
+            .into_iter()
+            .find(|build| string_member(build, "addonVersion") == *addon_version)
+            .unwrap_or_else(|| {
+                panic!("case {addon_name}/{addon_version}: the catalog must publish this build")
+            });
+        let reported = compute_types_of(&build);
+        assert_eq!(
+            reported,
+            expected.iter().map(|value| value.to_string()).collect::<Vec<_>>(),
+            "case {addon_name}/{addon_version}: expected the compute types the catalog publishes \
+             that BUILD for, got {reported:?}"
+        );
+    }
+
     // Across the WHOLE catalog: every build names compute, every value is one of
-    // the published kinds, every add-on runs on the EC2 instances of a node
-    // group, and the list is the ADD-ON's, so each of its builds reports the
-    // same one.
+    // the published kinds, and every add-on runs on the EC2 instances of a node
+    // group.
     let mut published_sets: BTreeSet<Vec<String>> = BTreeSet::new();
     for addon in &catalog {
         let addon_name = string_member(addon, "addonName");
-        let builds = versions_of(addon);
-        let first = compute_types_of(&builds[0]);
-        for build in &builds {
-            let case = format!("{addon_name}/{}", string_member(build, "addonVersion"));
-            let reported = compute_types_of(build);
+        for build in versions_of(addon) {
+            let case = format!("{addon_name}/{}", string_member(&build, "addonVersion"));
+            let reported = compute_types_of(&build);
             assert!(
                 !reported.is_empty(),
                 "case {case}: a published build names the compute it runs on, got {reported:?}"
@@ -255,13 +306,8 @@ async fn every_published_build_reports_the_addons_own_compute_types() {
                 "case {case}: every add-on is published for the EC2 instances of a node group, \
                  got {reported:?}"
             );
-            assert_eq!(
-                reported, first,
-                "case {case}: the compute types are the add-on's, so every build of it reports \
-                 the same list, got {reported:?} against {first:?}"
-            );
+            published_sets.insert(reported);
         }
-        published_sets.insert(first);
     }
     assert!(
         published_sets.len() > 1,
@@ -379,48 +425,46 @@ async fn a_builds_compatibilities_are_one_entry_per_supported_minor_newest_first
 }
 
 // ---------------------------------------------------------------------------
-// RULE: `defaultVersion` marks the build Amazon EKS installs for a Kubernetes
-// version when the caller names none — the NEWEST published build that supports
-// it — so a build is the default exactly for the versions no newer build of the
-// same add-on supports, and the install resolves the build the catalog marks.
+// RULE: `defaultVersion` marks the add-on's DEFAULT build — the newest published
+// build the add-on is offered at for the Kubernetes version Amazon EKS creates
+// clusters at by default — on EVERY compatibility row that build carries and on
+// no row of any other build, and an install that names no version is given that
+// same build.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn the_newest_published_build_is_the_default_for_every_version_it_supports() {
+async fn the_default_build_is_the_one_offered_for_the_default_cluster_version() {
     let router = emulator();
     let catalog = addons(&whole_catalog(&router).await);
+    let default_version = default_cluster_version(&router).await;
 
     for addon in &catalog {
         let addon_name = string_member(addon, "addonName");
         let builds = versions_of(addon);
-        // The newest build that supports each version the add-on is offered for:
-        // the builds are reported newest first, so the first one to claim a
-        // version is that version's default.
-        let mut default_for: BTreeMap<String, String> = BTreeMap::new();
-        for build in &builds {
-            let version = string_member(build, "addonVersion");
-            for minor in supported_minors(build) {
-                default_for.entry(minor).or_insert_with(|| version.clone());
-            }
-        }
+        // The builds are reported newest first, so the first one offered for the
+        // default Kubernetes version is the add-on's default build; an add-on
+        // whose published builds stop before that version has none.
+        let default_build = builds
+            .iter()
+            .find(|build| supported_minors(build).contains(&default_version))
+            .map(|build| string_member(build, "addonVersion"));
         for build in &builds {
             let version = string_member(build, "addonVersion");
             let case = format!("{addon_name}/{version}");
-            for (minor, flag) in supported_minors(build).iter().zip(default_flags(build)) {
-                let expected = default_for.get(minor) == Some(&version);
-                assert_eq!(
-                    flag, expected,
-                    "case {case} on {minor}: expected defaultVersion {expected} — the newest build \
-                     supporting {minor} is {:?}",
-                    default_for.get(minor)
-                );
-            }
+            let expected = default_build.as_ref() == Some(&version);
+            let flags = default_flags(build);
+            assert_eq!(
+                flags,
+                vec![expected; flags.len()],
+                "case {case}: expected defaultVersion {expected} on every row — the build \
+                 offered for {default_version} is {default_build:?}"
+            );
         }
     }
 
     // Read one version at a time, which is how a client resolves a build for its
-    // own cluster: the filtered listing marks the same build, and marks exactly
-    // one.
+    // own cluster: the filtered listing marks the same build the whole catalog
+    // marks, and marks at most one.
     let calendar = published_calendar_minors(&router).await;
     for minor in &calendar {
         let answer =
@@ -438,16 +482,27 @@ async fn the_newest_published_build_is_the_default_for_every_version_it_supports
                 .filter(|build| default_flags(build).iter().any(|flag| *flag))
                 .map(|build| string_member(build, "addonVersion"))
                 .collect();
-            assert_eq!(
-                defaults,
-                vec![string_member(&builds[0], "addonVersion")],
-                "case {case}: the newest reported build is the one default build, got {defaults:?}"
+            assert!(
+                defaults.len() <= 1,
+                "case {case}: at most one build is the add-on's default, got {defaults:?}"
             );
+            // The default build is reported as such exactly when it is one of the
+            // builds that support the version asked for, and it is then the
+            // newest of them: the flag is decided against every published build,
+            // not against the ones this answer carries.
+            if *minor == default_version {
+                assert_eq!(
+                    defaults,
+                    vec![string_member(&builds[0], "addonVersion")],
+                    "case {case}: the newest build offered for the default Kubernetes version is \
+                     the default build, got {defaults:?}"
+                );
+            }
         }
     }
 
     // The round trip: an install that names no version takes the build the
-    // catalog marks for the cluster's Kubernetes version, and reads back at it.
+    // catalog marks, and reads back at it.
     let version = default_cluster_version(&router).await;
     active_cluster(&router, "default build", "catalog-default").await;
     for addon_name in ["vpc-cni", "datadog_operator"] {

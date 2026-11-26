@@ -30,7 +30,7 @@ use std::time::Duration;
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
     self, addon_schema_not_found_message, ADDON_ANY_PLATFORM_VERSION, ADDON_OWNER_AWS,
     ADDON_OWNER_COMMUNITY, ADDON_OWNER_MARKETPLACE, ADDON_PUBLISHER_EKS,
-    ADDON_PUBLISHER_SAGEMAKER, CLUSTER_ACTIVATION_DELAY,
+    ADDON_PUBLISHER_SAGEMAKER, CLUSTER_ACTIVATION_DELAY, DEFAULT_KUBERNETES_VERSION,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -399,10 +399,21 @@ async fn the_published_catalog_is_reported_from_state() {
                  Kubernetes version, got {defaulted:?}"
             );
         }
-        assert!(
+        // The add-on's DEFAULT build is the one Amazon EKS installs unasked, so
+        // an add-on still offered for the Kubernetes version Amazon EKS creates
+        // clusters at by default has one — while an add-on whose publisher has
+        // stopped publishing before that version is still listed with the builds
+        // it has and Amazon EKS defaults to none of them.
+        let offered_for_the_default_version = versions_of(addon).iter().any(|build| {
+            compatibilities_of(build).iter().any(|compatibility| {
+                string_member(compatibility, "clusterVersion") == DEFAULT_KUBERNETES_VERSION
+            })
+        });
+        assert_eq!(
             !defaults.is_empty(),
-            "case {case}: an add-on must have a default build for some Kubernetes version, \
-             got {addon:?}"
+            offered_for_the_default_version,
+            "case {case}: expected a default build exactly when the add-on is offered for \
+             {DEFAULT_KUBERNETES_VERSION}, got {addon:?}"
         );
     }
 
@@ -656,12 +667,23 @@ async fn filters_narrow_the_listing() {
                     defaults.push(string_member(build, "addonVersion"));
                 }
             }
-            assert_eq!(
-                defaults.len(),
-                1,
-                "case {case}: expected exactly one default build for the Kubernetes version \
-                 asked for, got {defaults:?}"
+            assert!(
+                defaults.len() <= 1,
+                "case {case}: at most one build is the add-on's default, got {defaults:?}"
             );
+            // A listing filtered to the Kubernetes version Amazon EKS creates
+            // clusters at by default always carries the add-on's default build —
+            // that is the version the build is published for — while a listing
+            // filtered to an older version carries it only when the default
+            // build is published for that version too.
+            if *cluster_version == DEFAULT_KUBERNETES_VERSION {
+                assert_eq!(
+                    defaults.len(),
+                    1,
+                    "case {case}: expected the add-on's default build in a listing filtered to \
+                     the default Kubernetes version, got {defaults:?}"
+                );
+            }
         }
     }
 
