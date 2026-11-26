@@ -204,22 +204,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // call's failure and not a per-record error. Answering 200 there would
             // make a deleted or mistyped registry indistinguishable from one holding
             // none of the requested records.
-            let registry = match crate::state::owner::registry(&*self.engine, &entry.registry_id) {
-                Err(crate::state::owner::StoreUnavailable) => {
-                    return Err(
-                        BatchGetDiscoverableRegistryRecordErrorModeled::InternalServerException(
-                            InternalServerException {
-                                message: Some(
-                                    crate::state::owner::STORE_UNAVAILABLE_MESSAGE.to_string(),
-                                ),
-                            },
-                        )
-                        .into(),
-                    )
-                }
-                Ok(None) => return Err(registry_not_found(&entry.registry_id)),
-                Ok(Some(registry)) => registry,
-            };
+            let registry = crate::state::owner::resolve::<_, Self::Error>(
+                &*self.engine,
+                &entry.registry_id,
+            )?;
             let registry_id = crate::state::registry_id_from_identifier(&entry.registry_id);
             for requested in &entry.record_ids {
                 // A record ARN names its own registry; one that names a different
@@ -291,11 +279,20 @@ fn field_validation(member: &str, message: &str) -> BatchGetDiscoverableRegistry
 }
 
 /// The modelled 404 `ResourceNotFoundException` for an entry naming a registry
-/// this service does not hold, worded by the one shared constructor every
-/// discovery read answers that refusal through.
-fn registry_not_found(identifier: &str) -> BatchGetDiscoverableRegistryRecordError {
-    BatchGetDiscoverableRegistryRecordErrorModeled::ResourceNotFoundException(
-        crate::state::registry_not_found(identifier),
-    )
-    .into()
+/// this service does not hold, and the modelled 500 `InternalServerException` for an
+/// engine carrying no Agent Registry store, each lifted into THIS operation's error
+/// channel.
+///
+/// Which failure of resolving a registry becomes which modelled error, and the sentence
+/// each carries, belongs to the one resolver every discovery read goes through
+/// ([`crate::state::owner::resolve`]); all this read states is the variant it carries
+/// them in.
+impl crate::state::owner::RegistryResolution for BatchGetDiscoverableRegistryRecordError {
+    fn store_unavailable(exception: InternalServerException) -> Self {
+        BatchGetDiscoverableRegistryRecordErrorModeled::InternalServerException(exception).into()
+    }
+
+    fn registry_not_found(exception: ResourceNotFoundException) -> Self {
+        BatchGetDiscoverableRegistryRecordErrorModeled::ResourceNotFoundException(exception).into()
+    }
 }

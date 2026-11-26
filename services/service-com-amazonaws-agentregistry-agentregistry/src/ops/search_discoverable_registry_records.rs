@@ -218,29 +218,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut ranked: Vec<(usize, RegistryRecordSummary)> = Vec::new();
         for registry_id in &input.registry_ids {
-            let registry = match crate::state::owner::registry(&*self.engine, registry_id) {
-                Err(crate::state::owner::StoreUnavailable) => {
-                    return Err(
-                        SearchDiscoverableRegistryRecordsErrorModeled::InternalServerException(
-                            InternalServerException {
-                                message: Some(
-                                    crate::state::owner::STORE_UNAVAILABLE_MESSAGE.to_string(),
-                                ),
-                            },
-                        )
-                        .into(),
-                    )
-                }
-                Ok(None) => {
-                    return Err(
-                        SearchDiscoverableRegistryRecordsErrorModeled::ResourceNotFoundException(
-                            crate::state::registry_not_found(registry_id),
-                        )
-                        .into(),
-                    )
-                }
-                Ok(Some(registry)) => registry,
-            };
+            let registry =
+                crate::state::owner::resolve::<_, Self::Error>(&*self.engine, registry_id)?;
             for record in registry.discoverable_records() {
                 if !matches_metadata_filter(input.filters.as_ref(), record)? {
                     continue;
@@ -577,4 +556,22 @@ fn field_validation(member: &str, message: &str) -> SearchDiscoverableRegistryRe
         crate::state::field_validation(member, message),
     )
     .into()
+}
+
+/// The modelled 404 `ResourceNotFoundException` for a request naming a registry this
+/// service does not hold, and the modelled 500 `InternalServerException` for an engine
+/// carrying no Agent Registry store, each lifted into THIS operation's error channel.
+///
+/// Which failure of resolving a registry becomes which modelled error, and the sentence
+/// each carries, belongs to the one resolver every discovery read goes through
+/// ([`crate::state::owner::resolve`]); all this read states is the variant it carries
+/// them in.
+impl crate::state::owner::RegistryResolution for SearchDiscoverableRegistryRecordsError {
+    fn store_unavailable(exception: InternalServerException) -> Self {
+        SearchDiscoverableRegistryRecordsErrorModeled::InternalServerException(exception).into()
+    }
+
+    fn registry_not_found(exception: ResourceNotFoundException) -> Self {
+        SearchDiscoverableRegistryRecordsErrorModeled::ResourceNotFoundException(exception).into()
+    }
 }

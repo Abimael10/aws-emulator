@@ -24,10 +24,16 @@
 //!    `400 ValidationException` before the caller is authorized, before the registry is
 //!    resolved and before any record is read — over both members of
 //!    `RegistryRecordFilterName`, every value count the modelled list admits, every
-//!    position in the filter list and whatever else the request carries.
+//!    position in the filter list and whatever else the request carries;
+//! 5. resolving the registry a request names fails in exactly two ways — the store holds
+//!    no such registry, and this engine carries no such store — and each of them is
+//!    answered by ONE modelled error at ONE status with ONE sentence, whichever of the
+//!    three reads asked, over both failures, every identifier form and two engine types
+//!    that carry no store.
 //!
-//! The last test pins the other direction: a value AT each published bound is served,
-//! so the refusals above are about values outside the model's bounds.
+//! Two tests pin the other direction: a value AT each published bound is served, and a
+//! registry that DOES resolve is served by every read — so the refusals above are about
+//! values outside the model's bounds and about registries that did not resolve.
 //!
 //! Every bound, pattern and member path below comes from the model
 //! (`smithy_query(query="closure", operation="BatchGetDiscoverableRegistryRecord,\
@@ -963,4 +969,165 @@ async fn every_value_the_filtered_dimension_has_is_served_and_narrows_the_page()
         status, 200,
         "case {case:?}: expected 200, got {status}: {body}"
     );
+}
+
+/// An engine the Agent Registry store cannot be resolved in at all: every registry and
+/// record a discovery read reports is the CONTROL plane's resource, held in its slot of
+/// the emulator's in-memory engine, so a service mounted on any other engine type can
+/// resolve no registry. That is the second way resolving a registry fails, and it is
+/// reachable no other way.
+#[derive(Debug)]
+struct ForeignEngine;
+
+/// A second, unrelated engine type, so the agreement asserted below cannot be keyed to
+/// one shape of foreign engine.
+#[derive(Debug)]
+struct ForeignEngineWithState {
+    #[allow(dead_code)]
+    label: String,
+}
+
+/// This service mounted on `engine`, behind the same router the emulator serves it on.
+fn mounted_on<Eng: Send + Sync + 'static>(engine: Eng) -> MultiServiceRouter {
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(
+        service_com_amazonaws_agentregistry_agentregistry::EmulatedService::new(
+            std::sync::Arc::new(engine),
+        ),
+    );
+    router
+}
+
+/// What one read answered: the HTTP status, the error code and the sentence.
+async fn answer_of(
+    router: &MultiServiceRouter,
+    path: &str,
+    body: &Value,
+) -> (u16, String, String) {
+    let (status, response) = post(router, path, body).await;
+    (status, error_code(&response), stated(&response))
+}
+
+/// RULE: resolving the registry a request names fails in exactly two ways — the store
+/// holds no such registry, and this engine carries no such store — and each of them is
+/// answered by ONE modelled error at ONE status with ONE sentence, whichever of the three
+/// discovery reads is the one that asked.
+///
+/// The rows differ along which read asked (all three, each of which resolved its registry
+/// in its own handler before), which failure resolving it hit, which form of
+/// `RegistryIdentifier` the request named it by (bare id at both bounds of the pattern's
+/// `[a-zA-Z0-9]{12,16}` run, and the ARN form in two partitions) and — for the engine
+/// condition — which engine type the service was mounted on.
+///
+/// The statuses and codes are the modelled ones: `ResourceNotFoundException` is
+/// `httpError` 404 and `InternalServerException` is `httpError` 500
+/// (`smithy_query(query="operation",
+/// operation="BatchGetDiscoverableRegistryRecord,ListDiscoverableRegistryRecords,\
+/// SearchDiscoverableRegistryRecords")`). Which part of the request may reach the
+/// sentence follows from what the condition is a property of: the identifier for a
+/// registry the store does not hold (the caller reads its own value back), and nothing of
+/// the request for a store that cannot be reached.
+#[tokio::test]
+async fn every_read_states_a_registry_that_does_not_resolve_one_way() {
+    // (the form of `RegistryIdentifier`, a value in that form naming no seeded registry)
+    let identifiers: [(&str, &str); 4] = [
+        ("bare id at the pattern's minimum length", "zzz999999999"),
+        ("bare id at the pattern's maximum length", "ZZ99missing00000"),
+        (
+            "registry ARN",
+            "arn:aws:agent-registry:us-east-1:000000000000:registry/zzz999999999",
+        ),
+        (
+            "registry ARN in another partition",
+            "arn:aws-us-gov:agent-registry:us-gov-west-1:000000000000:registry/zzz999999999",
+        ),
+    ];
+
+    // (the condition, the router serving it, the modelled status and code it is answered
+    //  with, whether the identifier the request named is part of the sentence)
+    let conditions: [(&str, MultiServiceRouter, u16, &str, bool); 3] = [
+        (
+            "a registry the store does not hold",
+            seeded_router(),
+            404,
+            "ResourceNotFoundException",
+            true,
+        ),
+        (
+            "an engine carrying no Agent Registry store",
+            mounted_on(ForeignEngine),
+            500,
+            "InternalServerException",
+            false,
+        ),
+        (
+            "an engine of another shape carrying no Agent Registry store",
+            mounted_on(ForeignEngineWithState {
+                label: "no Agent Registry store".to_string(),
+            }),
+            500,
+            "InternalServerException",
+            false,
+        ),
+    ];
+
+    for (condition, router, expected_status, expected_code, states_identifier) in conditions {
+        for (form, identifier) in identifiers {
+            let mut stated_by: Vec<(&str, String)> = Vec::new();
+            for (operation, path, body) in reads_of(identifier) {
+                let case = format!("{operation} on {condition}, named by a {form}");
+                let (status, code, message) = answer_of(&router, &path, &body).await;
+                assert_eq!(
+                    status, expected_status,
+                    "case {case:?}: expected {expected_status}, got {status} ({code:?}: \
+                     {message:?})"
+                );
+                assert!(
+                    code.contains(expected_code),
+                    "case {case:?}: expected {expected_code}, got {code:?}: {message:?}"
+                );
+                assert_eq!(
+                    message.contains(identifier),
+                    states_identifier,
+                    "case {case:?}: expected the identifier stated in the sentence: \
+                     {states_identifier}, got {message:?}"
+                );
+                assert!(
+                    !message.is_empty(),
+                    "case {case:?}: expected a sentence, got {message:?}"
+                );
+                stated_by.push((operation, message));
+            }
+            let (first_read, first_sentence) = stated_by
+                .first()
+                .cloned()
+                .expect("every condition is asked of the three reads");
+            for (operation, message) in &stated_by {
+                assert_eq!(
+                    message, &first_sentence,
+                    "case {condition:?} named by a {form:?}: {operation} words it \
+                     {message:?} where {first_read} words it {first_sentence:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The contrast, so the agreement above is about a registry that did not resolve and not
+/// about the reads answering alike whatever happens: on the engine that DOES carry the
+/// store, every one of the three reads serves the registries it holds.
+#[tokio::test]
+async fn a_registry_that_resolves_is_served_by_every_read() {
+    let router = seeded_router();
+    for registry in [REGISTRY, EMPTY_REGISTRY] {
+        for (operation, path, body) in reads_of(registry) {
+            let case = format!("{operation} on {registry}");
+            let (status, code, message) = answer_of(&router, &path, &body).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected 200, got {status} ({code:?}: {message:?})"
+            );
+        }
+    }
 }

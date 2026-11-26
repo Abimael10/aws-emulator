@@ -22,13 +22,14 @@
 
 use super::{Registry, RegistryRecord};
 use crate::ops::types as discovery;
+use crate::ops::types::{InternalServerException, ResourceNotFoundException};
 use ::service_com_amazonaws_agentregistrycontrol_agentregistrycontrol::state as control;
 use ::service_com_amazonaws_agentregistrycontrol_agentregistrycontrol::ops::types as owner;
 
 /// This engine carries no Agent Registry store at all, so no discovery read can be
-/// answered from it. Each operation turns it into its own modelled
-/// `InternalServerException`, worded by [`STORE_UNAVAILABLE_MESSAGE`]; it is never a "that
-/// registry does not exist".
+/// answered from it. [`resolve`] turns it into the modelled `InternalServerException`
+/// worded by [`STORE_UNAVAILABLE_MESSAGE`], which each operation carries in its own error
+/// channel; it is never a "that registry does not exist".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreUnavailable;
 
@@ -42,7 +43,9 @@ pub const STORE_UNAVAILABLE_MESSAGE: &str = "the Agent Registry store is unavail
 ///
 /// `Ok(None)` when the owner's store holds no such registry — which is what every
 /// discovery read answers `ResourceNotFoundException` for — and `Err(StoreUnavailable)`
-/// when this engine carries no store to resolve it in.
+/// when this engine carries no store to resolve it in. A discovery read calls
+/// [`resolve`], which is where those two failures become the modelled errors it answers
+/// them with.
 ///
 /// The owner's clock-owed status transitions are materialised first, through the owner's
 /// own accessor: a registry whose creation span has elapsed is `READY` and a record whose
@@ -60,6 +63,48 @@ pub fn registry<Eng: Send + Sync + 'static>(
     state.materialise_due_transitions();
     let registry_id = super::registry_id_from_identifier(identifier);
     Ok(state.registries.get(registry_id).map(discoverable))
+}
+
+/// How ONE discovery read carries the two ways resolving a registry can fail.
+///
+/// [`resolve`] is where each failure of [`registry`] becomes a modelled exception, so
+/// which exception a failure becomes — and the sentence it carries — is decided in one
+/// place for all three reads. What a read still owns is its own error channel: every
+/// operation of this model declares its errors as an enum of its own, so each read
+/// implements this trait by naming the variant it carries an already-worded exception
+/// in, and nothing else.
+pub trait RegistryResolution: Sized {
+    /// This read's channel for [`StoreUnavailable`]: the modelled
+    /// `InternalServerException` worded by [`STORE_UNAVAILABLE_MESSAGE`].
+    fn store_unavailable(exception: InternalServerException) -> Self;
+
+    /// This read's channel for a registry the owner's store does not hold: the modelled
+    /// `ResourceNotFoundException` worded by [`super::registry_not_found`].
+    fn registry_not_found(exception: ResourceNotFoundException) -> Self;
+}
+
+/// The registry the `RegistryIdentifier` `identifier` names, or the calling read's own
+/// modelled refusal for why it did not resolve — the one mapping of [`registry`]'s two
+/// failure modes onto the modelled errors every discovery read answers them with.
+///
+/// This is what a read calls: it resolves the registry through [`registry`] and leaves
+/// the read only the lift into its own error channel ([`RegistryResolution`]), so the
+/// three reads cannot drift in which failure they report as which modelled error.
+pub fn resolve<Eng: Send + Sync + 'static, Refusal: RegistryResolution>(
+    engine: &Eng,
+    identifier: &str,
+) -> Result<Registry, Refusal> {
+    match registry(engine, identifier) {
+        Err(StoreUnavailable) => Err(Refusal::store_unavailable(InternalServerException {
+            message: Some(STORE_UNAVAILABLE_MESSAGE.to_string()),
+        })),
+        // The identifier is stated exactly as the request supplied it, which is why the
+        // refusal is built from the identifier this resolver was handed.
+        Ok(None) => Err(Refusal::registry_not_found(super::registry_not_found(
+            identifier,
+        ))),
+        Ok(Some(registry)) => Ok(registry),
+    }
 }
 
 /// One registry of the owner's store as the discovery surface sees it: its identity and
