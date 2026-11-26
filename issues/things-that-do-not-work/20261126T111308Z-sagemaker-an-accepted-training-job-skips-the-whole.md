@@ -1,0 +1,48 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: sagemaker.algorithm-delete-allowed-while-referenced
+Issue-Shape-Id: com.amazonaws.sagemaker#SageMaker
+Issue-Key: sagemaker.algorithm-delete-allowed-while-referenced|_wait_secondary_status_at_least_downloading#16|AssertionError|raise AssertionError(
+Issue-Commit: 6c92ba71c5d15ae01ba85514d047ce7aed8fd467
+
+# sagemaker: an accepted training job skips the whole InProgress SecondaryStatus lifecycle — it is already Completed/Completed on the first read-back, so no active-container phase is ever observable
+
+> _Note: this issue was identified against the code base at commit `6c92ba71c5d15ae01ba85514d047ce7aed8fd467`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+DescribeTrainingJob
+
+## Description
+Cause 1 of 1: a training job created by CreateTrainingJob never traverses the modeled InProgress secondary-status lifecycle. The emulator reports the job as TrainingJobStatus=InProgress at the instant CreateTrainingJob returns, but by the time a client polls DescribeTrainingJob the job is already TrainingJobStatus=Completed with SecondaryStatus=Completed — it never passes through any of the InProgress secondary statuses, so a poller that waits for an active-container phase can never see one. Failing check id: sagemaker.algorithm-delete-allowed-while-referenced.
+
+AWS: Smithy (services/service-com-amazonaws-sagemaker-sagemaker/smithy-model/com-amazonaws-sagemaker-sagemaker.json) models DescribeTrainingJob's TrainingJobStatus (enum: InProgress, Completed, Failed, Stopping, Stopped, Deleting), SecondaryStatus (enum: Starting, LaunchingMLInstances, PreparingTrainingStack, Downloading, DownloadingTrainingImage, Training, Uploading, Stopping, Stopped, MaxRuntimeExceeded, Completed, Failed, Interrupted, MaxWaitTimeExceeded, Updating, Restarting, Pending) and SecondaryStatusTransitions (list of SecondaryStatusTransition{Status required, StartTime required, EndTime, StatusMessage}). SecondaryStatusTransition.Status's own documentation states the grouping as a requirement: while TrainingJobStatus is InProgress the SecondaryStatus is one of Starting ("Starting the training job"), Downloading ("data is being downloaded to the ML storage volumes"), Training ("Training is in progress") or Uploading ("Training is complete and the model artifacts are being uploaded to the S3 location"); SecondaryStatus becomes Completed only once TrainingJobStatus is Completed. The shape's own doc says a training job "can be in one of several states, for example, starting, downloading, training, or uploading" and that SecondaryStatusTransitions "provides additional details about a status that the training job has transitioned through" — i.e. the transitions AWS records are the phases the job actually went through, and a real job that reaches Completed has gone through Starting and Training at minimum. No status code or error code is involved: all calls here are HTTP 200.
+
+Emulator: DescribeTrainingJob on an accepted job returns TrainingJobStatus=Completed with SecondaryStatus=Completed on the very first poll of a job that CreateTrainingJob had just reported InProgress. The replay fails in the check's poller with: "training job <TrainingJobName> left InProgress (status=Completed, secondary=Completed) before reaching an active-container phase" — the poller accepts any of Downloading / DownloadingTrainingImage / Training / Uploading and saw none of them. The job name in that message is the request's TrainingJobName and is a per-run value; the requirement is the transition sequence, not the name. The emulator therefore treats the job's lifecycle as a single instantaneous step from InProgress to the terminal status instead of a sequence of secondary phases with recorded transitions.
+
+Why: a client that relies on AWS's lifecycle cannot observe a running job at all. Every SageMaker poller — the SDK's TrainingJobCompletedOrStopped-style waiters, console/CLI progress reporting, and any code that branches on SecondaryStatus (for example to tell "still downloading input" from "container is training", or to read SecondaryStatusTransitions[].StatusMessage/StartTime/EndTime for per-phase timing) — sees a job that was never downloading, never training and never uploading. Any test or automation that must act while a job is live (stopping it, checking that a referenced resource may still be deleted mid-run, measuring per-phase duration, asserting an input channel was actually downloaded) has no window in which to act and no evidence the phases occurred. It also makes the job's "activeness" unobservable, so a client cannot distinguish a job that genuinely ran from one that was accepted and instantly marked done.
+
+Fix: belongs in the SageMaker training-job state model and its DescribeTrainingJob read-back — the component that advances a created training job's status. It must drive TrainingJobStatus/SecondaryStatus through the modeled InProgress phases (Starting, then Downloading when a File-mode input channel is present, then Training, then Uploading) before setting the terminal TrainingJobStatus, keep SecondaryStatus inside the InProgress group for as long as TrainingJobStatus is InProgress, and append one SecondaryStatusTransition per phase entered with its StartTime, its EndTime once the phase is left, and its StatusMessage, so DescribeTrainingJob's SecondaryStatusTransitions reflects the phases the job went through. Note the open issues 20261025T095709Z-sagemaker-training-jobs-never-run-an-accepted-createtrainingjob.md, 20261025T224154Z-sagemaker-createtrainingjob-is-accepted-but-never-executed-the.md and 20261029T211510Z-s3-sagemaker-sagemaker-jobs-never-execute-and-are-never-validated.md describe a job ending Failed with a no-container-runtime FailureReason and writing no model artifact; they do not cover this cause — the job observed here ends Completed, and the divergence is the missing secondary-status progression and transition record rather than the terminal outcome or the artifact.
+
+Traces: sagemaker.algorithm-delete-allowed-while-referenced (the check's remaining assertions — DeleteAlgorithm succeeding while a live job references the algorithm, DescribeAlgorithm/second DeleteAlgorithm reporting ValidationException "Algorithm <AlgorithmArn> does not exist.", and the job staying describable and still naming its deleted algorithm — are never reached because the poller fails first, so they are unverified by this run).
+
+## Evidence
+Check sagemaker.algorithm-delete-allowed-while-referenced, verdict mismatch.
+
+Expected (AWS, per the Smithy model's SecondaryStatus/SecondaryStatusTransition docs): while TrainingJobStatus == "InProgress", SecondaryStatus progresses through the InProgress group — Starting, then Downloading (File input mode), then Training, then Uploading — and only becomes "Completed" when TrainingJobStatus becomes "Completed"; DescribeTrainingJob.SecondaryStatusTransitions records one entry per phase entered with Status + StartTime (+ EndTime once left, + StatusMessage).
+
+Actual (emulator): CreateTrainingJob returns and the immediately following DescribeTrainingJob already reports TrainingJobStatus="Completed", SecondaryStatus="Completed". The check's poller, which polls DescribeTrainingJob every 10 s for up to 300 s and accepts SecondaryStatus in ("Downloading", "DownloadingTrainingImage", "Training", "Uploading"), observed none of them and aborted:
+
+  AssertionError: training job <TrainingJobName> left InProgress (status=Completed, secondary=Completed) before reaching an active-container phase
+  (raised at check_sagemaker_algorithm_delete_allowed_while_referenced.py line 227, from run() line 73)
+
+In that message, the fixed text is "training job ... left InProgress (status=..., secondary=...) before reaching an active-container phase"; <TrainingJobName> is the request's job name and the status/secondary values are the emulator's state — all per-run values. The requirement being violated is the sequence itself: zero InProgress secondary phases were observable between the InProgress reported by CreateTrainingJob and the terminal Completed.
+
+All calls in this sequence returned HTTP 200; no error code is involved.
+
+## Steps to Reproduce
+1. CreateTrainingJob with AlgorithmSpecification={"AlgorithmName": <an algorithm created via CreateAlgorithm whose TrainingSpecification.TrainingImage is a built-in-algorithm ECR image>, "TrainingInputMode": "File"}, a role trusting sagemaker.amazonaws.com, ResourceConfig={"InstanceType": "ml.m5.large", "InstanceCount": 1, "VolumeSizeInGB": 1}, OutputDataConfig={"S3OutputPath": "s3://<bucket>/output"} and StoppingCondition={"MaxRuntimeInSeconds": 120}.
+2. DescribeTrainingJob immediately: TrainingJobStatus is "InProgress".
+3. Poll DescribeTrainingJob every 10 s and record (TrainingJobStatus, SecondaryStatus) plus SecondaryStatusTransitions.
+4. Observe that the next observation is already ("Completed", "Completed"): SecondaryStatus is never any of Starting / Downloading / Training / Uploading while TrainingJobStatus is "InProgress", and no per-phase SecondaryStatusTransitions entries for those phases are ever present. On AWS the job spends time in the InProgress secondary phases and DescribeTrainingJob reports each of them, with SecondaryStatusTransitions accumulating one entry per phase.
+5. Replay the check: run_behavioral_suite and look at sagemaker.algorithm-delete-allowed-while-referenced.
