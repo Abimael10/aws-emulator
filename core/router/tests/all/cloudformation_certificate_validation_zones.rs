@@ -921,3 +921,284 @@ async fn a_zone_that_cannot_hold_the_record_fails_the_resource_under_the_minted_
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The failed row keeps the minted identifier, and says whose refusal failed it
+// ---------------------------------------------------------------------------
+
+/// One row of the kept-identifier table: a declaration whose named zone cannot hold the
+/// covered name's challenge record, read through the LIST form of the resource read and taken
+/// down afterwards.
+///
+/// The rows differ along what the rule generalises over: why the named zone cannot hold the
+/// record, the FORM of the covered name (a zone apex, a name inside the zone, a wildcard over
+/// it), the Region, and which `CreateStack` member leaves the failed resource in place — the
+/// one that disables the rollback and the one that asks for nothing to be done on failure,
+/// since what the row carries is the same either way.
+struct KeptRow {
+    case: &'static str,
+    region: &'static str,
+    /// The zone the covered name itself lives in, which is what lets ACM hand out a challenge
+    /// for it at all.
+    own_zone: &'static str,
+    /// The name the certificate covers.
+    domain: &'static str,
+    /// The zone the declaration names for that covered name, which the challenge record's own
+    /// name does not sit in.
+    named_zone: &'static str,
+    /// The `CreateStack` member that leaves the failed resource in place rather than rolling
+    /// it back, so its row stays readable.
+    kept_by: (&'static str, &'static str),
+}
+
+const KEPT_ROWS: &[KeptRow] = &[
+    KeptRow {
+        case: "a sibling zone, the failed create left in place by DisableRollback",
+        region: "us-east-2",
+        own_zone: "cfn-acm-kept-one.example",
+        domain: "cfn-acm-kept-one.example",
+        named_zone: "cfn-acm-kept-other.example",
+        kept_by: ("DisableRollback", "true"),
+    },
+    KeptRow {
+        case: "a zone below the covered name, the failed create left in place by OnFailure",
+        region: "eu-west-2",
+        own_zone: "cfn-acm-kept-two.example",
+        domain: "api.cfn-acm-kept-two.example",
+        named_zone: "under.cfn-acm-kept-two.example",
+        kept_by: ("OnFailure", "DO_NOTHING"),
+    },
+    KeptRow {
+        case: "a wildcard covered name whose challenge the named sibling zone cannot hold",
+        region: "ap-northeast-1",
+        own_zone: "cfn-acm-kept-three.example",
+        domain: "*.cfn-acm-kept-three.example",
+        named_zone: "cfn-acm-kept-three-other.example",
+        kept_by: ("DisableRollback", "true"),
+    },
+];
+
+/// The name of the hosted zone `zone_id`, as Route 53 reports it — fully qualified, which is
+/// how a refusal about that zone names it.
+async fn hosted_zone_name(
+    router: &MultiServiceRouter,
+    region: &str,
+    zone_id: &str,
+    case: &str,
+) -> String {
+    let (status, body) = route53(
+        router,
+        region,
+        "GET",
+        &format!("/2013-04-01/hostedzone/{zone_id}"),
+        "",
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from GetHostedZone for {zone_id}, got {status} with \
+         body {body}"
+    );
+    element(&body, "Name").to_string()
+}
+
+/// Every row: the failed resource's row carries the ARN ACM minted — in the LIST read a client
+/// makes of it as well as in the single read — its `ResourceStatusReason` is the refusal of the
+/// service that would not take the record, worded with ACM's own challenge name and the named
+/// zone's own name, and the certificate behind that identifier is still there, waiting on proof
+/// of domain control, until the stack is taken down — after which ACM resolves the identifier
+/// to nothing.
+#[tokio::test]
+async fn a_failed_certificate_row_keeps_the_minted_arn_and_quotes_the_refusal() {
+    let router = build_router();
+
+    for (index, row) in KEPT_ROWS.iter().enumerate() {
+        let case = row.case;
+        let region = row.region;
+        let stack_name = format!("acm-validation-kept-{index}");
+        let _own_zone_id = create_zone(&router, region, row.own_zone, case).await;
+        let named_zone_id = create_zone(&router, region, row.named_zone, case).await;
+        let template = json!({
+            "Resources": {
+                "Certificate": {
+                    "Type": "AWS::CertificateManager::Certificate",
+                    "Properties": {
+                        "DomainName": row.domain,
+                        "ValidationMethod": "DNS",
+                        "DomainValidationOptions": [
+                            { "DomainName": row.domain, "HostedZoneId": named_zone_id }
+                        ]
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let (status, body) = cloudformation(
+            &router,
+            region,
+            "CreateStack",
+            &[
+                ("StackName", &stack_name),
+                ("TemplateBody", &template),
+                (row.kept_by.0, row.kept_by.1),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from CreateStack, got {status} with body {body}"
+        );
+
+        let (resource_status, certificate_arn, _, read) =
+            wait_for_resource(&router, region, &stack_name, "Certificate", CREATE_FAILED).await;
+        assert_eq!(
+            resource_status, CREATE_FAILED,
+            "case {case:?}: expected the certificate resource to reach {CREATE_FAILED}, got \
+             {read}"
+        );
+        assert!(
+            is_well_formed_certificate_arn(&certificate_arn, region),
+            "case {case:?}: expected the failed row to keep the ACM certificate ARN the create \
+             minted, got {certificate_arn:?} in {read}"
+        );
+        // The reason is read through the DECODING reader: it quotes another service's message
+        // inside its own, so the answer carries that message's quotes as entities.
+        let reason = elements(&read, "ResourceStatusReason")
+            .first()
+            .cloned()
+            .unwrap_or_default();
+
+        // The LIST read of the stack's resources carries the same identifier: the handle on the
+        // certificate does not depend on which read a client makes.
+        let (status, listed) = cloudformation(
+            &router,
+            region,
+            "DescribeStackResources",
+            &[
+                ("StackName", &stack_name),
+                ("LogicalResourceId", "Certificate"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from DescribeStackResources, got {status} with \
+             body {listed}"
+        );
+        assert_eq!(
+            opt_element(&listed, "ResourceStatus").as_deref(),
+            Some(CREATE_FAILED),
+            "case {case:?}: expected the listed row to report {CREATE_FAILED}, got {listed}"
+        );
+        assert_eq!(
+            opt_element(&listed, "PhysicalResourceId").as_deref(),
+            Some(certificate_arn.as_str()),
+            "case {case:?}: expected the listed row to carry the minted ARN \
+             {certificate_arn:?}, got {listed}"
+        );
+
+        // That identifier is a usable ACM handle: the certificate exists and is still waiting
+        // on proof of domain control, because what failed was the publication of the proof.
+        let (status, answer) = acm(
+            &router,
+            region,
+            "DescribeCertificate",
+            &json!({ "CertificateArn": certificate_arn.clone() }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from DescribeCertificate on the id the failed row \
+             carries, got {status} with body {answer}"
+        );
+        assert_eq!(
+            answer["Certificate"]["CertificateArn"].as_str(),
+            Some(certificate_arn.as_str()),
+            "case {case:?}: expected ACM to resolve the row's identifier to that certificate, \
+             got {answer}"
+        );
+        assert_eq!(
+            answer["Certificate"]["Status"].as_str(),
+            Some(PENDING_VALIDATION),
+            "case {case:?}: expected the certificate to be left in {PENDING_VALIDATION}, got \
+             {answer}"
+        );
+
+        // The reason is the refusal of the service that would not take the record, worded with
+        // the challenge name ACM handed out and the name of the zone that refused it — both
+        // read back here rather than composed. Everything past the call's own identifier is
+        // per-run (the request id, the attempt count, the resource request's token).
+        let challenges = challenge_records(&router, region, &certificate_arn, case).await;
+        let (challenge_name, _) = challenges
+            .get(row.domain)
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: no challenge for {:?}", row.domain));
+        let refusing_zone = hosted_zone_name(&router, region, &named_zone_id, case).await;
+        let opening = format!(
+            "Resource handler returned message: \"[RRSet with DNS name {challenge_name} is not \
+             permitted in zone {refusing_zone}] (Service: Route53, Status Code: 400, Request \
+             ID: "
+        );
+        assert!(
+            reason.starts_with(&opening),
+            "case {case:?}: expected the failed row's reason to open {opening:?}, got {reason:?}"
+        );
+        assert!(
+            reason.contains("(SDK Attempt Count: "),
+            "case {case:?}: expected the reason to report the attempts the call was made in, \
+             got {reason:?}"
+        );
+        assert!(
+            reason.ends_with(&format!(", HandlerErrorCode: {GENERAL_SERVICE_EXCEPTION})")),
+            "case {case:?}: expected the reason to close under HandlerErrorCode \
+             {GENERAL_SERVICE_EXCEPTION}, got {reason:?}"
+        );
+
+        // Taking the stack down deletes the certificate it left behind, so the identifier the
+        // failed row published resolves to nothing afterwards.
+        let (status, body) =
+            cloudformation(&router, region, "DeleteStack", &[("StackName", &stack_name)]).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from DeleteStack, got {status} with body {body}"
+        );
+        let mut last = (200, Value::Null);
+        for _ in 0..POLLS {
+            last = acm(
+                &router,
+                region,
+                "DescribeCertificate",
+                &json!({ "CertificateArn": certificate_arn.clone() }),
+            )
+            .await;
+            if last.0 != 200 {
+                break;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        let (status, gone) = last;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected ACM to hold no certificate for {certificate_arn:?} once \
+             the stack was deleted, got {status} with body {gone}"
+        );
+        assert_eq!(
+            gone["__type"]
+                .as_str()
+                .unwrap_or_default()
+                .split('#')
+                .next_back(),
+            Some("ResourceNotFoundException"),
+            "case {case:?}: expected ResourceNotFoundException for the deleted certificate, got \
+             {gone}"
+        );
+        let expected_message = format!("Could not find certificate {certificate_arn}.");
+        assert_eq!(
+            gone["message"].as_str(),
+            Some(expected_message.as_str()),
+            "case {case:?}: expected the refusal to name the certificate it could not find, got \
+             {gone}"
+        );
+    }
+}
