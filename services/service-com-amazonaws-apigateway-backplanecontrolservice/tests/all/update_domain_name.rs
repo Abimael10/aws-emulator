@@ -197,8 +197,15 @@ async fn a_patched_domain_name_member_is_stored_and_read_back() {
             vec![("routingMode", json!("ROUTING_RULE_ONLY"))],
         ),
         (
+            // `endpointAccessMode` is "only available for DomainNames that use security
+            // policies that start with SecurityPolicy_", so the record this row adds a mode
+            // to is created under one of them.
             "add the endpoint access mode",
-            regional_request(),
+            {
+                let mut request = regional_request();
+                request["securityPolicy"] = json!("SecurityPolicy_TLS13_1_2_2021_06");
+                request
+            },
             vec![op("add", "/endpointAccessMode", Some("STRICT"))],
             vec![("endpointAccessMode", json!("STRICT"))],
         ),
@@ -488,6 +495,19 @@ async fn each_enum_typed_member_takes_exactly_its_declared_value_set() {
     created_domain(&gateway, name, regional_request()).await;
 
     for (member, path, values) in &members {
+        // `endpointAccessMode` is "only available for DomainNames that use security
+        // policies that start with SecurityPolicy_", so the record carries one of them
+        // before that member's own values are driven; the previous member's rows left it
+        // on a legacy policy.
+        if *member == "endpointAccessMode" {
+            patch_ok(
+                &gateway,
+                "the policy an endpoint access mode is available for",
+                &domain_uri(name),
+                vec![replace("/securityPolicy", "SecurityPolicy_TLS13_1_2_2021_06")],
+            )
+            .await;
+        }
         for value in *values {
             let case = format!("{path} takes {value}");
             let updated = patch_ok(

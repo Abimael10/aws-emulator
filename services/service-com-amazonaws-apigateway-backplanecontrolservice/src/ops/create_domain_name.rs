@@ -192,7 +192,7 @@ use crate::state::{
     bound_chars, bound_domain_name, bound_entries, bound_tag, domain_name_key,
     edge_distribution_domain_name, regional_endpoint_domain_name, DomainNameEntry,
     DEFAULT_ENDPOINT_TYPE, DEFAULT_SECURITY_POLICY, EDGE_DISTRIBUTION_HOSTED_ZONE_ID,
-    MAX_POLICY_CHARS, MAX_STRING_CHARS, MAX_TAGS, PRIVATE_ENDPOINT_TYPE, REGIONAL_ENDPOINT_TYPE,
+    MAX_POLICY_CHARS, MAX_STRING_CHARS, PRIVATE_ENDPOINT_TYPE, REGIONAL_ENDPOINT_TYPE,
 };
 
 /// Refuse a request whose caller-sized members would grow the store past a bound.
@@ -275,9 +275,10 @@ fn bound_input(input: &CreateDomainNameInput) -> Result<(), String> {
         }
     }
     // The tags a create carries are checked by the SAME rule `TagResource` applies, so a
-    // tag this service refuses on one path cannot be stored through the other.
+    // tag this service refuses on one path cannot be stored through the other — the
+    // per-resource quota included (`crate::state::bound_tags`).
     if let Some(tags) = &input.tags {
-        bound_entries("tags", tags.len(), MAX_TAGS)?;
+        crate::state::bound_tags(tags.len())?;
         for (key, value) in tags {
             bound_tag(key, value)?;
         }
@@ -459,6 +460,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is taken at all.
         bound_input(&input).map_err(bad_request)?;
 
+        // `endpointAccessMode` is "only available for DomainNames that use security
+        // policies that start with SecurityPolicy_", so the pair is read as the record
+        // would be STORED — the policy the request set or the service's default — before
+        // any id is minted, any socket opened or anything stored; see
+        // `crate::state::require_endpoint_access_mode_policy`.
+        let security_policy = input
+            .security_policy
+            .clone()
+            .unwrap_or_else(|| DEFAULT_SECURITY_POLICY.to_string());
+        crate::state::require_endpoint_access_mode_policy(
+            input.endpoint_access_mode.as_deref(),
+            Some(security_policy.as_str()),
+        )
+        .map_err(bad_request)?;
+
         // The endpoint configuration is completed by the rule `CreateRestApi` completes
         // it with — the model declares the shape for "an API (RestApi) or its custom
         // domain name (DomainName)" — so a stored domain name always names its endpoint
@@ -635,11 +651,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // An "optional text message containing detailed information about status of
             // the DomainName migration": nothing here has detail to add to the status.
             domain_name_status_message: None,
-            security_policy: Some(
-                input
-                    .security_policy
-                    .unwrap_or_else(|| DEFAULT_SECURITY_POLICY.to_string()),
-            ),
+            security_policy: Some(security_policy),
             endpoint_access_mode: input.endpoint_access_mode,
             mutual_tls_authentication: input.mutual_tls_authentication.map(|requested| {
                 MutualTlsAuthentication {

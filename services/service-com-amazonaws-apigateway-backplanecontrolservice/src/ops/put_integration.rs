@@ -352,6 +352,31 @@ pub fn complete_integration(integration: &mut GetIntegrationOutput) {
 /// "The valid value is one of the following: WHEN_NO_MATCH … WHEN_NO_TEMPLATES … NEVER".
 pub const PASSTHROUGH_BEHAVIORS: &[&str] = &["WHEN_NO_MATCH", "WHEN_NO_TEMPLATES", "NEVER"];
 
+/// The refusal for a `passthroughBehavior` outside that set.
+///
+/// API Gateway's own sentence for it: ENTIRELY FIXED text — it names the member in the
+/// record's spelling (`PassthroughBehavior`) and then lists the options, comma-separated
+/// with no spaces, in the order the refusal states them ([`PASSTHROUGH_BEHAVIORS_AS_LISTED`]).
+/// The rejected value is NOT part of it: the caller has to pick one of the options, which the
+/// sentence names in full, and the request already carries the value it sent.
+///
+/// `pub` because every call that reads that member onto the set states the same refusal — the
+/// integration a `PutIntegration` creates and the one `UpdateIntegration` patches — so the two
+/// cannot disagree about the sentence.
+pub fn invalid_passthrough_behavior() -> String {
+    format!(
+        "Invalid PassthroughBehavior specified. Valid options are {}",
+        PASSTHROUGH_BEHAVIORS_AS_LISTED.join(",")
+    )
+}
+
+/// The same three values as [`PASSTHROUGH_BEHAVIORS`], in the order the refusal above
+/// enumerates them — which is not the order the member's documentation lists them in.
+///
+/// Two spellings of ONE set: [`valid_passthrough_behaviors_are_listed`] holds them to the
+/// same members, so a value added to one is a value of the other.
+const PASSTHROUGH_BEHAVIORS_AS_LISTED: &[&str] = &["WHEN_NO_MATCH", "NEVER", "WHEN_NO_TEMPLATES"];
+
 /// The `passthroughBehavior` an integration carries when the request sets none: the
 /// behaviour that passes an unmapped body through rather than rejecting it, which is the
 /// first of the three documented values and the one API Gateway applies by default.
@@ -648,10 +673,7 @@ pub fn validate_integration(
         .as_deref()
         .unwrap_or(DEFAULT_PASSTHROUGH_BEHAVIOR);
     if !PASSTHROUGH_BEHAVIORS.contains(&passthrough_behavior) {
-        return Err(format!(
-            "Invalid passthroughBehavior specified: {passthrough_behavior}; expected one of {}",
-            PASSTHROUGH_BEHAVIORS.join(", ")
-        ));
+        return Err(invalid_passthrough_behavior());
     }
 
     accepted_timeout(integration.timeout_in_millis)?;
@@ -835,5 +857,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exactly what this request asks for.
         method.integration = Some(integration.clone());
         Ok(output_of(integration))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two spellings of the passthrough set hold the same values: the set a request is
+    /// checked against ([`PASSTHROUGH_BEHAVIORS`]) and the list the refusal names
+    /// ([`PASSTHROUGH_BEHAVIORS_AS_LISTED`]) are one set, so neither can gain a value the
+    /// other does not have.
+    #[test]
+    fn valid_passthrough_behaviors_are_listed() {
+        let mut checked: Vec<&str> = PASSTHROUGH_BEHAVIORS.to_vec();
+        checked.sort_unstable();
+        let mut listed: Vec<&str> = PASSTHROUGH_BEHAVIORS_AS_LISTED.to_vec();
+        listed.sort_unstable();
+        assert_eq!(
+            checked, listed,
+            "case the passthrough behaviour set: expected the listed values {listed:?} to be \
+             the checked ones {checked:?}"
+        );
     }
 }

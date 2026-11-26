@@ -22,8 +22,9 @@
 //!    expression over the three documented locations.
 //! 5. An `Integration`'s `credentials` names an IAM role, or the caller's own identity, or
 //!    nothing at all.
-//! 6. An explicitly EMPTY `description` is stored as an ABSENT one, on every record that
-//!    carries a description.
+//! 6. An explicitly EMPTY `description` is stored as an ABSENT one, on every record whose
+//!    create accepts one — a `RestApi`'s create refuses it instead, as its own suite
+//!    asserts (`rest_api_description_and_endpoint_access_mode`).
 //! 7. A constraint broken by one of a LIST's elements is stated AT THE LIST MEMBER, quoting
 //!    the list the request carried and nesting the element shape's own requirement.
 
@@ -815,16 +816,14 @@ struct Described {
     id_member: &'static str,
 }
 
-/// The records of this service whose `description` a CREATE sets, so the normalization is
-/// asserted over the member rather than over one resource.
+/// The records of this service whose `description` a CREATE sets AND normalizes, so the
+/// normalization is asserted over the member rather than over one resource.
+///
+/// A `RestApi` is not among them: its create REFUSES a description of no characters rather
+/// than normalizing it away, which its own suite asserts
+/// (`rest_api_description_and_endpoint_access_mode`).
 fn described_records() -> Vec<Described> {
     vec![
-        Described {
-            case: "a RestApi",
-            collection: "/restapis",
-            extra: json!({ "name": "described-api" }),
-            id_member: "id",
-        },
         Described {
             case: "an ApiKey",
             collection: "/apikeys",

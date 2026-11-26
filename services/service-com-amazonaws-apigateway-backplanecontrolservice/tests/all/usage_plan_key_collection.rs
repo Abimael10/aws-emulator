@@ -17,8 +17,8 @@
 //!   in the sequence is a bad request rather than an empty page;
 //! * `nameQuery` narrows the sequence to the keys whose name begins with it, in the same
 //!   order, and pages through the narrowed sequence;
-//! * a `usagePlanId` naming no stored plan is refused 404 rather than served an empty
-//!   page, and an association whose API key is gone is on no page;
+//! * a `usagePlanId` naming no stored plan is SERVED an empty page rather than refused,
+//!   and an association whose API key is gone is on no page;
 //! * a read changes nothing a later caller sees.
 //!
 //! [`Gateway`], [`Answer`], [`assert_failure`], [`string_member`] and [`page_items`] are
@@ -456,7 +456,7 @@ async fn name_query_narrows_the_collection_to_the_keys_whose_name_begins_with_it
 }
 
 #[tokio::test]
-async fn a_usage_plan_id_naming_no_stored_plan_is_refused() {
+async fn a_usage_plan_id_naming_no_stored_plan_is_served_an_empty_page() {
     let gateway = Gateway::new();
     let plan = bare_plan(&gateway, "key-collection-identifiers").await;
     let key = create_key(&gateway, "identifiers", json!({ "name": "identified-key" })).await;
@@ -480,8 +480,10 @@ async fn a_usage_plan_id_naming_no_stored_plan_is_refused() {
     chars[0] = if chars[0] == 'a' { 'b' } else { 'a' };
     let near_miss: String = chars.into_iter().collect();
 
-    // Rows differ in the FORM the unresolvable identifier takes: never minted, id-shaped,
-    // a near miss, the API key's id, and a deleted plan.
+    // "Which keys does this plan meter?" is answered with the keys it meters, and an id no
+    // plan of the account answers to meters none: the listing is the empty page, not an
+    // exception. Rows differ in the FORM the unresolvable identifier takes: never minted,
+    // id-shaped, a near miss, the API key's id, and a deleted plan.
     for identifier in [
         "nosuchplan",
         "0000000000",
@@ -492,12 +494,26 @@ async fn a_usage_plan_id_naming_no_stored_plan_is_refused() {
         for query in ["", "limit=1", "name=identified-key"] {
             let case = format!("GetUsagePlanKeys({identifier:?}, {query:?})");
             let answer = list_keys(&gateway, identifier, query).await;
-            assert_failure(&answer, 404, "NotFoundException", &case);
+            assert_eq!(
+                answer.status, 200,
+                "case {case}: expected the modelled 200, got {} with {:?}",
+                answer.status, answer.body
+            );
+            assert!(
+                listed_ids(&answer.body, &case).is_empty(),
+                "case {case}: expected no items, got {:?}",
+                answer.body
+            );
+            assert!(
+                answer.body["position"].is_null(),
+                "case {case}: an empty page is the last one and omits position, got {:?}",
+                answer.body["position"]
+            );
         }
     }
 
-    // The stored plan IS served, so the refusals above are about the identifier and not
-    // about the operation.
+    // The stored plan IS served its own associations, so the empty pages above are about
+    // the identifier naming no plan and not about the operation.
     let served = listed_ids(
         &listed(&gateway, &plan, "").await,
         "GetUsagePlanKeys(the stored plan)",

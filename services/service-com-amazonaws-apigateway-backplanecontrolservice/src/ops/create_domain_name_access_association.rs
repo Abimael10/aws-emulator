@@ -101,8 +101,8 @@
 use super::types::*;
 
 use crate::state::{
-    bound_chars, bound_entries, bound_tag, DomainNameAccessAssociationEntry,
-    MAX_DOMAIN_NAME_ACCESS_ASSOCIATIONS, MAX_STRING_CHARS, MAX_TAGS, PRIVATE_ENDPOINT_TYPE,
+    bound_chars, bound_tag, DomainNameAccessAssociationEntry,
+    MAX_DOMAIN_NAME_ACCESS_ASSOCIATIONS, MAX_STRING_CHARS, PRIVATE_ENDPOINT_TYPE,
 };
 
 /// The one `accessAssociationSourceType` the model declares, whose source is a VPC endpoint
@@ -138,8 +138,10 @@ fn bound_input(input: &CreateDomainNameAccessAssociationInput) -> Result<(), Str
         &input.access_association_source,
         MAX_STRING_CHARS,
     )?;
+    // The tags a create carries are checked by the SAME rule `TagResource` applies — the
+    // per-resource quota included (`crate::state::bound_tags`).
     if let Some(tags) = &input.tags {
-        bound_entries("tags", tags.len(), MAX_TAGS)?;
+        crate::state::bound_tags(tags.len())?;
         for (key, value) in tags {
             bound_tag(key, value)?;
         }

@@ -23,10 +23,12 @@
 //!   character bound) is refused, with the bound itself and one character past it as the
 //!   rows;
 //! * `stageName` associates the new snapshot with THAT stage, over a table of stages,
-//!   and a stage name the API does not have is not found.
+//!   and a stage name the API does not have is a bad request.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_apigateway_backplanecontrolservice::state::MAX_STRING_CHARS;
+use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
+    MAX_STRING_CHARS, NO_SUCH_STAGE,
+};
 
 use crate::rest_api_lifecycle::{assert_failure, create_api, string_member, Answer, Gateway};
 use crate::stage_lifecycle::create_deployed_stage;
@@ -339,15 +341,22 @@ async fn a_snapshot_created_for_a_stage_is_associated_with_that_stage_only() {
         );
     }
 
-    // A stage name the API does not have names nothing to associate, and the refused
-    // request stores no snapshot.
+    // A stage name the API does not have names nothing to associate: the `stageName` the
+    // request supplied is a bad INPUT to this create (400) rather than a report that the
+    // documentation version was not found, and the refused request stores no snapshot.
     let answer = create_version(
         &gateway,
         &api,
         json!({ "documentationVersion": "v2", "stageName": "nowhere" }),
     )
     .await;
-    assert_failure(&answer, 404, NOT_FOUND, "an unknown stage");
+    assert_failure(&answer, 400, BAD_REQUEST, "an unknown stage");
+    assert_eq!(
+        answer.body["message"].as_str(),
+        Some(NO_SUCH_STAGE),
+        "case an unknown stage: expected the message {NO_SUCH_STAGE:?}, got {:?}",
+        answer.body["message"]
+    );
     let read = get_version(&gateway, &api, "v2").await;
     assert_failure(
         &read,

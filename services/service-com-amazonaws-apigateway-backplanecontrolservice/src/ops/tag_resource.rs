@@ -182,9 +182,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // built: the merged collection always holds at least the request's distinct
         // keys, so a request carrying more entries than the per-resource quota can never
         // be stored anyway — and clamping it here keeps the allocation, the per-key
-        // check and the merge below bounded by the quota rather than by the body.
-        crate::state::bound_entries("tags", input.tags.len(), crate::state::MAX_TAGS)
-            .map_err(bad_request)?;
+        // check and the merge below bounded by the quota rather than by the body. The
+        // sentence is the quota's own ([`crate::state::bound_tags`]), which states that a
+        // refused write applies none of the tags it carried.
+        crate::state::bound_tags(input.tags.len()).map_err(bad_request)?;
         // Collected into a BTreeMap so the merge below is over the sorted collection the
         // records keep.
         let mut requested: BTreeMap<String, String> = BTreeMap::new();
@@ -206,9 +207,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The per-resource tag quota is also charged on the RESULT, which is what the
         // quota is about: re-setting a key the resource already carries does not grow
         // its collection, while a new key that would take it past the quota is refused
-        // before anything is written.
-        crate::state::bound_entries("tags", merged.len(), crate::state::MAX_TAGS)
-            .map_err(bad_request)?;
+        // before anything is written — so NONE of the request's tags is applied, as the
+        // refusal itself states.
+        crate::state::bound_tags(merged.len()).map_err(bad_request)?;
         *stored = merged;
         // The lock covers the state change only; everything below is owned.
         drop(store);

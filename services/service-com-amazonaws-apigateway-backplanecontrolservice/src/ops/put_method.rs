@@ -316,26 +316,47 @@ pub fn authorizer_in_use(method: &MethodEntry) -> Option<&str> {
 }
 
 /// Refuse a `Method` record that breaks one of the rules its own members publish: a
-/// `requestParameters` key that is no method request parameter mapping expression, and an
-/// `authorizerId` that names no `Authorizer` of the api the method belongs to.
+/// `requestParameters` key that is no method request parameter mapping expression, an
+/// `authorizerId` that names no `Authorizer` of the api the method belongs to, and a
+/// `requestValidatorId` that names no `RequestValidator` of it.
 ///
 /// Every rule is stated over the RECORD, so the same check serves the operation that
 /// creates a method and the one that patches it (`UpdateMethod`) — the way
 /// [`super::put_integration::validate_integration`] serves both of an integration's.
-/// `api_authorizer_ids` are the ids of the authorizers the method's own api holds, which is
-/// what an `authorizerId` has to name: an `Authorizer` lives inside one REST API
-/// ([`crate::state::RestApiEntry::authorizers`] is keyed by that id), and the set is passed
-/// in rather than the api because a patch is applied to a COPY of the record with the api's
-/// borrow already given up (as [`crate::state::unknown_model_name`] takes the model names).
+/// `api_authorizer_ids` and `api_request_validator_ids` are the ids of the authorizers and
+/// the request validators the method's own api holds, which is what those two members have
+/// to name: each of those records lives inside one REST API
+/// ([`crate::state::RestApiEntry::authorizers`] and
+/// [`crate::state::RestApiEntry::request_validators`] are keyed by those ids), and the sets
+/// are passed in rather than the api because a patch is applied to a COPY of the record
+/// with the api's borrow already given up (as [`crate::state::unknown_model_name`] takes the
+/// model names).
 pub fn validate_method(
     method: &MethodEntry,
     api_authorizer_ids: &::std::collections::BTreeSet<String>,
+    api_request_validator_ids: &::std::collections::BTreeSet<String>,
 ) -> Result<(), String> {
     // Read in key order, so a record carrying several malformed keys is refused with the
     // same one every time.
     for key in method.request_parameters.keys() {
         if !is_method_request_parameter(key) {
             return Err(invalid_request_parameter(key));
+        }
+    }
+    // `requestValidatorId` "specifies the identifier of a RequestValidator for validating
+    // the method request" (`Method$requestValidatorId`), so it has to name one OF THIS API:
+    // a reference that resolves to nothing validates nothing, and the method would be
+    // deployed claiming a validation no record of the api can perform. Refused with the
+    // sentence this service states for a request validator identifier that names no record,
+    // which is the same one a read of that identifier earns. A member set to the empty
+    // string names no validator, the same unnamed validator an absent member is.
+    if let Some(id) = method
+        .request_validator_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+    {
+        if !api_request_validator_ids.contains(id) {
+            return Err(crate::state::NO_SUCH_REQUEST_VALIDATOR.to_string());
         }
     }
     // A member set to the empty string names no authorizer, so it is the same unnamed
@@ -509,11 +530,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         // The authorizers the method's own api holds, read off the same api and in the
-        // same place, which is what the record's `authorizerId` has to name.
-        let api_authorizer_ids: ::std::collections::BTreeSet<String> = store
+        // same place, which is what the record's `authorizerId` has to name — and, beside
+        // them, the request validators its `requestValidatorId` has to name.
+        let (api_authorizer_ids, api_request_validator_ids): (
+            ::std::collections::BTreeSet<String>,
+            ::std::collections::BTreeSet<String>,
+        ) = store
             .rest_apis
             .get(&input.rest_api_id)
-            .map(|api| api.authorizers.keys().cloned().collect())
+            .map(|api| {
+                (
+                    api.authorizers.keys().cloned().collect(),
+                    api.request_validators.keys().cloned().collect(),
+                )
+            })
             .unwrap_or_default();
         // A method is put ON a resource, so the `(restApiId, resourceId)` pair is resolved
         // as ONE lookup for that resource: an identifier no stored API answers to leaves
@@ -562,14 +592,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             integration: None,
         };
         // The record is held to the rules its own members publish — the forms a
-        // `requestParameters` key takes, and the authorizer an authorization type needs —
-        // BEFORE it is stored, so a refused request leaves the resource's methods as they
+        // `requestParameters` key takes, the authorizer an authorization type needs, and
+        // the records its `authorizerId` and `requestValidatorId` have to name — BEFORE it
+        // is stored, so a refused request leaves the resource's methods as they
         // were. The same check holds a patched method ([`validate_method`]).
-        validate_method(&entry, &api_authorizer_ids).map_err(|message| {
-            PutMethodErrorModeled::BadRequestException(BadRequestException {
-                message: Some(message),
-            })
-        })?;
+        validate_method(&entry, &api_authorizer_ids, &api_request_validator_ids).map_err(
+            |message| {
+                PutMethodErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+            },
+        )?;
 
         resource.methods.insert(verb.clone(), entry);
 

@@ -268,15 +268,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // `stageName` is "the stage name to be associated with the new documentation
             // snapshot", so it has to name a stage of THIS API — there is nothing to
-            // associate otherwise.
+            // associate otherwise. The name is an INPUT member of this call rather than the
+            // resource its URI addresses, so a value naming no stage is the bad request it
+            // is (a 400), not a report that the documentation version was not found; the
+            // sentence is the one this service states for a stage identifier that names no
+            // record, which is what `CreateBasePathMapping` answers for the same member.
             if let Some(stage_name) = &input.stage_name {
                 if !api.stages.contains_key(stage_name) {
-                    return Err(CreateDocumentationVersionErrorModeled::NotFoundException(
-                        NotFoundException {
-                            message: Some(crate::state::NO_SUCH_STAGE.to_string()),
-                        },
-                    )
-                    .into());
+                    return Err(bad_request(crate::state::NO_SUCH_STAGE.to_string()));
                 }
             }
             api.documentation_parts_in_creation_order()

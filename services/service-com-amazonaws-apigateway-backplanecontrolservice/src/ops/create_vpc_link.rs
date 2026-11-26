@@ -136,7 +136,7 @@ pub fn vpc_link_body(entry: &VpcLinkEntry) -> CreateVpcLinkOutput {
 /// link in `FAILED` ([`provisioning_failure`]) instead of refusing the call.
 fn bound_input(input: &CreateVpcLinkInput) -> Result<(), String> {
     use crate::state::{
-        bound_chars, bound_entries, bound_tag, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS, MAX_TAGS,
+        bound_chars, bound_entries, bound_tag, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
     };
 
     bound_chars("name", &input.name, MAX_STRING_CHARS)?;
@@ -166,9 +166,10 @@ fn bound_input(input: &CreateVpcLinkInput) -> Result<(), String> {
         }
     }
     // The tags a create carries are checked by the SAME rule `TagResource` applies, so
-    // a tag this service refuses on one path cannot be stored through the other.
+    // a tag this service refuses on one path cannot be stored through the other — the
+    // per-resource quota included (`crate::state::bound_tags`).
     if let Some(tags) = &input.tags {
-        bound_entries("tags", tags.len(), MAX_TAGS)?;
+        crate::state::bound_tags(tags.len())?;
         for (key, value) in tags {
             bound_tag(key, value)?;
         }

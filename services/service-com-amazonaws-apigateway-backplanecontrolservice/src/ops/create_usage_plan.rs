@@ -141,7 +141,7 @@ impl From<&UsagePlanEntry> for CreateUsagePlanOutput {
 fn bound_input(input: &CreateUsagePlanInput) -> Result<(), String> {
     use crate::state::{
         bound_chars, bound_entries, bound_quota_settings, bound_tag, bound_throttle_settings,
-        MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS, MAX_TAGS,
+        MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
     };
 
     bound_chars("name", &input.name, MAX_STRING_CHARS)?;
@@ -172,9 +172,10 @@ fn bound_input(input: &CreateUsagePlanInput) -> Result<(), String> {
         }
     }
     // The tags a create carries are checked by the SAME rule `TagResource` applies, so a
-    // tag this service refuses on one path cannot be stored through the other.
+    // tag this service refuses on one path cannot be stored through the other — the
+    // per-resource quota included (`crate::state::bound_tags`).
     if let Some(tags) = &input.tags {
-        bound_entries("tags", tags.len(), MAX_TAGS)?;
+        crate::state::bound_tags(tags.len())?;
         for (key, value) in tags {
             bound_tag(key, value)?;
         }

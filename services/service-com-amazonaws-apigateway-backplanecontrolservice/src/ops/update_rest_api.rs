@@ -348,6 +348,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             apply_patch(&mut updated, patch).map_err(patch_failure)?;
         }
 
+        // The PATCHED record is held to the pairing its own members publish:
+        // `endpointAccessMode` is only available on an api whose `securityPolicy` admits
+        // one, so a list that would leave the record carrying a mode without such a policy
+        // — whichever of the two members it wrote — is refused with the create's own
+        // sentence. Checked on the copy, with nothing written yet, so a refused list leaves
+        // the stored api untouched.
+        crate::state::require_endpoint_access_mode_policy(
+            updated.endpoint_access_mode.as_deref(),
+            updated.security_policy.as_deref(),
+        )
+        .map_err(|message| patch_failure(PatchFailure::BadRequest(message)))?;
+
         store.rest_apis.insert(input.rest_api_id.clone(), updated);
         let stored = store
             .rest_apis

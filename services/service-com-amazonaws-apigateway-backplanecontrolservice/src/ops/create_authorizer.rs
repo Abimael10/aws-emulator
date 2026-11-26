@@ -297,7 +297,10 @@ pub fn implied_auth_type(authorizer_type: &str) -> Option<&'static str> {
 ///   without it.
 /// * `identitySource` — "For a TOKEN or COGNITO_USER_POOLS authorizer, this is required
 ///   …. For the REQUEST authorizer, this is required when authorization caching is
-///   enabled", and caching is enabled exactly when the stored TTL is above zero.
+///   enabled", and caching is enabled exactly when the stored TTL is above zero. For a
+///   `TOKEN` authorizer, which authorizes on "a single authorization token submitted in a
+///   custom header", the value also has to BE that header's mapping expression
+///   ([`is_method_request_header`]).
 /// * `providerARNs` — "A list of the Amazon Cognito user pool ARNs for the
 ///   COGNITO_USER_POOLS authorizer": the pools whose tokens are accepted, so that type
 ///   cannot authorize without at least one.
@@ -331,6 +334,23 @@ pub fn require_members_of_type(entry: &AuthorizerEntry) -> Result<(), String> {
     if identity_source_required && !supplied(&entry.identity_source) {
         return Err(INVALID_REQUEST_INPUT.to_string());
     }
+    // A `TOKEN` authorizer reads ONE value — "a single authorization token submitted in a
+    // custom header" (`AuthorizerType`) — and the member "specifies the request header
+    // mapping expression for the custom header holding the authorization token", so a value
+    // that is not such an expression names a header no request could be read from: it is
+    // refused with API Gateway's own sentence for an unreadable token source, which states
+    // the form the source must take and quotes the submitted expression back once
+    // ([`invalid_token_source`]). A `COGNITO_USER_POOLS` authorizer's source is not held to
+    // the form here: the data plane reads a presented token from wherever that expression
+    // names ([`crate::service::invoke`]), and a `REQUEST` authorizer's is "a comma-separated
+    // string of one or more mapping expressions" over any parameter location.
+    if authorizer_type == AUTHORIZER_TYPE_TOKEN {
+        if let Some(source) = entry.identity_source.as_deref() {
+            if !is_method_request_header(source) {
+                return Err(invalid_token_source(source));
+            }
+        }
+    }
     if authorizer_type == AUTHORIZER_TYPE_COGNITO_USER_POOLS && entry.provider_arns.is_empty() {
         return Err(INVALID_REQUEST_INPUT.to_string());
     }
@@ -341,6 +361,46 @@ pub fn require_members_of_type(entry: &AuthorizerEntry) -> Result<(), String> {
 /// one sentence API Gateway answers every one of them with, which makes no claim about
 /// which member is at fault.
 pub const INVALID_REQUEST_INPUT: &str = "Invalid request input";
+
+/// The prefix of the method request HEADER mapping expression a token source is: a method
+/// request parameter in the `header` location, as `Method$requestParameters` spells it
+/// ([`super::put_method::METHOD_REQUEST_PARAMETER_PREFIX`] with that location).
+pub const METHOD_REQUEST_HEADER_PREFIX: &str = "method.request.header.";
+
+/// The characters the header NAME inside such an expression is made of, as the refusal
+/// itself publishes them ([`invalid_token_source`]): `[a-zA-Z0-9._-]`.
+fn is_token_source_name_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+}
+
+/// Whether `source` is the method request header mapping expression a token source has to
+/// be: the documented prefix followed by at least one character of a header name.
+///
+/// One expression, not a list: a comma-separated list of mapping expressions is what the
+/// `REQUEST` type's identity sources are, while a `TOKEN` authorizer authorizes on "a single
+/// authorization token submitted in a custom header" (`AuthorizerType`), whose mapping
+/// expression this is.
+pub fn is_method_request_header(source: &str) -> bool {
+    let Some(name) = source.strip_prefix(METHOD_REQUEST_HEADER_PREFIX) else {
+        return false;
+    };
+    !name.is_empty() && name.chars().all(is_token_source_name_char)
+}
+
+/// The refusal for an identity source that is no method request header mapping expression
+/// on a `TOKEN` authorizer, which authorizes on the token that header holds.
+///
+/// The fixed text is everything but the expression: API Gateway states the rejected value
+/// once — it is what the caller has to change — and then the form the source must take,
+/// spelled as the pattern it publishes. Shared by every writer of the member, the create
+/// and the record `UpdateAuthorizer` patches, so one value is refused the same way whichever
+/// call wrote it.
+pub fn invalid_token_source(identity_source: &str) -> String {
+    format!(
+        "Invalid token source expression: {identity_source}. The source must be a method \
+         request header, matching 'method.request.header.[a-zA-Z0-9._-]+'"
+    )
+}
 
 /// The refusal for an authorizer whose `type` needs a Lambda to call and that carries no
 /// `authorizerUri`.

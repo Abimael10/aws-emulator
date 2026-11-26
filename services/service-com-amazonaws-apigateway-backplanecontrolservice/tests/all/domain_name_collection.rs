@@ -230,7 +230,10 @@ async fn a_created_domain_name_is_persisted_and_read_back_for_every_endpoint_typ
         let mut request = json!({
             "certificateName": "the certificate",
             "certificateArn": "arn:aws:acm:us-east-1:000000000000:certificate/abc",
-            "securityPolicy": "TLS_1_2",
+            // `endpointAccessMode` is "only available for DomainNames that use security
+            // policies that start with SecurityPolicy_", so the record that reports a mode
+            // is created under one of them.
+            "securityPolicy": "SecurityPolicy_TLS13_1_2_2021_06",
             "endpointAccessMode": "BASIC",
             "routingMode": "BASE_PATH_MAPPING_ONLY",
             "mutualTlsAuthentication": {
@@ -274,7 +277,7 @@ async fn a_created_domain_name_is_persisted_and_read_back_for_every_endpoint_typ
                 "certificateArn",
                 "arn:aws:acm:us-east-1:000000000000:certificate/abc",
             ),
-            ("securityPolicy", "TLS_1_2"),
+            ("securityPolicy", "SecurityPolicy_TLS13_1_2_2021_06"),
             ("endpointAccessMode", "BASIC"),
             ("routingMode", "BASE_PATH_MAPPING_ONLY"),
         ] {

@@ -265,10 +265,9 @@ fn apply_patch(entry: &mut GetIntegrationOutput, patch: &Patch) -> Result<(), Pa
                 patch.require_single_valued()?;
                 let value = patch.require_value()?;
                 if !PASSTHROUGH_BEHAVIORS.contains(&value) {
-                    return Err(PatchFailure::BadRequest(format!(
-                        "Invalid passthroughBehavior specified: {value}; expected one of {}",
-                        PASSTHROUGH_BEHAVIORS.join(", ")
-                    )));
+                    return Err(PatchFailure::BadRequest(
+                        super::put_integration::invalid_passthrough_behavior(),
+                    ));
                 }
             }
             let mut behavior = entry.passthrough_behavior.clone().unwrap_or_default();

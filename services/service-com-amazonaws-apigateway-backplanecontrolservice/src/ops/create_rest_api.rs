@@ -195,6 +195,17 @@ pub const API_STATUS_AVAILABLE: &str = "AVAILABLE";
 /// naming the member and quoting nothing back.
 pub const EMPTY_NAME: &str = "Name cannot be an empty string";
 
+/// The `BadRequestException` message for a `description` the request supplied as a string
+/// of no characters.
+///
+/// API Gateway's own sentence for it, worded exactly as the one for an empty `name`
+/// ([`EMPTY_NAME`]): entirely fixed text naming the member and quoting nothing back. A
+/// `description` the request SUPPLIES describes the API, so a value carrying no characters
+/// describes nothing — the api is refused rather than created with the member normalized
+/// away, which is what `crate::state::stored_description` does for the records whose
+/// create accepts an empty one.
+pub const EMPTY_DESCRIPTION: &str = "Description cannot be an empty string";
+
 
 /// The `path` of an API's implicit root resource.
 pub const ROOT_RESOURCE_PATH: &str = "/";
@@ -207,7 +218,7 @@ pub const ROOT_RESOURCE_PATH: &str = "/";
 fn bound_input(input: &CreateRestApiInput) -> Result<(), String> {
     use crate::state::{
         bound_chars, bound_entries, bound_tag, MAX_COLLECTION_ENTRIES, MAX_POLICY_CHARS,
-        MAX_STRING_CHARS, MAX_TAGS,
+        MAX_STRING_CHARS,
     };
 
     bound_chars("name", &input.name, MAX_STRING_CHARS)?;
@@ -235,7 +246,7 @@ fn bound_input(input: &CreateRestApiInput) -> Result<(), String> {
     // The tags a create carries are checked by the SAME rule `TagResource` applies, so
     // a tag this service refuses on one path cannot be stored through the other.
     if let Some(tags) = &input.tags {
-        bound_entries("tags", tags.len(), MAX_TAGS)?;
+        crate::state::bound_tags(tags.len())?;
         for (key, value) in tags {
             bound_tag(key, value)?;
         }
@@ -415,6 +426,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A `description` the request SUPPLIED is what the API is described by, so — like
+        // the `name` above — a value carrying no characters describes nothing and is
+        // refused with API Gateway's own sentence for it ([`EMPTY_DESCRIPTION`]). An
+        // ABSENT member describes nothing either, and is accepted: it supplies no value at
+        // all.
+        if input.description.as_deref() == Some("") {
+            return Err(CreateRestApiErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(EMPTY_DESCRIPTION.to_string()),
+                },
+            )
+            .into());
+        }
+
         // The model declares no range on `minimumCompressionSize`, so the boundary
         // validator passes any integer; the member's documented bounds are enforced
         // here, with the fixed sentence the service answers an out-of-range size with:
@@ -426,6 +451,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })?;
         }
+
+        // `endpointAccessMode` is "only available for RestApis that use security policies
+        // that start with SecurityPolicy_", so the pair is read as the record would be
+        // STORED — the policy the request set or the service's default — before anything is
+        // minted; see `crate::state::require_endpoint_access_mode_policy`.
+        let security_policy = input
+            .security_policy
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_SECURITY_POLICY.to_string());
+        crate::state::require_endpoint_access_mode_policy(
+            input.endpoint_access_mode.as_deref(),
+            Some(security_policy.as_str()),
+        )
+        .map_err(|message| {
+            CreateRestApiErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        })?;
 
         // FIRST critical section: refuse past the API quota, resolve `cloneFrom`, take
         // a bounded snapshot of the tree to copy, and reserve every id this call needs.
@@ -547,11 +590,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.endpoint_configuration,
             )),
             policy,
-            security_policy: Some(
-                input
-                    .security_policy
-                    .unwrap_or_else(|| crate::state::DEFAULT_SECURITY_POLICY.to_string()),
-            ),
+            security_policy: Some(security_policy),
             endpoint_access_mode: input.endpoint_access_mode,
             api_status: Some(API_STATUS_AVAILABLE.to_string()),
             api_status_message: None,

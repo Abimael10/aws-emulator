@@ -723,6 +723,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for patch in &patches {
             apply_patch(&mut updated, patch).map_err(patch_failure)?;
         }
+        // The PATCHED record is held to the pairing its own members publish:
+        // `endpointAccessMode` is only available on a record whose `securityPolicy` admits
+        // one, so a list that would leave the record carrying a mode without such a policy
+        // — whichever of the two members it wrote — is refused with the create's own
+        // sentence. Checked on the copy, with nothing written yet, so a refused list leaves
+        // the stored record untouched.
+        crate::state::require_endpoint_access_mode_policy(
+            updated.endpoint_access_mode.as_deref(),
+            updated.security_policy.as_deref(),
+        )
+        .map_err(|message| patch_failure(PatchFailure::BadRequest(message)))?;
         // An update that moved the record to another endpoint type migrates it to that
         // endpoint, which is what assigns the endpoint names it reports from now on. The
         // id the new endpoint's host label is minted from is taken only when there IS a

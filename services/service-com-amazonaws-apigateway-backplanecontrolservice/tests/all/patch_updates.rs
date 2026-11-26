@@ -935,6 +935,22 @@ async fn a_patched_method_member_is_stored_and_read_back() {
     )
     .await;
 
+    // A `requestValidatorId` names a `RequestValidator` OF THIS API — the same rule
+    // `PutMethod` applies — so the validator the row below names is created first.
+    let created_validator = gateway
+        .call(
+            "POST",
+            &format!("/restapis/{api}/requestvalidators"),
+            Some(json!({ "name": "patched-method-validator", "validateRequestBody": true })),
+        )
+        .await;
+    assert_eq!(
+        created_validator.status, 201,
+        "case CreateRequestValidator: expected 201, got {} with {:?}",
+        created_validator.status, created_validator.body
+    );
+    let validator_id = string_member(&created_validator.body, "id", "CreateRequestValidator");
+
     // Every documented authorization type is accepted and read back, not just the one
     // the method was created with.
     for authorization_type in authorization_types {
@@ -985,11 +1001,11 @@ async fn a_patched_method_member_is_stored_and_read_back() {
             "set the authorizer and the validator in one request",
             vec![
                 replace("/authorizerId", &authorizer_id),
-                replace("/requestValidatorId", "val1"),
+                replace("/requestValidatorId", &validator_id),
             ],
             vec![
                 ("authorizerId", json!(authorizer_id)),
-                ("requestValidatorId", json!("val1")),
+                ("requestValidatorId", json!(validator_id)),
             ],
         ),
         (

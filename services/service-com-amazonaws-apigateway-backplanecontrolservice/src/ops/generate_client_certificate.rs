@@ -120,13 +120,13 @@ pub fn client_certificate_body(entry: &ClientCertificateEntry) -> GenerateClient
 /// `TagResource` applies, so a tag this service refuses on one path cannot be stored
 /// through the other.
 fn bound_input(input: &GenerateClientCertificateInput) -> Result<(), String> {
-    use crate::state::{bound_chars, bound_entries, bound_tag, MAX_STRING_CHARS, MAX_TAGS};
+    use crate::state::{bound_chars, bound_tag, MAX_STRING_CHARS};
 
     if let Some(description) = &input.description {
         bound_chars("description", description, MAX_STRING_CHARS)?;
     }
     if let Some(tags) = &input.tags {
-        bound_entries("tags", tags.len(), MAX_TAGS)?;
+        crate::state::bound_tags(tags.len())?;
         for (key, value) in tags {
             bound_tag(key, value)?;
         }

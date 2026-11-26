@@ -200,17 +200,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A report of an existing collection, so this takes a shared read of the store and
         // writes nothing: a listing must not change what a later caller sees.
         let store = state.lock();
-        // The plan is the resource the request's URI addresses, so it is resolved first,
-        // the way the path itself reads: a plan the store does not hold meters nothing and
-        // is refused as the missing plan it is rather than served an empty page.
-        if !store.usage_plans.contains_key(&input.usage_plan_id) {
-            return Err(GetUsagePlanKeysErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(crate::state::NO_SUCH_USAGE_PLAN.to_string()),
-                },
-            )
-            .into());
-        }
+        // A `usagePlanId` naming no stored plan is NOT refused: the question this operation
+        // answers is which API keys the plan meters, and a plan that meters none — including
+        // one no record of the account answers to — has an empty collection to report, so
+        // the call is served as the empty page it is rather than aborted with the modelled
+        // `NotFoundException`. The sequence the page is cut out of is empty for such an id
+        // ([`metered_key_ids_in_added_order`]), which is what makes the page empty.
+        //
         // `nameQuery` narrows the sequence BEFORE the page is cut, so paging a filtered
         // listing walks the filtered sequence rather than cutting pages out of the whole
         // collection and emptying them afterwards.

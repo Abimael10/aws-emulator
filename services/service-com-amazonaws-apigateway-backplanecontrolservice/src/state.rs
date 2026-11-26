@@ -4887,3 +4887,14 @@ mod stage_references;
 /// each name as `crate::state::…`.
 mod pages;
 pub use pages::*;
+
+/// The per-resource TAG QUOTA and the one sentence a write past it is refused with;
+/// re-exported whole, so a handler still reaches each name as `crate::state::…`.
+mod tag_quota;
+pub use tag_quota::*;
+
+/// WHEN a record may carry an `endpointAccessMode` — the security policies that member is
+/// available for — and the refusal for a request that sets one without such a policy;
+/// re-exported whole, so a handler still reaches each name as `crate::state::…`.
+mod endpoint_access_mode;
+pub use endpoint_access_mode::*;

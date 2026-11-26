@@ -227,7 +227,7 @@ pub fn stage_body(entry: &StageEntry, web_acl_arn: Option<String>) -> CreateStag
 /// records at all.
 fn bound_input(input: &CreateStageInput) -> Result<(), String> {
     use crate::state::{
-        bound_chars, bound_entries, bound_tag, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS, MAX_TAGS,
+        bound_chars, bound_entries, bound_tag, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
     };
 
     for (member, value) in [
@@ -270,9 +270,10 @@ fn bound_input(input: &CreateStageInput) -> Result<(), String> {
         }
     }
     // The tags a create carries are checked by the SAME rule `TagResource` applies, so
-    // a tag this service refuses on one path cannot be stored through the other.
+    // a tag this service refuses on one path cannot be stored through the other — the
+    // per-resource quota included (`crate::state::bound_tags`).
     if let Some(tags) = &input.tags {
-        bound_entries("tags", tags.len(), MAX_TAGS)?;
+        crate::state::bound_tags(tags.len())?;
         for (key, value) in tags {
             bound_tag(key, value)?;
         }
