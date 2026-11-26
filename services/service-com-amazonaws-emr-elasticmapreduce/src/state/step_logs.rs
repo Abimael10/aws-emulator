@@ -43,9 +43,13 @@
 //! (no such bucket) or refuses the write loses that round and is reported in this service's own
 //! tracing — it never fails the call that happened to drain it, and it leaves the step owed its
 //! files again ([`ComAmazonawsEmrElasticmapreduceState::forget_delivered_step_logs`]), so
-//! nothing ever reports a log file the object store does not hold. The write is made the way any
-//! emulated service reaches another, over the in-process callback with the one shared client
-//! builder ([`service_common::s3_client`]), so the files land in the very store
+//! nothing ever reports a log file the object store does not hold. A delivery that is IN FLIGHT
+//! is CLAIMED rather than recorded as delivered ([`StepRecord::claimed_log_uri`]), which is what
+//! keeps a second drainer from writing the same files beside the first while leaving a read
+//! taken meanwhile reporting no file: the path is reported only once the write has landed
+//! ([`ComAmazonawsEmrElasticmapreduceState::record_delivered_step_logs`]). The write is made the
+//! way any emulated service reaches another, over the in-process callback with the one shared
+//! client builder ([`service_common::s3_client`]), so the files land in the very store
 //! `s3:ListObjectsV2` and `s3:GetObject` read and no connection leaves this process.
 //!
 //! # Whose permissions decide whether a file lands
@@ -371,6 +375,9 @@ pub struct PendingLogObject {
 pub struct PendingStepLogs {
     /// The step they belong to, for the tracing of a failed write.
     pub step_id: String,
+    /// The `s3://` directory they are being written to, which is the path the step reports its
+    /// log file under ONCE they have landed there.
+    pub directory: String,
     /// WHO the push is made by, as the launch named it: the step's own runtime role where it
     /// carries one, and otherwise the cluster's instance profile, whose role the nodes that
     /// push the files assume. The permissions in force on that role are what decide whether a
@@ -381,17 +388,20 @@ pub struct PendingStepLogs {
 }
 
 impl ComAmazonawsEmrElasticmapreduceState {
-    /// The log files the finished steps of the cluster `cluster_id` are owed, recorded as
-    /// delivered.
+    /// The log files the finished steps of the cluster `cluster_id` are owed, with the delivery
+    /// of each CLAIMED.
     ///
     /// Called with the store held, right after the step transitions were materialised, and
     /// answers nothing for a cluster this account holds none of or one whose launch named no
     /// `LogUri`: with no destination configured there is nowhere a log file could exist, which
     /// is also what the real service does with such a cluster.
     ///
-    /// A step owes its files from the instant it ENDED, and owes them once: the directory they
-    /// were written to is recorded on the step ([`StepRecord::delivered_log_uri`]), which is
-    /// also the path a failed step reports its log file under.
+    /// A step owes its files from the instant it ENDED, and owes them once: the claim
+    /// ([`StepRecord::claimed_log_uri`]) is what keeps a second drainer from writing the same
+    /// files beside this one, and the directory they LANDED in is recorded separately, once the
+    /// write has gone through ([`Self::record_delivered_step_logs`]) — which is the path a
+    /// failed step reports its log file under, so a delivery still in flight points a reader at
+    /// nothing.
     pub fn take_due_step_logs(&mut self, cluster_id: &str) -> Vec<PendingStepLogs> {
         let Some(cluster) = self.clusters.get_mut(cluster_id) else {
             return Vec::new();
@@ -412,7 +422,7 @@ impl ComAmazonawsEmrElasticmapreduceState {
             if !step.is_terminal() || step.start_date_time.is_none() {
                 continue;
             }
-            if step.delivered_log_uri.is_some() {
+            if step.delivered_log_uri.is_some() || step.claimed_log_uri.is_some() {
                 continue;
             }
             let Some(destination) = step
@@ -443,9 +453,11 @@ impl ComAmazonawsEmrElasticmapreduceState {
             if objects.len() != STEP_LOG_OBJECTS.len() {
                 continue;
             }
-            step.delivered_log_uri = Some(format!("s3://{}/{prefix}", destination.bucket));
+            let directory = format!("s3://{}/{prefix}", destination.bucket);
+            step.claimed_log_uri = Some(directory.clone());
             owed.push(PendingStepLogs {
                 step_id: step.id.clone(),
+                directory,
                 pushed_by: step
                     .execution_role_arn
                     .clone()
@@ -456,16 +468,31 @@ impl ComAmazonawsEmrElasticmapreduceState {
         owed
     }
 
-    /// Give back the record of delivery for the steps `step_ids` of the cluster `cluster_id`:
-    /// their files were recorded as delivered and the write did not go through, so the next
-    /// call that reports the cluster writes them rather than the step reporting a log file
-    /// nothing holds.
+    /// Record that every file of the steps `delivered` — each `(step id, directory)` — landed in
+    /// the directory it was written to, which is the path those steps report their log file
+    /// under from now on, and release the claim the delivery was made under.
+    pub fn record_delivered_step_logs(&mut self, cluster_id: &str, delivered: &[(String, String)]) {
+        let Some(cluster) = self.clusters.get_mut(cluster_id) else {
+            return;
+        };
+        for step in &mut cluster.steps {
+            if let Some((_, directory)) = delivered.iter().find(|(id, _)| *id == step.id) {
+                step.delivered_log_uri = Some(directory.clone());
+                step.claimed_log_uri = None;
+            }
+        }
+    }
+
+    /// Give back the claim the delivery for the steps `step_ids` of the cluster `cluster_id` was
+    /// made under: their write did not go through, so the next call that reports the cluster
+    /// writes those files rather than the step reporting a log file nothing holds.
     pub fn forget_delivered_step_logs(&mut self, cluster_id: &str, step_ids: &[String]) {
         let Some(cluster) = self.clusters.get_mut(cluster_id) else {
             return;
         };
         for step in &mut cluster.steps {
             if step_ids.contains(&step.id) {
+                step.claimed_log_uri = None;
                 step.delivered_log_uri = None;
             }
         }
@@ -481,7 +508,9 @@ impl ComAmazonawsEmrElasticmapreduceState {
 ///
 /// Each file is written only where the permissions in force on the role the push is made by
 /// do not deny the object write (see the module docs), so a step whose files IAM refuses is
-/// left owed them rather than reporting a directory the object store does not hold.
+/// left owed them rather than reporting a directory the object store does not hold — and the
+/// directory is recorded on the step only once EVERY file of it has landed, so a read taken
+/// while this write is in flight reports no log file either.
 pub async fn deliver_due_step_logs<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -504,6 +533,7 @@ pub async fn deliver_due_step_logs<Eng: Send + Sync + 'static>(
     }
     let client = ::service_common::s3_client::s3_client(ctx.callback(), region);
     let mut undelivered: Vec<String> = Vec::new();
+    let mut delivered: Vec<(String, String)> = Vec::new();
     for logs in owed {
         // The ROLE the node's push is authorized against, resolved once for this step's
         // directory: its own runtime role, or the role the cluster's instances assume through
@@ -513,6 +543,7 @@ pub async fn deliver_due_step_logs<Eng: Send + Sync + 'static>(
             Some(named) => super::work_role_arn(ctx, region, named).await,
             None => None,
         };
+        let mut landed = true;
         for object in &logs.objects {
             if let Some(role_arn) = pushed_by.as_deref() {
                 let resource = object_arn(&object.bucket, &object.key);
@@ -533,7 +564,7 @@ pub async fn deliver_due_step_logs<Eng: Send + Sync + 'static>(
                         "an Amazon EMR step log file was not written: the permissions in force \
                          on the role the cluster's nodes run as deny the object write"
                     );
-                    undelivered.push(logs.step_id.clone());
+                    landed = false;
                     break;
                 }
             }
@@ -556,15 +587,22 @@ pub async fn deliver_due_step_logs<Eng: Send + Sync + 'static>(
                     error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
                     "an Amazon EMR step log file could not be delivered to Amazon S3"
                 );
-                undelivered.push(logs.step_id.clone());
+                landed = false;
                 break;
             }
         }
+        if landed {
+            delivered.push((logs.step_id, logs.directory));
+        } else {
+            undelivered.push(logs.step_id);
+        }
     }
-    // A step whose files did not land reports no log file and is owed them again: nothing
-    // points a reader at an object the store does not hold.
-    if !undelivered.is_empty() {
+    // A step whose files LANDED reports its directory from now on, and one whose files did not
+    // reports no log file and is owed them again: nothing points a reader at an object the
+    // object store does not hold.
+    if !delivered.is_empty() || !undelivered.is_empty() {
         let mut store = state.lock();
+        store.record_delivered_step_logs(cluster_id, &delivered);
         store.forget_delivered_step_logs(cluster_id, &undelivered);
     }
 }

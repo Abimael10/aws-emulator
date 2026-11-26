@@ -36,7 +36,7 @@ use smithy_server_runtime::MultiServiceRouter;
 const REGION: &str = "us-east-1";
 
 /// The bucket every application, every output and every log file of this suite lives in.
-const BUCKET: &str = "emr-step-logs";
+pub(crate) const BUCKET: &str = "emr-step-logs";
 
 /// The key prefix the cluster's `LogUri` names inside it.
 const LOG_PREFIX: &str = "logs";
@@ -47,24 +47,24 @@ const SERVICE_ROLE: &str = "EMR_DefaultRole";
 
 /// How long a poll waits for a condition: both provisioning phases, the steps' own spans and
 /// their application runs, with room to spare on a loaded host.
-const DEADLINE: Duration = Duration::from_secs(90);
+pub(crate) const DEADLINE: Duration = Duration::from_secs(90);
 
 /// How long a poll sleeps between looks.
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The states a step never leaves (`com.amazonaws.emr#StepState`).
-const TERMINAL: [&str; 4] = ["COMPLETED", "CANCELLED", "FAILED", "INTERRUPTED"];
+pub(crate) const TERMINAL: [&str; 4] = ["COMPLETED", "CANCELLED", "FAILED", "INTERRUPTED"];
 
 /// The marker a row's application writes, which no other text of this suite carries: finding it
 /// in a file is what shows the file holds THAT run's output.
-const MARKER: &str = "sim-to-real-step-log-marker";
+pub(crate) const MARKER: &str = "sim-to-real-step-log-marker";
 
 /// What a Python driver's traceback opens with, which is what a client greps a failed step's
 /// standard error for.
 const TRACEBACK_HEADER: &str = "Traceback (most recent call last):";
 
 /// Amazon EMR and Amazon S3 on one engine, the shape the router mounts them in.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -78,7 +78,7 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// One `awsJson1_1` Amazon EMR call that must be served.
-async fn emr_ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
+pub(crate) async fn emr_ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
     let host = format!("elasticmapreduce.{REGION}.amazonaws.com");
     let request = ::http::Request::builder()
         .method("POST")
@@ -112,7 +112,12 @@ async fn emr_ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Va
 }
 
 /// One path-style Amazon S3 request, answered as `(status, body)`.
-async fn s3(router: &MultiServiceRouter, method: &str, uri: &str, body: &[u8]) -> (u16, Vec<u8>) {
+pub(crate) async fn s3(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: &[u8],
+) -> (u16, Vec<u8>) {
     let host = format!("s3.{REGION}.amazonaws.com");
     let request = ::http::Request::builder()
         .method(method)
@@ -133,7 +138,7 @@ async fn s3(router: &MultiServiceRouter, method: &str, uri: &str, body: &[u8]) -
 }
 
 /// Put `body` at `key`, which must be served.
-async fn put_object(router: &MultiServiceRouter, case: &str, key: &str, body: &[u8]) {
+pub(crate) async fn put_object(router: &MultiServiceRouter, case: &str, key: &str, body: &[u8]) {
     let (status, answered) = s3(router, "PUT", &format!("/{BUCKET}/{key}"), body).await;
     assert!(
         (200..300).contains(&status),
@@ -143,7 +148,7 @@ async fn put_object(router: &MultiServiceRouter, case: &str, key: &str, body: &[
 }
 
 /// The keys of every object under `prefix`, from `ListObjectsV2`.
-async fn keys_under(router: &MultiServiceRouter, prefix: &str) -> Vec<String> {
+pub(crate) async fn keys_under(router: &MultiServiceRouter, prefix: &str) -> Vec<String> {
     let (status, listing) = s3(
         router,
         "GET",
@@ -273,7 +278,12 @@ fn step_config(case: &Case, ordinal: usize) -> Value {
 }
 
 /// A cluster that stays up, launched with `steps` and the `LogUri` the row asks for.
-async fn launch(router: &MultiServiceRouter, name: &str, steps: Value, log_uri: Option<&str>) -> String {
+pub(crate) async fn launch(
+    router: &MultiServiceRouter,
+    name: &str,
+    steps: Value,
+    log_uri: Option<&str>,
+) -> String {
     let mut request = json!({
         "Name": name,
         "ReleaseLabel": "emr-6.15.0",

@@ -37,6 +37,36 @@ Expected (AWS): first leg — GET <stage invoke URL>/secure with no Authorizatio
 
 Actual (emulator): the first leg's poll (accept = status in {200,401,403}, 150 s budget, 3 s interval) never sees an accepted status; the check consumes the whole 60 s harness budget and is killed before any assertion can be evaluated. No 401, no 403, no 200, and no error response of any kind is observed on the deployed stage URL.
 
+## Resolution
+
+Cause 1 — FIXED, and no divergence of this emulator remains for it. A `COGNITO_USER_POOLS`-gated
+method of a deployed stage decides every request at the edge, before its integration, and answers
+it synchronously: `401` `{"message":"Unauthorized"}` with `UnauthorizedException` in
+`x-amzn-errortype` for a value at the authorizer's `identitySource` that no pool its
+`providerARNs` name signed — nothing presented, the header carrying nothing, a value that is no
+token, one behind the bearer scheme — with the `AWS_PROXY` function never run, and the
+integration's own `200` for a token such a pool minted. That decision lives in
+`src/service/invoke.rs` (`authorization_refusal` -> `cognito_user_pools::evaluate` ->
+`cognito_refusal`, then `lambda_proxy`), and the data plane claims both addressings of a deployed
+stage in `src/service.rs`; it landed before this report was worked, which the report's own drift
+note anticipates (the earlier report carrying this same replay key is
+`20261105T223150Z-apigateway-cognito-idp-lambda-a-deployed-rest-api.md`).
+
+Added for this report, because the level at which "the caller is answered at all" is observable is
+a real socket and every existing suite of this rule drove the router in process:
+`tests/all/stage_cognito_gate_on_the_served_wire.rs` — the same emulator served by this emulator's
+own entry point with request authentication on, seven rows over ONE keep-alive connection, each
+answer read by its own `content-length`, the backend's run (or its absence) read back through
+CloudWatch Logs' `FilterLogEvents` on `/aws/lambda/<function>`. The rows span what is presented at
+the identity source and both addressings of the stage, and the whole scenario — pool, app client,
+user, sign-in, a function created from its own `.zip` and reported `Active`, the api, its
+deployment and stage, seven served invokes and two Lambda runs — completes in about 2.5 s.
+
+What still fails on replay is the check's own wall clock: `Error: Check timed out after 60.0s`,
+whose recorded failure site is the check's fixed-window absence watch (`_stays_absent`, at
+`time.sleep(interval_s)`) — a span the check sleeps out whatever the emulator answers, rather than
+an answer of this emulator.
+
 ## Steps to Reproduce
 1. cognito-idp: CreateUserPool, CreateUserPoolClient (ALLOW_ADMIN_USER_PASSWORD_AUTH), AdminCreateUser + AdminSetUserPassword(Permanent=true), then AdminInitiateAuth(ADMIN_USER_PASSWORD_AUTH) to obtain a real IdToken.
 2. lambda: create a python3.12 AWS_PROXY backend function that returns 200 with a marker body, and AddPermission for apigateway.amazonaws.com on arn:aws:execute-api:<region>:<account>:<api-id>/*/*.

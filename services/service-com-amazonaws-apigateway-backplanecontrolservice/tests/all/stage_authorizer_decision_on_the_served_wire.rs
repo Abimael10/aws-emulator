@@ -152,13 +152,17 @@ const ROWS: &[Row] = &[
 
 /// One answer as it was READ off the wire: the status of its status line, the field lines it
 /// carried and the body its own `content-length` named.
+///
+/// Public to this target because every suite that reads an answer of this data plane off a
+/// socket reads it the same way ([`read_answer`]), rather than keeping a second reading of
+/// HTTP/1.1 framing of its own.
 #[derive(Debug)]
-struct OnTheWire {
-    status: u16,
+pub struct OnTheWire {
+    pub status: u16,
     /// The id the answer reported the request under, which its access-log record names.
-    request_id: Option<String>,
-    head: String,
-    body: String,
+    pub request_id: Option<String>,
+    pub head: String,
+    pub body: String,
 }
 
 /// Read one HTTP/1.1 response from `socket`: the head up to the empty line, then exactly the
@@ -169,7 +173,7 @@ struct OnTheWire {
 /// what this suite exists to catch. An answer carrying no `content-length` at all is such a
 /// reason too: every answer this plane sends declares its own length, and a chunked one would
 /// be a different framing than the rule under test states.
-async fn read_answer(socket: &mut tokio::net::TcpStream) -> Result<OnTheWire, String> {
+pub async fn read_answer(socket: &mut tokio::net::TcpStream) -> Result<OnTheWire, String> {
     let mut raw: Vec<u8> = Vec::new();
     let mut byte = [0_u8; 1];
     // The head, byte by byte: the body may not be read past, because the next row's answer
@@ -211,7 +215,7 @@ async fn read_answer(socket: &mut tokio::net::TcpStream) -> Result<OnTheWire, St
 }
 
 /// The value of the field line `name` of a response head, or `None` when it carries none.
-fn field_of(head: &str, name: &str) -> Option<String> {
+pub fn field_of(head: &str, name: &str) -> Option<String> {
     head.lines().find_map(|line| {
         let (field, value) = line.split_once(':')?;
         field

@@ -92,6 +92,14 @@ pub struct StepRecord {
     /// directory a failed step reports its log file under. `None` while nothing has been
     /// delivered for this step, including for a cluster whose launch named no `LogUri`.
     pub delivered_log_uri: Option<String>,
+    /// The `s3://` directory a delivery of this step's files that is IN FLIGHT is writing to
+    /// ([`ComAmazonawsEmrElasticmapreduceState::take_due_step_logs`]): the claim that keeps a
+    /// second caller from writing the same files beside the first, held only until that write
+    /// lands or fails. `None` whenever no delivery of this step is in flight.
+    ///
+    /// It is not what a read REPORTS: a file is a path a reader can fetch only once it really
+    /// exists, so only [`Self::delivered_log_uri`] is reported.
+    pub claimed_log_uri: Option<String>,
     /// The applications the cluster's RESOURCE MANAGER admitted for this step, in the order it
     /// admitted them ([`record_resource_manager_applications`]).
     ///
@@ -189,6 +197,7 @@ impl StepRecord {
             published_state: None,
             abandoned_runs: 0,
             delivered_log_uri: None,
+            claimed_log_uri: None,
             resource_manager_application_ids: Vec::new(),
         }
     }
