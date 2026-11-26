@@ -329,7 +329,13 @@ fn cases() -> Vec<Case> {
             label: "environment-emptied",
             package: Package::Zip,
             patch: json!({ "Environment": { "Variables": {} } }),
-            expected: json!({ "Environment": null }),
+            // The member is the environment the configuration CARRIES, not a report of
+            // whether it holds any variables: an update that states an empty one leaves
+            // the function carrying an environment with nothing in it, which is a
+            // different configuration from one carrying no environment at all (the row
+            // `no-setting-named` leaves the member out, and the function keeps what it
+            // had).
+            expected: json!({ "Environment": { "Variables": {} } }),
         },
         Case {
             label: "tracing-mode-replaced",

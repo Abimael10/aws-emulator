@@ -100,7 +100,9 @@ pub enum RenderRefusal {
 /// what the member has to be is refused with ([`invalid_rendering_data`]).
 ///
 /// The parse is `serde_json`'s, which returns an error rather than panicking on anything a
-/// caller sends, and the input is bounded by the member's own 262144-byte maximum.
+/// caller sends, and the input is bounded by the member's own 262144-byte maximum. Nothing
+/// the reader could not read is echoed back, so the sentence is the same text for every
+/// such value.
 pub fn message_variables(raw: &str) -> Result<Value, String> {
     if raw.is_empty() {
         return Ok(Value::Object(::serde_json::Map::new()));

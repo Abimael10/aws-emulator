@@ -706,20 +706,28 @@ fn model(
             ),
         );
     }
-    if let Some(variables) = configuration
-        .environment
-        .as_ref()
-        .and_then(|environment| environment.variables.as_ref())
-    {
+    if let Some(environment) = configuration.environment.as_ref() {
+        // The property is reported for the environment the FUNCTION CARRIES, which is what
+        // `GetFunction` answers the member as — not for whether it holds any variables: a
+        // function configured with an explicitly empty environment reports the property
+        // with an empty `Variables`, and one configured with none reports no property at
+        // all, so a client reading the model back can tell an empty block from an absent
+        // one.
         model.insert(
             ENVIRONMENT.to_string(),
             Value::Object(Map::from_iter([(
                 ENVIRONMENT_VARIABLES.to_string(),
                 Value::Object(
-                    variables
-                        .iter()
-                        .map(|(name, value)| (name.clone(), Value::from(value.clone())))
-                        .collect(),
+                    environment
+                        .variables
+                        .as_ref()
+                        .map(|variables| {
+                            variables
+                                .iter()
+                                .map(|(name, value)| (name.clone(), Value::from(value.clone())))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 ),
             )])),
         );

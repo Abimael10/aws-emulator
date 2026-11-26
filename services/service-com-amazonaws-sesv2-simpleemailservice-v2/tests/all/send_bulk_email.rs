@@ -368,7 +368,7 @@ fn request(data: Option<&str>, entries: Vec<Value>) -> Value {
 
 #[tokio::test]
 async fn the_default_template_data_has_to_be_a_set_of_key_value_pairs() {
-    // The rows span the ways default template data can fail to supply message variables:
+    // The rows span the ways default template data can fail to be a set of key-value pairs:
     // every JSON value that is no object — a list, each kind of scalar — and text the JSON
     // reader cannot read at all, which is one failure of the member and is refused in one
     // sentence. The member left out ALTOGETHER is the distinct refusal

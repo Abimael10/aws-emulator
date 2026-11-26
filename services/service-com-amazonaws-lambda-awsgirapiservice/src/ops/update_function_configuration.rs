@@ -865,6 +865,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if let Some(environment) = environment {
             config.environment = environment;
+            // An update that STATES the member leaves the function carrying an
+            // environment, whatever variables it put in it — including none.
+            config.environment_configured = true;
         }
         if let Some(layers) = layers {
             config.layers = layers;
