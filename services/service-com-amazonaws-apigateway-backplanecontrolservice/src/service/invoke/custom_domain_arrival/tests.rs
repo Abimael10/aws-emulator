@@ -149,9 +149,12 @@ fn the_selected_invoke_path_carries_the_stage_the_mapping_names() {
 }
 
 /// RULE: a request addresses a custom domain name record by the NAME itself, however cased
-/// and whatever port it states, or by the `host:port` that record published as its
-/// `regionalDomainName`; a host that names neither addresses no record, and neither does the
-/// name of a record served by another endpoint type.
+/// and whatever port it states, by the address that record PUBLISHED for a DNS record to
+/// target (a regional endpoint's `host:port`, an edge-optimized one's distribution name), or
+/// by either of those CARRIED in the reserved data-plane path namespace — which is how a
+/// client that resolves none of those hosts addresses one. A host that names none of them
+/// addresses no record, and neither spelling reaches a PRIVATE record, which is reached
+/// through the VPC endpoints its endpoint configuration names.
 #[test]
 fn a_record_is_addressed_by_its_name_or_by_the_address_it_published() {
     let mut store = ApiGatewayState::default();
@@ -171,22 +174,80 @@ fn a_record_is_addressed_by_its_name_or_by_the_address_it_published() {
         types: Some(vec!["EDGE".to_string()]),
         ..Default::default()
     });
+    edge.distribution_domain_name = Some("d111111abcdef8.cloudfront.net".to_string());
     store.domain_names.insert(edge.domain_name.clone(), edge);
+    let mut private = record_with(&[(NONE_BASE_PATH, "api-private", Some("live"))]);
+    private.domain_name = "private.example.com".to_string();
+    private.domain_name_id = Some("abcd1234".to_string());
+    private.endpoint_configuration = Some(crate::ops::types::EndpointConfiguration {
+        types: Some(vec![crate::state::PRIVATE_ENDPOINT_TYPE.to_string()]),
+        ..Default::default()
+    });
+    store
+        .domain_names
+        .insert("private.example.com+abcd1234".to_string(), private);
 
     // The rows span what the addressing generalises over: the name, the name upper-cased,
-    // the name with a port, the published address, a host naming no record, an
-    // edge-optimized record's own name, and no host at all.
+    // the name with a port, the address each endpoint type published, a host naming no
+    // record, a private record's own name, and no host at all.
     let cases: &[(&str, Option<&str>, Option<&str>)] = &[
         ("the name itself", Some("shop.example.com"), Some("api-root")),
         ("the name upper-cased", Some("SHOP.Example.COM"), Some("api-root")),
         ("the name with a port", Some("shop.example.com:443"), Some("api-root")),
         ("the published address", Some("127.0.0.1:34567"), Some("api-root")),
         ("a host naming no record", Some("other.example.com"), None),
-        ("an edge-optimized record's name", Some("edge.example.com"), None),
+        ("an edge-optimized record's name", Some("edge.example.com"), Some("api-edge")),
+        (
+            "the distribution name an edge-optimized record published",
+            Some("d111111abcdef8.cloudfront.net"),
+            Some("api-edge"),
+        ),
+        ("a private record's name", Some("private.example.com"), None),
         ("no host at all", None, None),
     ];
     for (case, host, expected) in cases {
         let reached = arrival(&store, *host, "/pets").map(|arrival| arrival.api_id.to_string());
+        assert_eq!(
+            reached.as_deref(),
+            *expected,
+            "case {case:?}: expected {expected:?}, got {reached:?}"
+        );
+    }
+
+    // And the same hosts CARRIED in the reserved path namespace, by a client that reaches the
+    // emulator's own endpoint because it resolves none of them: the host it carried decides
+    // the record, and the path left under it is the path a mapping answers.
+    let carried: &[(&str, &str, Option<&str>)] = &[
+        ("a name carried in the path", "/_aws/shop.example.com/pets", Some("api-root")),
+        (
+            "a published address carried in the path",
+            "/_aws/127.0.0.1:34567/pets",
+            Some("api-root"),
+        ),
+        (
+            "an edge-optimized name carried in the path",
+            "/_aws/edge.example.com/pets",
+            Some("api-edge"),
+        ),
+        (
+            "a carried host naming no record",
+            "/_aws/other.example.com/pets",
+            None,
+        ),
+        (
+            "a carried private record's name",
+            "/_aws/private.example.com/pets",
+            None,
+        ),
+        // The api's own endpoint is spelled in that same namespace, and names no record: it
+        // keeps resolving as the endpoint it is, which is `super::resolve`'s own reading.
+        ("the api's own endpoint", "/_aws/execute-api/other/live/x", None),
+    ];
+    for (case, path, expected) in carried {
+        // The host a client that carries one states is the emulator's own endpoint, which
+        // stands for no record at all.
+        let reached =
+            arrival(&store, Some("127.0.0.1:9297"), path).map(|arrival| arrival.api_id.to_string());
         assert_eq!(
             reached.as_deref(),
             *expected,

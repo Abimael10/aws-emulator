@@ -7,6 +7,42 @@ Issue-Commit: fe65e03d933b6ac0ef81655d3240f2b613766017
 
 # API Gateway custom domains never serve a mapped path: a signed GET on the custom domain never answers inside the run budget
 
+## Resolution
+
+A custom domain name's mapped path is now served at EVERY address this emulator answers at, for
+every endpoint type a public alias is published for:
+
+* the domain name itself, and the address the record published for a caller's DNS record to
+  target — `regionalDomainName` (the `host:port` of the socket the create opened) and
+  `distributionDomainName` (the distribution name the record was assigned) — read as the `Host`
+  of a request made at either of them;
+* either of those CARRIED in the emulator's reserved data-plane path namespace
+  (`/_aws/{host}/{path}`), which is how a client on the machine this emulator runs on addresses
+  a host it resolves nowhere — the rewriting every other data plane of this tree already served
+  and a custom domain name did not;
+* an EDGE-OPTIMIZED record as well as a regional one. An edge-optimized record — the type a
+  create naming no `endpointConfiguration` carries, which is API Gateway's default — was
+  resolved by NO addressing at all: its base path mappings were never consulted, so every
+  request to it reached no api of the account.
+
+Pinned by `core/router/tests/all/apigateway_custom_domain_mapped_path.rs` (Certificate Manager,
+Route 53 and API Gateway on one engine: an issued DNS-validated certificate, a regional and an
+edge-optimized domain name over one deployed `AWS_IAM` method, every spelling of every host, with
+the unsigned twin refused) and, for an HTTP api's custom domain, by
+`services/service-com-amazonaws-apigatewayv2-apigatewayv2/tests/all/custom_domain_carried_host_invoke.rs`.
+
+What REMAINS for this check, and it is not these service crates' to serve: its client reaches the
+custom domain at an address this process cannot answer on. A client that resolves the published
+record and dials it uses the port `https` implies (443), while `Listeners::tcp_plaintext`
+(`vendor/server/src/listeners.rs`, through `bind_tokio`/`bind_std`) takes no requested port — it
+binds an OS-assigned port inside `EMULATOR_LISTENER_PORT_RANGE` — and a client that verifies the
+name it dialled cannot be served either, because the one process certificate
+(`vendor/server/src/tls_certificate_authority.rs`, `covering` is crate-private and its names are
+fixed on first use) covers loopback and the bound interface alone, with no per-connection
+certificate resolver. This is the same core gap recorded for this surface in
+`issues/things-that-now-work/20261114T121226Z-acm-apigateway-a-regional-custom-domain-s-data.md`.
+
+
 > _Note: this issue was identified against the code base at commit `fe65e03d933b6ac0ef81655d3240f2b613766017`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

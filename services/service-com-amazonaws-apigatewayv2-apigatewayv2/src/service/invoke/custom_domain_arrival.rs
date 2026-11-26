@@ -21,7 +21,10 @@
 //!   of a request made there, exactly as a client of AWS sends it to API Gateway's own front
 //!   door, and this module is what resolves it. The host the client STATED is what decides it
 //!   (`service_common::data_plane_addressing::addressed_authority`), so nothing of the
-//!   addressing is invented.
+//!   addressing is invented — and a client that cannot state it at all, because it resolves
+//!   no custom domain name of the account, CARRIES it in the reserved path namespace instead
+//!   ([`carried_domain_name`]), the one rewriting every data plane of this tree is addressed
+//!   through.
 //!
 //! Both front doors read ONE statement of which mapping answers a path
 //! ([`crate::service::domain_name_socket::matching_mapping`]), ONE statement of which host
@@ -59,9 +62,8 @@ pub(super) fn arrival<'s>(
     store: &'s ServiceStore,
     addressed: &Addressed<'_>,
 ) -> Option<Arrival<'s>> {
-    let record = addressed_record(store, addressed)?;
-    let (mapping, under) =
-        crate::service::domain_name_socket::matching_mapping(record, addressed.path)?;
+    let (record, path) = addressed_record(store, addressed)?;
+    let (mapping, under) = crate::service::domain_name_socket::matching_mapping(record, path)?;
     Some(Arrival {
         domain_name: &record.domain_name,
         api_id: &mapping.api_id,
@@ -82,6 +84,41 @@ pub(super) fn addresses_a_domain_name(store: &ServiceStore, addressed: &Addresse
     addressed_record(store, addressed).is_some()
 }
 
+/// The record a client CARRIED the custom domain name of in the reserved path namespace, and
+/// the path left under it — or `None` for a path that carries none.
+///
+/// A client on the machine this emulator runs on resolves no custom domain name of the
+/// account, so it reaches the emulator's own endpoint and carries in the path what it cannot
+/// carry in the host: `/{namespace}/{host}/{path}`, the same rewriting the api's own endpoint
+/// is reached through ([`super::local_endpoint_path`]). The segment behind the namespace has
+/// to NAME A RECORD of this account for the path to be read this way, so an api's own endpoint
+/// carried in that namespace keeps resolving as the endpoint it names.
+fn carried_domain_name<'s, 'p>(
+    store: &'s ServiceStore,
+    path: &'p str,
+) -> Option<(&'s crate::state::DomainName, &'p str)> {
+    let (namespace, rest) = super::split_first_segment(path)?;
+    if namespace != crate::state::LOCAL_ENDPOINT_PREFIX {
+        return None;
+    }
+    let (host, under) = super::split_first_segment(rest)?;
+    let record = named_record(store, host)?;
+    Some((record, under))
+}
+
+/// The record `host` names, read the one way a host is matched against a domain name of this
+/// account ([`crate::service::domain_name_socket::host_names_domain_name`], which is what the
+/// socket in front of a record asks too).
+fn named_record<'s>(store: &'s ServiceStore, host: &str) -> Option<&'s crate::state::DomainName> {
+    let host = ::service_common::data_plane_addressing::host_only(host);
+    if host.is_empty() {
+        return None;
+    }
+    store.domain_names.values().find(|record| {
+        crate::service::domain_name_socket::host_names_domain_name(&record.domain_name, host)
+    })
+}
+
 /// The custom domain name record `addressed` arrived on, or `None` for a request that arrived
 /// on none: a host that names no record of the account, a host that is an ADDRESS of this
 /// emulator or sits in a zone AWS publishes its own endpoints in, and a path that is a PLANE of
@@ -99,11 +136,20 @@ pub(super) fn addresses_a_domain_name(store: &ServiceStore, addressed: &Addresse
 /// of that question) — a name no customer can be issued there, so a record whose name is a
 /// wildcard over such a zone can take neither another service's traffic nor this service's own
 /// control plane.
-fn addressed_record<'s>(
+fn addressed_record<'s, 'p>(
     store: &'s ServiceStore,
-    addressed: &Addressed<'_>,
-) -> Option<&'s crate::state::DomainName> {
-    if store.domain_names.is_empty() || addresses_another_plane(addressed.path) {
+    addressed: &Addressed<'p>,
+) -> Option<(&'s crate::state::DomainName, &'p str)> {
+    if store.domain_names.is_empty() {
+        return None;
+    }
+    // The name a client that resolves none of these hosts carried across, which is read
+    // BEFORE the host: such a request states the emulator's own endpoint as its host, which
+    // stands for no record at all.
+    if let Some(carried) = carried_domain_name(store, addressed.path) {
+        return Some(carried);
+    }
+    if addresses_another_plane(addressed.path) {
         return None;
     }
     let addressed_host = addressed.host?;
@@ -114,9 +160,7 @@ fn addressed_record<'s>(
     if ::service_common::data_plane_addressing::addresses_an_aws_endpoint(addressed_host) {
         return None;
     }
-    store.domain_names.values().find(|record| {
-        crate::service::domain_name_socket::host_names_domain_name(&record.domain_name, host)
-    })
+    named_record(store, host).map(|record| (record, addressed.path))
 }
 
 /// Whether `path` names a PLANE of this emulator rather than a path an api mapping answers:

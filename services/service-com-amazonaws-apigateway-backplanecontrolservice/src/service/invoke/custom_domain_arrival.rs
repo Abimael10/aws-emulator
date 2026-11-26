@@ -25,6 +25,23 @@
 //!   from another site to a custom domain name's address is refused by the front door, as
 //!   every other cross-site request this emulator receives is.
 //!
+//! # Which host addresses a record, and how a client states it
+//!
+//! A record is addressed by the domain NAME itself and by the address API Gateway PUBLISHED
+//! for it — the regional endpoint's `host:port` and the edge-optimized record's distribution
+//! name, which is what a caller points a DNS record at ([`addressed_record`]). Both kinds of
+//! record are served here: the endpoint a client reaches either of them at is this process,
+//! so WHICH of them a request arrived on changes nothing about which api its mapping names. A
+//! PRIVATE record is not: it is reached through the VPC endpoints its endpoint configuration
+//! names, which is a different address and its own access-association contract.
+//!
+//! A client on the machine this emulator runs on resolves none of those hosts, so it reaches
+//! the emulator's own endpoint and carries in the PATH what it cannot carry in the host — the
+//! reserved namespace every data plane of this tree is addressed through
+//! (`::service_common::data_plane_addressing`). A custom domain name carried that way names
+//! exactly the record it spells ([`carried_host`]), and the path left under it is the path the
+//! mapping answers, so one request reaches one api whichever way the client stated the host.
+//!
 //! The socket relays the client's request AS THE CLIENT SENT IT — its verb, its path, its
 //! query, its headers and its body — because a SigV4 signature covers exactly those: a leg
 //! that re-addressed the request to the api's own endpoint would present the stage a request
@@ -32,11 +49,9 @@
 //! What the stage needs instead of a re-addressed path is this resolution, which is why it
 //! lives beside the plane rather than inside the socket.
 //!
-//! Only a REGIONAL record is resolved here: its `regionalDomainName` is an address this
-//! emulator itself answers on, while an edge-optimized record is served by the CloudFront
-//! distribution API Gateway puts in front of it and a private one is reached through the VPC
-//! endpoints its endpoint configuration names — neither of which is this process's address
-//! (see [`crate::state::custom_domain_endpoint`]).
+//! A PRIVATE record is resolved nowhere here: it is reached through the VPC endpoints its
+//! endpoint configuration names, which is not an address this front door answers at (see
+//! [`crate::state::custom_domain_endpoint`]).
 //!
 //! Nothing here writes: every reading is of records the control plane persisted.
 
@@ -80,13 +95,21 @@ pub(crate) fn arrival_of(
 ///
 /// `None` when the request reaches no api of this account: a host that names no custom domain
 /// name of it, and a path no base path mapping of that domain name answers.
+///
+/// The host the request addressed is the one it STATED, or — for a client that resolves no
+/// custom domain name of the account — the one it CARRIED in the reserved path namespace,
+/// under which the rest of the path is what a mapping answers ([`carried_host`]).
 pub(crate) fn arrival(
     store: &ApiGatewayState,
     host: Option<&str>,
     path: &str,
 ) -> Option<Arrival> {
-    let record = addressed_record(store, host?)?;
-    let (mapping, remainder) = matching_mapping(record, path)?;
+    let (addressed, under) = match carried_host(store, path) {
+        Some(carried) => carried,
+        None => (host?, path),
+    };
+    let record = addressed_record(store, addressed)?;
+    let (mapping, remainder) = matching_mapping(record, under)?;
     Some(Arrival {
         domain_name: record.domain_name.clone(),
         api_id: mapping.rest_api_id.clone(),
@@ -94,15 +117,42 @@ pub(crate) fn arrival(
     })
 }
 
+/// The custom domain name a client CARRIED in the reserved path namespace, and the path left
+/// under it — or `None` for a path that carries none.
+///
+/// A client on the machine this emulator runs on resolves no custom domain name of the
+/// account, so it reaches the emulator's own endpoint and carries in the path what it cannot
+/// carry in the host: `/{namespace}/{host}/{path}`, the one rewriting every data plane of this
+/// tree is addressed through ([`super::EMULATOR_PATH_NAMESPACE`]). The segment behind the
+/// namespace has to NAME A RECORD of this account ([`addressed_record`]) for the path to be
+/// read this way, so the api's own endpoint — which is spelled in that same namespace
+/// ([`super::resolve`]) — keeps resolving as the endpoint it names.
+fn carried_host<'p>(store: &ApiGatewayState, path: &'p str) -> Option<(&'p str, &'p str)> {
+    let (namespace, rest) = ::service_common::data_plane_addressing::first_segment(path)?;
+    if namespace != super::EMULATOR_PATH_NAMESPACE {
+        return None;
+    }
+    let (host, under) = ::service_common::data_plane_addressing::first_segment(rest)?;
+    addressed_record(store, host).map(|_| (host, under))
+}
+
 /// The custom domain name record a request addressed to `host` arrived on, or `None` for a
 /// host that names none.
 ///
-/// TWO spellings address one record, because a client of this emulator reaches it at a
+/// TWO KINDS of spelling address one record, because a client of this emulator reaches it at a
 /// different address than a client of AWS reaches the custom domain at: the domain NAME
 /// itself — what a client states in `Host` after pointing DNS at the published address, read
-/// case-insensitively as a host is — and the `host:port` the record PUBLISHED as its
-/// `regionalDomainName`, which is what a client that resolves no name at all dials and
-/// states.
+/// case-insensitively as a host is — and the address the record PUBLISHED for that DNS record
+/// to point at, which is what a client that resolves no name at all dials and states. A
+/// regional record publishes the `host:port` of its own socket and an edge-optimized one the
+/// distribution name API Gateway assigned it, so each is matched both as the whole authority
+/// and as the host within it.
+///
+/// Every record of a PUBLIC endpoint type is addressed here — the two the model names a
+/// published alias for ([`crate::state::is_publicly_addressed_domain_name`]) — because the
+/// endpoint a client reaches either of them at is this process. A PRIVATE record is reached
+/// through the VPC endpoints its endpoint configuration names instead, so no request to this
+/// front door arrives on one.
 pub(crate) fn addressed_record<'s>(
     store: &'s ApiGatewayState,
     host: &str,
@@ -121,14 +171,26 @@ pub(crate) fn addressed_record<'s>(
     store
         .domain_names
         .values()
-        .filter(|record| crate::state::is_regional_domain_name(record))
+        .filter(|record| crate::state::is_publicly_addressed_domain_name(record))
         .find(|record| {
             record.domain_name.eq_ignore_ascii_case(name)
-                || record
-                    .regional_domain_name
-                    .as_deref()
-                    .is_some_and(|published| published.eq_ignore_ascii_case(authority))
+                || published_addresses(record).any(|published| {
+                    published.eq_ignore_ascii_case(authority) || published.eq_ignore_ascii_case(name)
+                })
         })
+}
+
+/// The addresses `record` PUBLISHED for a caller to point its own DNS record at: the regional
+/// endpoint's `host:port` and the edge-optimized record's distribution name, whichever the
+/// record's endpoint type gave it (`DomainName$regionalDomainName`,
+/// `DomainName$distributionDomainName`).
+fn published_addresses(record: &DomainNameEntry) -> impl Iterator<Item = &str> {
+    [
+        record.regional_domain_name.as_deref(),
+        record.distribution_domain_name.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
 }
 
 /// Whether `path` reaches any base path mapping of `record` — the question the socket in

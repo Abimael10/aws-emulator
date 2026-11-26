@@ -57,6 +57,37 @@ pub fn is_regional_domain_name(record: &super::DomainNameEntry) -> bool {
         && record.domain_name_id.is_none()
 }
 
+/// Whether `record` is reached at an address this emulator's front door answers at — a
+/// custom domain name of a PUBLIC endpoint type, which is every type the model names a
+/// published alias for: `EDGE` carries "the domain name of the Amazon CloudFront distribution
+/// associated with this custom domain name" and `REGIONAL` "the domain name associated with
+/// the regional endpoint", and a caller points its own DNS record at whichever it was given.
+///
+/// A PRIVATE record is not one: it publishes neither member and is reached through the VPC
+/// endpoints its endpoint configuration names (`vpcEndpointIds` is "only supported for
+/// `PRIVATE` endpoint type"), under the access associations that admit those endpoints — a
+/// different address, with its own contract. Such a record is the one this service mints a
+/// `domainNameId` for ("supported only for private custom domain names"), so both halves of
+/// what makes it private are read.
+///
+/// What this decides is which records the data plane resolves a request's host against
+/// ([`crate::service::invoke::custom_domain_arrival`]): the endpoint a client reaches an
+/// edge-optimized or a regional record at is this one process, so which of them a request
+/// arrived on changes nothing about the api its base path mapping names.
+#[must_use]
+pub fn is_publicly_addressed_domain_name(record: &super::DomainNameEntry) -> bool {
+    record.domain_name_id.is_none()
+        && record
+            .endpoint_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.types.as_ref())
+            .is_some_and(|types| {
+                types
+                    .iter()
+                    .all(|kind| kind != super::PRIVATE_ENDPOINT_TYPE)
+            })
+}
+
 /// One regional custom domain name's own address: where it answers, and the handle that
 /// keeps it open.
 ///
