@@ -17,10 +17,14 @@
 //! The second half of this module is the WIRE harness — [`Answer`], [`call`] and the
 //! tag-key fixture around them — which the suites about the modelled `TagKey` constraint
 //! share instead of each carrying its own copy of the dispatch, the credential scope and
-//! the submission body.
+//! the submission body, followed by the AMAZON S3 half of it ([`ObjectAnswer`], [`s3_call`]
+//! and the object helpers around them) and the terminal-status poll
+//! ([`poll_until_terminal`]): a job's output objects belong to the object store, so the
+//! suites about what a finished job wrote read them back over that service's own wire
+//! protocol, and they share one harness for it.
 
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -279,6 +283,206 @@ pub fn pdf_document(pages: &[&[&str]]) -> Vec<u8> {
     }
     pdf.type1_font(font_id).base_font(Name(b"Helvetica"));
     pdf.finish()
+}
+
+/// The media type an object written with no `Content-Type` of its own carries (Amazon S3's
+/// documented default for an upload that specifies none) — what a client reads a job's
+/// output document with.
+pub const DEFAULT_MEDIA_TYPE: &str = "binary/octet-stream";
+
+/// The `ChecksumType` a single whole-object write settles: there are no parts to compose a
+/// checksum from.
+pub const FULL_OBJECT: &str = "FULL_OBJECT";
+
+/// The server-side encryption Amazon S3 applies to a new object by default (SSE-S3).
+pub const SSE_S3: &str = "AES256";
+
+/// How long [`poll_until_terminal`] may wait for a job to reach a terminal status.
+///
+/// GENEROUS on purpose: the emulated lifecycle spans are a fraction of a second, and this is
+/// only the deadline that stops a broken build from hanging — the loop waits for the
+/// CONDITION, not for a duration, so a loaded machine takes longer and still passes.
+const TERMINAL_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long one poll sleeps before asking again.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// One raw Amazon S3 answer: the status, the response headers and the body.
+///
+/// A job's output objects belong to the OBJECT STORE, so every suite about them reads them
+/// back over Amazon S3's own wire protocol rather than out of this service — which is why the
+/// harness lives here, shared, instead of once per suite.
+pub struct ObjectAnswer {
+    /// The HTTP status the object store answered with.
+    pub status: u16,
+    /// The response headers, which is where a stored object's own metadata travels.
+    pub headers: http::HeaderMap,
+    /// The response body: the object's bytes, a listing, or a refusal document.
+    pub body: Vec<u8>,
+}
+
+impl ObjectAnswer {
+    /// One response header's value, or `None` when the answer carries no such header.
+    pub fn header(&self, name: &str) -> Option<String> {
+        self.headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string)
+    }
+
+    /// The body as text, for an answer a case reports in an assertion message.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).to_string()
+    }
+
+    /// The body as JSON, or `Value::Null` when it is not a JSON document.
+    pub fn json(&self) -> Value {
+        serde_json::from_slice(&self.body).unwrap_or(Value::Null)
+    }
+}
+
+/// One path-style request to the emulator's own Amazon S3 front door: the bucket and the key
+/// live in the URI, the body is the object's own bytes. The credential scope names `s3`,
+/// which is what claims it.
+pub async fn s3_call(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> ObjectAnswer {
+    let mut request = http::Request::builder()
+        .method(method)
+        .uri(format!("https://s3.{REGION}.amazonaws.com{path}"))
+        .header("host", format!("s3.{REGION}.amazonaws.com"))
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/s3/aws4_request, \
+                 SignedHeaders=host, Signature=0000"
+            ),
+        );
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let request = request
+        .body(Bytes::copy_from_slice(body))
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    ObjectAnswer {
+        status: response.status().as_u16(),
+        headers: response.headers().clone(),
+        body: response.body().as_ref().to_vec(),
+    }
+}
+
+/// Create `bucket` in [`REGION`], the way a caller creates one before staging anything in it.
+///
+/// A region-specific endpoint needs the location constraint stated: "the unspecified location
+/// constraint is incompatible for the region specific endpoint this request was sent to" is
+/// what the object store answers a create without one.
+pub async fn create_bucket(router: &MultiServiceRouter, bucket: &str) {
+    let configuration = format!(
+        "<CreateBucketConfiguration><LocationConstraint>{REGION}</LocationConstraint>\
+         </CreateBucketConfiguration>"
+    );
+    let answer = s3_call(
+        router,
+        "PUT",
+        &format!("/{bucket}"),
+        &[],
+        configuration.as_bytes(),
+    )
+    .await;
+    assert_eq!(
+        answer.status, 200,
+        "the bucket {bucket:?} must be created, got {} / {}",
+        answer.status,
+        answer.text()
+    );
+}
+
+/// Store `bytes` at `key` in `bucket`, the way a caller uploads an input asset before
+/// submitting a job that reads it.
+pub async fn put_object(
+    router: &MultiServiceRouter,
+    case: &str,
+    bucket: &str,
+    key: &str,
+    bytes: &[u8],
+) {
+    let answer = s3_call(router, "PUT", &format!("/{bucket}/{key}"), &[], bytes).await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: the object {key:?} must be stored in {bucket:?}, got {} / {}",
+        answer.status,
+        answer.text()
+    );
+}
+
+/// Read one object back with the checksum mode enabled, which is what asks Amazon S3 for the
+/// checksum it stored ("to retrieve the checksum, this mode must be enabled",
+/// `GetObjectRequest$ChecksumMode`).
+pub async fn read_object(router: &MultiServiceRouter, bucket: &str, key: &str) -> ObjectAnswer {
+    s3_call(
+        router,
+        "GET",
+        &format!("/{bucket}/{key}"),
+        &[("x-amz-checksum-mode", "ENABLED")],
+        &[],
+    )
+    .await
+}
+
+/// Ask for one object's metadata alone, with the same checksum mode.
+pub async fn head_object(router: &MultiServiceRouter, bucket: &str, key: &str) -> ObjectAnswer {
+    s3_call(
+        router,
+        "HEAD",
+        &format!("/{bucket}/{key}"),
+        &[("x-amz-checksum-mode", "ENABLED")],
+        &[],
+    )
+    .await
+}
+
+/// Poll `GetDataAutomationStatus` until the job `invocation_arn` names reaches a terminal
+/// status, and answer the FIRST body that reported it — so every assertion a suite makes
+/// about that job's output is made against the very read a polling client would have acted
+/// on.
+///
+/// The wait is bounded by [`TERMINAL_DEADLINE`] and is a wait for the CONDITION: the loop
+/// asks again until the job reports terminal, so nothing here depends on how fast the host
+/// runs.
+pub async fn poll_until_terminal(
+    router: &MultiServiceRouter,
+    case: &str,
+    invocation_arn: &str,
+) -> Value {
+    let deadline = Instant::now() + TERMINAL_DEADLINE;
+    loop {
+        let answer = call(
+            router,
+            "GetDataAutomationStatus",
+            json!({"invocationArn": invocation_arn}),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected 200 from GetDataAutomationStatus, got {} / {}",
+            answer.status, answer.body
+        );
+        let status = answer.body["status"].as_str().unwrap_or_default();
+        if matches!(status, "Success" | "ClientError" | "ServiceError") {
+            return answer.body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: the job never reached a terminal status, last read {}",
+            answer.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// The refusal message a tag key outside the modelled pattern earns at input path `path`:

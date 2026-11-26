@@ -24,17 +24,16 @@
 
 use std::io::Cursor;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use bytes::Bytes;
-use serde_json::{json, Value};
+use serde_json::json;
 use service_com_amazonaws_bedrockdataautomationruntime_amazonbedrockkeystoneruntimeservice as bda;
 use service_com_amazonaws_s3_amazons3 as s3;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The region every request below signs for: the handler reads the region out of the SigV4
-/// credential scope and addresses the object store in it, so every call here agrees on one.
-const REGION: &str = "us-west-2";
+use crate::support::{
+    create_bucket, head_object, poll_until_terminal, put_object, read_object, DEFAULT_MEDIA_TYPE,
+    FULL_OBJECT, SSE_S3,
+};
 
 /// The data-automation project every submission names — the member that says WHAT to extract.
 /// Arranged in the owning (build-time) service's store, because a submission naming a project
@@ -55,27 +54,6 @@ const OUTPUT_PREFIX: &str = "output";
 /// the algorithm its value is a digest under.
 const CRC32: &str = "CRC32";
 
-/// The `ChecksumType` a single whole-object write settles: there are no parts to compose a
-/// checksum from.
-const FULL_OBJECT: &str = "FULL_OBJECT";
-
-/// The media type an object written with no `Content-Type` of its own carries (Amazon S3's
-/// documented default for an upload that specifies none).
-const DEFAULT_MEDIA_TYPE: &str = "binary/octet-stream";
-
-/// The server-side encryption Amazon S3 applies to a new object by default (SSE-S3).
-const SSE_S3: &str = "AES256";
-
-/// How long a poll may wait for a job to reach a terminal status.
-///
-/// GENEROUS on purpose: the emulated lifecycle spans are a fraction of a second, and this is
-/// only the deadline that stops a broken build from hanging — the loop below waits for the
-/// CONDITION, not for a duration, so a loaded machine takes longer and still passes.
-const TERMINAL_DEADLINE: Duration = Duration::from_secs(60);
-
-/// How long one poll sleeps before asking again.
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
-
 /// One emulator: this service and Amazon S3 on a single shared engine behind the production
 /// router, with the referenced project arranged and both buckets created.
 async fn emulator() -> MultiServiceRouter {
@@ -86,121 +64,15 @@ async fn emulator() -> MultiServiceRouter {
     router.register_service(bda::EmulatedService::new(Arc::clone(&engine)));
     router.register_service(s3::EmulatedService::new(Arc::clone(&engine)));
     for bucket in [ASSET_BUCKET, OUTPUT_BUCKET] {
-        // A region-specific endpoint needs the location constraint stated.
-        let configuration = format!(
-            "<CreateBucketConfiguration><LocationConstraint>{REGION}</LocationConstraint>\
-             </CreateBucketConfiguration>"
-        );
-        let answer = s3_call(
-            &router,
-            "PUT",
-            &format!("/{bucket}"),
-            &[],
-            configuration.as_bytes(),
-        )
-        .await;
-        assert_eq!(
-            answer.status, 200,
-            "the bucket {bucket:?} must be created, got {} / {}",
-            answer.status,
-            answer.text()
-        );
+        create_bucket(&router, bucket).await;
     }
     router
-}
-
-/// One raw Amazon S3 answer: the status, the response headers and the body.
-struct ObjectAnswer {
-    status: u16,
-    headers: http::HeaderMap,
-    body: Vec<u8>,
-}
-
-impl ObjectAnswer {
-    /// One response header's value, or `None` when the answer carries no such header.
-    fn header(&self, name: &str) -> Option<String> {
-        self.headers
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string)
-    }
-
-    /// The body as text, for an answer a case reports in an assertion message.
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.body).to_string()
-    }
-}
-
-/// One path-style request to the emulator's own Amazon S3 front door. The credential scope
-/// names `s3`, which is what claims it.
-async fn s3_call(
-    router: &MultiServiceRouter,
-    method: &str,
-    path: &str,
-    headers: &[(&str, &str)],
-    body: &[u8],
-) -> ObjectAnswer {
-    let mut request = http::Request::builder()
-        .method(method)
-        .uri(format!("https://s3.{REGION}.amazonaws.com{path}"))
-        .header("host", format!("s3.{REGION}.amazonaws.com"))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/s3/aws4_request, \
-                 SignedHeaders=host, Signature=0000"
-            ),
-        );
-    for (name, value) in headers {
-        request = request.header(*name, *value);
-    }
-    let request = request
-        .body(Bytes::copy_from_slice(body))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    ObjectAnswer {
-        status: response.status().as_u16(),
-        headers: response.headers().clone(),
-        body: response.body().as_ref().to_vec(),
-    }
 }
 
 /// Stage one input asset at `key` in [`ASSET_BUCKET`], the way a caller uploads it before
 /// submitting.
 async fn stage_asset(router: &MultiServiceRouter, case: &str, key: &str, bytes: &[u8]) {
-    let answer = s3_call(router, "PUT", &format!("/{ASSET_BUCKET}/{key}"), &[], bytes).await;
-    assert_eq!(
-        answer.status, 200,
-        "case {case:?}: the asset {key:?} must be staged, got {} / {}",
-        answer.status,
-        answer.text()
-    );
-}
-
-/// Read one object back with the checksum mode enabled, which is what asks Amazon S3 for the
-/// checksum it stored ("to retrieve the checksum, this mode must be enabled",
-/// `GetObjectRequest$ChecksumMode`).
-async fn read_object(router: &MultiServiceRouter, bucket: &str, key: &str) -> ObjectAnswer {
-    s3_call(
-        router,
-        "GET",
-        &format!("/{bucket}/{key}"),
-        &[("x-amz-checksum-mode", "ENABLED")],
-        &[],
-    )
-    .await
-}
-
-/// Ask for one object's metadata alone, with the same checksum mode.
-async fn head_object(router: &MultiServiceRouter, bucket: &str, key: &str) -> ObjectAnswer {
-    s3_call(
-        router,
-        "HEAD",
-        &format!("/{bucket}/{key}"),
-        &[("x-amz-checksum-mode", "ENABLED")],
-        &[],
-    )
-    .await
+    put_object(router, case, ASSET_BUCKET, key, bytes).await;
 }
 
 /// Submit one invocation reading `input_s3_uri` and writing under [`OUTPUT_PREFIX`], and
@@ -226,36 +98,6 @@ async fn submit(router: &MultiServiceRouter, case: &str, input_s3_uri: &str) -> 
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: no invocationArn in {}", answer.body))
         .to_string()
-}
-
-/// Poll `GetDataAutomationStatus` until the job reaches a terminal status, and answer the
-/// FIRST body that reported it — so every assertion below is made against the very read a
-/// polling client would have acted on.
-async fn poll_until_terminal(router: &MultiServiceRouter, case: &str, invocation_arn: &str) -> Value {
-    let deadline = Instant::now() + TERMINAL_DEADLINE;
-    loop {
-        let answer = crate::support::call(
-            router,
-            "GetDataAutomationStatus",
-            json!({"invocationArn": invocation_arn}),
-        )
-        .await;
-        assert_eq!(
-            answer.status, 200,
-            "case {case:?}: expected 200 from GetDataAutomationStatus, got {} / {}",
-            answer.status, answer.body
-        );
-        let status = answer.body["status"].as_str().unwrap_or_default();
-        if matches!(status, "Success" | "ClientError" | "ServiceError") {
-            return answer.body;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "case {case:?}: the job never reached a terminal status, last read {}",
-            answer.body
-        );
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
 }
 
 /// The Base64 digest of `data` under the `ChecksumAlgorithm` value `algorithm`, as every
