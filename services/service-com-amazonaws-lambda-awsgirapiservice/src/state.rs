@@ -1723,11 +1723,25 @@ pub const PROVISIONED_CONCURRENCY_READY: &str = "READY";
 ///
 /// AWS documents no duration for it — only that the allocation is not immediate ("The
 /// status of the allocation process" is `IN_PROGRESS` while Lambda prepares the
-/// environments) — so the span is EMULATOR-CHOSEN, the same half second this slice uses
-/// for a function's own activation ([`ACTIVATION_DELAY`]). It is never zero, so a caller
-/// that reads the configuration straight after setting it sees the `IN_PROGRESS` status
-/// and the zero allocation that go with a warm-up still under way.
-pub const PROVISIONED_CONCURRENCY_ALLOCATION_DELAY: Duration = Duration::from_millis(500);
+/// environments) — so the span is EMULATOR-CHOSEN, and what it has to serve are both
+/// halves of what the API advertises.
+///
+/// It is never zero, so the call that ACCEPTS the allocation, and a read taken in the same
+/// breath as it, report the `IN_PROGRESS` status and the zero allocation that go with a
+/// warm-up still under way — the asynchronous shape `PutProvisionedConcurrencyConfig`
+/// documents by answering 202 rather than a finished allocation.
+///
+/// And it is SHORT, a tenth of a second rather than the half second a function's own
+/// activation takes ([`ACTIVATION_DELAY`]), because a client does not sit this span out: it
+/// POLLS for `READY` before it cuts traffic over to the allocation (the wait AWS's own
+/// waiters implement over `GetProvisionedConcurrencyConfig`), and such a poll looks again on
+/// the order of a second and gives up after a handful of looks. A span that outlasts the
+/// first looks a readiness poll takes leaves that client waiting on a status this emulator
+/// has nothing left to do for: the environments an allocation stands for are the pool's and
+/// are built on the invoke path, so no work of this process is pending on the warm-up. So
+/// the span is the smallest one that still makes the transient status observable, and the
+/// looks a polling client takes find the allocation ready.
+pub const PROVISIONED_CONCURRENCY_ALLOCATION_DELAY: Duration = Duration::from_millis(100);
 
 /// The message a provisioned-concurrency operation refuses with when the qualifier a
 /// configuration would be ADDED to names the unpublished version.
