@@ -173,7 +173,7 @@ enum Dimension {
     /// `ISP`: the recipient's mailbox provider.
     Isp(String),
     /// `TENANT_NAME`: a tenant of the account.
-    Tenant,
+    Tenant(String),
 }
 
 impl Dimension {
@@ -185,7 +185,7 @@ impl Dimension {
             // compares it.
             DIMENSION_EMAIL_IDENTITY => Self::EmailIdentity(crate::state::identity_key(value)),
             DIMENSION_CONFIGURATION_SET => Self::ConfigurationSet(value.to_string()),
-            DIMENSION_TENANT_NAME => Self::Tenant,
+            DIMENSION_TENANT_NAME => Self::Tenant(value.to_string()),
             // The one remaining name is `ISP`, "the recipient ISP (e.g. Gmail,
             // Yahoo, etc.)" — the keys are checked against the model's value set
             // before a query reaches here.
@@ -215,11 +215,11 @@ impl Dimension {
                 message.configuration_set_name.as_deref() == Some(name.as_str())
             }
             Self::Isp(isp) => serves_recipient(isp, recipient),
-            // "The name of the tenant used when sending messages (if one was used)":
-            // no message in the log was sent through a tenant, because the send
-            // operations answer a request carrying a `TenantName` as unwritten, so no
-            // tenant accounts for any message.
-            Self::Tenant => false,
+            // "The name of the tenant used when sending messages (if one was used)": the
+            // tenant a message was sent through is the one the send named and the account
+            // held, as the log records it, so a value naming another tenant — or naming one
+            // while the message went through none — keeps no message.
+            Self::Tenant(name) => message.tenant_name.as_deref() == Some(name.as_str()),
         }
     }
 }

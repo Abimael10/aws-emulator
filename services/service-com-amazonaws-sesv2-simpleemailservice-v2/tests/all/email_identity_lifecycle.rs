@@ -1515,6 +1515,7 @@ async fn the_outbound_log_and_the_sending_quota_are_bounded() {
                 body: None,
                 body_html: None,
                 configuration_set_name: None,
+                tenant_name: None,
                 reply_to: Vec::new(),
                 feedback_forwarding: None,
                 email_tags: Vec::new(),
@@ -1794,11 +1795,10 @@ async fn send_refuses_what_it_cannot_accept() {
     // answered as unwritten, not accepted as if they had not been sent.
     // `ListManagementOptions` is NOT one of them: it names a contact list, which this
     // slice holds, so it is resolved against the contact-list table (see
-    // `send_list_management_options`).
-    for member in [
-        json!({"TenantName": "tenant-a"}),
-        json!({"EndpointId": "endpoint-a"}),
-    ] {
+    // `send_list_management_options`). Neither is `TenantName`: it names a tenant, which
+    // this slice holds too, so it is resolved against the tenant table (see
+    // `send_through_a_tenant`).
+    for member in [json!({"EndpointId": "endpoint-a"})] {
         let mut request = json!({
             "FromEmailAddress": "solo@example.net",
             "Destination": destination,

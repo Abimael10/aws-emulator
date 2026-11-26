@@ -86,6 +86,10 @@ mod tenant_reputation;
 /// The hold a tenant's resource associations put on the resource they name: the one gate
 /// every delete of an associable resource reads, and the sentence it refuses with.
 mod tenant_associations;
+/// The tenant a send names, resolved against the account's tenants: the one lookup both
+/// send paths run before the message is weighed against the account's sending identities,
+/// and the sentence an unresolvable name is refused with.
+mod send_tenant;
 /// The account's Virtual Deliverability Manager configuration as a gate: whether the
 /// feature is on, and how a call that can only be answered from its data is refused
 /// while it is off.
@@ -127,6 +131,7 @@ pub use minted_ids::*;
 pub use pricing::*;
 pub use suppression::*;
 pub use templates::*;
+pub use send_tenant::*;
 pub use tenant_associations::*;
 pub use tenant_reputation::*;
 pub use vdm::*;
@@ -3478,6 +3483,13 @@ pub struct SentMessage {
     pub body_html: Option<String>,
     /// The configuration set the message was sent with.
     pub configuration_set_name: Option<String>,
+    /// The tenant the message was sent THROUGH (`SendEmailRequest$TenantName`), or `None`
+    /// for a send of the account itself. Resolved against the account's tenants before the
+    /// message was accepted ([`unresolved_send_tenant`]), so a name recorded here is a
+    /// tenant the account held at that moment — which is what the surfaces that report or
+    /// filter a message by its tenant read: the message-insights export's `TenantName`
+    /// field and the `TENANT_NAME` metric dimension.
+    pub tenant_name: Option<String>,
     /// `ReplyToAddresses`.
     pub reply_to: Vec<String>,
     /// `FeedbackForwardingEmailAddress`: where the caller asked for bounce and

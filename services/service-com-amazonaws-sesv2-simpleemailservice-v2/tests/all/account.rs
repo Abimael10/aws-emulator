@@ -206,6 +206,7 @@ impl Ses {
             body: None,
             body_html: None,
             configuration_set_name: None,
+            tenant_name: None,
             reply_to: Vec::new(),
             feedback_forwarding: None,
             email_tags: Vec::new(),

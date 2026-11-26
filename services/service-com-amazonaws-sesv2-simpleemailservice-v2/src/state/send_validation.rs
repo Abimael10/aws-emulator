@@ -101,6 +101,23 @@ pub fn recipient_set_defect(recipients: &[&str]) -> Option<String> {
         .map(str::to_string)
 }
 
+/// What is wrong with the `TenantName` a send names, or `None` for a value SES accepts —
+/// a send that names no tenant at all included.
+///
+/// The member names a TENANT of the account, so the value has to be one a tenant can be
+/// named by: the documented `TenantName` form, read through the one check every operation
+/// that takes the member reads ([`crate::state::tenant_name_is_well_formed`]) and refused
+/// with the one sentence they all refuse it with
+/// ([`crate::state::invalid_tenant_name`]). Part of the REQUEST's own form, so it is
+/// settled before the account's tenant table is read, exactly as the addresses and the
+/// recipient set above are.
+#[must_use]
+pub fn tenant_name_defect(tenant_name: Option<&str>) -> Option<String> {
+    let name = tenant_name?;
+    (!crate::state::tenant_name_is_well_formed(name))
+        .then(|| crate::state::invalid_tenant_name(name))
+}
+
 /// The defect in the address a BULK send is SENT FROM, or `None` for a value that names a
 /// mailbox.
 ///

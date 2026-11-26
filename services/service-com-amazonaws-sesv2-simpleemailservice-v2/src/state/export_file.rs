@@ -741,10 +741,12 @@ impl<'a> InsightRecord<'a> {
         ""
     }
 
-    /// The tenant the message was sent through, which no message in the log was: the
-    /// send operations answer a request carrying a `TenantName` as unwritten.
-    fn tenant_name(&self) -> &'static str {
-        ""
+    /// The tenant the message was sent through, as the log holds it
+    /// (`super::SentMessage::tenant_name`): a send that named one was resolved against the
+    /// account's tenants before it was accepted, and a send of the account itself went
+    /// through no tenant, so that field is empty for it.
+    fn tenant_name(&self) -> &str {
+        self.message.tenant_name.as_deref().unwrap_or_default()
     }
 
     /// This record as the export writes it, in [`MESSAGE_INSIGHTS_FIELDS`] order.

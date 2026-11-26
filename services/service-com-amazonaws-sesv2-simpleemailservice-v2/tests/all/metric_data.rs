@@ -304,6 +304,9 @@ impl Ses {
             configuration_set_name: message
                 .configuration_set
                 .map(|configuration_set| configuration_set.to_string()),
+            // Every message this table places in the log is a send of the account
+            // itself: a send through a tenant is covered by its own suite.
+            tenant_name: None,
             reply_to: Vec::new(),
             feedback_forwarding: None,
             email_tags: Vec::new(),
@@ -721,8 +724,8 @@ async fn a_dimension_keeps_the_activity_it_names() {
             expected: Vec::new(),
         },
         Case {
-            // Nothing in this slice sends through a tenant, so no message is
-            // attributed to one — including a tenant the account does hold.
+            // No message this table logged was sent through a tenant, so no tenant is
+            // attributed one — including a tenant the account does hold.
             case: "a tenant of the account accounts for no message",
             dimensions: json!({"TENANT_NAME": "a-tenant"}),
             expected: Vec::new(),

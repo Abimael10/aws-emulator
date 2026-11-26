@@ -230,7 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Members that select a resource this slice does not own: the sending
-        // authorization policies, tenants, multi-region endpoints and per-request tracking
+        // authorization policies, multi-region endpoints and per-request tracking
         // overrides they name are kept by operations nobody has written yet. A request
         // that names one is answered as unwritten, rather than accepted as if the member
         // had not been sent.
@@ -246,7 +246,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "FeedbackForwardingEmailAddressIdentityArn",
             ),
             (input.endpoint_id.is_some(), "EndpointId"),
-            (input.tenant_name.is_some(), "TenantName"),
             (
                 input.configuration_overrides.is_some(),
                 "ConfigurationOverrides",
@@ -396,6 +395,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let content = {
             let mut store = state.lock();
             store.settle(now);
+
+            // "The name of the tenant through which this email will be sent": the member
+            // NAMES a tenant of the caller's account, so it is resolved against the
+            // account's tenant table — ahead of every gate on the account's sending and on
+            // the sending identity below, exactly as a single send resolves it
+            // (`crate::ops::send_email`), since a send through a tenant that is not there
+            // is refused for the tenant and for nothing else.
+            if let Some(message) = crate::state::unresolved_send_tenant(
+                &store,
+                input.tenant_name.as_deref(),
+                crate::state::CallerScope::of(ctx.parts()).account_id,
+            ) {
+                return Err(SendBulkEmailErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
 
             // The account-level sending switch (`GetAccount`'s `SendingEnabled`, which
             // `PutAccountSendingAttributes` sets) gates every message this account
@@ -557,6 +575,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::ComAmazonawsSesv2SimpleemailserviceV2State::retained_body,
                 ),
                 configuration_set_name: input.configuration_set_name.clone(),
+                // The tenant every message of this call was sent through, resolved above.
+                tenant_name: input.tenant_name.clone(),
                 reply_to: input.reply_to_addresses.clone().unwrap_or_default(),
                 // Recorded, not acted on: nothing here forwards a bounce or a complaint as
                 // mail to the address the caller nominated, so that address is part of what
@@ -1057,6 +1077,13 @@ fn validate_request(
     if let Some(defect) = crate::state::send_validation::tags_defect(
         input.default_email_tags.as_deref().unwrap_or_default(),
     ) {
+        return Err(bad_request(defect));
+    }
+    // The tenant every message of this call is sent THROUGH: a resource of the account, so
+    // the value has to be one a tenant can be named by before the tenant table is read.
+    if let Some(defect) =
+        crate::state::send_validation::tenant_name_defect(input.tenant_name.as_deref())
+    {
         return Err(bad_request(defect));
     }
     Ok(())

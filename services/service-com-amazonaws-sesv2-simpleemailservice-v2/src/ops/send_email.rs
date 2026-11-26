@@ -255,11 +255,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         validate_request(&input)?;
 
         // Members that select a resource this slice does not own: the sending
-        // authorization policies, tenants and multi-region endpoints they name are
-        // kept by operations nobody has written yet. A request that names one is
-        // answered as unwritten, rather than accepted as if the member had not been
-        // sent. Behind the validation above: a request that is malformed is refused for
-        // that whichever of these members it also carries.
+        // authorization policies and multi-region endpoints they name are kept by
+        // operations nobody has written yet. A request that names one is answered as
+        // unwritten, rather than accepted as if the member had not been sent. Behind the
+        // validation above: a request that is malformed is refused for that whichever of
+        // these members it also carries.
         for (present, member) in [
             (
                 input.from_email_address_identity_arn.is_some(),
@@ -272,7 +272,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "FeedbackForwardingEmailAddressIdentityArn",
             ),
             (input.endpoint_id.is_some(), "EndpointId"),
-            (input.tenant_name.is_some(), "TenantName"),
             (
                 input.configuration_overrides.is_some(),
                 "ConfigurationOverrides",
@@ -343,6 +342,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.settle(now);
+
+        // "The name of the tenant through which this email will be sent": the member NAMES
+        // a tenant of the caller's account, so it is resolved against the account's tenant
+        // table — ahead of every gate on the account's sending and on the sending identity
+        // below, since a send through a tenant that is not there is refused for the tenant
+        // and for nothing else ([`crate::state::unresolved_send_tenant`]).
+        if let Some(message) = crate::state::unresolved_send_tenant(
+            &store,
+            input.tenant_name.as_deref(),
+            crate::state::CallerScope::of(ctx.parts()).account_id,
+        ) {
+            return Err(SendEmailErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+            .into());
+        }
 
         // "An object used to specify a list or topic to which an email belongs, which
         // will be used when a contact chooses to unsubscribe": the list and the topic
@@ -537,6 +552,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::ComAmazonawsSesv2SimpleemailserviceV2State::retained_body,
             ),
             configuration_set_name: input.configuration_set_name,
+            // The tenant this message was sent through, resolved above: what the surfaces
+            // that report or filter a message by its tenant read.
+            tenant_name: input.tenant_name,
             reply_to: input.reply_to_addresses.unwrap_or_default(),
             // Recorded, not acted on: a bounce or a complaint this send produces is
             // reported to the configuration set's event destinations below, and nothing
@@ -842,6 +860,14 @@ fn validate_request(input: &SendEmailInput) -> Result<(), SendEmailError> {
                 }
             }
         }
+    }
+
+    // The tenant the message is sent THROUGH: a resource of the account, so the value has
+    // to be one a tenant can be named by before the account's tenant table is read for it.
+    if let Some(defect) =
+        crate::state::send_validation::tenant_name_defect(input.tenant_name.as_deref())
+    {
+        return Err(bad_request(defect));
     }
 
     Ok(())
