@@ -73,6 +73,23 @@ async fn delete(router: &MultiServiceRouter, region: &str, plan_arn: &str) -> An
     .await
 }
 
+/// `value` as the INSTANT it denotes, which is what an order comparison between two
+/// timestamps reads.
+///
+/// The modelled `ISO8601DatetimeString` renders fractional seconds with trailing zeros
+/// trimmed, so two instants of the same second carry fractions of different widths and
+/// their TEXT does not order them: `…:47.513Z` is the same instant as `…:47.513000Z` and
+/// precedes `…:47.513364Z`, while comparing the two strings puts it after. Parsed with
+/// the same reader [`is_iso8601`] admits the value with.
+fn instant(value: &str) -> (i64, u32) {
+    let parsed = ::aws_smithy_types::DateTime::from_str(
+        value,
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .unwrap_or_else(|error| panic!("expected {value:?} to be an ISO-8601 instant: {error}"));
+    (parsed.secs(), parsed.subsec_nanos())
+}
+
 /// The status of a reported plan.
 fn status_of(answer: &Answer) -> String {
     plan_of(answer)
@@ -239,13 +256,14 @@ async fn an_update_writes_what_it_names_and_the_read_reports_it() {
             is_iso8601(updated_at),
             "case {case}: updatedAt must stay an ISO-8601 instant in UTC, got {after}"
         );
+        let before_updated_at = before
+            .get("updatedAt")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         assert!(
-            updated_at
-                >= before
-                    .get("updatedAt")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-            "case {case}: updatedAt must not move backwards, got {after}"
+            instant(updated_at) >= instant(before_updated_at),
+            "case {case}: updatedAt must not move backwards from {before_updated_at}, got \
+             {after}"
         );
         assert_executable(case, &answer);
 

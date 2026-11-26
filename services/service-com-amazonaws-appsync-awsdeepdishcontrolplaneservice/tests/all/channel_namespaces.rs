@@ -56,7 +56,7 @@ const NAMESPACE_AUTH_MODE: &str =
 
 /// `Namespace`'s published maximum length (`@length` 1..50,
 /// `smithy_query(query="shape", shape="Namespace")`).
-const NAMESPACE_MAX_LEN: usize = 50;
+pub(crate) const NAMESPACE_MAX_LEN: usize = 50;
 
 /// `Code`'s published maximum length, the bound on `codeHandlers`
 /// (`@length` 1..32768, `smithy_query(query="shape", shape="Code")`).

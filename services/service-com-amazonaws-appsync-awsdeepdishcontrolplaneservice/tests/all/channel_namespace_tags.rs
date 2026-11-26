@@ -37,16 +37,12 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::channel_namespaces::{create_event_api, create_namespace};
+use crate::channel_namespaces::{create_event_api, create_namespace, NAMESPACE_MAX_LEN};
 use crate::error_contract::{call, create_api, router};
 use crate::graphql_api_lifecycle::REGION;
 use crate::resource_tags::{ABSENT_API_ID, ACCOUNT};
 use crate::tag_resource::{list_tags, tag_resource, RESOURCE_NOT_FOUND, TAG_WRITE_STATUS};
 use crate::untag_resource::untag_resource;
-
-/// `Namespace`'s published maximum length (`@length` 1..50, `smithy_query(query="shape",
-/// shape="Namespace")`), which is the longest name a namespace ARN can carry.
-const NAMESPACE_MAX_LEN: usize = 50;
 
 /// The authorization type the `Api` these namespaces hang off is configured with.
 const AUTH_TYPES: &[&str] = &["API_KEY"];
@@ -58,7 +54,7 @@ const INVALID_RESOURCE_ARN: &str = "Invalid input resource arn";
 const EXPECTED_VENDOR: &str = "Invalid input resource arn: expected vendor appsync";
 
 /// Create one channel namespace with `tags` and answer the ARN the service minted for it.
-async fn namespace_arn(
+pub(crate) async fn namespace_arn(
     router: &MultiServiceRouter,
     api_id: &str,
     name: &str,
