@@ -1859,3 +1859,302 @@ async fn a_failure_of_a_cbor_framed_request_is_answered_in_that_framing() {
         unknown.body
     );
 }
+
+// ---------------------------------------------------------------------------
+// A request whose FRAMING CONTRADICTS ITSELF.
+//
+// RULE: the RPC v2 CBOR framing names its operation in the request path and its
+// specification PROHIBITS the `awsJson` framing's dispatch headers
+// (`X-Amz-Target`, `X-Amzn-Target`), so a request that names that framing and
+// carries one of those headers anyway names its operation twice, in two
+// framings, and is a request in neither: the front door refuses it with HTTP 400
+// whose body names the class `MalformedHttpRequestException` and carries nothing
+// else. The refusal is decided from the request's headers and path alone, so it
+// is settled before any byte of the body is read, before any operation is named,
+// and no operation of this endpoint runs for such a request.
+//
+// The rows below differ along what that rule generalises over: which spelling and
+// casing of the prohibited header the request carries, how it names the CBOR
+// framing (that framing's header, its path, or both), which operation the path
+// names (a read, a write, one this endpoint does not have), whether the header
+// agrees with the path, and what the body holds (a filter, no member, bytes that
+// are not CBOR at all, nothing).
+// ---------------------------------------------------------------------------
+
+/// The class the front door reports a malformed HTTP request as. The whole body
+/// of that refusal is this one member, with no content under it: the front door
+/// read no operation and no member, so it words nothing.
+const MALFORMED_HTTP_REQUEST: &str = "MalformedHttpRequestException";
+
+/// One answer the front door gave: the status, the media type it labelled the
+/// body with, the body's bytes as text (for an assertion to report), and that
+/// body parsed as JSON (`Null` when it is empty or is not JSON).
+#[derive(Debug, Clone, PartialEq)]
+struct FrontDoorAnswer {
+    status: u16,
+    content_type: String,
+    text: String,
+    body: serde_json::Value,
+}
+
+/// `POST uri` carrying `headers` and `body`, and what the endpoint answered.
+///
+/// The headers are given per case rather than per framing, because the whole
+/// point of a case is the combination of markers a request carries.
+async fn asked_with(
+    router: &MultiServiceRouter,
+    uri: &str,
+    headers: &[(&str, String)],
+    body: Vec<u8>,
+) -> FrontDoorAnswer {
+    // The SigV4 credential scope is the routing signal that names the `tagging`
+    // signing name this service claims, whatever framing the request is in.
+    let mut request = http::Request::builder().method("POST").uri(uri).header(
+        "authorization",
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/tagging/aws4_request, \
+         SignedHeaders=host, Signature=0",
+    );
+    for (name, value) in headers {
+        request = request.header(*name, value.as_str());
+    }
+    let request = request
+        .body(bytes::Bytes::from(body))
+        .expect("build the request");
+
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let text = String::from_utf8_lossy(response.body()).to_string();
+    let body = serde_json::from_slice(response.body()).unwrap_or(serde_json::Value::Null);
+    FrontDoorAnswer {
+        status,
+        content_type,
+        text,
+        body,
+    }
+}
+
+/// The headers the CBOR framing itself carries: the protocol marker and the media
+/// types of that framing's bodies.
+fn cbor_framing_headers() -> Vec<(&'static str, String)> {
+    vec![
+        (SMITHY_PROTOCOL.0, SMITHY_PROTOCOL.1.to_string()),
+        ("content-type", CBOR_MEDIA_TYPE.to_string()),
+        ("accept", CBOR_MEDIA_TYPE.to_string()),
+    ]
+}
+
+/// The path that framing routes `operation` on.
+fn cbor_path(operation: &str) -> String {
+    format!("/service/{SERVICE_LABEL}/operation/{operation}")
+}
+
+/// One row of the table below: the case, the uri asked for, the headers the
+/// request carries beyond the credential scope, and its body bytes.
+type ContradictoryCase = (
+    &'static str,
+    String,
+    Vec<(&'static str, String)>,
+    Vec<u8>,
+);
+
+#[tokio::test]
+async fn a_cbor_framed_request_carrying_a_target_header_is_a_malformed_http_request() {
+    let router = emulator();
+    let alpha = "arn:aws:lex:us-east-1:123456789012:bot:alpha";
+    tag(&router, &[alpha], &[("Env", "prod")]).await;
+
+    // The ARN the contradictory WRITE row asks to tag. It must still be untagged
+    // afterwards: the refusal runs no operation.
+    let never_written = "arn:aws:lex:us-east-1:123456789012:bot:never-written";
+    let filter = serde_json::json!({ "TagFilters": [{ "Key": "Env", "Values": ["prod"] }] });
+    let target = |operation: &str| format!("{SERVICE_LABEL}.{operation}");
+    let with = |extra: (&'static str, String)| {
+        let mut headers = cbor_framing_headers();
+        headers.push(extra);
+        headers
+    };
+
+    let rows: Vec<ContradictoryCase> = vec![
+        // The framing's own header and path, plus the header it prohibits.
+        (
+            "the framing's header and path, plus x-amz-target",
+            cbor_path("GetResources"),
+            with(("x-amz-target", target("GetResources"))),
+            cbor_bytes(&filter, Lengths::Declared),
+        ),
+        // The other spelling of that header, on another operation, with the
+        // request's containers written the other way.
+        (
+            "x-amzn-target, the other spelling of that header",
+            cbor_path("GetTagKeys"),
+            with(("x-amzn-target", target("GetTagKeys"))),
+            cbor_bytes(&serde_json::json!({}), Lengths::Indefinite),
+        ),
+        // Header names are case-insensitive on the wire, so the upper-case
+        // spelling an SDK writes is the same header.
+        (
+            "X-Amz-Target spelled in upper case",
+            cbor_path("GetTagValues"),
+            with(("X-Amz-Target", target("GetTagValues"))),
+            cbor_bytes(&serde_json::json!({ "Key": "Env" }), Lengths::Declared),
+        ),
+        // The framing named by its PATH alone, with no protocol header.
+        (
+            "the framing's path alone, plus that header",
+            cbor_path("GetResources"),
+            vec![
+                ("content-type", CBOR_MEDIA_TYPE.to_string()),
+                ("x-amz-target", target("GetResources")),
+            ],
+            cbor_bytes(&filter, Lengths::Declared),
+        ),
+        // The framing named by its HEADER alone, posted to `/`.
+        (
+            "the framing's header alone, posted to /, plus that header",
+            "/".to_string(),
+            with(("x-amz-target", target("GetResources"))),
+            cbor_bytes(&filter, Lengths::Indefinite),
+        ),
+        // A WRITE named in both framings at once.
+        (
+            "a write operation named in both framings",
+            cbor_path("TagResources"),
+            with(("x-amz-target", target("TagResources"))),
+            cbor_bytes(
+                &serde_json::json!({
+                    "ResourceARNList": [never_written],
+                    "Tags": { "Env": "prod" }
+                }),
+                Lengths::Declared,
+            ),
+        ),
+        // The two namings disagreeing about which operation is called, which is
+        // why the framing prohibits the header in the first place.
+        (
+            "a target header naming another operation than the path",
+            cbor_path("GetResources"),
+            with(("x-amz-target", target("GetTagKeys"))),
+            cbor_bytes(&filter, Lengths::Declared),
+        ),
+        // An empty value still names the other framing's dispatch header.
+        (
+            "an empty target header value",
+            cbor_path("GetResources"),
+            with(("x-amz-target", String::new())),
+            cbor_bytes(&filter, Lengths::Declared),
+        ),
+        // An operation this endpoint does not have: the framing is already
+        // contradictory, so the request is refused before any operation is named.
+        (
+            "an operation this endpoint does not have, plus that header",
+            cbor_path("GetNoSuchThing"),
+            with(("x-amz-target", target("GetResources"))),
+            cbor_bytes(&serde_json::json!({}), Lengths::Declared),
+        ),
+        // Bodies the framing could not read: the refusal is settled by the
+        // headers and the path, before a byte of the body is read.
+        (
+            "a body that is not CBOR at all",
+            cbor_path("GetResources"),
+            with(("x-amz-target", target("GetResources"))),
+            b"not cbor at all".to_vec(),
+        ),
+        (
+            "no body at all",
+            cbor_path("GetResources"),
+            with(("x-amz-target", target("GetResources"))),
+            Vec::new(),
+        ),
+    ];
+
+    for (case, uri, headers, body) in rows {
+        let answer = asked_with(&router, &uri, &headers, body).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: expected HTTP 400 for a self-contradictory framing, got {} with \
+             {:?}",
+            answer.status, answer.text
+        );
+        assert_eq!(
+            answer.body,
+            serde_json::json!({ MALFORMED_HTTP_REQUEST: "" }),
+            "case {case:?}: expected the body to name {MALFORMED_HTTP_REQUEST} and nothing \
+             else, got {:?}",
+            answer.text
+        );
+    }
+
+    // No operation ran for any of those requests: the write row tagged nothing,
+    // and the store still answers exactly what was tagged before them.
+    let (status, read) = call(
+        &router,
+        "GetResources",
+        serde_json::json!({ "TagFilters": [{ "Key": "Env", "Values": ["prod"] }] }),
+    )
+    .await;
+    assert_eq!(status, 200, "case the read afterwards: body {read}");
+    assert_eq!(
+        page_arns(&read),
+        vec![alpha.to_string()],
+        "case the read afterwards: the refused requests must have changed nothing, got {read}"
+    );
+}
+
+#[tokio::test]
+async fn each_framing_on_its_own_is_still_served() {
+    let router = emulator();
+    let alpha = "arn:aws:lex:us-east-1:123456789012:bot:alpha";
+    tag(&router, &[alpha], &[("Env", "prod")]).await;
+
+    let filter = serde_json::json!({ "TagFilters": [{ "Key": "Env", "Values": ["prod"] }] });
+    // (case, uri, headers, body) — the same calls as the table above with the one
+    // marker that makes them contradictory removed, plus the `awsJson` framing
+    // whose dispatch header `X-Amz-Target` is.
+    let rows: Vec<ContradictoryCase> = vec![
+        (
+            "the CBOR framing with no target header",
+            cbor_path("GetResources"),
+            cbor_framing_headers(),
+            cbor_bytes(&filter, Lengths::Declared),
+        ),
+        (
+            "the CBOR framing's path alone, no target header",
+            cbor_path("GetResources"),
+            vec![("content-type", CBOR_MEDIA_TYPE.to_string())],
+            cbor_bytes(&filter, Lengths::Indefinite),
+        ),
+        (
+            "the awsJson framing, whose dispatch header that is",
+            "/".to_string(),
+            vec![
+                ("content-type", "application/x-amz-json-1.1".to_string()),
+                (
+                    "x-amz-target",
+                    format!("{SERVICE_LABEL}.GetResources"),
+                ),
+            ],
+            filter.to_string().into_bytes(),
+        ),
+    ];
+
+    for (case, uri, headers, body) in rows {
+        let answer = asked_with(&router, &uri, &headers, body).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: a framing that names itself once must be served, got {} with {:?}",
+            answer.status, answer.text
+        );
+        assert!(
+            !answer.text.contains(MALFORMED_HTTP_REQUEST),
+            "case {case:?}: expected no malformed-request refusal, got {:?} ({})",
+            answer.text,
+            answer.content_type
+        );
+    }
+}

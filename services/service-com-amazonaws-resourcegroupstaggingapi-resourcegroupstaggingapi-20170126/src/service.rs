@@ -51,6 +51,11 @@ use std::sync::Arc;
 /// answered in; see the module's own header.
 mod request_framing;
 
+/// What this endpoint answers a request whose framing CONTRADICTS ITSELF — one naming the
+/// RPC v2 CBOR framing that also carries a header that framing prohibits; see the module's
+/// own header.
+mod contradictory_framing;
+
 /// What this service states about the half of a constraint refusal the framework cannot
 /// state — the COLLECTION a clause about a collection member is about; see the module's own
 /// header.
@@ -72,6 +77,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// wrapped operation reads and writes the one store. Held on the service because
     /// [`Service::override_operation`] hands back a borrow of `self`.
     quoting_submitted_collections: OperationRoutingTable,
+    /// The answer a request whose framing contradicts itself earns, ahead of every modelled
+    /// operation ([`contradictory_framing`]). Stateless, and held here rather than built per
+    /// request, because [`Service::override_operation`] hands back a borrow of `self`.
+    refusing_contradictory_framing: contradictory_framing::MalformedHttpRequest,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -82,6 +91,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             quoting_submitted_collections:
                 submitted_collections::quoting_submitted_collections(&engine),
+            refusing_contradictory_framing: contradictory_framing::MalformedHttpRequest,
             entry: request_framing::ServedInTheFramingOfTheRequest::new(
                 crate::ServiceDefinition::new(engine),
             ),
@@ -127,6 +137,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // does not hold declines here, leaving the generated table and the router's
         // routing-error path unchanged. The wrapper declares the wrapped
         // operation's own auth schemes, so nothing about signing changes.
+        // Before any of that: a request whose framing CONTRADICTS ITSELF — one naming the
+        // RPC v2 CBOR framing that also carries a header that framing prohibits — is a
+        // malformed HTTP request, refused ahead of every modelled operation and without
+        // reading its body (see [`contradictory_framing`]).
+        if contradictory_framing::frames_itself_contradictorily(req) {
+            return Some(&self.refusing_contradictory_framing as &dyn ErasedOperation);
+        }
         let operation = self.entry.wire_protocol(req).protocol().routing_key(req).ok()?;
         self.quoting_submitted_collections.get(operation)
     }

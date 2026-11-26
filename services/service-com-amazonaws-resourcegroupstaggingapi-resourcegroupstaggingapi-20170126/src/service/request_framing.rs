@@ -52,7 +52,7 @@ use smithy_server_runtime::{
 /// recognises a framing by, reading the `smithy-protocol` header and the
 /// `/service/{Service}/operation/{Operation}` path and nothing else — so this service
 /// cannot recognise a request the framework would not, or miss one it would.
-fn names_rpc_v2_cbor(req: &RtRequest) -> bool {
+pub(super) fn names_rpc_v2_cbor(req: &RtRequest) -> bool {
     matches!(
         WireProtocolKind::detect(req),
         Some(WireProtocolKind::RpcV2Cbor)
