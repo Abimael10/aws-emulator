@@ -25,6 +25,21 @@ pub fn missing_parameter_message(member: &str) -> String {
 /// validating walk spells it (lowerCamel).
 pub const KEY_SCHEMA_MEMBER_PATH: &str = "keySchema";
 
+/// The THIRD way the same absence is stated: the sentence the body READER itself raises
+/// for a member it ran out of entries for, which names the member and where in the body
+/// the read of the enclosing object stopped.
+///
+/// The surface whose request reader words it this way states no parameter check and no
+/// constraint clause for the absence at all: the read of the body is what fails, so the
+/// message is the reader's — the member named as the model spells it on the wire, between
+/// backticks, and the ONE-based line and column just past the object the read was building
+/// (a read only runs out of members once that object has been consumed whole). Which
+/// operations answer an absent member this way is recorded in `src/service.rs` beside the
+/// other refusal wordings that follow the operation served.
+pub fn missing_field_message(member: &str, line: usize, column: usize) -> String {
+    format!("missing field `{member}` at line {line} column {column}")
+}
+
 /// The other way the same absence is stated: the validating WALK's own clause for a member
 /// the request carries no value for, inside the `<N> validation error(s) detected: `
 /// envelope that counts it.

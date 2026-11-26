@@ -419,4 +419,129 @@ fn declared_trait<'t, T: 'static>(
     traits.get(id)?.as_any().downcast_ref::<T>()
 }
 
+/// Where the reader of `req`'s body stands once it has read the request object whole: the
+/// one-based line and column serde's own reader fixes to a failure raised inside that
+/// read, which is the position a `missing field` refusal states.
+///
+/// `None` for an operation whose reader states no position for an absent member
+/// (`super::BODY_READER_OPERATIONS`), and for bytes that are not text at all — bytes no
+/// reader gets a position in are refused as the protocol's own marshalling failure instead
+/// (`super::request_layer`).
+///
+/// A read only runs out of members once the object it was building has been consumed
+/// whole, so the position such a refusal states is that object's end rather than the
+/// member's. Nothing is scanned for it: the position comes from the reader that ran, which
+/// is why a brace inside a string value, an escape and a nested object need no handling
+/// here.
+pub fn body_read_end(operation: &str, req: &RtRequest) -> Option<(usize, usize)> {
+    if !super::reads_body_with_its_own_reader(operation) {
+        return None;
+    }
+    let body = ::std::str::from_utf8(req.body().bytes()?).ok()?;
+    Some(read_to_the_end_of_the_object(body))
+}
+
+/// Read `body` as an object, consuming every entry it carries, and report the position the
+/// reader fixes to the failure that read then raises.
+///
+/// The failure IS the reading: `serde_json` fixes the position of an error raised while
+/// reading an object to just past that object's close, so running a read that consumes the
+/// object and then reports it ran out of members is what produces the position such a
+/// refusal states — the same reader, the same rule, with nothing re-scanning the document.
+/// A body whose top-level value is not an object is reported at the position that value's
+/// own read failed at; no member of such a body is ever found absent, because a body that
+/// builds no input is refused as a marshalling failure first.
+fn read_to_the_end_of_the_object(body: &str) -> (usize, usize) {
+    let mut reader = ::serde_json::Deserializer::from_str(body);
+    match ::serde::Deserializer::deserialize_map(&mut reader, RanOutOfMembers) {
+        Err(reported) => (reported.line(), reported.column()),
+        // The reader above reports a failure for every body, so there is no value here:
+        // `Infallible` has no variants to name.
+        Ok(unreachable) => match unreachable {},
+    }
+}
+
+/// A reader that consumes a JSON object whole and then reports that it ran out of members
+/// — the read a refusal naming an absent member is the position of.
+struct RanOutOfMembers;
+
+impl<'de> ::serde::de::Visitor<'de> for RanOutOfMembers {
+    type Value = ::std::convert::Infallible;
+
+    fn expecting(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        formatter.write_str("a JSON object")
+    }
+
+    fn visit_map<A: ::serde::de::MapAccess<'de>>(
+        self,
+        mut entries: A,
+    ) -> Result<Self::Value, A::Error> {
+        // What the entries HOLD is read by the layers that are about the values; this read
+        // is about where the object ends, so each entry is stepped over.
+        while entries
+            .next_entry::<::serde::de::IgnoredAny, ::serde::de::IgnoredAny>()?
+            .is_some()
+        {}
+        Err(::serde::de::Error::custom("the object ends here"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_to_the_end_of_the_object;
+
+    #[test]
+    fn the_read_ends_past_everything_nested_and_quoted_in_the_object() {
+        // Each row is a body and the position the read of its object ends at: a flat
+        // object, one with a nested object, a brace inside a string value, an escaped
+        // quote before such a brace, and a body with bytes after the object.
+        let rows: Vec<(&str, (usize, usize))> = vec![
+            ("{}", (1, 2)),
+            (r#"{"a":1}"#, (1, 7)),
+            (r#"{"a":{"b":1}}"#, (1, 13)),
+            (r#"{"a":"}"}"#, (1, 9)),
+            (r#"{"a":"\"}"}"#, (1, 11)),
+            (r#"{"a":1}  "#, (1, 7)),
+        ];
+        for (body, expected) in rows {
+            let found = read_to_the_end_of_the_object(body);
+            assert_eq!(
+                found, expected,
+                "case {body:?}: expected the read to end at {expected:?}, got {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_column_counts_from_the_start_of_the_line_the_read_ended_on() {
+        // A body written over several lines: the line the object closes on, and the bytes
+        // consumed on that line — which is how the reader counts a position.
+        let rows: Vec<(&str, (usize, usize))> = vec![
+            ("{\n  \"a\": 1\n}", (3, 1)),
+            ("{\n  \"a\": {\n    \"b\": 1\n  }\n}", (5, 1)),
+            ("{\"a\": 1,\n \"b\": 2}", (2, 8)),
+        ];
+        for (body, expected) in rows {
+            let found = read_to_the_end_of_the_object(body);
+            assert_eq!(
+                found, expected,
+                "case {body:?}: expected the read to end at {expected:?}, got {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_body_that_never_closes_its_object_is_reported_where_the_read_stopped() {
+        // Bytes a reader cannot finish: the reader still states where it got to, which is
+        // the end of the input it ran out of.
+        for body in [r#"{"a":1"#, ""] {
+            let (line, column) = read_to_the_end_of_the_object(body);
+            assert_eq!(
+                line, 1,
+                "case {body:?}: expected the first line, got line {line} column {column}"
+            );
+        }
+    }
+}
+
 

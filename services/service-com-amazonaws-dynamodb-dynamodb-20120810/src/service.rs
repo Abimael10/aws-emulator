@@ -426,6 +426,36 @@ fn states_absent_member_as_clause(operation: &str) -> bool {
         .is_ok()
 }
 
+/// The operations whose request body is read by a reader that words an absent member as
+/// its OWN failure to read one — the member it ran out of, and where in the body the read
+/// stopped ([`crate::state::missing_field_message`]) — rather than as this service's
+/// parameter-required sentence or the validating walk's clause.
+///
+/// The VECTOR-search surface is read that way: its refusal of a request that carries no
+/// value for a member its input requires states neither the sentence
+/// ([`SERVICE_REQUIRED_MEMBERS`]) nor the clause
+/// ([`VALIDATOR_NULL_CLAUSE_OPERATIONS`]), but the reader's own sentence with the position
+/// in the body it stopped at — a position only a reader of the body has, which is why that
+/// position is read off the request while it is still in hand
+/// ([`request_constraints::body_read_end`]).
+///
+/// Nothing about the model distinguishes this surface — the member is `@required` exactly
+/// as every other operation's is (`smithy_query(query="operation",
+/// operation="SearchVectors")` gives `TableName`, `IndexName`, `SearchVector` and `TopK`
+/// required) — so this list is the only place the difference is recorded, and an operation
+/// later found to be read that way needs its own entry here.
+/// `tests/all/refusal_precedence_and_body_reader.rs` pins the three readings side by
+/// side, so the difference is visible rather than silent.
+///
+/// Sorted, which [`reads_body_with_its_own_reader`] relies on for `binary_search` and
+/// `body_reader_operations_are_sorted` pins.
+const BODY_READER_OPERATIONS: &[&str] = &["SearchVectors"];
+
+/// Whether `operation`'s body is read by such a reader.
+fn reads_body_with_its_own_reader(operation: &str) -> bool {
+    BODY_READER_OPERATIONS.binary_search(&operation).is_ok()
+}
+
 /// The operations whose own request code reads the members of an ARN-ADDRESSED TAGGING
 /// call — the whole tagging surface — so the refusal of one of those members is the
 /// sentence THAT check states and not the validating walk's clause about it.
@@ -740,6 +770,11 @@ const CLAUSE_FORMS: &[ClauseFormRow] = &[
         ClauseForm::WireMemberOnly,
         WALK_PAGE_SIZE_ECHOES_ITS_VALUE,
     ),
+    // The VECTOR search states its members the same way — `Value at 'TopK' …`, with no
+    // value echoed — which is the one form its whole input is recorded in; it is also the
+    // surface whose body reader words an absent member itself
+    // ([`BODY_READER_OPERATIONS`]).
+    ("SearchVectors", ClauseForm::WireMemberOnly, EVERY_MEMBER_ALIKE),
     (
         "TransactGetItems",
         ClauseForm::WireMemberOnly,
@@ -832,6 +867,13 @@ tokio::task_local! {
     /// read back by [`validation_envelope`] in place of the walk's own clause about that
     /// member.
     static SERVED_CAPPED_LIST_CLAUSE: Option<request_constraints::CappedListClause>;
+
+    /// Where the reader of the request this task is serving stops reading its body
+    /// ([`request_constraints::body_read_end`]), for an operation whose reader words an
+    /// absent member as its own failure to read one ([`BODY_READER_OPERATIONS`]), set
+    /// around the same run and read back by [`validation_envelope`]: the position is a
+    /// fact of the BODY, which no refusal seam is handed.
+    static SERVED_BODY_READ_END: Option<(usize, usize)>;
 }
 
 /// The forms the operation this task is serving states its clauses in.
@@ -910,6 +952,16 @@ fn served_body_violations() -> Vec<Violation> {
 fn served_capped_list_clause() -> Option<request_constraints::CappedListClause> {
     SERVED_CAPPED_LIST_CLAUSE
         .try_with(Clone::clone)
+        .unwrap_or_default()
+}
+
+/// Where the reader of the request this task is serving stops reading its body. None at
+/// all is a refusal raised outside an operation's run, where there is no request to have
+/// read a position off — and the answer every operation whose reader states no position
+/// gives is the one such a refusal states.
+fn served_body_read_end() -> Option<(usize, usize)> {
+    SERVED_BODY_READ_END
+        .try_with(|held| *held)
         .unwrap_or_default()
 }
 
@@ -1053,11 +1105,16 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedClauseForm<E
                                         ),
                                         SERVED_CAPPED_LIST_CLAUSE.scope(
                                             capped_list,
-                                            SERVED_READABLE_BODY.scope(
-                                                request_constraints::readable_body(
+                                            SERVED_BODY_READ_END.scope(
+                                                request_constraints::body_read_end(
                                                     operation, req,
                                                 ),
-                                                op.run(svc, req, ctx),
+                                                SERVED_READABLE_BODY.scope(
+                                                    request_constraints::readable_body(
+                                                        operation, req,
+                                                    ),
+                                                    op.run(svc, req, ctx),
+                                                ),
                                             ),
                                         ),
                                     ),
@@ -1149,7 +1206,12 @@ fn body_violation_refusal(
                         || {
                             SERVED_SERVICE_CHECKED_CLAUSES.sync_scope(
                                 request_constraints::service_checked_clauses(operation, req),
-                                || validation_envelope(violations),
+                                || {
+                                    SERVED_BODY_READ_END.sync_scope(
+                                        request_constraints::body_read_end(operation, req),
+                                        || validation_envelope(violations),
+                                    )
+                                },
                             )
                         },
                     )
@@ -1412,6 +1474,15 @@ fn validation_envelope(violations: &[Violation]) -> Option<String> {
     // by ([`TABLE_NAME_FORM_OPERATIONS`]).
     if let Some(refusal) = crate::state::validation_message(served_table_name_clauses()) {
         return Some(refusal);
+    }
+    // The surface whose body reader words an absent member itself answers that reader's
+    // own sentence, naming the member it ran out of and the position the read stopped at
+    // ([`BODY_READER_OPERATIONS`]). It comes before the two readings a member's absence is
+    // otherwise given, because on this surface neither of them is what found it.
+    if let Some((line, column)) = served_body_read_end() {
+        if let Some(absent) = absent_required_member(violations) {
+            return Some(crate::state::missing_field_message(&absent, line, column));
+        }
     }
     if let Some(absent) = missing_service_required_member(violations) {
         if !served_states_absent_member_as_clause() {
@@ -1683,6 +1754,30 @@ fn missing_service_required_member(violations: &[Violation]) -> Option<String> {
         .map(|violation| wire_member_path(&violation.path))
 }
 
+/// ANY TOP-LEVEL member this refusal found absent, named as the model spells it on the
+/// wire, or `None` when the refusal is about anything else.
+///
+/// A member's absence is reported whichever member it is, because the refusal this answers
+/// for is the body READER's own failure to read one ([`BODY_READER_OPERATIONS`]) rather
+/// than a check of one named member. One request can omit several; the one reported is the
+/// first in the order the refusal states them, which is the order the input's members were
+/// read — the order that reader ran out of them in.
+///
+/// A member absent inside a NESTED structure is not reported here: the position such a
+/// refusal states is the end of the object the read was building
+/// ([`request_constraints::body_read_end`] reads the request's own), so a nested absence
+/// would be stated at the wrong place and under a dotted path no reader spells a field by.
+/// It keeps the reading every other operation gives it.
+fn absent_required_member(violations: &[Violation]) -> Option<String> {
+    violations
+        .iter()
+        .find(|violation| {
+            matches!(violation.kind, ViolationKind::MissingRequiredMember)
+                && !violation.path.contains('.')
+        })
+        .map(|violation| wire_member_path(&violation.path))
+}
+
 /// The entry the sentence names for the required tag list this refusal found absent
 /// ([`REQUIRED_TAG_LISTS`]), or `None` when the refusal is about anything else.
 fn absent_required_tag_list(violations: &[Violation]) -> Option<&'static str> {
@@ -1903,9 +1998,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 #[cfg(test)]
 mod tests {
     use super::{
-        checks_its_own_members, clause_forms, holds_table_name_to_its_form, served_clause_form,
-        stated_enum_order, states_absent_member_as_clause, states_service_checked_clause_bare,
-        ClauseForm, BARE_CLAUSE_OPERATIONS, CLAUSE_FORMS, PUBLISHED_ENUM_ORDERS,
+        checks_its_own_members, clause_forms, holds_table_name_to_its_form,
+        reads_body_with_its_own_reader, served_clause_form, stated_enum_order,
+        states_absent_member_as_clause, states_service_checked_clause_bare, ClauseForm,
+        BARE_CLAUSE_OPERATIONS, BODY_READER_OPERATIONS, CLAUSE_FORMS, PUBLISHED_ENUM_ORDERS,
         SELF_CHECKED_MEMBER_OPERATIONS, TABLE_NAME_FORM_OPERATIONS,
         VALIDATOR_NULL_CLAUSE_OPERATIONS,
     };
@@ -2050,6 +2146,32 @@ mod tests {
             assert!(
                 !checks_its_own_members(operation),
                 "case {operation:?}: expected the walk's clause, got the service's sentence"
+            );
+        }
+    }
+
+    #[test]
+    fn body_reader_operations_are_sorted() {
+        let mut sorted = BODY_READER_OPERATIONS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            BODY_READER_OPERATIONS,
+            sorted.as_slice(),
+            "case the body-reader list: expected it sorted for `binary_search`, got \
+             {BODY_READER_OPERATIONS:?}"
+        );
+        for operation in BODY_READER_OPERATIONS {
+            assert!(
+                reads_body_with_its_own_reader(operation),
+                "case {operation:?}: expected the reader's own sentence, got another reading"
+            );
+        }
+        // The operations whose absent member is stated by this service's parameter check or
+        // by the validating walk instead, which is what tells the groups apart.
+        for operation in ["CreateTable", "DescribeTable", "GetItem", "Query", "UpdateTable"] {
+            assert!(
+                !reads_body_with_its_own_reader(operation),
+                "case {operation:?}: expected another reading, got the reader's own sentence"
             );
         }
     }

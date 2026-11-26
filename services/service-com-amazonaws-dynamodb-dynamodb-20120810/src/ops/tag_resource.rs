@@ -193,6 +193,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
 
+        // A tag write states its tags in a list, so a list with no entries states no
+        // write: it is refused as INPUT, ahead of the selector the request addressed a
+        // resource by — the list is empty whatever that selector turns out to name, and a
+        // caller told its ARN is wrong would fix the wrong member
+        // ([`crate::state::check_tag_entries_stated`]).
+        crate::state::check_tag_entries_stated(crate::state::TAG_LIST_ENTRY, input.tags.len())
+            .map_err(lift)?;
+
         // The ARN is this operation's whole selector, and it must address a table of
         // the endpoint this request reached — the region it is signed for.
         let resource = crate::state::resolve_resource_arn(
@@ -200,13 +208,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &crate::state::request_region(ctx.parts()),
         )
         .map_err(lift)?;
-
-        // A tag write states its tags in a list, so a list with no entries states no
-        // write: it is refused as INPUT, before the resource it addressed is looked up,
-        // whichever resource that would have been
-        // ([`crate::state::check_tag_entries_stated`]).
-        crate::state::check_tag_entries_stated(crate::state::TAG_LIST_ENTRY, input.tags.len())
-            .map_err(lift)?;
 
         // The request's tag list is caller-sized, so it is bounded BEFORE anything
         // walks it: a table may carry at most `MAX_TAGS_PER_TABLE` tags, so a list

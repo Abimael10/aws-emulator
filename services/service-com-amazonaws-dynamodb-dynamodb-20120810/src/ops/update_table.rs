@@ -421,6 +421,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // taken, so no loop whose length the request chooses runs inside the critical
         // section.
         let declared_definitions = clamped_definitions(&input).map_err(lift)?;
+        // An index this call CREATES must have the attributes of its key schema declared in
+        // the request's OWN `AttributeDefinitions` — "AttributeDefinitions must include the
+        // key element(s) of the new index" (`UpdateTable$AttributeDefinitions`). Nothing the
+        // store holds decides that, so it is answered here, ahead of resolving the table the
+        // request names: the request is invalid as sent whatever the store holds, and a
+        // client handed the not-found class for it would retry a call that can never succeed
+        // ([`check_requested_index_definitions`]).
+        check_requested_index_definitions(&index_updates, &declared_definitions).map_err(lift)?;
 
         // WHO this request speaks for, resolved before this service's store is locked: a
         // control-plane call on a table is authorized exactly as a read or a write of its
@@ -628,15 +636,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
         )
         .map_err(lift)?;
-        let indexes = resolve_indexes(
-            table,
-            &billing_mode,
-            &declared,
-            &declared_definitions,
-            &index_updates,
-            now,
-        )
-        .map_err(lift)?;
+        let indexes = resolve_indexes(table, &billing_mode, &declared, &index_updates, now)
+            .map_err(lift)?;
         // The capacity the table would be provisioned for after this update is held to the
         // per-table throughput quota, exactly as a declaration of a NEW table's capacity is:
         // the quota bounds the sum of the table's own capacity and its indexes', whichever
@@ -1852,6 +1853,29 @@ fn retained_definitions(
 /// chosen by the same count ([`super::create_table::undefined_key_refusal`]): both lists
 /// where the request declared at least as many definitions as the index's key has
 /// elements, and the element left without a definition where it declared fewer.
+///
+/// Both lists are the REQUEST's own, so this is answered before the table the request
+/// names is resolved: an undeclared key attribute makes the call permanently invalid
+/// whether or not that table exists, and the not-found class would have a client retry
+/// it.
+fn check_requested_index_definitions(
+    updates: &[GlobalSecondaryIndexUpdate],
+    requested_definitions: &[AttributeDefinition],
+) -> Result<(), crate::state::RequestError> {
+    for update in updates {
+        if let Some(create) = &update.create {
+            check_index_definitions(
+                &create.index_name,
+                &create.key_schema,
+                requested_definitions,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Hold ONE index a request creates to having its key attributes declared in the
+/// `AttributeDefinitions` that request carried.
 fn check_index_definitions(
     index_name: &str,
     key_schema: &[KeySchemaElement],
@@ -1913,14 +1937,14 @@ const INDEX_ALREADY_EXISTS_MESSAGE: &str = "Attempting to create an index which 
 /// ([`resolve_vector_indexes`]).
 ///
 /// `definitions` are the ones in force for the updated table — the stored ones plus the
-/// ones this request declares ([`merged_definitions`]) — and `requested_definitions` are
-/// the ones the REQUEST carried, which is the list an index this call CREATES must have
-/// its key attributes declared in ([`check_index_definitions`]).
+/// ones this request declares ([`merged_definitions`]). What the REQUEST itself declared
+/// is not read here: an index this call creates is held to having its key attributes in
+/// that list before the table is resolved at all
+/// ([`check_requested_index_definitions`]).
 fn resolve_indexes(
     table: &crate::state::Table,
     billing_mode: &str,
     definitions: &[AttributeDefinition],
-    requested_definitions: &[AttributeDefinition],
     updates: &[GlobalSecondaryIndexUpdate],
     now: ::std::time::SystemTime,
 ) -> Result<Vec<crate::state::GlobalSecondaryIndex>, crate::state::RequestError> {
@@ -1963,11 +1987,6 @@ fn resolve_indexes(
                     crate::state::MAX_GLOBAL_SECONDARY_INDEXES
                 )));
             }
-            check_index_definitions(
-                &create.index_name,
-                &create.key_schema,
-                requested_definitions,
-            )?;
             super::create_table::validated_index_key_schema(
                 &create.index_name,
                 &create.key_schema,

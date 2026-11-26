@@ -48,10 +48,10 @@ pub const TAG_KEY_LIST_ENTRY: &str = "Tag Key";
 
 /// Refuse a required tag list the request states no `entry` of.
 ///
-/// An empty list is an INPUT failure, so it is refused before the resource the request
-/// addressed is looked up: a request that states no tag cannot be served whatever the
-/// resource turns out to be, and a caller told its table is missing would fix the wrong
-/// thing.
+/// An empty list is an INPUT failure, so it is refused ahead of the selector the request
+/// addressed a resource by: a request that states no tag cannot be served whatever that
+/// selector names — a resource it does not resolve to at all included — and a caller told
+/// its ARN is wrong would fix the wrong member.
 pub fn check_tag_entries_stated(entry: &str, entries: usize) -> Result<(), RequestError> {
     if entries == 0 {
         return Err(RequestError::Validation(no_tag_entries_message(entry)));
