@@ -21,7 +21,7 @@
 
 use ::bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use super::{codecs, RecordCodec, RecordHeaders, StoredRecord, SubmittedRecord};
+use super::{codecs, RecordCodec, RecordHeaders, RecordProducer, StoredRecord, SubmittedRecord};
 
 /// The record batch format this endpoint writes and reads field by field: the one
 /// Apache Kafka has used since 0.11, which is the only one that carries headers — and
@@ -53,6 +53,12 @@ const HEADER_BYTES: usize = HEADER_BYTES_AFTER_LENGTH + 12;
 const CODEC_MASK: i16 = 0x07;
 /// See [`CODEC_MASK`].
 const LOG_APPEND_TIME_BIT: i16 = 0x08;
+/// The attribute bit that says the batch was written inside a TRANSACTION, and the one
+/// that says it is a transaction CONTROL batch — a `COMMIT` or an `ABORT` marker (Apache
+/// Kafka record batch attributes).
+const TRANSACTIONAL_BIT: i16 = 0x10;
+/// See [`TRANSACTIONAL_BIT`].
+const CONTROL_BIT: i16 = 0x20;
 
 /// The codec each value of those bits names (Apache Kafka record batch attributes).
 const CODEC_NONE: i16 = 0;
@@ -182,6 +188,9 @@ fn decode_legacy(payload: &Bytes, budget: &mut usize) -> Option<Vec<SubmittedRec
             value,
             headers: Vec::new(),
             codec: RecordCodec::None,
+            // Neither of the two older formats carries a producer id at all, so a
+            // message in one of them belongs to no idempotent or transactional producer.
+            producer: None,
         });
         if records.len() > MAX_RECORDS_PER_PAYLOAD {
             return None;
@@ -238,11 +247,20 @@ fn decode_batch(buf: &mut Bytes, budget: &mut usize) -> Option<Vec<SubmittedReco
     let _last_offset_delta = body.try_get_i32().ok()?;
     let base_timestamp = body.try_get_i64().ok()?;
     let _max_timestamp = body.try_get_i64().ok()?;
-    let _producer_id = body.try_get_i64().ok()?;
-    let _producer_epoch = body.try_get_i16().ok()?;
+    let producer_id = body.try_get_i64().ok()?;
+    let producer_epoch = body.try_get_i16().ok()?;
     let _base_sequence = body.try_get_i32().ok()?;
     let record_count = body.try_get_i32().ok()?;
     let codec = batch_codec(attributes)?;
+    // WHO wrote the batch, which a fetch hands back with its records: a read_committed
+    // consumer decides what it may read from the producer the batch names, so the id, the
+    // epoch and whether the batch is part of a transaction travel with the records.
+    let producer = (producer_id >= 0).then_some(RecordProducer {
+        id: producer_id,
+        epoch: producer_epoch,
+        transactional: attributes & TRANSACTIONAL_BIT != 0,
+        control: attributes & CONTROL_BIT != 0,
+    });
     // The decompression is bounded by what is LEFT of the payload's budget, INSIDE the
     // decode itself, so a batch that would pass it is refused rather than held.
     let decompressed = codecs::decompress(&body, codec, *budget)?;
@@ -256,7 +274,7 @@ fn decode_batch(buf: &mut Bytes, budget: &mut usize) -> Option<Vec<SubmittedReco
     // is read, so a batch that states many records and carries none allocates nothing.
     let mut decoded = Vec::new();
     for _ in 0..count {
-        decoded.push(decode_record(&mut records, base_timestamp, codec)?);
+        decoded.push(decode_record(&mut records, base_timestamp, codec, producer)?);
     }
     Some(decoded)
 }
@@ -275,11 +293,12 @@ fn batch_codec(attributes: i16) -> Option<RecordCodec> {
 }
 
 /// One record off the front of a batch's decompressed records, carrying the codec the
-/// batch it came in was compressed with.
+/// batch it came in was compressed with and the producer that wrote it.
 fn decode_record(
     buf: &mut Bytes,
     base_timestamp: i64,
     codec: RecordCodec,
+    producer: Option<RecordProducer>,
 ) -> Option<SubmittedRecord> {
     let length = usize::try_from(read_varlong(buf)?).ok()?;
     if length > buf.remaining() {
@@ -308,6 +327,7 @@ fn decode_record(
         value,
         headers,
         codec,
+        producer,
     })
 }
 
@@ -378,6 +398,12 @@ fn write_nullable_bytes(buf: &mut BytesMut, value: Option<&[u8]>) {
 /// timestamp and the kind of timestamp it is, its key, its value and its headers in
 /// order — so a consumer reads the record the producer sent.
 ///
+/// One answer may carry SEVERAL batches, one after the other, exactly as a log segment
+/// does: a batch carries ONE producer's id and epoch and one set of attributes, so the
+/// records are written in runs of the producer that wrote them ([`StoredRecord::producer`])
+/// — which is what lets a read_committed consumer tell an aborted record from a committed
+/// one, and a transaction's control marker from a record of the topic.
+///
 /// The two older formats carry neither headers nor (for the oldest) a timestamp, so a
 /// client that negotiated one of them is answered with what that format HAS: a broker
 /// converts the batch down to the format the fetching client can read, and what the
@@ -390,6 +416,25 @@ pub fn encode(records: &[StoredRecord], codec: RecordCodec, magic: i8) -> Option
     if magic < MAGIC_V2 {
         return encode_legacy(records, magic);
     }
+    records.first()?;
+    let mut encoded = BytesMut::new();
+    // The runs of consecutive records sharing a producer: each one is a batch of its own,
+    // since the id, the epoch and the attributes are the BATCH's fields.
+    let mut rest = records;
+    while let Some(first) = rest.first() {
+        let run = rest
+            .iter()
+            .take_while(|record| record.producer == first.producer)
+            .count();
+        let (batch, remaining) = rest.split_at(run);
+        encoded.put_slice(&encode_batch(batch, codec)?);
+        rest = remaining;
+    }
+    Some(encoded.freeze())
+}
+
+/// ONE record batch, holding records that share a producer ([`encode`]).
+fn encode_batch(records: &[StoredRecord], codec: RecordCodec) -> Option<Bytes> {
     let first = records.first()?;
     let base_offset = first.offset;
     let base_timestamp = first.timestamp_ms;
@@ -423,6 +468,14 @@ pub fn encode(records: &[StoredRecord], codec: RecordCodec, magic: i8) -> Option
         | match first.log_append_time {
             true => LOG_APPEND_TIME_BIT,
             false => 0,
+        }
+        | match first.producer {
+            Some(producer) if producer.transactional => TRANSACTIONAL_BIT,
+            _ => 0,
+        }
+        | match first.producer {
+            Some(producer) if producer.control => CONTROL_BIT,
+            _ => 0,
         };
     // Everything the CRC covers, built first: the attributes to the end of the records.
     let mut body = BytesMut::new();
@@ -430,8 +483,12 @@ pub fn encode(records: &[StoredRecord], codec: RecordCodec, magic: i8) -> Option
     body.put_i32(i32::try_from(last.offset.saturating_sub(base_offset)).unwrap_or(i32::MAX));
     body.put_i64(base_timestamp);
     body.put_i64(max_timestamp);
-    body.put_i64(NO_PRODUCER);
-    body.put_i16(NO_PRODUCER_EPOCH);
+    body.put_i64(first.producer.map_or(NO_PRODUCER, |producer| producer.id));
+    body.put_i16(
+        first
+            .producer
+            .map_or(NO_PRODUCER_EPOCH, |producer| producer.epoch),
+    );
     body.put_i32(NO_BASE_SEQUENCE);
     body.put_i32(i32::try_from(records.len()).unwrap_or(i32::MAX));
     body.put_slice(&compressed);
@@ -485,9 +542,16 @@ pub fn fetch_magic(api_version: i16) -> i8 {
 /// not reported in it — magic 0 carries no timestamp, and neither format carries headers —
 /// and the messages are handed back UNCOMPRESSED, which every client of those versions
 /// reads.
+///
+/// Neither format has a CONTROL batch, so a transaction's commit and abort markers are
+/// not written down into it: a client that negotiated one of these versions runs no
+/// transaction, and a marker rendered as a message would read as a record of the topic.
 fn encode_legacy(records: &[StoredRecord], magic: i8) -> Option<Bytes> {
     let mut encoded = BytesMut::new();
-    for record in records {
+    for record in records
+        .iter()
+        .filter(|record| !record.producer.is_some_and(|producer| producer.control))
+    {
         // Everything the message's CRC covers: the magic to the end of the value.
         let mut message = BytesMut::new();
         message.put_i8(magic);

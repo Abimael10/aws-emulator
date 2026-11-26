@@ -3100,6 +3100,12 @@ pub struct ComAmazonawsKafkaKafkaState {
     /// group id): the members a group holds and the offsets it has committed
     /// ([`broker_plane::groups`]). Released with the cluster.
     pub consumer_groups: HashMap<(String, String), broker_plane::groups::ConsumerGroup>,
+    /// The TRANSACTIONAL IDS each cluster's coordinator holds, keyed by (cluster ARN,
+    /// transactional id): the producer that holds each id, the epoch it is at and the
+    /// transaction it has in flight ([`broker_plane::transactions`]). `BTreeMap` so the
+    /// readers have one total order to walk. Released with the cluster.
+    pub producer_transactions:
+        BTreeMap<(String, String), broker_plane::transactions::ProducerTransaction>,
 }
 
 impl VpcConnection {

@@ -3580,6 +3580,66 @@ async fn call_at(
                 .await
                 .map(drop)
         }
+        // The transaction coordinator's APIs, each with the smallest request a client
+        // sends: what is under test here is the ANSWER's framing, so the transactional id
+        // names no transaction this sweep began.
+        ApiKey::AddPartitionsToTxn => {
+            let request = wire::AddPartitionsToTxnRequest::default()
+                .with_v3_and_below_transactional_id(wire::TransactionalId(
+                    StrBytes::from_static_str("version-sweep"),
+                ))
+                .with_v3_and_below_topics(vec![
+                    wire::add_partitions_to_txn_request::AddPartitionsToTxnTopic::default()
+                        .with_name(topic_name.clone())
+                        .with_partitions(vec![0]),
+                ]);
+            client
+                .exchange::<_, wire::AddPartitionsToTxnResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::AddOffsetsToTxn => {
+            let request = wire::AddOffsetsToTxnRequest::default()
+                .with_transactional_id(wire::TransactionalId(StrBytes::from_static_str(
+                    "version-sweep",
+                )))
+                .with_group_id(group.clone());
+            client
+                .exchange::<_, wire::AddOffsetsToTxnResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::TxnOffsetCommit => {
+            let request = wire::TxnOffsetCommitRequest::default()
+                .with_transactional_id(wire::TransactionalId(StrBytes::from_static_str(
+                    "version-sweep",
+                )))
+                .with_group_id(group.clone())
+                .with_topics(vec![
+                    wire::txn_offset_commit_request::TxnOffsetCommitRequestTopic::default()
+                        .with_name(topic_name.clone())
+                        .with_partitions(vec![
+                            wire::txn_offset_commit_request::TxnOffsetCommitRequestPartition::default()
+                                .with_partition_index(0)
+                                .with_committed_offset(0),
+                        ]),
+                ]);
+            client
+                .exchange::<_, wire::TxnOffsetCommitResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::EndTxn => {
+            let request = wire::EndTxnRequest::default()
+                .with_transactional_id(wire::TransactionalId(StrBytes::from_static_str(
+                    "version-sweep",
+                )))
+                .with_committed(true);
+            client
+                .exchange::<_, wire::EndTxnResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
         ApiKey::JoinGroup => {
             let request = wire::JoinGroupRequest::default()
                 .with_group_id(group.clone())

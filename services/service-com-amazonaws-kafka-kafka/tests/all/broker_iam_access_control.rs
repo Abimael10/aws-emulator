@@ -20,6 +20,7 @@
 //! credential the row names.
 
 use ::bytes::{Bytes, BytesMut};
+use ::kafka_protocol::messages as wire;
 use ::kafka_protocol::messages::{
     join_group_request::JoinGroupRequestProtocol,
     produce_request::{PartitionProduceData, TopicProduceData},
@@ -203,6 +204,215 @@ async fn a_credential_no_policy_bounds_is_not_refused_for_a_missing_grant() {
         "case {case:?}: the join must be served, got {}",
         joined.error_code
     );
+}
+
+/// RULE: the TRANSACTION calls that write a consumer group's committed position are
+/// decided against that group's own scope, exactly as `OffsetCommit` is, and the one that
+/// enlists a partition is decided against the topic's, exactly as the produce it is the
+/// first half of — so a connection refused the group or the topic cannot reach the same
+/// state through a transaction.
+///
+/// The rows span what the rule generalises over: which call is made, and whether the
+/// policy covers the group or the topic the call names.
+#[tokio::test]
+async fn the_transaction_calls_are_decided_against_the_group_and_the_topic_scope() {
+    let case = "a policy scoped to one group and one topic";
+    let emulator = Emulator::with_iam();
+    let cluster = given_iam_cluster(&emulator, "iam-transactions").await;
+    given_topic(&emulator, &cluster, TOPIC).await;
+    given_topic(&emulator, &cluster, OTHER_TOPIC).await;
+    let access_key_id = "ASIAKAFKATRANSACTIONS";
+    let policy = json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": [CONNECT, WRITE_DATA, READ_DATA, DESCRIBE_TOPIC],
+                "Resource": [topic_resource(TOPIC), cluster_resource()],
+            },
+            {
+                "Effect": "Allow",
+                "Action": [ALTER_GROUP],
+                "Resource": [group_resource(GROUP)],
+            },
+        ],
+    });
+    given_principal(&emulator, "kafka-transactional-client", access_key_id, Some(&policy));
+
+    let authority = sasl_iam_address(&emulator, &cluster, case).await;
+    let mut client = iam_client(case, &authority, access_key_id).await;
+    let transactional_id = "iam-scoped-producer";
+    let producer = begin_producer(&mut client, case, transactional_id).await;
+
+    // (the group a call names, what AddOffsetsToTxn and TxnOffsetCommit answer for it)
+    let groups: &[(&str, i16)] = &[
+        (GROUP, 0),
+        (OTHER_GROUP, ResponseError::GroupAuthorizationFailed.code()),
+    ];
+    for (group, expected) in groups {
+        let added = add_offsets(&mut client, case, transactional_id, producer, group).await;
+        assert_eq!(
+            added, *expected,
+            "case {case:?}: expected AddOffsetsToTxn({group}) to answer {expected}, got {added}"
+        );
+        let committed =
+            commit_offsets(&mut client, case, transactional_id, producer, group, TOPIC).await;
+        assert_eq!(
+            committed, *expected,
+            "case {case:?}: expected TxnOffsetCommit({group}) to answer {expected}, got \
+             {committed}"
+        );
+    }
+
+    // (the topic a call names, what AddPartitionsToTxn answers for it)
+    let topics: &[(&str, i16)] = &[
+        (TOPIC, 0),
+        (
+            OTHER_TOPIC,
+            ResponseError::TopicAuthorizationFailed.code(),
+        ),
+    ];
+    for (topic, expected) in topics {
+        let added = add_partitions(&mut client, case, transactional_id, producer, topic).await;
+        assert_eq!(
+            added, *expected,
+            "case {case:?}: expected AddPartitionsToTxn({topic}) to answer {expected}, got \
+             {added}"
+        );
+    }
+}
+
+/// The producer one transactional id is held by: the id and the epoch the coordinator
+/// assigned, which every later call of that producer quotes.
+#[derive(Debug, Clone, Copy)]
+struct Producer {
+    id: i64,
+    epoch: i16,
+}
+
+/// `InitProducerId` for a transactional id over this connection.
+async fn begin_producer(client: &mut Client, case: &str, transactional_id: &str) -> Producer {
+    let answered: wire::InitProducerIdResponse = client
+        .call(
+            case,
+            ApiKey::InitProducerId,
+            2,
+            &wire::InitProducerIdRequest::default()
+                .with_transactional_id(Some(wire::TransactionalId(StrBytes::from_string(
+                    transactional_id.to_string(),
+                ))))
+                .with_transaction_timeout_ms(60_000),
+        )
+        .await;
+    assert_eq!(
+        answered.error_code, 0,
+        "case {case:?}: InitProducerId must assign a producer, got error {}",
+        answered.error_code
+    );
+    Producer {
+        id: answered.producer_id.0,
+        epoch: answered.producer_epoch,
+    }
+}
+
+/// `AddOffsetsToTxn` naming `group`, answering the error code it was given.
+async fn add_offsets(
+    client: &mut Client,
+    case: &str,
+    transactional_id: &str,
+    producer: Producer,
+    group: &str,
+) -> i16 {
+    let answered: wire::AddOffsetsToTxnResponse = client
+        .call(
+            case,
+            ApiKey::AddOffsetsToTxn,
+            3,
+            &wire::AddOffsetsToTxnRequest::default()
+                .with_transactional_id(wire::TransactionalId(StrBytes::from_string(
+                    transactional_id.to_string(),
+                )))
+                .with_producer_id(wire::ProducerId(producer.id))
+                .with_producer_epoch(producer.epoch)
+                .with_group_id(GroupId(StrBytes::from_string(group.to_string()))),
+        )
+        .await;
+    answered.error_code
+}
+
+/// `TxnOffsetCommit` naming `group`, answering the error code its one partition was given.
+async fn commit_offsets(
+    client: &mut Client,
+    case: &str,
+    transactional_id: &str,
+    producer: Producer,
+    group: &str,
+    topic: &str,
+) -> i16 {
+    use ::kafka_protocol::messages::txn_offset_commit_request::{
+        TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic,
+    };
+
+    let answered: wire::TxnOffsetCommitResponse = client
+        .call(
+            case,
+            ApiKey::TxnOffsetCommit,
+            2,
+            &wire::TxnOffsetCommitRequest::default()
+                .with_transactional_id(wire::TransactionalId(StrBytes::from_string(
+                    transactional_id.to_string(),
+                )))
+                .with_group_id(GroupId(StrBytes::from_string(group.to_string())))
+                .with_producer_id(wire::ProducerId(producer.id))
+                .with_producer_epoch(producer.epoch)
+                .with_topics(vec![TxnOffsetCommitRequestTopic::default()
+                    .with_name(TopicName(StrBytes::from_string(topic.to_string())))
+                    .with_partitions(vec![TxnOffsetCommitRequestPartition::default()
+                        .with_partition_index(0)
+                        .with_committed_offset(1)])]),
+        )
+        .await;
+    answered
+        .topics
+        .first()
+        .and_then(|topic| topic.partitions.first())
+        .map(|partition| partition.error_code)
+        .unwrap_or_else(|| panic!("case {case:?}: TxnOffsetCommit reported no partition"))
+}
+
+/// `AddPartitionsToTxn` naming partition 0 of `topic`, answering the error code it was
+/// given.
+async fn add_partitions(
+    client: &mut Client,
+    case: &str,
+    transactional_id: &str,
+    producer: Producer,
+    topic: &str,
+) -> i16 {
+    use ::kafka_protocol::messages::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
+
+    let answered: wire::AddPartitionsToTxnResponse = client
+        .call(
+            case,
+            ApiKey::AddPartitionsToTxn,
+            3,
+            &wire::AddPartitionsToTxnRequest::default()
+                .with_v3_and_below_transactional_id(wire::TransactionalId(StrBytes::from_string(
+                    transactional_id.to_string(),
+                )))
+                .with_v3_and_below_producer_id(wire::ProducerId(producer.id))
+                .with_v3_and_below_producer_epoch(producer.epoch)
+                .with_v3_and_below_topics(vec![AddPartitionsToTxnTopic::default()
+                    .with_name(TopicName(StrBytes::from_string(topic.to_string())))
+                    .with_partitions(vec![0])]),
+        )
+        .await;
+    answered
+        .results_by_topic_v3_and_below
+        .first()
+        .and_then(|topic| topic.results_by_partition.first())
+        .map(|partition| partition.partition_error_code)
+        .unwrap_or_else(|| panic!("case {case:?}: AddPartitionsToTxn reported no partition"))
 }
 
 /// A policy document allowing `actions` on `resources`, in the shape

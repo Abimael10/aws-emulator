@@ -91,6 +91,8 @@ impl ComAmazonawsKafkaKafkaState {
         self.broker_acls.remove(arn);
         self.consumer_groups
             .retain(|(group_cluster, _), _| group_cluster != arn);
+        self.producer_transactions
+            .retain(|(producer_cluster, _), _| producer_cluster != arn);
         if let Some(count) = self.clusters_per_region.get_mut(&cluster.region) {
             *count = count.saturating_sub(1);
             if *count == 0 {

@@ -46,7 +46,7 @@ use ::emulator_server::{ListenerConn, NativeHandler, TlsUpgrader};
 use ::kafka_protocol::messages::{
     api_versions_response::ApiVersion,
     describe_configs_response::{DescribeConfigsResourceResult, DescribeConfigsResult},
-    fetch_response::{FetchableTopicResponse, PartitionData},
+    fetch_response::{AbortedTransaction, FetchableTopicResponse, PartitionData},
     list_offsets_response::{ListOffsetsPartitionResponse, ListOffsetsTopicResponse},
     metadata_response::{MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic},
     produce_response::{PartitionProduceResponse, TopicProduceResponse},
@@ -67,8 +67,8 @@ use ::tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::sasl::{self, Authenticated, Mechanism};
 use super::{
-    acls, groups, iam_access, legacy_frames, records, topics, AccessPath, BROKER_NODE_ID,
-    MAX_FRAME_BYTES,
+    acls, groups, iam_access, legacy_frames, records, topics, transactions, AccessPath,
+    Isolation, BROKER_NODE_ID, MAX_FRAME_BYTES,
 };
 
 /// The resource type a `DescribeConfigs` request names a TOPIC by, and the one it
@@ -242,6 +242,39 @@ fn served_apis() -> Vec<(ApiKey, i16, i16)> {
     serve(
         ApiKey::InitProducerId,
         carried::<InitProducerIdRequest, InitProducerIdResponse>(0, 4),
+    );
+    // The transaction coordinator's own APIs: a producer with a transactional id cannot
+    // begin a transaction at all unless the broker advertises them, and a client that
+    // finds one missing reports its cluster as too old to run transactions rather than
+    // sending anything. Each stops at the last version that names ONE transaction and its
+    // topics by name, which is the form this coordinator answers.
+    serve(
+        ApiKey::AddPartitionsToTxn,
+        carried::<
+            ::kafka_protocol::messages::AddPartitionsToTxnRequest,
+            ::kafka_protocol::messages::AddPartitionsToTxnResponse,
+        >(0, 3),
+    );
+    serve(
+        ApiKey::AddOffsetsToTxn,
+        carried::<
+            ::kafka_protocol::messages::AddOffsetsToTxnRequest,
+            ::kafka_protocol::messages::AddOffsetsToTxnResponse,
+        >(0, 3),
+    );
+    serve(
+        ApiKey::EndTxn,
+        carried::<
+            ::kafka_protocol::messages::EndTxnRequest,
+            ::kafka_protocol::messages::EndTxnResponse,
+        >(0, 3),
+    );
+    serve(
+        ApiKey::TxnOffsetCommit,
+        carried::<
+            ::kafka_protocol::messages::TxnOffsetCommitRequest,
+            ::kafka_protocol::messages::TxnOffsetCommitResponse,
+        >(0, 3),
     );
     serve(
         ApiKey::JoinGroup,
@@ -642,8 +675,97 @@ impl Broker {
                 self.encode(key, api_version, &header, &response)
             }
             ApiKey::InitProducerId => {
-                let _request = InitProducerIdRequest::decode(&mut body, api_version).ok()?;
-                let response = self.init_producer_id();
+                let request = InitProducerIdRequest::decode(&mut body, api_version).ok()?;
+                let response = self.init_producer_id(&request);
+                self.encode(key, api_version, &header, &response)
+            }
+            ApiKey::AddPartitionsToTxn => {
+                let request = ::kafka_protocol::messages::AddPartitionsToTxnRequest::decode(
+                    &mut body,
+                    api_version,
+                )
+                .ok()?;
+                // Enlisting a partition in a transaction is the first half of WRITING to
+                // it, so it is decided against the topic's own scope exactly as the
+                // produce that follows is: a client no policy lets write the topic is told
+                // so here rather than when its records arrive.
+                let withheld = self.withheld_topics(
+                    session,
+                    request
+                        .v3_and_below_topics
+                        .iter()
+                        .map(|topic| topic.name.0.to_string()),
+                    super::OPERATION_WRITE,
+                    iam_access::ACTION_WRITE_DATA,
+                );
+                let response = transactions::add_partitions(
+                    &mut self.state.lock(),
+                    &self.cluster_arn,
+                    &request,
+                    &withheld,
+                    MAX_REQUEST_ENTRIES,
+                );
+                self.encode(key, api_version, &header, &response)
+            }
+            ApiKey::AddOffsetsToTxn => {
+                let request = ::kafka_protocol::messages::AddOffsetsToTxnRequest::decode(
+                    &mut body,
+                    api_version,
+                )
+                .ok()?;
+                // Carrying a group's offsets in a transaction writes that group's
+                // committed position when the transaction commits, so it needs what every
+                // other write of that position needs: `AlterGroup` on the group itself.
+                let response = match self.group_allowed(
+                    session,
+                    &request.group_id.0.to_string(),
+                    iam_access::ACTION_ALTER_GROUP,
+                ) {
+                    false => ::kafka_protocol::messages::AddOffsetsToTxnResponse::default()
+                        .with_error_code(group_authorization_failed()),
+                    true => transactions::add_offsets(
+                        &mut self.state.lock(),
+                        &self.cluster_arn,
+                        &request,
+                    ),
+                };
+                self.encode(key, api_version, &header, &response)
+            }
+            ApiKey::TxnOffsetCommit => {
+                let request = ::kafka_protocol::messages::TxnOffsetCommitRequest::decode(
+                    &mut body,
+                    api_version,
+                )
+                .ok()?;
+                let response = match self.group_allowed(
+                    session,
+                    &request.group_id.0.to_string(),
+                    iam_access::ACTION_ALTER_GROUP,
+                ) {
+                    false => transactions::offsets_refused(
+                        &request,
+                        group_authorization_failed(),
+                        MAX_REQUEST_ENTRIES,
+                    ),
+                    true => transactions::commit_offsets(
+                        &mut self.state.lock(),
+                        &self.cluster_arn,
+                        &request,
+                        MAX_REQUEST_ENTRIES,
+                    ),
+                };
+                self.encode(key, api_version, &header, &response)
+            }
+            ApiKey::EndTxn => {
+                let request =
+                    ::kafka_protocol::messages::EndTxnRequest::decode(&mut body, api_version)
+                        .ok()?;
+                let response = transactions::end_transaction(
+                    &mut self.state.lock(),
+                    &self.cluster_arn,
+                    &request,
+                    SystemTime::now(),
+                );
                 self.encode(key, api_version, &header, &response)
             }
             ApiKey::JoinGroup => {
@@ -1297,6 +1419,10 @@ impl Broker {
                     &self.cluster_arn,
                     &name,
                     partition.partition,
+                    // Where an EPOCH ends is a position in the log itself, not a reading
+                    // of what is decided: a client validating a position it resumed from
+                    // is told the end of the log.
+                    Isolation::ReadUncommitted,
                     now,
                 );
                 partitions.push(match offsets {
@@ -1468,19 +1594,16 @@ impl Broker {
         ::kafka_protocol::messages::DeleteGroupsResponse::default().with_results(results)
     }
 
-    /// `InitProducerId`: the id an IDEMPOTENT producer writes under, which the broker
-    /// assigns.
-    ///
-    /// The id comes from the store's own counter, so two producers of one emulator are
-    /// never given the same one, and the epoch starts at zero as it does for an id
-    /// nobody has fenced yet.
-    fn init_producer_id(&self) -> InitProducerIdResponse {
-        let mut store = self.state.lock();
-        let producer_id = store.next_producer_id;
-        store.next_producer_id += 1;
-        InitProducerIdResponse::default()
-            .with_producer_id(::kafka_protocol::messages::ProducerId(producer_id))
-            .with_producer_epoch(0)
+    /// `InitProducerId`: the id a producer writes under, which the broker assigns — and,
+    /// for a producer that names a TRANSACTIONAL ID, the epoch it holds that id at
+    /// ([`transactions::init_producer_id`]).
+    fn init_producer_id(&self, request: &InitProducerIdRequest) -> InitProducerIdResponse {
+        transactions::init_producer_id(
+            &mut self.state.lock(),
+            &self.cluster_arn,
+            request,
+            SystemTime::now(),
+        )
     }
 
     /// Whether this connection is kept from `operation` on `topic`: by an ACL binding
@@ -1755,12 +1878,17 @@ impl Broker {
     /// carries ([`records::fetch_magic`]): a broker converts its log's batches down to the
     /// format the fetching client can read, and a client answered a newer one reads no
     /// records out of an answer that is not empty.
+    ///
+    /// The ISOLATION LEVEL the request states decides how far the read reaches: a
+    /// `read_committed` consumer is answered nothing from a transaction that has neither
+    /// committed nor aborted ([`Isolation`]).
     async fn fetch(
         &self,
         request: &FetchRequest,
         session: &Session,
         api_version: i16,
     ) -> FetchResponse {
+        let isolation = Isolation::of_request(request.isolation_level);
         let min_bytes = usize::try_from(request.min_bytes).unwrap_or(0);
         let wait = fetch_wait(request.max_wait_ms);
         let deadline = ::std::time::Instant::now() + wait;
@@ -1774,7 +1902,7 @@ impl Broker {
             iam_access::ACTION_READ_DATA,
         );
         loop {
-            let answered = self.fetch_once(request, &withheld, api_version);
+            let answered = self.fetch_once(request, &withheld, api_version, isolation);
             let enough = min_bytes == 0 || rendered_bytes(&answered) >= min_bytes;
             if enough || refuses_a_partition(&answered) || ::std::time::Instant::now() >= deadline {
                 return answered;
@@ -1796,6 +1924,7 @@ impl Broker {
         request: &FetchRequest,
         withheld: &BTreeSet<String>,
         api_version: i16,
+        isolation: Isolation,
     ) -> FetchResponse {
         let now = SystemTime::now();
         let mut responses = Vec::new();
@@ -1825,12 +1954,15 @@ impl Broker {
                     continue;
                 }
                 let remaining = MAX_FETCHED_RECORDS_PER_REQUEST.saturating_sub(rendered);
-                let read = self.state.lock().data_plane_fetch(
+                let read = self.state.lock().data_plane_fetch_isolated(
                     &self.cluster_arn,
                     &name,
                     partition.partition,
-                    partition.fetch_offset,
-                    MAX_FETCHED_RECORDS.min(remaining),
+                    super::PartitionRead {
+                        fetch_offset: partition.fetch_offset,
+                        max_records: MAX_FETCHED_RECORDS.min(remaining),
+                        isolation,
+                    },
                     now,
                 );
                 partitions.push(match read {
@@ -1839,14 +1971,28 @@ impl Broker {
                         PartitionData::default()
                             .with_partition_index(partition.partition)
                             .with_high_watermark(fetched.high_watermark)
-                            .with_last_stable_offset(fetched.high_watermark)
+                            .with_last_stable_offset(fetched.last_stable_offset)
                             .with_log_start_offset(fetched.log_start_offset)
-                            // No transaction of this endpoint has been aborted, and the
-                            // leader states no preference for a replica to read from:
-                            // one endpoint serves the cluster, so the partition's leader
-                            // is the only place to read it. Both stated rather than left
-                            // out, since a client acts on them.
-                            .with_aborted_transactions(Some(Vec::new()))
+                            // The transactions of this partition an ABORT ended, which is
+                            // what a read_committed consumer drops the records of — the
+                            // records are in the log, and the client filters them by the
+                            // producer the batch names. The leader states no preference
+                            // for a replica to read from: one endpoint serves the cluster,
+                            // so the partition's leader is the only place to read it. Both
+                            // stated rather than left out, since a client acts on them.
+                            .with_aborted_transactions(Some(
+                                fetched
+                                    .aborted
+                                    .iter()
+                                    .map(|aborted| {
+                                        AbortedTransaction::default()
+                                            .with_producer_id(::kafka_protocol::messages::ProducerId(
+                                                aborted.producer_id,
+                                            ))
+                                            .with_first_offset(aborted.first_offset)
+                                    })
+                                    .collect(),
+                            ))
                             .with_preferred_read_replica(BrokerId(NO_PREFERRED_READ_REPLICA))
                             .with_records(encode_records(
                                 &fetched.records,
@@ -1883,8 +2029,13 @@ impl Broker {
     /// answered with neither ([`NO_OFFSET`]). Bounded as a whole like [`Self::fetch`]:
     /// at most [`MAX_REQUEST_ENTRIES`] entries, each one once, with the store's lock
     /// taken and released per entry.
+    ///
+    /// The LATEST offset is read at the ISOLATION LEVEL the request states: the end of
+    /// the log for a read_uncommitted client, and the last stable offset for a
+    /// read_committed one — the offset past which nothing is decided.
     fn list_offsets(&self, request: &ListOffsetsRequest) -> ListOffsetsResponse {
         let now = SystemTime::now();
+        let isolation = Isolation::of_request(request.isolation_level);
         let mut topics = Vec::new();
         let mut entries = 0usize;
         let mut served: BTreeSet<(String, i32)> = BTreeSet::new();
@@ -1906,6 +2057,7 @@ impl Broker {
                             &self.cluster_arn,
                             &name,
                             partition.partition_index,
+                            isolation,
                             now,
                         )
                         .map(|(earliest, latest)| match partition.timestamp {
@@ -1915,17 +2067,20 @@ impl Broker {
                     wanted => self
                         .state
                         .lock()
-                        .data_plane_fetch(
+                        .data_plane_fetch_isolated(
                             &self.cluster_arn,
                             &name,
                             partition.partition_index,
-                            0,
-                            MAX_FETCHED_RECORDS,
+                            super::PartitionRead {
+                                fetch_offset: 0,
+                                max_records: MAX_FETCHED_RECORDS,
+                                isolation,
+                            },
                             now,
                         )
                         .map(|fetched| {
                             fetched
-                                .records
+                                .committed_records()
                                 .iter()
                                 .find(|record| record.timestamp_ms >= wanted)
                                 .map(|record| (record.offset, record.timestamp_ms))

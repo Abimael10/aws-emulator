@@ -70,6 +70,7 @@ fn record(offset: i64, value: Option<&str>) -> StoredRecord {
         value: value.map(|text| text.as_bytes().to_vec()),
         headers: Vec::new(),
         codec: Default::default(),
+        producer: None,
     }
 }
 

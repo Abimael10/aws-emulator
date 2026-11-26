@@ -850,6 +850,30 @@ impl ConsumerGroup {
         true
     }
 
+    /// Store one position a COMMITTED TRANSACTION carried as this group's committed
+    /// offset in a partition, answering whether the group took it.
+    ///
+    /// The same `offsets` an `OffsetCommit` writes and an `OffsetFetch` reads, held to the
+    /// same ceiling ([`MAX_COMMITTED_PARTITIONS_PER_GROUP`]). What fences this write is
+    /// the transaction's own producer epoch, decided before the transaction committed
+    /// ([`super::transactions`]): the position is the transaction's, not a member's, so a
+    /// group with no members takes it exactly as one with members does.
+    pub fn commit_transactional_offset(
+        &mut self,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+    ) -> bool {
+        let key = (topic.to_string(), partition);
+        if !self.offsets.contains_key(&key)
+            && self.offsets.len() >= MAX_COMMITTED_PARTITIONS_PER_GROUP
+        {
+            return false;
+        }
+        self.offsets.insert(key, offset);
+        true
+    }
+
     /// Admit the consumer `client_id` names as a MEMBER of this group, holding the
     /// partitions `assigned` names of the topics it subscribed to, and answer the member id
     /// the coordinator gave it — or `None` for a group this consumer may not be admitted

@@ -21,11 +21,13 @@
 //! address `GetBootstrapBrokers` published.
 
 use ::kafka_protocol::messages::{
-    ApiKey, ApiVersionsRequest, ApiVersionsResponse, CreateAclsRequest, CreateAclsResponse,
-    CreatePartitionsRequest, CreatePartitionsResponse, CreateTopicsRequest, CreateTopicsResponse,
-    DeleteAclsRequest, DeleteAclsResponse, DeleteGroupsRequest, DeleteGroupsResponse,
-    DeleteTopicsRequest, DeleteTopicsResponse, DescribeAclsRequest, DescribeAclsResponse,
-    DescribeConfigsRequest, DescribeConfigsResponse, DescribeGroupsRequest, DescribeGroupsResponse,
+    AddOffsetsToTxnRequest, AddOffsetsToTxnResponse, AddPartitionsToTxnRequest,
+    AddPartitionsToTxnResponse, ApiKey, ApiVersionsRequest, ApiVersionsResponse, CreateAclsRequest,
+    CreateAclsResponse, CreatePartitionsRequest, CreatePartitionsResponse, CreateTopicsRequest,
+    CreateTopicsResponse, DeleteAclsRequest, DeleteAclsResponse, DeleteGroupsRequest,
+    DeleteGroupsResponse, DeleteTopicsRequest, DeleteTopicsResponse, DescribeAclsRequest,
+    DescribeAclsResponse, DescribeConfigsRequest, DescribeConfigsResponse, DescribeGroupsRequest,
+    DescribeGroupsResponse, EndTxnRequest, EndTxnResponse,
     FetchRequest, FetchResponse, FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest,
     HeartbeatResponse, InitProducerIdRequest, InitProducerIdResponse, JoinGroupRequest,
     JoinGroupResponse, LeaveGroupRequest, LeaveGroupResponse, ListGroupsRequest, ListGroupsResponse,
@@ -33,7 +35,7 @@ use ::kafka_protocol::messages::{
     OffsetCommitRequest, OffsetCommitResponse, OffsetFetchRequest, OffsetFetchResponse,
     OffsetForLeaderEpochRequest, OffsetForLeaderEpochResponse, ProduceRequest, ProduceResponse,
     SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse,
-    SyncGroupRequest, SyncGroupResponse,
+    SyncGroupRequest, SyncGroupResponse, TxnOffsetCommitRequest, TxnOffsetCommitResponse,
 };
 use ::kafka_protocol::protocol::Message;
 
@@ -229,6 +231,26 @@ async fn probe(client: &mut Client, case: &str, key: ApiKey, version: i16) {
         ApiKey::InitProducerId => {
             let _: InitProducerIdResponse = client
                 .call(case, key, version, &InitProducerIdRequest::default())
+                .await;
+        }
+        ApiKey::AddPartitionsToTxn => {
+            let _: AddPartitionsToTxnResponse = client
+                .call(case, key, version, &AddPartitionsToTxnRequest::default())
+                .await;
+        }
+        ApiKey::AddOffsetsToTxn => {
+            let _: AddOffsetsToTxnResponse = client
+                .call(case, key, version, &AddOffsetsToTxnRequest::default())
+                .await;
+        }
+        ApiKey::EndTxn => {
+            let _: EndTxnResponse = client
+                .call(case, key, version, &EndTxnRequest::default())
+                .await;
+        }
+        ApiKey::TxnOffsetCommit => {
+            let _: TxnOffsetCommitResponse = client
+                .call(case, key, version, &TxnOffsetCommitRequest::default())
                 .await;
         }
         ApiKey::OffsetForLeaderEpoch => {

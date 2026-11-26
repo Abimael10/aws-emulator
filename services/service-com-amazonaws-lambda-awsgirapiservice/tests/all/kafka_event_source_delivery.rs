@@ -108,6 +108,7 @@ fn produce(engine: &Arc<engine::InMemoryEngine>, case: &str, cluster_arn: &str, 
             value: Some(value.as_bytes().to_vec()),
             headers: Vec::new(),
             codec: Default::default(),
+            producer: None,
         }],
         SystemTime::now(),
     );

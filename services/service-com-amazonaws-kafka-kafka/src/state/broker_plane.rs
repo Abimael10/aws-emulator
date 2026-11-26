@@ -59,6 +59,7 @@ pub mod records;
 pub mod sasl;
 pub mod topic_config;
 pub mod topics;
+pub mod transactions;
 pub mod wire;
 
 /// The broker node id a cluster with no broker nodes of its own reports itself under in
@@ -89,6 +90,16 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_RECORDS_PER_PARTITION: usize = 4096;
 /// See [`MAX_RECORDS_PER_PARTITION`].
 pub const MAX_LOG_BYTES_PER_PARTITION: usize = 8 * 1024 * 1024;
+
+/// The most transactions one partition holds OPEN at once, and the most aborted ones it
+/// keeps the record of. CHOSEN as process-safety bounds, not Apache Kafka settings: a
+/// client opens a transaction per producer it starts, so without a ceiling one client
+/// would size both stores. Sized far above the producers one partition of this emulator
+/// is driven with, and the oldest record of an abort goes first — the same end of the log
+/// retention drops.
+pub const MAX_OPEN_TRANSACTIONS_PER_PARTITION: usize = 64;
+/// See [`MAX_OPEN_TRANSACTIONS_PER_PARTITION`].
+pub const MAX_ABORTED_TRANSACTIONS_PER_PARTITION: usize = 256;
 
 /// The most bytes of record one produce may carry when nothing narrows it: the BROKER's
 /// own `message.max.bytes` ([`BROKER_CONFIG_DEFAULTS`]), which is Apache Kafka's
@@ -200,6 +211,9 @@ pub struct SubmittedRecord {
     pub headers: RecordHeaders,
     /// The codec the batch this record arrived in was compressed with.
     pub codec: RecordCodec,
+    /// The producer that wrote the batch this record arrived in, and `None` for a batch
+    /// no idempotent or transactional producer owns ([`RecordProducer`]).
+    pub producer: Option<RecordProducer>,
 }
 
 /// One record in a partition's log, as a fetch hands it back.
@@ -224,6 +238,36 @@ pub struct StoredRecord {
     /// The codec the batch this record arrived in was compressed with, which is the
     /// codec a fetch answers with for a topic whose `compression.type` is `producer`.
     pub codec: RecordCodec,
+    /// The producer that wrote the batch this record belongs to, and `None` for a batch
+    /// no idempotent or transactional producer owns ([`RecordProducer`]). A fetch hands
+    /// the record back in a batch carrying it, because a read_committed consumer tells an
+    /// aborted record from a committed one by the producer of the batch it is in.
+    pub producer: Option<RecordProducer>,
+}
+
+/// The PRODUCER of one record batch, as the batch carries it: the id and epoch the
+/// broker assigned that producer ([`transactions`]), whether the batch was written
+/// inside a TRANSACTION, and whether the batch is one of the CONTROL batches a
+/// transaction coordinator writes to end one.
+///
+/// Kept with the record because a fetch has to hand it back: the batch a
+/// read_committed consumer reads carries the producer id it decides visibility by, and a
+/// control batch is the marker that tells such a consumer the transaction ended. A record
+/// a plain producer wrote carries none of this, which is the `None` the record holds
+/// instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordProducer {
+    /// The producer id the broker assigned (`InitProducerId`).
+    pub id: i64,
+    /// The epoch that id is at, which rises when the id is taken over by another
+    /// producer of the same transactional id.
+    pub epoch: i16,
+    /// Whether the batch was written inside a transaction (the batch's transactional
+    /// bit), rather than by an idempotent producer running outside one.
+    pub transactional: bool,
+    /// Whether the batch is a transaction CONTROL batch — a `COMMIT` or `ABORT` marker —
+    /// rather than one carrying a client's records.
+    pub control: bool,
 }
 
 /// The compression codec a record batch travels in: the codecs Apache Kafka's record
@@ -294,6 +338,37 @@ pub struct PartitionLog {
     segment_first_timestamp_ms: i64,
     /// See [`Self::segment_first_timestamp_ms`].
     segment_bytes: usize,
+    /// The transactions still OPEN in this partition: the producer id of each, and the
+    /// first offset that producer wrote inside the transaction.
+    ///
+    /// What the LAST STABLE OFFSET is read from ([`Self::last_stable_offset`]): a
+    /// read_committed consumer reads no further than the first offset of the oldest
+    /// transaction nothing has committed or aborted yet, because whether those records
+    /// become visible is not decided. Emptied as each transaction ends
+    /// ([`Self::end_transaction`]).
+    open_transactions: BTreeMap<i64, i64>,
+    /// The transactions ABORTED in this partition, oldest first: a fetch reports them so
+    /// a read_committed consumer can drop the records of each, which is how the Apache
+    /// Kafka protocol hides an aborted record from such a consumer — the records are in
+    /// the log, and the client filters them by the producer the batch names.
+    ///
+    /// Bounded with the log itself: an entry whose marker has aged out of the log is one
+    /// no fetch can read the records of, so it goes with them.
+    aborted_transactions: VecDeque<AbortedTransaction>,
+}
+
+/// One ABORTED transaction of a partition, as a fetch reports it: the producer whose
+/// records were aborted, the first offset it wrote in that transaction, and the offset of
+/// the `ABORT` control batch that ended it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AbortedTransaction {
+    /// The producer id whose records the abort discarded.
+    pub producer_id: i64,
+    /// The first offset that producer wrote inside the aborted transaction, which is
+    /// where a consumer starts dropping its records.
+    pub first_offset: i64,
+    /// The offset the `ABORT` control batch took, which is where that dropping stops.
+    pub marker_offset: i64,
 }
 
 /// What closes a segment: the topic's own `segment.ms` and `segment.bytes`, as the
@@ -409,6 +484,91 @@ impl PartitionLog {
             self.drop_oldest();
         }
         self.restate_log_start();
+    }
+
+    /// The offset a READ_COMMITTED consumer reads up to: the first offset of the oldest
+    /// transaction still open in this partition, and the end of the log when none is.
+    ///
+    /// Apache Kafka's last stable offset — "the offset such that all records below it are
+    /// decided": the records of an open transaction are in the log and may yet be
+    /// aborted, so a consumer reading only committed records stops before the first of
+    /// them.
+    #[must_use]
+    pub fn last_stable_offset(&self) -> i64 {
+        self.open_transactions
+            .values()
+            .copied()
+            .min()
+            .unwrap_or(self.next_offset)
+    }
+
+    /// The transactions aborted in this partition that a fetch from `fetch_offset`
+    /// reports: the ones whose marker the fetch can still reach, so a consumer is told
+    /// about every abort that covers a record it may read.
+    #[must_use]
+    pub fn aborted_transactions(&self, fetch_offset: i64) -> Vec<AbortedTransaction> {
+        self.aborted_transactions
+            .iter()
+            .filter(|aborted| aborted.marker_offset >= fetch_offset)
+            .copied()
+            .collect()
+    }
+
+    /// Note that the producer `producer_id` has written inside a transaction at `offset`,
+    /// which is what makes the records from there on undecided until the transaction ends.
+    ///
+    /// Idempotent per transaction: the FIRST offset the producer wrote in it is the one
+    /// kept, since that is where a read_committed consumer stops.
+    fn begin_transaction(&mut self, producer_id: i64, offset: i64) {
+        if self.open_transactions.len() >= MAX_OPEN_TRANSACTIONS_PER_PARTITION
+            && !self.open_transactions.contains_key(&producer_id)
+        {
+            return;
+        }
+        self.open_transactions.entry(producer_id).or_insert(offset);
+    }
+
+    /// End the transaction the producer `producer_id` holds in this partition, appending
+    /// the control batch that marks it — which takes an offset of its own, exactly as
+    /// Apache Kafka's commit and abort markers do — and answering that offset.
+    ///
+    /// An ABORTED transaction is recorded so a fetch can report it: the records stay in
+    /// the log, and a read_committed consumer drops them by the producer the batch names.
+    pub fn end_transaction(
+        &mut self,
+        marker: StoredRecord,
+        producer_id: i64,
+        committed: bool,
+        segmenting: Segmenting,
+    ) -> i64 {
+        let first_offset = self.open_transactions.remove(&producer_id);
+        let marker_offset = self.append(marker, segmenting);
+        if let Some(first_offset) = first_offset.filter(|_| !committed) {
+            self.aborted_transactions.push_back(AbortedTransaction {
+                producer_id,
+                first_offset,
+                marker_offset,
+            });
+        }
+        self.forget_unreachable_aborts();
+        marker_offset
+    }
+
+    /// Drop the record of every abort whose marker has left the log: the records it
+    /// discarded are gone with it, so no fetch can read one.
+    ///
+    /// Bounded past that by [`MAX_ABORTED_TRANSACTIONS_PER_PARTITION`], which drops the
+    /// oldest entry first — the same end of the log retention drops.
+    fn forget_unreachable_aborts(&mut self) {
+        let start = self.log_start_offset;
+        while self
+            .aborted_transactions
+            .front()
+            .is_some_and(|aborted| aborted.marker_offset < start)
+            || self.aborted_transactions.len() > MAX_ABORTED_TRANSACTIONS_PER_PARTITION
+        {
+            self.aborted_transactions.pop_front();
+        }
     }
 }
 
@@ -966,6 +1126,10 @@ pub enum PartitionRefusal {
     MessageTooLarge,
     /// The fetch asked for an offset outside the log: `OFFSET_OUT_OF_RANGE`.
     OffsetOutOfRange,
+    /// The batch was written by a transactional producer another has taken its
+    /// transactional id over from, so the epoch it wrote under is not the one in force:
+    /// `INVALID_PRODUCER_EPOCH`.
+    InvalidProducerEpoch,
 }
 
 impl PartitionRefusal {
@@ -978,6 +1142,9 @@ impl PartitionRefusal {
             }
             Self::MessageTooLarge => ::kafka_protocol::ResponseError::MessageTooLarge.code(),
             Self::OffsetOutOfRange => ::kafka_protocol::ResponseError::OffsetOutOfRange.code(),
+            Self::InvalidProducerEpoch => {
+                ::kafka_protocol::ResponseError::InvalidProducerEpoch.code()
+            }
         }
     }
 }
@@ -1036,6 +1203,24 @@ pub struct FetchedPartition {
     /// The offset the next produced record will take, which is the partition's high
     /// watermark.
     pub high_watermark: i64,
+    /// The offset every record below which is DECIDED: the first offset of the oldest
+    /// transaction nothing has committed or aborted yet, and the high watermark when
+    /// there is none ([`PartitionLog::last_stable_offset`]).
+    pub last_stable_offset: i64,
+    /// The transactions aborted in this partition that this read covers, which is what a
+    /// read_committed consumer drops the records of.
+    pub aborted: Vec<AbortedTransaction>,
+    /// The offset through which this read's LEADING records are ones no consumer is
+    /// given — a transaction control batch, or a record an abort discarded — and `None`
+    /// where the read begins with a record it surfaces.
+    ///
+    /// Filled in for a consumer of THIS process, which keeps its own position and is
+    /// handed the records a client library would surface ([`ComAmazonawsKafkaKafkaState::data_plane_fetch`]):
+    /// such a reader must move past a window made of records nobody is given, exactly as a
+    /// client library moves its position past a control batch, rather than reading the
+    /// same window again without end. A protocol client does its own filtering and is
+    /// answered every record, so nothing is withheld from it and this is `None`.
+    pub undelivered_through: Option<i64>,
     /// The first offset still readable.
     pub log_start_offset: i64,
     /// The codec the topic keeps its records in, from its own `compression.type`:
@@ -1043,6 +1228,98 @@ pub struct FetchedPartition {
     /// setting's default value (`producer`).
     pub codec: Option<RecordCodec>,
 }
+
+impl FetchedPartition {
+    /// The records of this read a COMMITTED reader is given: the ones no aborted
+    /// transaction discarded, with the transaction control batches left out.
+    ///
+    /// What a client library surfaces to its caller under `read_committed`: a control
+    /// batch is the protocol's own marker and no record of the topic, and a record
+    /// written inside a transaction an `ABORT` marker ended is one the transaction threw
+    /// away — recognised, as a client recognises it, by the PRODUCER the batch names and
+    /// the span the abort covers.
+    #[must_use]
+    pub fn committed_records(&self) -> Vec<StoredRecord> {
+        self.records
+            .iter()
+            .filter(|record| self.surfaced(record))
+            .cloned()
+            .collect()
+    }
+
+    /// The offset through which the records at the HEAD of this read are ones no consumer
+    /// is given, and `None` where the first record of it is surfaced
+    /// ([`Self::undelivered_through`]).
+    #[must_use]
+    pub fn undelivered_prefix(&self) -> Option<i64> {
+        self.records
+            .iter()
+            .take_while(|record| !self.surfaced(record))
+            .map(|record| record.offset)
+            .last()
+    }
+
+    /// Whether one record of this read is one a committed reader is GIVEN: a control
+    /// batch is the protocol's own marker and no record of the topic, and a record
+    /// written inside a transaction an `ABORT` marker ended is one the transaction threw
+    /// away — recognised, as a client recognises it, by the PRODUCER the batch names and
+    /// the span the abort covers.
+    fn surfaced(&self, record: &StoredRecord) -> bool {
+        let Some(producer) = record.producer else {
+            return true;
+        };
+        !producer.control
+            && !self.aborted.iter().any(|aborted| {
+                aborted.producer_id == producer.id
+                    && (aborted.first_offset..aborted.marker_offset).contains(&record.offset)
+            })
+    }
+}
+
+/// What one read of a partition ASKS FOR: where it starts, how many records at most, and
+/// the isolation level it reads at. One value rather than three parameters, so what a read
+/// wants travels as a whole.
+#[derive(Debug, Clone, Copy)]
+pub struct PartitionRead {
+    /// The offset the read starts at.
+    pub fetch_offset: i64,
+    /// The most records it answers.
+    pub max_records: usize,
+    /// The isolation level it reads at.
+    pub isolation: Isolation,
+}
+
+/// The ISOLATION LEVEL a read is made at (Apache Kafka's `Fetch` and `ListOffsets`): a
+/// `read_uncommitted` reader is given every record in the log, and a `read_committed` one
+/// only what is DECIDED — nothing from a transaction that has neither committed nor
+/// aborted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Isolation {
+    /// Every record the log holds, whatever transaction wrote it: the level the protocol
+    /// states as `0`, and what a client that asks for none reads.
+    #[default]
+    ReadUncommitted,
+    /// Only the records below the partition's last stable offset: the level the protocol
+    /// states as `1`.
+    ReadCommitted,
+}
+
+impl Isolation {
+    /// The level a request's `IsolationLevel` names (Apache Kafka: `0` is
+    /// read_uncommitted and `1` read_committed; a version that carries none reads as the
+    /// default, which is read_uncommitted).
+    #[must_use]
+    pub fn of_request(isolation_level: i8) -> Self {
+        match isolation_level {
+            ISOLATION_LEVEL_READ_COMMITTED => Self::ReadCommitted,
+            _ => Self::ReadUncommitted,
+        }
+    }
+}
+
+/// The value a request states to read only COMMITTED records with (Apache Kafka
+/// protocol, `IsolationLevel`).
+const ISOLATION_LEVEL_READ_COMMITTED: i8 = 1;
 
 impl ComAmazonawsKafkaKafkaState {
     /// The topic `topic` of the cluster `cluster_arn`, as a reader at `now` sees it —
@@ -1142,11 +1419,28 @@ impl ComAmazonawsKafkaKafkaState {
         // What closes the log's active segment, which is what makes the records before it
         // sweepable: the topic's own `segment.ms` and `segment.bytes`.
         let segmenting = segmenting_of(&configuration);
+        // The TRANSACTION a transactional batch is part of: its records are in the log
+        // from here on, and whether they ever become visible to a read_committed consumer
+        // is not decided until the transaction ends ([`PartitionLog::last_stable_offset`]).
+        let transactional = records
+            .first()
+            .and_then(|record| record.producer)
+            .filter(|producer| producer.transactional);
+        // A producer whose transactional id another producer has taken over writes under
+        // an epoch that is no longer in force, and a broker appends nothing for it: the
+        // records of the producer now holding that id are the ones the transaction's
+        // marker decides ([`transactions`]).
+        if transactional.is_some_and(|producer| transactions::fenced(self, cluster_arn, producer)) {
+            return Err(PartitionRefusal::InvalidProducerEpoch);
+        }
         let log = self
             .partition_logs
             .entry((cluster_arn.to_string(), topic.to_string(), partition))
             .or_default();
         let base = log.next_offset;
+        if let Some(producer) = transactional {
+            log.begin_transaction(producer.id, base);
+        }
         for record in records {
             let stamped = match log_append_time || record.timestamp_ms <= 0 {
                 // A producer that sends no timestamp has the broker stamp the record
@@ -1167,6 +1461,7 @@ impl ComAmazonawsKafkaKafkaState {
                     value: record.value,
                     headers: record.headers,
                     codec: record.codec,
+                    producer: record.producer,
                 },
                 segmenting,
             );
@@ -1177,8 +1472,21 @@ impl ComAmazonawsKafkaKafkaState {
         })
     }
 
-    /// Read one partition from `fetch_offset` on, with the records the topic's
-    /// retention has aged out already gone.
+    /// Read one partition from `at.fetch_offset` on, with the records the topic's
+    /// retention has aged out already gone, as an in-process CONSUMER of this cluster
+    /// reads it — an event source mapping of the Lambda emulator.
+    ///
+    /// Such a consumer is handed the records a client library would surface to it, so
+    /// what it reads is what a READ_COMMITTED client reads once its own filtering has
+    /// run: the transaction control batches the protocol carries are not records of
+    /// anybody's topic, and an aborted record is one no committed reader is given
+    /// ([`FetchedPartition::committed_records`]).
+    ///
+    /// The read also reports how far it got PAST the records it surfaced none of
+    /// ([`FetchedPartition::undelivered_through`]), because a consumer of this plane
+    /// keeps its own position: a client library moves past a control batch and an
+    /// aborted record, so a reader handed an empty batch out of a window made of them
+    /// must be able to move past that window instead of reading it again without end.
     pub fn data_plane_fetch(
         &mut self,
         cluster_arn: &str,
@@ -1186,6 +1494,39 @@ impl ComAmazonawsKafkaKafkaState {
         partition: i32,
         fetch_offset: i64,
         max_records: usize,
+        now: SystemTime,
+    ) -> Result<FetchedPartition, PartitionRefusal> {
+        let mut read = self.data_plane_fetch_isolated(
+            cluster_arn,
+            topic,
+            partition,
+            PartitionRead {
+                fetch_offset,
+                max_records,
+                isolation: Isolation::ReadCommitted,
+            },
+            now,
+        )?;
+        let through = read.undelivered_prefix();
+        read.undelivered_through = through;
+        read.records = read.committed_records();
+        Ok(read)
+    }
+
+    /// The same read as the protocol's own `Fetch` makes it, under the ISOLATION LEVEL
+    /// the request states: a read_committed one stops at the last stable offset, because
+    /// the records of a transaction nothing has decided yet may still be aborted.
+    ///
+    /// The records of an ABORTED transaction are answered either way, with the aborted
+    /// transactions beside them: that is how the Apache Kafka protocol hides them from a
+    /// read_committed consumer — the records stay in the log and the client drops the ones
+    /// the producers it is told about wrote.
+    pub fn data_plane_fetch_isolated(
+        &mut self,
+        cluster_arn: &str,
+        topic: &str,
+        partition: i32,
+        at: PartitionRead,
         now: SystemTime,
     ) -> Result<FetchedPartition, PartitionRefusal> {
         let configuration = self
@@ -1213,40 +1554,132 @@ impl ComAmazonawsKafkaKafkaState {
             return Ok(FetchedPartition {
                 records: Vec::new(),
                 high_watermark: 0,
+                last_stable_offset: 0,
+                aborted: Vec::new(),
+                undelivered_through: None,
                 log_start_offset: 0,
                 codec,
             });
         };
         log.expire(now_ms, retention);
-        if fetch_offset > log.next_offset {
+        if at.fetch_offset > log.next_offset {
             return Err(PartitionRefusal::OffsetOutOfRange);
         }
+        let last_stable_offset = log.last_stable_offset();
+        // What the read may REACH: the whole log for a read_uncommitted consumer, and
+        // only the decided part of it for a read_committed one.
+        let reachable = match at.isolation {
+            Isolation::ReadUncommitted => log.next_offset,
+            Isolation::ReadCommitted => last_stable_offset,
+        };
         let records = log
             .records
             .iter()
-            .filter(|record| record.offset >= fetch_offset)
-            .take(max_records)
+            .filter(|record| record.offset >= at.fetch_offset && record.offset < reachable)
+            .take(at.max_records)
             .cloned()
             .collect();
         Ok(FetchedPartition {
             records,
             high_watermark: log.next_offset,
+            last_stable_offset,
+            // The aborted transactions are reported to a READ_COMMITTED reader, which is
+            // the reader that decides anything by them: an uncommitted one is given every
+            // record in the log whatever transaction wrote it.
+            aborted: match at.isolation {
+                Isolation::ReadUncommitted => Vec::new(),
+                Isolation::ReadCommitted => log.aborted_transactions(at.fetch_offset),
+            },
+            // Nothing is withheld from the records answered here: a protocol client does
+            // its own filtering, and this is the reading that gives it everything it needs
+            // to ([`data_plane_fetch`] fills this in for a consumer of this process).
+            undelivered_through: None,
             log_start_offset: log.log_start_offset,
             codec,
         })
     }
 
     /// Where one partition's log begins and ends at `now`, with aged-out records
-    /// already gone: `(log start offset, high watermark)`.
+    /// already gone: `(log start offset, end offset)`, where the end is the partition's
+    /// high watermark for a read_uncommitted reader and its LAST STABLE OFFSET for a
+    /// read_committed one — which is what `ListOffsets` answers each of them with.
     pub fn data_plane_offsets(
         &mut self,
         cluster_arn: &str,
         topic: &str,
         partition: i32,
+        isolation: Isolation,
         now: SystemTime,
     ) -> Result<(i64, i64), PartitionRefusal> {
-        let fetched = self.data_plane_fetch(cluster_arn, topic, partition, 0, 0, now)?;
-        Ok((fetched.log_start_offset, fetched.high_watermark))
+        let fetched = self.data_plane_fetch_isolated(
+            cluster_arn,
+            topic,
+            partition,
+            PartitionRead {
+                fetch_offset: 0,
+                max_records: 0,
+                isolation,
+            },
+            now,
+        )?;
+        let end = match isolation {
+            Isolation::ReadUncommitted => fetched.high_watermark,
+            Isolation::ReadCommitted => fetched.last_stable_offset,
+        };
+        Ok((fetched.log_start_offset, end))
+    }
+
+    /// End a transaction in ONE partition: append the `COMMIT` or `ABORT` marker the
+    /// coordinator writes for it, which takes an offset of its own, and answer that
+    /// offset.
+    ///
+    /// `None` where there is nothing to mark: a topic the cluster no longer holds (a
+    /// transaction that touched one which has since been deleted lost the records it wrote
+    /// with it), a partition index the topic does not have — read exactly as the produce
+    /// and fetch paths read it, so a marker cannot name a partition no produce could have
+    /// written to — and a partition whose log holds nothing, which has no record of this
+    /// producer's to decide and is not brought into being by marking it.
+    pub fn data_plane_end_transaction(
+        &mut self,
+        cluster_arn: &str,
+        topic: &str,
+        partition: i32,
+        producer: RecordProducer,
+        committed: bool,
+        now: SystemTime,
+    ) -> Option<i64> {
+        let configuration = self
+            .data_plane_topic_configuration(cluster_arn, topic, now)?
+            .effective;
+        let held = self.data_plane_topic(cluster_arn, topic, now)?;
+        if partition < 0 || partition >= held.partition_count.clamp(1, MAX_PARTITIONS_PER_TOPIC) {
+            return None;
+        }
+        let segmenting = segmenting_of(&configuration);
+        let marker = transactions::marker_record(producer, committed, epoch_millis(now));
+        let log = self
+            .partition_logs
+            .get_mut(&(cluster_arn.to_string(), topic.to_string(), partition))?;
+        Some(log.end_transaction(marker, producer.id, committed, segmenting))
+    }
+
+    /// Store one position a COMMITTED transaction carried as the committed offset of the
+    /// consumer group it named, answering whether the group took it.
+    ///
+    /// What makes a read-process-write loop exactly-once: the offsets the producer sent
+    /// to the transaction become the group's own only when the transaction commits, and
+    /// what fences the write is the PRODUCER's epoch rather than the group's membership —
+    /// the commit speaks for the transaction, not for a member of the group.
+    pub fn data_plane_commit_transactional_offset(
+        &mut self,
+        cluster_arn: &str,
+        group_id: &str,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+    ) -> bool {
+        self.consumer_group_in(cluster_arn, group_id)
+            .is_some_and(|group| group.commit_transactional_offset(topic, partition, offset))
     }
 
     /// Store the position `at` states as the one the consumer group it names on the cluster

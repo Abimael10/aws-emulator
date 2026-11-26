@@ -76,6 +76,7 @@ fn submitted(base_timestamp: i64) -> Vec<StoredRecord> {
             value: Some(vec![b'v'; 2_400]),
             headers: headers(),
             codec: RecordCodec::None,
+            producer: None,
         },
         StoredRecord {
             offset: 1,
@@ -85,6 +86,7 @@ fn submitted(base_timestamp: i64) -> Vec<StoredRecord> {
             value: Some(b"no key".to_vec()),
             headers: Vec::new(),
             codec: RecordCodec::None,
+            producer: None,
         },
         StoredRecord {
             offset: 2,
@@ -94,6 +96,7 @@ fn submitted(base_timestamp: i64) -> Vec<StoredRecord> {
             value: None,
             headers: vec![("only".to_string(), Some(b"one".to_vec()))],
             codec: RecordCodec::None,
+            producer: None,
         },
         StoredRecord {
             offset: 3,
@@ -103,6 +106,7 @@ fn submitted(base_timestamp: i64) -> Vec<StoredRecord> {
             value: Some(Vec::new()),
             headers: Vec::new(),
             codec: RecordCodec::None,
+            producer: None,
         },
     ]
 }
@@ -392,6 +396,7 @@ async fn an_unreadable_batch_is_refused_and_appends_nothing() {
             value: Some(vec![0u8; 16 * 1024 * 1024]),
             headers: Vec::new(),
             codec: RecordCodec::Gzip,
+            producer: None,
         }],
         RecordCodec::Gzip,
         records::MAGIC_V2,

@@ -718,7 +718,12 @@ fn read_partition(
             })?
     };
     let mut records = fetched.records;
-    let mut excluded_through = None;
+    // The records this read surfaced NONE of are handled by being passed over: a
+    // transaction's control batch and a record an abort discarded are not records any
+    // consumer is handed, so the position moves past them exactly as a client library
+    // moves its own past them — otherwise a window made only of them would be read again
+    // on every pass and the partition would never move.
+    let mut excluded_through = fetched.undelivered_through;
     if let Some(instant) = before {
         let excluded = records
             .iter()
