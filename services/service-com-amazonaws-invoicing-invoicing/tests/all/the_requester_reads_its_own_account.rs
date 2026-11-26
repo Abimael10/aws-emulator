@@ -5,14 +5,13 @@
 //! `X-Amz-Target: Invoicing.BatchGetInvoiceProfile` and an awsJson1_0 body, through the
 //! same `MultiServiceRouter` the production router uses).
 //!
-//! The rule under test: the operation answers an invoice profile for every account of the
-//! requester's OWN organization — the account the caller authenticates as, which is that
-//! organization's management account, together with every account this service's state
-//! links into it — and refuses the request WHOLE with the modelled 403
-//! `AccessDeniedException`, naming the first account id in request order the organization
-//! does not contain. The caller is inside its own organization whatever else state holds,
-//! so a caller reading itself is always answered; every OTHER account id is readable
-//! exactly when a stored configuration links it.
+//! The rule under test: the operation answers an invoice profile for every LINKED account of
+//! the requester's organization — "the accounts must be linked accounts under the requester
+//! management account organization" — and refuses the request WHOLE with the modelled 403
+//! `AccessDeniedException`, naming the first account id in request order that is not one.
+//! The requester authenticates as the organization's MANAGEMENT account, which is not a
+//! linked account of it, so the caller's OWN account is readable on exactly the same terms as
+//! every other id: when a stored configuration links it, and not otherwise.
 //!
 //! The rows span what the rule generalises over: how (and whether) a configuration names
 //! the account asked about, in each of the ways this service's state can name one (nowhere,
@@ -182,7 +181,7 @@ async fn create_unit(
 /// How this service's state names (or does not name) one account, as the rows of the
 /// tables below. Each arrangement is applied BOTH to the caller's own account and to an
 /// ordinary account id, which is what pins that the arrangement decides the answer for
-/// every id but the caller's own.
+/// EVERY id, the caller's own included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Arrangement {
     /// A fresh emulator: no invoice unit at all, which is how a client first meets this
@@ -210,7 +209,8 @@ enum Arrangement {
 
 impl Arrangement {
     /// Whether this arrangement LINKS the subject into the organization, which is what
-    /// decides the answer for every account but the one the caller authenticates as.
+    /// decides the answer for every account id, the one the caller authenticates as
+    /// included.
     fn links_the_subject(self) -> bool {
         matches!(
             self,
@@ -397,20 +397,20 @@ async fn assert_reported(
     }
 }
 
-/// RULE, the caller's half: the account the caller authenticates as resolves to its invoice
-/// profile whatever this service's state holds — including against an organization no
-/// configuration has linked an account into — whatever shape the batch takes.
+/// RULE, the caller's half: the account the caller authenticates as is readable exactly when
+/// a stored configuration LINKS it into the organization — the caller is that organization's
+/// MANAGEMENT account, which is not a linked account of it — whatever shape the batch takes.
 #[tokio::test]
-async fn the_caller_reads_its_own_invoice_profile_whatever_state_holds() {
+async fn the_callers_own_account_is_readable_exactly_when_a_configuration_links_it() {
     let own = own_account();
 
     for arrangement in ARRANGEMENTS {
         let router = emulator();
         let linked = arrange(&router, arrangement, &own).await;
+        let readable = arrangement.links_the_subject();
 
-        // The batch shapes the own account can be asked about in, each with the profiles it
-        // must be answered with: one per account asked about, in the order the request
-        // first names it.
+        // The batch shapes the own account can be asked about in: the answer follows the
+        // arrangement, not the shape.
         let mut shapes: Vec<(String, Vec<String>, Vec<String>)> = vec![
             ("alone".to_string(), vec![own.clone()], vec![own.clone()]),
             (
@@ -443,11 +443,22 @@ async fn the_caller_reads_its_own_invoice_profile_whatever_state_holds() {
 
         for (shape, requested, expected) in shapes {
             let label = format!("{arrangement:?}, {shape}");
-            assert_reported(&router, &label, &requested, &expected).await;
+            if readable {
+                assert_reported(&router, &label, &requested, &expected).await;
+            } else {
+                // Refused WHOLE, naming the first id in request order that is not a linked
+                // account — which, where the caller's own account comes first, is it.
+                let refused = requested
+                    .iter()
+                    .find(|id| !linked.contains(id))
+                    .cloned()
+                    .unwrap_or_else(|| own.clone());
+                assert_refused(&router, &label, &requested, &refused).await;
+            }
         }
 
-        // Every account the arrangement linked into the organization is readable as well:
-        // the answer is per account, not per caller.
+        // Every account the arrangement linked into the organization is readable, whether
+        // or not the caller's own account is: the answer is per account, not per caller.
         if !linked.is_empty() {
             let label = format!("{arrangement:?}, the accounts state links");
             assert_reported(&router, &label, &linked, &linked).await;
@@ -455,19 +466,20 @@ async fn the_caller_reads_its_own_invoice_profile_whatever_state_holds() {
     }
 }
 
-/// RULE, the other accounts' half: every account id but the caller's own is readable
-/// exactly when this service's state links it into the organization, so the SAME
-/// arrangement decides the answer for an ordinary account id — and an id the organization
-/// does not contain refuses the request WHOLE, naming the first such id in request order
-/// rather than the caller.
+/// RULE, the other accounts' half: an ordinary account id is readable on exactly the terms
+/// the caller's own account is — this service's state linking it into the organization — so
+/// the SAME arrangement decides its answer, and an id no configuration links refuses the
+/// request WHOLE, naming the first such id in request order.
 #[tokio::test]
 async fn an_account_outside_the_organization_refuses_the_whole_batch_by_name() {
-    let own = own_account();
-
     for arrangement in ARRANGEMENTS {
         let router = emulator();
         let subject = account(11);
         let linked = arrange(&router, arrangement, &subject).await;
+        // A linked account of the row, if it has one, to put beside the subject: the
+        // caller's own account is no longer readable by identity, so the bystander is one
+        // the arrangement really linked.
+        let bystander = linked.first().cloned();
 
         let label = format!("{arrangement:?}, an ordinary account id");
         if arrangement.links_the_subject() {
@@ -478,113 +490,110 @@ async fn an_account_outside_the_organization_refuses_the_whole_batch_by_name() {
                 std::slice::from_ref(&subject),
             )
             .await;
-            // Beside the caller's own account, which is readable in every arrangement.
-            assert_reported(
-                &router,
-                &format!("{label}, beside the caller"),
-                &[own.clone(), subject.clone()],
-                &[own.clone(), subject.clone()],
-            )
-            .await;
+            if let Some(bystander) = &bystander {
+                assert_reported(
+                    &router,
+                    &format!("{label}, beside a linked account"),
+                    &[bystander.clone(), subject.clone()],
+                    &[bystander.clone(), subject.clone()],
+                )
+                .await;
+            }
         } else {
             assert_refused(&router, &label, std::slice::from_ref(&subject), &subject).await;
-            // The caller's own account travelling beside it does not rescue the batch, and
-            // the refusal names the account the organization does not contain rather than
-            // the caller.
-            assert_refused(
-                &router,
-                &format!("{label}, after the caller"),
-                &[own.clone(), subject.clone()],
-                &subject,
-            )
-            .await;
+            if let Some(bystander) = &bystander {
+                // A linked account travelling beside it does not rescue the batch, and the
+                // refusal names the account the organization does not link.
+                assert_refused(
+                    &router,
+                    &format!("{label}, after a linked account"),
+                    &[bystander.clone(), subject.clone()],
+                    &subject,
+                )
+                .await;
+            }
         }
 
-        // Ids no arrangement names are never readable, wherever they sit beside the
-        // caller's own account and the linked accounts of the row: the refusal names the
-        // FIRST id in request order the organization does not contain.
+        // Ids no arrangement names are never readable, wherever they sit beside the linked
+        // accounts of the row: the refusal names the FIRST id in request order that is not
+        // a linked account.
         let outsiders = [account(90), account(91), account(92)];
-        let mut among_linked = vec![own.clone()];
-        among_linked.extend(linked.iter().cloned());
+        let mut among_linked = linked.clone();
         among_linked.push(outsiders[0].clone());
-        for (shape, requested, refused) in [
+        let mut rows: Vec<(&str, Vec<String>, String)> = vec![
             (
                 "an outsider alone",
                 vec![outsiders[0].clone()],
                 outsiders[0].clone(),
             ),
             (
-                "an outsider after the caller",
-                vec![own.clone(), outsiders[1].clone()],
+                "two outsiders in a row",
+                vec![outsiders[1].clone(), outsiders[2].clone()],
                 outsiders[1].clone(),
             ),
             (
-                "an outsider before the caller",
-                vec![outsiders[2].clone(), own.clone()],
-                outsiders[2].clone(),
-            ),
-            (
-                "two outsiders around the caller",
-                vec![outsiders[1].clone(), own.clone(), outsiders[2].clone()],
-                outsiders[1].clone(),
-            ),
-            (
-                "an outsider last, after the caller and every linked account",
+                "an outsider last, after every linked account",
                 among_linked,
                 outsiders[0].clone(),
             ),
-        ] {
+        ];
+        if let Some(bystander) = &bystander {
+            rows.push((
+                "an outsider before a linked account",
+                vec![outsiders[2].clone(), bystander.clone()],
+                outsiders[2].clone(),
+            ));
+        }
+        for (shape, requested, refused) in rows {
             let label = format!("{arrangement:?}, {shape}");
             assert_refused(&router, &label, &requested, &refused).await;
         }
     }
 }
 
-/// RULE, the state half: what admits an account OTHER than the caller's own is a stored
-/// configuration linking it and nothing else — so a create that links it turns the very
-/// same refused request into an answer, while a read (reported or refused) changes nothing
-/// a later caller sees and never teaches the service about an account.
+/// RULE, the state half: what admits an account — the caller's own included — is a stored
+/// configuration linking it and nothing else, so a create that links it turns the very same
+/// refused request into an answer, while a read (reported or refused) changes nothing a later
+/// caller sees and never teaches the service about an account.
 #[tokio::test]
-async fn only_a_stored_configuration_admits_an_account_other_than_the_caller() {
+async fn only_a_stored_configuration_admits_an_account() {
     let router = emulator();
     let own = own_account();
     let other = account(21);
 
-    // Against a bare organization the caller reads itself and nothing else, and repeating
-    // either request answers identically: neither read changed state.
-    assert_reported(
-        &router,
-        "bare organization, the caller's own account",
-        std::slice::from_ref(&own),
-        std::slice::from_ref(&own),
-    )
-    .await;
-    let first = batch_get(&router, std::slice::from_ref(&other)).await;
-    let second = batch_get(&router, std::slice::from_ref(&other)).await;
-    assert_eq!(
-        first.0, 403,
-        "case bare organization, another account: expected HTTP 403, got {first:?}"
-    );
-    assert_eq!(
-        first, second,
-        "case repeated refusal: a refused read must not have admitted the account, got \
-         {first:?} then {second:?}"
-    );
+    // Against a bare organization NOTHING is readable — not even the account the caller
+    // authenticates as, which is the organization's management account rather than a linked
+    // account of it — and repeating either request answers identically: neither read
+    // changed state.
+    for subject in [&own, &other] {
+        let first = batch_get(&router, std::slice::from_ref(subject)).await;
+        let second = batch_get(&router, std::slice::from_ref(subject)).await;
+        assert_eq!(
+            first.0, 403,
+            "case bare organization, {subject}: expected HTTP 403, got {first:?}"
+        );
+        assert_eq!(
+            first, second,
+            "case repeated refusal, {subject}: a refused read must not have admitted the \
+             account, got {first:?} then {second:?}"
+        );
+    }
 
-    // A create linking it is what admits it.
+    // A create linking them is what admits them — the caller's own account on the same
+    // terms as any other.
     create_unit(
         &router,
-        "admits-another-account",
+        "admits-two-accounts",
         &account(1),
-        std::slice::from_ref(&other),
+        &[other.clone(), own.clone()],
         &[],
     )
     .await;
     assert_reported(
         &router,
-        "after a create links the account",
-        std::slice::from_ref(&other),
-        std::slice::from_ref(&other),
+        "after a create links the accounts",
+        &[own.clone(), other.clone()],
+        &[own.clone(), other.clone()],
     )
     .await;
 

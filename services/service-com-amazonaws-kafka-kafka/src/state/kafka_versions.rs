@@ -231,9 +231,8 @@ pub fn final_zookeeper_release() -> &'static [u32] {
 }
 
 /// The Apache Kafka versions this service would INSTALL on a cluster that already
-/// exists: the versions it still builds NEW clusters on
-/// ([`new_cluster_kafka_versions`], whichever broker category is offered them),
-/// each once, in published order.
+/// exists: the versions it still builds a NEW cluster on
+/// ([`new_cluster_kafka_versions`]), each once, in published order.
 ///
 /// An in-place version update installs the broker software the service currently
 /// ships, so the set an upgrade can land is the set it still offers a cluster that
@@ -244,18 +243,17 @@ pub fn final_zookeeper_release() -> &'static [u32] {
 /// make a version an upgrade target.
 ///
 /// The broker CATEGORY is not a question an upgrade asks — the cluster already has
-/// its brokers — so a version any category is offered is one an upgrade can land.
+/// its brokers — so this is ONE set: the standard category's offering, which is the
+/// software the service ships to brokers of either category (a line it offers the
+/// Express brokers alone is not software it installs on a running cluster).
 ///
 /// Derived once, like [`catalogued_kafka_versions`]: both factors are constants.
 pub fn upgrade_target_kafka_versions() -> &'static [&'static str] {
     static TARGETS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+        let shipped = new_cluster_offering(BROKER_CATEGORY_STANDARD);
         catalogued_kafka_versions()
             .iter()
-            .filter(|version| {
-                KAFKA_VERSIONS_FOR_A_NEW_CLUSTER
-                    .iter()
-                    .any(|offering| offering.versions.contains(*version))
-            })
+            .filter(|version| shipped.contains(*version))
             .copied()
             .collect()
     });
@@ -608,68 +606,49 @@ pub fn broker_instance_category(instance_type: &str) -> &'static str {
     }
 }
 
-/// One broker category's offering: the versions Amazon MSK takes for a NEW
-/// cluster whose brokers come from that category, in the order it names them in
-/// when it refuses a version a create may not name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct NewClusterOffering {
-    /// The category, as [`broker_instance_category`] reports it.
-    category: &'static str,
-    /// The versions a create of that category may name.
-    versions: &'static [&'static str],
-}
-
-/// The Apache Kafka versions Amazon MSK takes for a NEW cluster, in the order it
-/// names them in when it refuses one it does not take.
+/// The Apache Kafka versions Amazon MSK builds no new STANDARD-broker cluster on
+/// although its catalog publishes an `ACTIVE` row for them: the newest KRaft line,
+/// which MSK offers the EXPRESS brokers alone.
 ///
-/// Recorded ONCE and referenced by every category that is offered exactly it
-/// ([`KAFKA_VERSIONS_FOR_A_NEW_CLUSTER`]), so two categories offering the same
-/// versions say so rather than keeping two copies that can diverge by typo. A
-/// category MSK offers something else gets its own sequence beside this one.
-const KAFKA_VERSIONS_EVERY_CATEGORY_IS_OFFERED: &[&str] = &[
-    "3.8.x",
-    "3.8.x.kraft",
-    "3.9.x",
-    "3.9.x.kraft",
-    "4.0.x.kraft",
-    "4.1.x.kraft",
-];
+/// Recorded: a provisioned create naming such a line with a `kafka.*` instance
+/// type is refused "Standard instance types are not supported for Kafka version
+/// 4.2.x.kraft. Valid values: [...]", while a create naming the OLDEST `ACTIVE` row
+/// of the same catalog is accepted. So the standard category's offering is the
+/// published `ACTIVE` set MINUS these lines, and nothing else narrows it.
+const KAFKA_VERSIONS_FOR_EXPRESS_BROKERS_ONLY: &[&str] = &["4.2.x.kraft"];
 
 /// The versions Amazon MSK offers for a NEW cluster, PER BROKER CATEGORY, in the
 /// order it names them in when it refuses a version a create may not name
 /// ([`create_kafka_version_violation`]).
 ///
-/// A category's offering is NARROWER than the versions the catalog publishes, and
-/// narrower than the ones it publishes an `ACTIVE` row for: a version stays in the
-/// published catalog — and stays an upgrade target for the clusters already on it
-/// — after the service has stopped taking it for a cluster that does not exist
-/// yet. So this is a THIRD fact about a version, beside its membership of the
-/// catalog and the lifecycle status the catalog publishes it under, and it is
-/// recorded separately rather than derived from either. It is recorded per
-/// category because each category is a different broker build, so each has an
-/// offering of its own.
+/// A category's offering is the set of versions the catalog publishes an `ACTIVE`
+/// row for ([`kafka_version_status`]) — "a version the catalog publishes with
+/// Status=ACTIVE is a version MSK still offers for a new cluster" — narrowed, for
+/// the standard brokers, by the lines MSK offers the Express brokers alone
+/// ([`KAFKA_VERSIONS_FOR_EXPRESS_BROKERS_ONLY`]). It is therefore narrower than the
+/// published catalog, which goes on publishing a version — and going on offering it
+/// as an upgrade target — after the service has deprecated it for a cluster that
+/// does not exist yet.
 ///
-/// Source: the valid-value list the service itself renders in that refusal, for
-/// each category it renders one for. Both categories are recorded as offering the
-/// same sequence, which is why they share it.
-///
-/// Only versions the catalog publishes are named
-/// ([`new_cluster_kafka_versions`]), so a category can never offer a version no
-/// reader of this service knows.
-const KAFKA_VERSIONS_FOR_A_NEW_CLUSTER: &[NewClusterOffering] = &[
-    NewClusterOffering {
-        category: BROKER_CATEGORY_STANDARD,
-        versions: KAFKA_VERSIONS_EVERY_CATEGORY_IS_OFFERED,
-    },
-    NewClusterOffering {
-        category: BROKER_CATEGORY_EXPRESS,
-        versions: KAFKA_VERSIONS_EVERY_CATEGORY_IS_OFFERED,
-    },
-];
+/// Derived from the catalog rather than recorded beside it, so the listing and the
+/// create gate cannot contradict each other: a version the listing publishes as
+/// offered is one a create of the standard category may name, and a version it
+/// publishes as deprecated is one no create may.
+fn new_cluster_offering(category: &str) -> Vec<&'static str> {
+    catalogued_kafka_versions()
+        .iter()
+        .filter(|version| kafka_version_status(version) == Some(KAFKA_VERSION_ACTIVE))
+        .filter(|version| {
+            category == BROKER_CATEGORY_EXPRESS
+                || !KAFKA_VERSIONS_FOR_EXPRESS_BROKERS_ONLY.contains(version)
+        })
+        .copied()
+        .collect()
+}
 
 /// The versions a create whose brokers are of `instance_type`'s category may
-/// name, as the refusal below lists them: that category's recorded sequence,
-/// narrowed to the versions the catalog really publishes.
+/// name, as the refusal below lists them: that category's offering
+/// ([`new_cluster_offering`]), in the order the catalog publishes those versions.
 ///
 /// This is BOTH the admission gate of a provisioned create and the valid-value
 /// list its refusal carries, so the set a client is told to retry with is exactly
@@ -680,19 +659,9 @@ const KAFKA_VERSIONS_FOR_A_NEW_CLUSTER: &[NewClusterOffering] = &[
 pub fn new_cluster_kafka_versions(instance_type: &str) -> &'static [&'static str] {
     static OFFERED: std::sync::LazyLock<Vec<(&'static str, Vec<&'static str>)>> =
         std::sync::LazyLock::new(|| {
-            KAFKA_VERSIONS_FOR_A_NEW_CLUSTER
-                .iter()
-                .map(|offering| {
-                    (
-                        offering.category,
-                        offering
-                            .versions
-                            .iter()
-                            .filter(|version| kafka_version_index(version).is_some())
-                            .copied()
-                            .collect(),
-                    )
-                })
+            [BROKER_CATEGORY_STANDARD, BROKER_CATEGORY_EXPRESS]
+                .into_iter()
+                .map(|category| (category, new_cluster_offering(category)))
                 .collect()
         });
     let category = broker_instance_category(instance_type);

@@ -584,26 +584,22 @@ impl ComAmazonawsInvoicingInvoicingState {
         }
     }
 
-    /// Every account of the requester's organization this service may be answered for:
-    /// the organization's MANAGEMENT account — the identity the caller authenticates as
-    /// ([`::engine::emulator_account_id`]) — together with every LINKED account
-    /// [`Self::linked_accounts`] derives from stored configurations.
+    /// Every account this service may be answered about: the LINKED accounts of the
+    /// requester's organization, which [`Self::linked_accounts`] derives from stored
+    /// configurations.
     ///
-    /// An operation documented over "linked accounts under the requester management
-    /// account organization" (`BatchGetInvoiceProfile`) is answered for the accounts of
-    /// the requester's OWN organization, and the requester is always inside it: the
-    /// account the caller authenticates as is that organization's management account, so
-    /// it is readable by the caller whatever else state holds. An account id the
-    /// organization does not contain is what such an operation refuses
-    /// ([`not_authorized_for_account`]).
+    /// `BatchGetInvoiceProfile` is documented over "linked accounts under the requester
+    /// management account organization", so what it may be answered for is the LINKED half
+    /// of that organization and nothing else: the requester authenticates as the
+    /// organization's MANAGEMENT account, which is not a linked account of it, so the
+    /// requester's own account is readable exactly when a stored configuration links it —
+    /// as every other account id is. An account id this set does not hold is what such an
+    /// operation refuses ([`not_authorized_for_account`]).
     ///
-    /// The caller's identity admits ONLY the caller's own account: every other id is in
-    /// this set exactly when a stored configuration links it, so a read never widens what
-    /// the requester may be answered for and nothing but a write changes it.
+    /// A read never widens the set: membership is derived from stored configurations alone,
+    /// so nothing but a write changes it.
     pub fn accounts_the_requester_may_read(&self) -> BTreeSet<String> {
-        let mut accounts = self.linked_accounts();
-        accounts.insert(::engine::emulator_account_id().to_string());
-        accounts
+        self.linked_accounts()
     }
 
     /// Every LINKED account this service's state names under the requester's
@@ -617,8 +613,8 @@ impl ComAmazonawsInvoicingInvoicingState {
     /// and `smithy_query(query="operation", operation="CreateInvoiceUnit")`.
     ///
     /// Membership of this set is derived from those configurations and from NOTHING else:
-    /// it is the LINKED half of the organization, which
-    /// [`Self::accounts_the_requester_may_read`] adds the management account to.
+    /// it is the LINKED half of the organization, which is the whole of what
+    /// [`Self::accounts_the_requester_may_read`] admits.
     ///
     /// `BillSourceAccounts` is deliberately NOT a source: the model documents those as
     /// accounts that "can be payer accounts from other organizations that have

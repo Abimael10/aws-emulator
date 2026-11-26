@@ -57,11 +57,10 @@ pub const SERVICE_IPV4_MAX_PREFIX: u8 = 24;
 /// `172.20.0.0/16` CIDR blocks"
 /// (`KubernetesNetworkConfigResponse$serviceIpv4Cidr`) — so the block is one of
 /// these two and WHICH of them is the service's choice per cluster, never a
-/// constant. `172.20.0.0/16` is first because that is the block the recorded
-/// answer for a cluster whose VPC overlaps neither of them carries; the other is
-/// what such a cluster gets when its VPC's address space leaves no room for the
-/// first (see [`default_service_ipv4_cidr`]).
-pub const SERVICE_IPV4_CIDR_BLOCKS: &[&str] = &["172.20.0.0/16", "10.100.0.0/16"];
+/// constant. `10.100.0.0/16` is first because that is the block a cluster whose
+/// VPC leaves it free is assigned; the other is what such a cluster gets when its
+/// VPC's address space overlaps the first (see [`default_service_ipv4_cidr`]).
+pub const SERVICE_IPV4_CIDR_BLOCKS: &[&str] = &["10.100.0.0/16", "172.20.0.0/16"];
 
 /// The service CIDR a cluster created with no `serviceIpv4Cidr` is assigned, for
 /// the address space of the VPC its subnets resolved to.

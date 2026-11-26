@@ -529,7 +529,9 @@ async fn a_capacity_mode_outside_the_declared_set_is_refused_as_the_member_it_is
     );
 
     // An UPDATE that moves a table with no stored capacity into the provisioned mode and
-    // names none is the same contradiction, which the update states in its own words.
+    // names none is the same contradiction, which the update states in its own words: the
+    // MEMBER the request had to carry, where the create names the two capacity members it
+    // needed.
     let (status, body) = call(
         &router,
         "UpdateTable",
@@ -541,8 +543,8 @@ async fn a_capacity_mode_outside_the_declared_set_is_refused_as_the_member_it_is
         (status, said.as_str()),
         (
             400,
-            "One or more parameter values were invalid: ReadCapacityUnits and WriteCapacityUnits \
-             must both be specified when BillingMode is PROVISIONED"
+            "One or more parameter values were invalid: ProvisionedThroughput must be \
+             specified when BillingMode is PROVISIONED"
         ),
         "case \"a provisioned update with no capacity\": got {status} with {body}"
     );

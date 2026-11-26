@@ -251,10 +251,10 @@ async fn every_published_row_carries_its_own_sources_ladder() {
         // The `.tiered` storage spelling of a deprecated release: on the
         // ZooKeeper line, and terminal for the same reason.
         ("2.8.2.tiered", &[]),
-        // Still offered, no longer shipped: a ladder of the shipped
-        // ZooKeeper-mode versions above it — not every offered one, since `3.7.x`
-        // is published as offered and no longer shipped.
-        ("3.6.0", &["3.8.x", "3.9.x"]),
+        // Still offered and still shipped: a ladder of the shipped ZooKeeper-mode
+        // versions above it, which is every version the catalog publishes as
+        // offered on that line above this release.
+        ("3.6.0", &["3.7.x", "3.8.x", "3.9.x"]),
         ("3.6.0.1", &[]),
         ("3.7.x", &["3.8.x", "3.9.x"]),
         // A KRaft source climbs its own line only; there is no way back to

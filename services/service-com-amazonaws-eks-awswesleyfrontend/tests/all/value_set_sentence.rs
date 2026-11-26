@@ -8,7 +8,9 @@
 //! declares it, with no parent structure and no preamble before it — then states the values
 //! that member accepts, in the order the model declares them, and echoes the rejected value
 //! nowhere. So one member earns one sentence whatever depth the request carries it at and
-//! whichever operation it was sent to.
+//! whichever operation it was sent to. The ONE member this API words differently is a
+//! connector configuration's `provider`, whose own sentence carries a preamble and names the
+//! member at the PATH the request spelled it at.
 //!
 //! The rows span what the rule generalises over: the DEPTH the member sits at (a member of
 //! the body, a member of a nested structure), which seam words it (the validating walk
@@ -23,7 +25,9 @@
 use std::collections::BTreeSet;
 
 use service_com_amazonaws_eks_awswesleyfrontend::ops::types::CONNECTOR_CONFIG_PROVIDER_VALUES;
-use service_com_amazonaws_eks_awswesleyfrontend::state::value_must_be_one_of_message;
+use service_com_amazonaws_eks_awswesleyfrontend::state::{
+    provider_must_be_one_of_message, value_must_be_one_of_message,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cluster_lifecycle::{create, describe, minimal_request, REGION};
@@ -131,36 +135,11 @@ async fn a_nested_member_is_named_by_itself_and_not_by_its_path() {
 }
 
 /// The same sentence answers the other operations that judge a value against an enum's set:
-/// a registration's `connectorConfig.provider` — nested, like the mode above — and the
-/// cluster-version catalog's own `versionStatus` filter, which travels in the query string
-/// and is judged by the handler rather than by the validating walk.
+/// the cluster-version catalog's own `versionStatus` filter, which travels in the query
+/// string and is judged by the handler rather than by the validating walk.
 #[tokio::test]
 async fn every_operation_that_judges_a_value_set_states_the_same_sentence() {
     let router = emulator();
-
-    let answer = register(&router, &minimal_registration("value-set-provider", "nomad")).await;
-    let actual = refusal("a provider nothing declares", &answer);
-    assert!(
-        actual.starts_with("provider must be one of [") && actual.ends_with(']'),
-        "a registration's provider earns the member's own sentence, got {actual:?}"
-    );
-    assert!(
-        !actual.contains("connectorConfig"),
-        "the structure the provider travelled in is no part of the sentence, got {actual:?}"
-    );
-    // The values it states are the set the model declares — compared as a SET, because the
-    // sentence states them in the model's own declaration order and the generated constant
-    // holds its own.
-    let stated: BTreeSet<&str> = actual
-        .trim_start_matches("provider must be one of [")
-        .trim_end_matches(']')
-        .split(", ")
-        .collect();
-    assert_eq!(
-        stated,
-        CONNECTOR_CONFIG_PROVIDER_VALUES.iter().copied().collect(),
-        "the sentence states the set the model declares, got {actual:?}"
-    );
 
     let statuses = expected("versionStatus", &VERSION_STATUSES);
     for (case, query) in [
@@ -181,6 +160,81 @@ async fn every_operation_that_judges_a_value_set_states_the_same_sentence() {
         assert_eq!(
             answer.status, 200,
             "case {status:?}: a declared status filters the catalog, got {answer:?}"
+        );
+    }
+}
+
+/// A connector configuration's `provider` is the one member of this API whose value-set
+/// refusal carries a preamble and names the member at the path the request spelled it at:
+/// "The value of connectorConfig.provider must be one of [...]".
+///
+/// The rows span the ways a value misses that set — wrong case, a token nothing declares,
+/// the empty string, a declared member with surrounding space — so no row is about one
+/// rejected value; the values the sentence states are read out of the model's own generated
+/// constant.
+#[tokio::test]
+async fn the_connector_provider_is_named_at_its_path_after_the_preamble() {
+    let router = emulator();
+
+    for (index, (case, provider)) in [
+        ("a provider nothing declares", "nomad"),
+        ("a declared provider in the wrong case", "eks_anywhere"),
+        ("the empty string", ""),
+        ("a declared provider with surrounding space", " OTHER "),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let name = format!("value-set-provider-{index}");
+        let answer = register(&router, &minimal_registration(&name, provider)).await;
+        let actual = refusal(case, &answer);
+        assert!(
+            actual.starts_with("The value of connectorConfig.provider must be one of [")
+                && actual.ends_with(']'),
+            "case {case:?}: the provider earns its own sentence, naming the member at its \
+             path, got {actual:?}"
+        );
+        // The values it states are the set the model declares — compared as a SET, because
+        // the sentence states them in the model's own declaration order and the generated
+        // constant holds its own.
+        let stated: BTreeSet<&str> = actual
+            .trim_start_matches("The value of connectorConfig.provider must be one of [")
+            .trim_end_matches(']')
+            .split(", ")
+            .collect();
+        assert_eq!(
+            stated,
+            CONNECTOR_CONFIG_PROVIDER_VALUES.iter().copied().collect(),
+            "case {case:?}: the sentence states the set the model declares, got {actual:?}"
+        );
+        // The service words that sentence in ONE place: the same values, in the order the
+        // sentence states them (the model's own, which is not the generated constant's),
+        // render the message a client is answered with.
+        let in_stated_order: Vec<String> = actual
+            .trim_start_matches("The value of connectorConfig.provider must be one of [")
+            .trim_end_matches(']')
+            .split(", ")
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            actual,
+            provider_must_be_one_of_message("connectorConfig.provider", &in_stated_order),
+            "case {case:?}: the service words that sentence in one place, got {actual:?}"
+        );
+        assert!(
+            !actual.contains(provider) || provider.trim().is_empty(),
+            "case {case:?}: the rejected value is not echoed into the sentence, got \
+             {actual:?}"
+        );
+    }
+
+    // The accepted side of the same rule: every declared provider registers a cluster.
+    for provider in CONNECTOR_CONFIG_PROVIDER_VALUES {
+        let name = format!("value-set-provider-ok-{}", provider.to_ascii_lowercase());
+        let answer = register(&router, &minimal_registration(&name, provider)).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {provider:?}: a declared provider is accepted, got {answer:?}"
         );
     }
 }

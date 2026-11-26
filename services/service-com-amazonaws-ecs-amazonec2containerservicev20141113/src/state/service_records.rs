@@ -89,10 +89,10 @@ pub struct ServiceRecord {
     /// service's AvailabilityZoneRebalancing value. If the service never had an
     /// AvailabilityZoneRebalancing value set, Amazon ECS treats this as DISABLED." Every
     /// service this API creates comes out of its create with one of the two enum values —
-    /// the one the create named, else [`AZ_REBALANCING_ENABLED`] — so the value a record
-    /// holds IS "the existing service's value" an update that names none defaults to, and
-    /// the closing sentence covers a service that carries no value at all, which no create
-    /// here leaves behind.
+    /// the one the create named, else the one its placement resolves
+    /// ([`default_az_rebalancing`]) — so the value a record holds IS "the existing service's
+    /// value" an update that names none defaults to, and a service that was never given one
+    /// carries the value that closing sentence reads it as.
     pub availability_zone_rebalancing: String,
     pub tags: Vec<Tag>,
     /// `Service$createdBy`: "The principal that created the service" — the authenticated

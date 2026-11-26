@@ -6,11 +6,11 @@
 //! body), so what these tests see is exactly what an SDK client sees.
 //!
 //! 1. `BatchGetInvoiceProfile` answers a profile for every account the requester may be
-//!    answered for — every account of its own organization: those this service's state
-//!    LINKS into it, plus the account the caller authenticates as, which is that
-//!    organization's management account — and reserves the modelled 403
-//!    `AccessDeniedException` for any other well-formed account id, refusing such a
-//!    request WHOLE.
+//!    answered for — every LINKED account of its own organization, those this service's
+//!    state links into it — and reserves the modelled 403 `AccessDeniedException` for any
+//!    other well-formed account id, the account the caller authenticates as included (that
+//!    is the organization's MANAGEMENT account, not a linked account of it), refusing such
+//!    a request WHOLE.
 //! 2. A `ResourceNotFoundException` of the PROCUREMENT-PORTAL-PREFERENCE plane states a
 //!    message BUILT FROM THE REQUEST: the kind of resource asked about and the exact ARN
 //!    supplied for it, whichever operation of that plane answers. The invoice-unit and
@@ -156,10 +156,10 @@ async fn create_unit(
 }
 
 /// RULE 1, the positive half: an account a rule names as a linked account resolves to its
-/// invoice profile — as does the account the caller authenticates as, which its own
-/// organization contains whatever state holds — with every organization shape beside it:
-/// alone, repeated, and interleaved with other linked accounts, in which case the answer is
-/// one profile per account asked about in request order.
+/// invoice profile — the account the caller authenticates as included, on exactly those
+/// terms — with every organization shape beside it: alone, repeated, and interleaved with
+/// other linked accounts, in which case the answer is one profile per account asked about in
+/// request order.
 #[tokio::test]
 async fn a_named_linked_account_resolves_to_its_invoice_profile() {
     let own = management_account().to_string();
@@ -203,9 +203,8 @@ async fn a_named_linked_account_resolves_to_its_invoice_profile() {
 
     for (label, requested, expected) in shapes {
         let router = emulator();
-        // The rows name other linked accounts too, so the organization has to hold them;
-        // the caller's own account is in it as its management account, and a rule naming it
-        // beside them changes nothing for it.
+        // Every id these rows ask about has to be a LINKED account of the organization,
+        // the caller's own included: the management account is not one by identity.
         create_unit(
             &router,
             "profiles-unit",
@@ -232,19 +231,24 @@ async fn a_named_linked_account_resolves_to_its_invoice_profile() {
     }
 
     // The bare case: nothing at all in state, which is how a client first meets this
-    // operation — the organization then links no account whatsoever, yet the caller is
-    // still its management account, so the caller reads itself and every other id is
-    // refused.
+    // operation — the organization then links no account whatsoever, so every id is
+    // refused, the account the caller authenticates as included.
     let router = emulator();
     let (status, body) = batch_get(&router, std::slice::from_ref(&own)).await;
     assert_eq!(
-        status, 200,
-        "case empty organization ({own}): expected HTTP 200, got {status} {body}"
+        status, 403,
+        "case empty organization ({own}): expected HTTP 403, got {status} {body}"
     );
+    assert!(
+        error_code(&body).contains("AccessDeniedException"),
+        "case empty organization ({own}): expected an AccessDeniedException, got {body}"
+    );
+    let own_refusal =
+        format!("Account {own} is not authorized to access resources for account {own}");
     assert_eq!(
-        reported_accounts(&body),
-        vec![own.clone()],
-        "case empty organization ({own}): expected the caller's own profile, got {body}"
+        error_message(&body),
+        own_refusal,
+        "case empty organization ({own}): expected message {own_refusal:?}, got {body}"
     );
     let stranger = account(41);
     let (status, body) = batch_get(&router, std::slice::from_ref(&stranger)).await;

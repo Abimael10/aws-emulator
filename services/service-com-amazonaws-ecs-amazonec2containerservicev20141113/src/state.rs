@@ -2701,6 +2701,29 @@ pub const AZ_REBALANCING_ENABLED: &str = "ENABLED";
 /// ECS treats this as DISABLED."
 pub const AZ_REBALANCING_DISABLED: &str = "DISABLED";
 
+/// The `availabilityZoneRebalancing` a CREATE that named none leaves a service with, for a
+/// service placed on Fargate (`places_on_fargate`) and for one that is not.
+///
+/// Rebalancing MOVES a service's tasks between Availability Zones ("Indicates whether to use
+/// Availability Zone rebalancing for the service"), which Amazon ECS can only do where it
+/// owns the capacity the replacement task is placed on: a service on Fargate is placed by
+/// Amazon ECS itself, so the create resolves the member's documented default
+/// ([`AZ_REBALANCING_ENABLED`]), while a service placed on the capacity registered to the
+/// cluster is left with no value set at all, which the same member's doc says is read as
+/// [`AZ_REBALANCING_DISABLED`] — "If the service never had an AvailabilityZoneRebalancing
+/// value set, Amazon ECS treats this as DISABLED."
+///
+/// ONE statement of that default, so the value a create stores and the value every later
+/// read and update of the service reports cannot drift
+/// ([`az_rebalancing_after_update`]).
+pub fn default_az_rebalancing(places_on_fargate: bool) -> &'static str {
+    if places_on_fargate {
+        AZ_REBALANCING_ENABLED
+    } else {
+        AZ_REBALANCING_DISABLED
+    }
+}
+
 /// The `availabilityZoneRebalancing` an UPDATE leaves a service with: the value the request
 /// named, else the value the service already carries.
 ///
@@ -2709,10 +2732,8 @@ pub const AZ_REBALANCING_DISABLED: &str = "DISABLED";
 /// defaults to the existing service's AvailabilityZoneRebalancing value. If the service
 /// never had an AvailabilityZoneRebalancing value set, Amazon ECS treats this as DISABLED."
 /// Both sentences read off the ONE value the service carries: an update that names none
-/// keeps it, whether a request stated it or the create defaulted it to
-/// [`AZ_REBALANCING_ENABLED`], and the closing sentence is about a service carrying no value
-/// at all — which this API's creates never leave behind, since every one of them resolves
-/// the member.
+/// keeps it, whether a request stated it or the create resolved it
+/// ([`default_az_rebalancing`]).
 pub fn az_rebalancing_after_update(requested: Option<&str>, stored: &str) -> String {
     requested.unwrap_or(stored).to_string()
 }

@@ -1710,10 +1710,25 @@ fn resolve_table_throughput(
             Ok(Some(throughput))
         }
         None => Err(crate::state::RequestError::Validation(
-            super::create_table::THROUGHPUT_WITHOUT_PROVISIONED_MESSAGE.to_string(),
+            THROUGHPUT_WITHOUT_PROVISIONED_ON_UPDATE_MESSAGE.to_string(),
         )),
     }
 }
+
+/// AWS's fixed text for an UPDATE that puts a table on `PROVISIONED` without stating a
+/// `ProvisionedThroughput` — and whose table carries none either, since a table already
+/// provisioned keeps its own pair.
+///
+/// "When switching from pay-per-request to provisioned capacity, initial provisioned
+/// capacity values must be set" (`UpdateTable$BillingMode`): the sentence names the BLOCK
+/// those values travel in rather than the two capacity members inside it, which is where it
+/// differs from the create's sentence for the same rule
+/// ([`super::create_table::THROUGHPUT_WITHOUT_PROVISIONED_MESSAGE`]) — a create has no
+/// stored pair to fall back on, so it complains about the members it needed, while an update
+/// complains about the member the request had to carry. It interpolates nothing.
+pub(crate) const THROUGHPUT_WITHOUT_PROVISIONED_ON_UPDATE_MESSAGE: &str =
+    "One or more parameter values were invalid: ProvisionedThroughput must be specified when \
+     BillingMode is PROVISIONED";
 
 /// The attribute definitions this request declares, refused when the list is longer
 /// than any table could keep.

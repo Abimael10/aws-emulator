@@ -136,6 +136,23 @@ pub fn value_must_be_one_of_message(member: &str, accepted: &[String]) -> String
     format!("{member} must be one of [{}]", accepted.join(", "))
 }
 
+/// The sentence a `connectorConfig.provider` outside `ConnectorConfigProvider` is
+/// refused with: fixed preamble, the member named by the PATH the request spelled it
+/// at, then the values it accepts in the order the model declares them. The rejected
+/// value is NOT echoed into the sentence.
+///
+/// RECORDED: a registration whose `connectorConfig.provider` carries a value outside
+/// that enum is refused with "The value of connectorConfig.provider must be one of
+/// [EKS_ANYWHERE, ANTHOS, GKE, AKS, OPENSHIFT, TANZU, RANCHER, EC2, OTHER]" — this
+/// member's OWN sentence, which names the structure it sits in and is not the one the
+/// other value-set refusals of this API carry ([`value_must_be_one_of_message`]).
+pub fn provider_must_be_one_of_message(member_path: &str, accepted: &[String]) -> String {
+    format!(
+        "The value of {member_path} must be one of [{}]",
+        accepted.join(", ")
+    )
+}
+
 /// The sentence the deprecated cluster-version `status` filter is refused with when
 /// it carries a value outside `ClusterVersionStatus`: fixed text plus the rejected
 /// value from the request.

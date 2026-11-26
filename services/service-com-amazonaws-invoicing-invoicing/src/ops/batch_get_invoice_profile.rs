@@ -2,21 +2,20 @@
 
 //! @op BatchGetInvoiceProfile
 //!
-//! Reports the invoice profile of each account the request names, for the accounts of the
-//! requester's own organization:
+//! Reports the invoice profile of each account the request names, for the LINKED accounts
+//! of the requester's organization:
 //! [`crate::state::ComAmazonawsInvoicingInvoicingState::accounts_the_requester_may_read`]
-//! — the account the caller authenticates as, which is that organization's MANAGEMENT
-//! account, plus every LINKED account this service's state names. The operation is
+//! — every account this service's state links into that organization. The operation is
 //! documented "the accounts must be linked accounts under the requester management
-//! account organization", so an account id that organization does not contain is one the
+//! account organization", so an account id that organization does not LINK is one the
 //! requester holds no access to, and naming it refuses the request WHOLE with the
 //! modelled `AccessDeniedException` (HTTP 403) — none of the requested profiles is
 //! reported, because the request itself is what the service refuses.
 //!
-//! The caller's own account is inside its own organization whatever else state holds, so
-//! a caller reading its own invoice profile is answered even against an organization no
-//! configuration has linked an account into; every OTHER account id is readable exactly
-//! when a stored configuration links it, and refused when none does.
+//! The requester authenticates as the organization's MANAGEMENT account, which is not a
+//! linked account of it: a caller reading ITS OWN invoice profile is answered exactly when
+//! a stored configuration links that account, as for every other account id, and refused
+//! when none does.
 //!
 //! `@readonly`: this handler only reads state.
 //!
@@ -180,12 +179,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The accounts must be linked accounts under the requester management account
         // organization": the requester holds no access to an account its own organization
-        // does not contain, so naming one is refused with the modelled 403, naming the
-        // first such account in request order, and refused WHOLE rather than answered for
-        // the accounts it may read. The organization is the management account the caller
-        // authenticates as together with the linked accounts state names, so a caller
-        // asking about ITSELF is always answered and only an id outside that organization
-        // reaches the refusal.
+        // does not LINK, so naming one is refused with the modelled 403, naming the first
+        // such account in request order, and refused WHOLE rather than answered for the
+        // accounts it may read. The requester authenticates as the organization's
+        // MANAGEMENT account, which is not a linked account of it, so an id is readable
+        // exactly when a stored configuration links it — the caller's own included.
         let readable = store.accounts_the_requester_may_read();
         if let Some(outsider) = requested
             .iter()

@@ -3,17 +3,17 @@
 //! What a `NextToken` a listing cannot read a position out of asks for, and what one naming a
 //! position past the last item asks for.
 //!
-//! THE RULE: a continuation token NAMES a position in a listing's enumeration — "The token
+//! THE RULE: a continuation token NAMES a position a listing's enumeration reached — "The token
 //! returned by a previous call to indicate that there is more data available."
 //! (`DescribeAlarmsInput$NextToken`), "The token that marks the start of the next batch of
 //! returned results." (`DescribeAlarmsOutput$NextToken`), "The token returned from a previous call
 //! to indicate where to continue retrieving results." (`ListAlarmMuteRulesInput$NextToken`) — so
 //! for **the listings of this service that SERVE such a token rather than refusing it, a value no
-//! position can be read out of names none, and the request is answered as if it had carried no
-//! token at all: the FIRST page, still scoped by every other filter the request named**. A token
-//! that IS readable is answered at the position it names, which for a key no item sits at or after
-//! is the end of the enumeration: the exhausted page, every item member present and EMPTY with no
-//! `NextToken`.
+//! position of this enumeration can be read out of is the position a walk they cannot place
+//! reached: the END of it, where the page delivers nothing and owes no token**. A token that IS
+//! readable is answered at the position it names, which for a key no item sits at or after is
+//! that same end: the exhausted page, every item member present and EMPTY with no `NextToken`.
+//! Only an ABSENT or EMPTY `NextToken` asks for the first page.
 //!
 //! The rows span what the rule generalises over: both listings of this service that serve such a
 //! token, the FORM an unreadable value takes (a word, a hexadecimal cursor whose bytes are no
@@ -136,7 +136,7 @@ async fn given_rules(router: &MultiServiceRouter, count: usize) {
 }
 
 #[tokio::test]
-async fn a_token_the_alarm_listing_cannot_read_is_answered_the_first_page() {
+async fn a_token_the_alarm_listing_cannot_read_is_answered_the_end_of_its_walk() {
     // (case, how many alarms the prefix holds, the page size the rows ask for)
     let rows: [(&str, usize, Option<i64>); 4] = [
         ("one alarm, no page size asked for", 1, None),
@@ -176,23 +176,24 @@ async fn a_token_the_alarm_listing_cannot_read_is_answered_the_first_page() {
             }
             let listed = ok(&router, "DescribeAlarms", &request).await;
             let case = format!("{case} with {token_case} ({token:?})");
+            // The walk that token belongs to is one this listing cannot place, so the page it
+            // is served is that walk's END: nothing delivered, and nothing owed.
             assert_eq!(
                 listed_alarms(&listed),
-                baseline_alarms,
-                "case {case:?}: expected the first page {baseline_alarms:?}, got {listed}"
+                Vec::<String>::new(),
+                "case {case:?}: expected the empty end of the walk, got {listed}"
             );
             assert_eq!(
                 next_token(&listed),
-                baseline_token,
-                "case {case:?}: expected the first page's own token {baseline_token:?}, got \
-                 {listed}"
+                None,
+                "case {case:?}: the end of a walk owes no token, got {listed}"
             );
             // Asking for it again answers the same page: a read of a position consumes nothing.
             let again = ok(&router, "DescribeAlarms", &request).await;
             assert_eq!(
                 listed_alarms(&again),
-                baseline_alarms,
-                "case {case:?}: expected the same first page twice, got {again}"
+                Vec::<String>::new(),
+                "case {case:?}: expected the same empty page twice, got {again}"
             );
         }
 
@@ -288,7 +289,7 @@ async fn a_token_the_alarm_listing_cannot_read_is_answered_the_first_page() {
 }
 
 #[tokio::test]
-async fn a_token_the_mute_rule_listing_cannot_read_is_answered_the_first_page() {
+async fn a_token_the_mute_rule_listing_cannot_read_is_answered_the_end_of_its_walk() {
     // The same rule through the other listing of this service that serves such a token.
     for (case, total) in [("one rule", 1_usize), ("three rules", 3)] {
         let router = build_router();
@@ -309,20 +310,19 @@ async fn a_token_the_mute_rule_listing_cannot_read_is_answered_the_first_page() 
             let case = format!("{case} with {token_case} ({token:?})");
             assert_eq!(
                 listed_arns(&listed),
-                whole,
-                "case {case:?}: expected the first page {whole:?}, got {listed}"
+                Vec::<String>::new(),
+                "case {case:?}: expected the empty end of the walk, got {listed}"
             );
             assert_eq!(
                 next_token(&listed),
                 None,
-                "case {case:?}: the whole listing fits in one page, so no token is owed, got \
-                 {listed}"
+                "case {case:?}: the end of a walk owes no token, got {listed}"
             );
             let again = ok(&router, "ListAlarmMuteRules", &request).await;
             assert_eq!(
                 listed_arns(&again),
-                whole,
-                "case {case:?}: expected the same first page twice, got {again}"
+                Vec::<String>::new(),
+                "case {case:?}: expected the same empty page twice, got {again}"
             );
         }
 

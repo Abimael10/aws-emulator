@@ -399,8 +399,8 @@ async fn the_connector_role_must_be_a_role_this_caller_can_pass() {
 // ---------------------------------------------------------------------------
 // RULE: `connectorConfig.provider` names a member of the modelled
 // `ConnectorConfigProvider` enum; any other value is refused with the sentence
-// this API states for a member judged by an enum's value set — naming the member
-// by its PATH from the request root and the values the model declares for it, in
+// this API states for that member — its own preamble, the member named at the
+// PATH the request spelled it at, and the values the model declares for it, in
 // the order it declares them.
 // ---------------------------------------------------------------------------
 
@@ -434,7 +434,7 @@ async fn the_provider_must_be_a_modelled_member() {
         CONNECTOR_CONFIG_PROVIDER_VALUES
     );
     let expected_message = format!(
-        "provider must be one of [{}]",
+        "The value of connectorConfig.provider must be one of [{}]",
         DECLARED_PROVIDERS.join(", ")
     );
     // Every member of the enum, straight from the model — so a model that grows a
@@ -472,8 +472,8 @@ async fn the_provider_must_be_a_modelled_member() {
             Some("InvalidParameterException"),
             "case {case:?}: expected InvalidParameterException, got {answer:?}"
         );
-        // The sentence names the member by its own name, and the values it accepts in
-        // the model's own order.
+        // The sentence names the member at the PATH the request spelled it at, after this
+        // API's own preamble, and the values it accepts in the model's own order.
         assert_eq!(
             answer.message(),
             expected_message,

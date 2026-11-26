@@ -30,7 +30,8 @@
 use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    InvalidParameterException, CLUSTER_VERSION_STATUS_VALUES, LOG_TYPE_VALUES,
+    InvalidParameterException, CLUSTER_VERSION_STATUS_VALUES, CONNECTOR_CONFIG_PROVIDER_VALUES,
+    LOG_TYPE_VALUES,
 };
 use crate::state;
 
@@ -94,6 +95,15 @@ pub fn refusal_message(violations: &[Violation]) -> Option<String> {
         // One control-plane log type of a cluster's logging configuration.
         if same_value_set(declared, LOG_TYPE_VALUES) {
             return Some(state::unsupported_log_type_message(value));
+        }
+        // The provider of a connector configuration, whose refusal is worded with this
+        // API's own preamble and names the member at the PATH the request spelled it at
+        // ([`state::provider_must_be_one_of_message`]).
+        if same_value_set(declared, CONNECTOR_CONFIG_PROVIDER_VALUES) {
+            return Some(state::provider_must_be_one_of_message(
+                &violation.path,
+                declared,
+            ));
         }
     }
     let member = member_of(&violation.path)?;
@@ -352,9 +362,12 @@ mod tests {
             );
         }
 
+        // And a member NESTED in a structure is named by its OWN name, not by the path the
+        // request spelled it at — except where this API words that member's refusal itself,
+        // which the connector's provider does (asserted over its real value set below).
         assert_eq!(
             refusal_message(&[violation(
-                "authenticationMode",
+                "accessConfig.authenticationMode",
                 ViolationKind::EnumValue(
                     ["API", "API_AND_CONFIG_MAP", "CONFIG_MAP"]
                         .iter()
@@ -365,16 +378,20 @@ mod tests {
             )])
             .as_deref(),
             Some("authenticationMode must be one of [API, API_AND_CONFIG_MAP, CONFIG_MAP]"),
-            "another enum member earns the sentence naming it and the values it accepts"
+            "a nested enum member is named by the member alone"
         );
 
-        // And a member NESTED in a structure is named by its OWN name, not by the path the
-        // request spelled it at.
+        // The connector's provider carries its own sentence: the preamble, the member at
+        // the path it arrived at, and the values the model declares for it.
+        let providers: Vec<String> = ["EKS_ANYWHERE", "ANTHOS", "GKE"]
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect();
         assert_eq!(
             refusal_message(&[violation(
                 "connectorConfig.provider",
                 ViolationKind::EnumValue(
-                    ["EKS_ANYWHERE", "OTHER"]
+                    CONNECTOR_CONFIG_PROVIDER_VALUES
                         .iter()
                         .map(|value| (*value).to_string())
                         .collect()
@@ -382,8 +399,29 @@ mod tests {
                 Some("eks_anywhere"),
             )])
             .as_deref(),
-            Some("provider must be one of [EKS_ANYWHERE, OTHER]"),
-            "a nested enum member is named by the member alone"
+            Some(
+                state::provider_must_be_one_of_message(
+                    "connectorConfig.provider",
+                    &CONNECTOR_CONFIG_PROVIDER_VALUES
+                        .iter()
+                        .map(|value| (*value).to_string())
+                        .collect::<Vec<String>>()
+                )
+                .as_str()
+            ),
+            "the connector's provider is named at its path, after this API's preamble"
+        );
+        // A set that is NOT that enum's keeps the sentence every other value-set member
+        // earns, so the preamble belongs to the member rather than to the word "provider".
+        assert_eq!(
+            refusal_message(&[violation(
+                "connectorConfig.provider",
+                ViolationKind::EnumValue(providers.clone()),
+                Some("eks_anywhere"),
+            )])
+            .as_deref(),
+            Some("provider must be one of [EKS_ANYWHERE, ANTHOS, GKE]"),
+            "another nested enum member is named by the member alone"
         );
 
         // A value INSIDE a collection, judged against an enum this API states no
