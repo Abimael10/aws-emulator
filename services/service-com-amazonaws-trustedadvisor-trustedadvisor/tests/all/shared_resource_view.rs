@@ -373,3 +373,249 @@ async fn the_two_views_of_one_resource_differ_only_where_they_are_modelled_to() 
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The THIRD view of the same stored resource
+// ---------------------------------------------------------------------------
+//
+// `ListRecommendationsForResource` reports a (recommendation, flagged resource)
+// pair, and four of the members it reports — `status`, `lastUpdatedAt`,
+// `exclusionStatus` and `metadata` — are the flagged resource's own, the ones
+// the two resource lists above report for it. It therefore reports them from
+// the SAME projection of the stored resource, so the three views of one
+// resource cannot disagree about it. The table below drives that one path
+// through an operation of each view.
+
+/// The stored values one case writes onto a seeded resource of [`CHECK`]: the
+/// four members the shared projection fills, plus the Region and instance id
+/// the AWS resource ARN of the third view is formed from.
+struct Projected {
+    case: &'static str,
+    /// Which seeded resource of [`CHECK`] this case writes.
+    resource_id: &'static str,
+    /// The instance the stored resource flags — kept as the seed holds it, so
+    /// each case addresses a distinct AWS resource ARN.
+    aws_resource_id: &'static str,
+    region_code: &'static str,
+    status: &'static str,
+    exclusion_status: &'static str,
+    /// The resource's metadata VALUES, positionally aligned with the owning
+    /// check's column headings, as the store holds them.
+    metadata: &'static [&'static str],
+    last_updated_at_millis: i64,
+}
+
+impl Projected {
+    /// The ARN of the AWS resource this case's stored resource flags, which is
+    /// what `ListRecommendationsForResource` is asked about. [`CHECK`] flags
+    /// `AWS::EC2::Instance`, whose published ARN form is
+    /// `arn:aws:ec2:<region>:<account>:instance/<instance id>`.
+    fn aws_resource_arn(&self) -> String {
+        format!(
+            "arn:aws:ec2:{}:{}:instance/{}",
+            self.region_code,
+            engine::EMULATOR_ACCOUNT_ID,
+            self.aws_resource_id
+        )
+    }
+
+    /// The `metadata` map every view reports for it: the stored values keyed by
+    /// column index as a string.
+    fn metadata(&self) -> Value {
+        Value::Object(
+            self.metadata
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (index.to_string(), Value::String((*value).to_string())))
+                .collect(),
+        )
+    }
+}
+
+/// The cases, differing along every dimension the projection spans: each
+/// `ResourceStatus` value, both `ExclusionStatus` values, four Regions, one,
+/// two and four metadata columns with values of their own, and instants a
+/// second, a whole second count and a sub-second remainder apart. The last row
+/// rewrites the first row's resource, so the views are shown to follow the
+/// store rather than the seed.
+const PROJECTED: &[Projected] = &[
+    Projected {
+        case: "a warning in us-east-1, every metadata column, an instant on the second",
+        resource_id: "res-ec2-0001",
+        aws_resource_id: "i-0abc1de23f4567890",
+        region_code: "us-east-1",
+        status: "warning",
+        exclusion_status: "included",
+        metadata: &["us-east-1", "i-0abc1de23f4567890", "m5.xlarge", "72.00"],
+        last_updated_at_millis: 1_735_689_600_000,
+    },
+    Projected {
+        case: "an excluded ok resource in eu-west-1, one metadata column, a sub-second instant",
+        resource_id: "res-ec2-0002",
+        aws_resource_id: "i-0abc2de23f4567891",
+        region_code: "eu-west-1",
+        status: "ok",
+        exclusion_status: "excluded",
+        metadata: &["eu-west-1"],
+        last_updated_at_millis: 1_762_000_123_456,
+    },
+    Projected {
+        case: "an error in ap-southeast-2, two metadata columns, one second past the epoch",
+        resource_id: "res-ec2-0003",
+        aws_resource_id: "i-0abc3de23f4567892",
+        region_code: "ap-southeast-2",
+        status: "error",
+        exclusion_status: "included",
+        metadata: &["ap-southeast-2", "i-0abc3de23f4567892"],
+        last_updated_at_millis: 1_000,
+    },
+    Projected {
+        case: "the first resource rewritten: excluded, ok, moved to us-west-2, three columns",
+        resource_id: "res-ec2-0001",
+        aws_resource_id: "i-0abc1de23f4567890",
+        region_code: "us-west-2",
+        status: "ok",
+        exclusion_status: "excluded",
+        metadata: &["us-west-2", "i-0abc1de23f4567890", "t3.nano"],
+        last_updated_at_millis: 1_893_456_000_000,
+    },
+];
+
+/// Write one case's values onto its stored resource, the way the part of
+/// Trusted Advisor that runs a check would: no modelled operation of this API
+/// creates a recommendation resource, moves its status or rewrites its
+/// metadata.
+fn store(engine: &engine::InMemoryEngine, case: &Projected) {
+    let state = service_state(engine).expect("the in-memory engine carries this service's state");
+    let mut state = state.lock();
+    let arn = resource_arn(CHECK, case.resource_id);
+    let resource = state
+        .recommendation_resources
+        .get_mut(&arn)
+        .unwrap_or_else(|| panic!("no seeded resource {arn}"));
+    resource.region_code = case.region_code.to_string();
+    resource.status = case.status.to_string();
+    resource.exclusion_status = case.exclusion_status.to_string();
+    resource.metadata = case
+        .metadata
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (index.to_string(), (*value).to_string()))
+        .collect();
+    resource.last_updated_at_millis = case.last_updated_at_millis;
+}
+
+/// The one row `ListRecommendationsForResource` reports for an AWS resource
+/// ARN, asserting 200 first. Exactly one, because [`CHECK`] is the only seeded
+/// check that flagged these instances.
+async fn resource_row(router: &MultiServiceRouter, case: &str, aws_resource_arn: &str) -> Value {
+    let (status, body) = call(
+        router,
+        "GET",
+        &format!(
+            "/v1/recommendations-for-resource/{}",
+            label(aws_resource_arn)
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200 from ListRecommendationsForResource, got {status} with {body}"
+    );
+    let rows = body["recommendationForResourceSummaries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a summaries array, got {body}"))
+        .clone();
+    assert_eq!(
+        rows.len(),
+        1,
+        "case {case:?}: expected one row for {aws_resource_arn}, got {rows:?}"
+    );
+    rows.into_iter().next().expect("the one row asserted above")
+}
+
+/// A timestamp a view reported, as milliseconds since the epoch — read through
+/// the shared helper so the assertion is about the INSTANT and not about the
+/// wire encoding.
+fn reported_millis(value: &Value) -> i64 {
+    (crate::recommendation_loop::timestamp_secs(value) * 1000.0).round() as i64
+}
+
+/// Every member the shared projection fills, as `view` reported it for this
+/// case's stored resource.
+fn assert_projection(case: &str, view: &str, summary: &Value, expected: &Projected) {
+    assert_eq!(
+        summary["status"].as_str(),
+        Some(expected.status),
+        "case {case:?}: expected the {view} view to report status {:?}, got {:?}",
+        expected.status,
+        summary["status"]
+    );
+    assert_eq!(
+        summary["exclusionStatus"].as_str(),
+        Some(expected.exclusion_status),
+        "case {case:?}: expected the {view} view to report exclusionStatus {:?}, got {:?}",
+        expected.exclusion_status,
+        summary["exclusionStatus"]
+    );
+    assert_eq!(
+        summary["metadata"],
+        expected.metadata(),
+        "case {case:?}: expected the {view} view to report metadata {}, got {}",
+        expected.metadata(),
+        summary["metadata"]
+    );
+    assert_eq!(
+        reported_millis(&summary["lastUpdatedAt"]),
+        expected.last_updated_at_millis,
+        "case {case:?}: expected the {view} view to report lastUpdatedAt {} ms, got {:?}",
+        expected.last_updated_at_millis,
+        summary["lastUpdatedAt"]
+    );
+}
+
+#[tokio::test]
+async fn all_three_views_of_one_resource_report_the_shared_projection() {
+    let (router, engine) = emulator_on_plan(SupportPlan::Business);
+
+    // The rows span every value of the two filtered enums, so a value added to
+    // either is not silently left untested here.
+    for status in RESOURCE_STATUS_VALUES {
+        assert!(
+            PROJECTED.iter().any(|case| &case.status == status),
+            "the table must cover the resource status {status}"
+        );
+    }
+    for exclusion in EXCLUSION_STATUS_VALUES {
+        assert!(
+            PROJECTED.iter().any(|case| &case.exclusion_status == exclusion),
+            "the table must cover the exclusion status {exclusion}"
+        );
+    }
+
+    for expected in PROJECTED {
+        store(&engine, expected);
+        let case = expected.case;
+        let arn = resource_arn(CHECK, expected.resource_id);
+
+        // The two resource lists, which report the projection directly.
+        for level in Level::ALL {
+            let view = format!("{level:?}");
+            let reported = summaries(&router, case, *level, "").await;
+            let summary = reported
+                .iter()
+                .find(|summary| summary["arn"].as_str() == Some(arn.as_str()))
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: {arn} is not in the {view} view: {reported:?}")
+                });
+            assert_projection(case, &view, summary, expected);
+        }
+
+        // And the third view: the (recommendation, resource) row of
+        // `ListRecommendationsForResource`, reached by the flagged AWS
+        // resource's own ARN.
+        let row = resource_row(&router, case, &expected.aws_resource_arn()).await;
+        assert_projection(case, "ListRecommendationsForResource", &row, expected);
+    }
+}

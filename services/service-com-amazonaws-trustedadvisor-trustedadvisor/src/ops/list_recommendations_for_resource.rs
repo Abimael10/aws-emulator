@@ -142,18 +142,34 @@ fn recommendation_for_resource_summary(
     check_arn: String,
     aws_resource_arn: String,
 ) -> RecommendationForResourceSummary {
+    // Taken from [`crate::state::resource_summary`], the ONE projection of a
+    // stored resource, and destructured by NAME — as
+    // `crate::state::organization_resource_summary` does — so the four members
+    // this row shares with the resource lists reach it exactly as that
+    // projection computed them, rather than as a second copy of the
+    // computation that could drift from it. The members this shape does not
+    // declare are dropped here; `awsResourceArn` is the ARN the resource was
+    // resolved BY, and `checkArn`, `recommendationArn` and `pillars` belong to
+    // the recommendation side of the pair.
+    let RecommendationResourceSummary {
+        status,
+        last_updated_at,
+        exclusion_status,
+        metadata,
+        id: _,
+        arn: _,
+        aws_resource_id: _,
+        region_code: _,
+        recommendation_arn: _,
+    } = crate::state::resource_summary(resource);
     RecommendationForResourceSummary {
         check_arn,
         recommendation_arn: recommendation.arn.clone(),
         aws_resource_arn,
-        status: resource.status.clone(),
-        last_updated_at: crate::state::date_time(resource.last_updated_at_millis),
-        exclusion_status: resource.exclusion_status.clone(),
-        metadata: resource
-            .metadata
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
+        status,
+        last_updated_at,
+        exclusion_status,
+        metadata,
         pillars: recommendation.pillars.clone(),
     }
 }
