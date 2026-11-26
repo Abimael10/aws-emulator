@@ -7,9 +7,10 @@
 //! rendering of the type system the API holds — the declaring keyword and the type's name
 //! on a line of their own, a blank line, the body's opening brace on its own line, each
 //! field written unindented and followed by a blank line, consecutive fields separated by
-//! one further blank line, the closing brace on its own line, and the whole document
-//! terminated by a newline — computed from the PARSED definition, so it depends neither on
-//! the text the request wrote the definition in nor on the way the type got into the API.
+//! one further blank line, the closing brace on its own line — after one further blank line
+//! when the body's last field names a non-null type — and the whole document terminated by
+//! a newline, computed from the PARSED definition, so it depends neither on the text the
+//! request wrote the definition in nor on the way the type got into the API.
 //!
 //! What this suite adds to the tables of [`crate::type_sdl_rendering`] and
 //! [`crate::list_types_sdl_layout`] is that the layout holds for a type nobody chose: the
@@ -77,7 +78,19 @@ impl Drawn {
             .iter()
             .map(|(name, value_type)| format!("{name}: {value_type}\n\n"))
             .collect();
-        format!("type {}\n\n{{\n{}}}\n", self.name, fields.join("\n"))
+        // What closes the body is read off its LAST field: one further blank line when the
+        // type that field names is non-null, which a reference written in SDL says with
+        // the trailing `!` the drawn reference forms carry.
+        let closed_by_a_non_null = self
+            .fields
+            .last()
+            .is_some_and(|(_, value_type)| value_type.ends_with('!'));
+        let close = if closed_by_a_non_null { "\n" } else { "" };
+        format!(
+            "type {}\n\n{{\n{}{close}}}\n",
+            self.name,
+            fields.join("\n")
+        )
     }
 }
 

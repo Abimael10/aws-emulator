@@ -15,7 +15,8 @@
 //! 2. the body of a rendered definition writes a member that NAMES A TYPE (a field, an
 //!    input field) followed by a blank line, and a member that is a name alone (an enum
 //!    value) without it, so an enum's values are one blank line apart and the closing
-//!    brace follows the last value directly.
+//!    brace follows the last value directly — and the brace that closes a body whose last
+//!    member names a NON-NULL type follows one further blank line.
 //!
 //! The tables span the shapes each rule generalises over: every kind of type a definition
 //! can declare and every place a directive can be written for rule 1, and bodies of one,
@@ -64,7 +65,7 @@ fn directive_rows() -> Vec<Row> {
             label: "an object type carrying two directives of its own",
             name: "Todo",
             stated: "type Todo @aws_api_key @aws_iam { id: ID! }",
-            sdl: "type Todo @aws_api_key @aws_iam\n\n{\nid: ID!\n\n}\n",
+            sdl: "type Todo @aws_api_key @aws_iam\n\n{\nid: ID!\n\n\n}\n",
             json: "{\"name\":\"Todo\",\"kind\":\"OBJECT\",\"fields\":[\
                    {\"name\":\"id\",\"type\":{\"kind\":\"NON_NULL\",\"ofType\":{\"name\":\"ID\"}},\
                    \"args\":[],\"directives\":[],\"isDeprecated\":false}],\

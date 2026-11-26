@@ -17,6 +17,11 @@
 //! definition has no `{ … }` body — a union, a scalar — is the declaration alone,
 //! terminated the same way.
 //!
+//! What CLOSES a body is read off its last member: the brace follows one further blank
+//! line when that member names a NON-NULL type ([`closing_blank_lines`]), so the lines
+//! between the last member and the brace are the member's own rather than a count that
+//! holds for every body.
+//!
 //! Everything the document says comes from the parsed definition
 //! ([`super::TypeDefinition`]): the kind's keyword, the interfaces it implements, the
 //! directives the definition and its members carry, and the members that kind carries
@@ -65,6 +70,8 @@ impl TypeDefinition {
                 }
                 lines.extend(member);
             }
+            // What closes the body is read off its LAST member.
+            lines.extend(closing_blank_lines(self.last_member_type()));
             lines.push(BLOCK_CLOSE.to_string());
         }
 
@@ -103,6 +110,26 @@ impl TypeDefinition {
             _ => Vec::new(),
         }
     }
+
+    /// The type the LAST member of this type's body names, or `None` for a body whose last
+    /// member names none — an enum value, which is a name alone — and for a kind with no
+    /// body at all.
+    ///
+    /// Read off the same members [`Self::member_lines`] writes, so what closes a body
+    /// ([`closing_blank_lines`]) is read off the member the brace actually follows.
+    fn last_member_type(&self) -> Option<&TypeRef> {
+        match self.kind {
+            OBJECT_KIND | INTERFACE_KIND => self
+                .fields
+                .last()
+                .and_then(|field| field.value_type.as_ref()),
+            INPUT_OBJECT_KIND => self
+                .input_fields
+                .last()
+                .and_then(|input| input.value_type.as_ref()),
+            _ => None,
+        }
+    }
 }
 
 /// The SDL keyword that declares a type of `kind`, as GraphQL's SDL grammar spells each
@@ -120,6 +147,17 @@ pub(crate) fn keyword(kind: &str) -> &'static str {
         SCALAR_KIND => "scalar",
         _ => OBJECT_KEYWORD,
     }
+}
+
+/// The blank lines between the LAST member of a body and the closing brace, over the
+/// `value_type` that member names (`None` for a member that names none).
+///
+/// RECORDED behaviour: the brace follows the blank line a member that names a type is
+/// written with, and one FURTHER blank line when the type that member names is non-null —
+/// so what closes a body is read off its last member rather than fixed for every body.
+fn closing_blank_lines(value_type: Option<&TypeRef>) -> Vec<String> {
+    let non_null = matches!(value_type, Some(TypeRef::NonNull(_)));
+    vec![String::new(); usize::from(non_null)]
 }
 
 /// One field of an object or interface type: its description, then its name, the

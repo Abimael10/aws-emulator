@@ -8,8 +8,9 @@
 //! keyword and the type's name on a line of their own, a blank line, the body's opening
 //! brace on its own line, each member unindented and separated from the next by a blank
 //! line (a member that NAMES A TYPE followed by one further blank line, an enum value not),
-//! the closing brace, and a terminating newline — whatever text the definition arrived as
-//! and whichever way it got into the API, while the call that STATED a definition
+//! the closing brace — which follows one further blank line when the body's last member
+//! names a NON-NULL type — and a terminating newline, whatever text the definition arrived
+//! as and whichever way it got into the API, while the call that STATED a definition
 //! (`CreateType`, `UpdateType`) reports that definition back as the request wrote it.
 //!
 //! The table spans the shapes the rule generalises over: every kind of type a GraphQL SDL
@@ -104,7 +105,7 @@ pub(crate) fn rows() -> Vec<Row> {
             label: "an interface type",
             name: "Node",
             stated: "interface Node {\n  id: ID!\n}\n",
-            rendered: "interface Node\n\n{\nid: ID!\n\n}\n",
+            rendered: "interface Node\n\n{\nid: ID!\n\n\n}\n",
         },
         Row {
             label: "an object type holding a described field",
