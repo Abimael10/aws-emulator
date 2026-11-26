@@ -34,6 +34,8 @@ pub struct WidgetConfig {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum QueryParameters {
+    Budget(BudgetQuery),
+    costEfficiency(CostEfficiencyQuery),
     costAndUsage(CostAndUsageQuery),
     savingsPlansCoverage(SavingsPlansCoverageQuery),
     savingsPlansUtilization(SavingsPlansUtilizationQuery),
@@ -47,6 +49,21 @@ pub struct CostAndUsageQuery {
     pub metrics: Vec<String>,
     pub time_range: DateTimeRange,
     pub granularity: String,
+    pub group_by: Option<Vec<GroupDefinition>>,
+    pub filter: Option<Expression>,
+}
+
+#[smithy_macros::smithy(shape = "com.amazonaws.bcmdashboards#BudgetQuery")]
+#[derive(Debug, Clone, Default)]
+pub struct BudgetQuery {
+    pub filter: Option<Expression>,
+}
+
+#[smithy_macros::smithy(shape = "com.amazonaws.bcmdashboards#CostEfficiencyQuery")]
+#[derive(Debug, Clone, Default)]
+pub struct CostEfficiencyQuery {
+    pub time_range: DateTimeRange,
+    pub granularity: Option<String>,
     pub group_by: Option<Vec<GroupDefinition>>,
     pub filter: Option<Expression>,
 }

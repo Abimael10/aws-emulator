@@ -11347,7 +11347,6 @@ dependencies = [
  "fancy-regex 0.16.2",
  "hex",
  "http",
- "md-5 0.10.6",
  "serde_json",
  "service-com-amazonaws-eventbridge-awsevents",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",

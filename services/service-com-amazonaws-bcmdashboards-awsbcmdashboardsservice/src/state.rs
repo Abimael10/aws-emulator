@@ -2035,23 +2035,36 @@ struct SubmittedMetrics<'a> {
 /// that list at all.
 struct SubmittedQuery<'a> {
     member: &'static str,
-    range: &'a DateTimeRange,
+    /// The time period the query asks over, or `None` for a member that models no
+    /// `timeRange` at all — there is then no range of its to judge.
+    range: Option<&'a DateTimeRange>,
     metrics: Option<SubmittedMetrics<'a>>,
 }
 
 /// The submitted query one `QueryParameters` union member carries.
 ///
-/// Every member of the union carries a `@required` `timeRange`
+/// Nearly every member of the union carries a `@required` `timeRange`
 /// (`smithy_query(query="shape",shape="QueryParameters")`), so the rules a range has to
-/// satisfy reach all five of them rather than only the cost-and-usage query. THREE of them
-/// also model a `metrics` list, and each one documents its own set of valid `MetricName`
-/// values; the two utilization queries model no `metrics` member at all, so there is no
-/// metric of theirs to judge.
+/// satisfy reach all of those rather than only the cost-and-usage query; the budget query
+/// models no time period, so it has no range to judge. THREE members also model a
+/// `metrics` list, and each one documents its own set of valid `MetricName` values; the
+/// utilization, budget and cost-efficiency queries model no `metrics` member at all, so
+/// there is no metric of theirs to judge.
 fn submitted_query(parameters: &QueryParameters) -> SubmittedQuery<'_> {
     match parameters {
+        QueryParameters::Budget(_) => SubmittedQuery {
+            member: "budget",
+            range: None,
+            metrics: None,
+        },
+        QueryParameters::costEfficiency(query) => SubmittedQuery {
+            member: "costEfficiency",
+            range: Some(&query.time_range),
+            metrics: None,
+        },
         QueryParameters::costAndUsage(query) => SubmittedQuery {
             member: "costAndUsage",
-            range: &query.time_range,
+            range: Some(&query.time_range),
             metrics: Some(SubmittedMetrics {
                 query_shape: "CostAndUsageQuery",
                 submitted: &query.metrics,
@@ -2060,7 +2073,7 @@ fn submitted_query(parameters: &QueryParameters) -> SubmittedQuery<'_> {
         },
         QueryParameters::savingsPlansCoverage(query) => SubmittedQuery {
             member: "savingsPlansCoverage",
-            range: &query.time_range,
+            range: Some(&query.time_range),
             metrics: Some(SubmittedMetrics {
                 query_shape: "SavingsPlansCoverageQuery",
                 submitted: query.metrics.as_deref().unwrap_or_default(),
@@ -2069,12 +2082,12 @@ fn submitted_query(parameters: &QueryParameters) -> SubmittedQuery<'_> {
         },
         QueryParameters::savingsPlansUtilization(query) => SubmittedQuery {
             member: "savingsPlansUtilization",
-            range: &query.time_range,
+            range: Some(&query.time_range),
             metrics: None,
         },
         QueryParameters::reservationCoverage(query) => SubmittedQuery {
             member: "reservationCoverage",
-            range: &query.time_range,
+            range: Some(&query.time_range),
             metrics: Some(SubmittedMetrics {
                 query_shape: "ReservationCoverageQuery",
                 submitted: query.metrics.as_deref().unwrap_or_default(),
@@ -2083,7 +2096,7 @@ fn submitted_query(parameters: &QueryParameters) -> SubmittedQuery<'_> {
         },
         QueryParameters::reservationUtilization(query) => SubmittedQuery {
             member: "reservationUtilization",
-            range: &query.time_range,
+            range: Some(&query.time_range),
             metrics: None,
         },
     }
@@ -2183,7 +2196,10 @@ pub fn widget_list_refusal(widgets: &[Widget]) -> Option<String> {
                 query_path.clone(),
                 "timeRange".to_string(),
             ]);
-            if let Some(message) = date_time_range_refusal(&path, query.range) {
+            if let Some(message) = query
+                .range
+                .and_then(|range| date_time_range_refusal(&path, range))
+            {
                 return Some(message);
             }
             let Some(metrics) = query.metrics else {

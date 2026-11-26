@@ -50,12 +50,6 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # written with the negative look-ahead the `regex` crate behind `@pattern` cannot compile
 # (`state::ConstrainedText`).
 fancy-regex = "0.16"
-# `md-5`: a widget id is 32 lowercase hexadecimal characters (`WidgetId`'s `@pattern`), and
-# the panels this emulator synthesizes for a catalog entry whose published panels are not
-# recorded need one each that is stable and distinct
-# (`state::managed_catalog::synthesized_widget_id`). An MD5 digest is exactly that width, so
-# the digest comes from this crate rather than from a hand-rolled hash.
-md-5 = "0.10"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
