@@ -52,7 +52,7 @@ use crate::traffic_policies::{
     create_policy, document_with_start_endpoint, document_with_start_rule, policy_of,
 };
 use crate::traffic_policy_not_found_envelope::{
-    assert_identity_only, assert_no_such_traffic_policy,
+    assert_identity_only, assert_no_such_traffic_policy, assert_no_such_traffic_policy_version,
 };
 use crate::traffic_policy_versions::create_version;
 
@@ -695,10 +695,16 @@ async fn a_create_naming_something_the_account_does_not_hold_is_refused() {
             row.code,
             reply.body
         );
-        // A traffic policy the account does not hold is reported by its code alone, and
-        // every other refusal here says why in its own message.
+        // A traffic policy the account does not hold is reported per condition — its code
+        // alone for an id that names no policy (the rows that name their own `policy`), and
+        // the fixed sentence for a version the held policy does not hold — and every other
+        // refusal here says why in its own message.
         if row.code == "NoSuchTrafficPolicy" {
-            assert_no_such_traffic_policy(&reply, row.case);
+            if row.policy.is_some() {
+                assert_no_such_traffic_policy(&reply, row.case);
+            } else {
+                assert_no_such_traffic_policy_version(&reply, row.case);
+            }
         } else {
             assert!(
                 reply

@@ -71,7 +71,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::no_such_traffic_policy;
+use crate::state::{no_such_traffic_policy, no_such_traffic_policy_version};
 
 /// The refusal text a delete of a traffic policy version that traffic policy
 /// instances were created from answers with (`TrafficPolicyInUse`, HTTP 400).
@@ -189,19 +189,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         });
 
         // A traffic policy version is addressed by both halves of
-        // `(Id, Version)`, so a policy the account does not hold and a version
-        // that policy does not hold are the same refusal: this operation's own,
-        // which states the refusal's identity and no message. A version
-        // an earlier delete already flagged is no longer one the account holds
-        // either, so deleting it again is that same refusal rather than a second
-        // success.
-        let stored = store
-            .traffic_policies
-            .get_mut(&input.id)
-            .and_then(|policy| policy.versions.get_mut(&input.version))
+        // `(Id, Version)`, and each half names nothing in its own way: an `Id`
+        // the account holds no policy under is this refusal's identity alone,
+        // while a policy that IS held, at a version it does not hold, states
+        // that the policy does not exist. A version an earlier delete already
+        // flagged is no longer one the account holds either, so deleting it
+        // again is that same refusal rather than a second success.
+        let policy = store.traffic_policies.get_mut(&input.id).ok_or_else(|| {
+            DeleteTrafficPolicyErrorModeled::NoSuchTrafficPolicy(no_such_traffic_policy())
+        })?;
+        let stored = policy
+            .versions
+            .get_mut(&input.version)
             .filter(|version| !version.deleted)
             .ok_or_else(|| {
-                DeleteTrafficPolicyErrorModeled::NoSuchTrafficPolicy(no_such_traffic_policy())
+                DeleteTrafficPolicyErrorModeled::NoSuchTrafficPolicy(
+                    no_such_traffic_policy_version(),
+                )
             })?;
 
         if in_use {

@@ -3381,22 +3381,45 @@ pub fn apply_tag_changes(
     Ok(())
 }
 
-/// The modelled `NoSuchTrafficPolicy` (HTTP 404) for a request that names no
-/// traffic policy in this store: the refusal's IDENTITY alone.
+/// The modelled `NoSuchTrafficPolicy` (HTTP 404) for a request that names an `Id`
+/// this store holds NO traffic policy under: the refusal's IDENTITY alone.
 ///
 /// The ONE place this service words that refusal, so every operation addressed at
-/// a traffic policy answers a missing one identically — whichever half of
-/// `(Id, Version)` the store does not hold, and whether the request named a
+/// a policy id nothing minted answers it identically, whether the request named a
 /// version at all.
 ///
-/// MESSAGELESS, like the instance refusal below it: Route 53 reports a traffic policy
-/// it does not hold as the error's identity alone — the `Error` element carries `Type`
+/// MESSAGELESS, like the instance refusal below it: Route 53 reports a policy ID it
+/// cannot resolve as the error's identity alone — the `Error` element carries `Type`
 /// and `Code` and no `Message` child — so this shape's optional `message` member is left
 /// unset and the serializer emits no element for it. It takes no argument because a
 /// refusal with no message has nothing to take from the request: a caller learns WHAT it
 /// asked about from its own request.
+///
+/// The OTHER half of `(Id, Version)` is a different refusal of the same class:
+/// see [`no_such_traffic_policy_version`].
 pub fn no_such_traffic_policy() -> NoSuchTrafficPolicy {
     NoSuchTrafficPolicy { message: None }
+}
+
+/// The fixed sentence Route 53 refuses a VERSION of a policy it does hold with.
+///
+/// Wholly fixed text with no variable part: it names neither the policy id, nor the
+/// version, nor the policy's name, so nothing of the request reaches it.
+pub const NO_SUCH_TRAFFIC_POLICY_VERSION_MESSAGE: &str = "The policy does not exist.";
+
+/// The modelled `NoSuchTrafficPolicy` (HTTP 404) for a request whose `Id` this store
+/// DOES hold a traffic policy under, at a `Version` that policy does not hold.
+///
+/// The same error class as [`no_such_traffic_policy`] and the same status, worded
+/// differently because the condition is different: the policy id resolved, and it is
+/// the version that names nothing, which Route 53 states as
+/// [`NO_SUCH_TRAFFIC_POLICY_VERSION_MESSAGE`]. The ONE place this service words that,
+/// so every operation addressed at `(Id, Version)` — a read, a comment update, a
+/// delete, an instance create — refuses a version the policy does not hold identically.
+pub fn no_such_traffic_policy_version() -> NoSuchTrafficPolicy {
+    NoSuchTrafficPolicy {
+        message: Some(NO_SUCH_TRAFFIC_POLICY_VERSION_MESSAGE.to_string()),
+    }
 }
 
 /// The modelled `NoSuchTrafficPolicyInstance` (HTTP 404) for a request that

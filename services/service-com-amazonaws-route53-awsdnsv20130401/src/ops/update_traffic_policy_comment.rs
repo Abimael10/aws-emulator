@@ -66,7 +66,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::no_such_traffic_policy;
+use crate::state::{no_such_traffic_policy, no_such_traffic_policy_version};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -151,12 +151,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The comment belongs to ONE VERSION of the policy, so the request
-        // addresses both halves of `(Id, Version)`: a policy the account does
-        // not hold and a version that policy does not hold are the same refusal,
-        // worded through the ONE place this service words it. A version a delete
-        // has flagged is not one the account holds either — its record is
-        // retained only for `GetTrafficPolicy` — so there is no comment of it to
-        // update.
+        // addresses both halves of `(Id, Version)`, and each half names nothing
+        // in its own way: an `Id` the account holds no policy under is the
+        // refusal's identity alone, while a policy that IS held, at a version it
+        // does not hold, states that the policy does not exist — each worded
+        // through the ONE place this service words it. A version a delete has
+        // flagged is not one the account holds either — its record is retained
+        // only for `GetTrafficPolicy` — so there is no comment of it to update.
         let policy = store.traffic_policies.get_mut(&input.id).ok_or_else(|| {
             UpdateTrafficPolicyCommentErrorModeled::NoSuchTrafficPolicy(no_such_traffic_policy())
         })?;
@@ -166,7 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|version| !version.deleted)
             .ok_or_else(|| {
                 UpdateTrafficPolicyCommentErrorModeled::NoSuchTrafficPolicy(
-                    no_such_traffic_policy(),
+                    no_such_traffic_policy_version(),
                 )
             })?;
 

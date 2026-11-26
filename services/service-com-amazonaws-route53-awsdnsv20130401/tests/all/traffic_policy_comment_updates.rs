@@ -17,8 +17,9 @@
 //!    update repeated with the comment the version already carries.
 //! 2. Both halves of `(Id, Version)` address the version, so either half naming
 //!    something the store does not hold is the modelled `NoSuchTrafficPolicy`
-//!    (HTTP 404), worded as the one fixed sentence Route 53 answers a traffic
-//!    policy it does not hold with, and persists nothing; a `Version` outside
+//!    (HTTP 404) and persists nothing — reported by its code alone for an `Id`
+//!    the account holds no policy under, and with the fixed sentence Route 53
+//!    answers a version of a policy it DOES hold with; a `Version` outside
 //!    the modelled range, or a `Comment` past its modelled maximum, never
 //!    reaches the handler at all.
 //!
@@ -35,7 +36,9 @@ use crate::traffic_policies::{
     create_policy, document_with_start_endpoint, document_with_start_rule, get_policy,
     policy_count, policy_of, PolicyView,
 };
-use crate::traffic_policy_not_found_envelope::assert_no_such_traffic_policy;
+use crate::traffic_policy_not_found_envelope::{
+    assert_no_such_traffic_policy, assert_no_such_traffic_policy_version,
+};
 use crate::traffic_policy_versions::create_version;
 
 /// `TrafficPolicyComment` is `len 0..1024`
@@ -374,10 +377,14 @@ async fn an_id_or_version_the_store_does_not_hold_is_refused() {
              got {} with body {}",
             reply.status, reply.body
         );
-        // Route 53 reports a traffic policy it does not hold by its code alone,
-        // so both halves of `(Id, Version)`, in every form above, are refused
-        // with the same body: `Type` and `Code` and no `Message` element.
-        assert_no_such_traffic_policy(&reply, case);
+        // One error class, two conditions: an id the account holds no policy
+        // under is reported by its code alone, while a version of the policy it
+        // DOES hold states that the policy does not exist.
+        if *id == held.id {
+            assert_no_such_traffic_policy_version(&reply, case);
+        } else {
+            assert_no_such_traffic_policy(&reply, case);
+        }
     }
 
     assert_versions_read_back(&router, &held, "after the refusals").await;

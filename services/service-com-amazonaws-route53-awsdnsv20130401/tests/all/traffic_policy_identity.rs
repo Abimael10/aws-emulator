@@ -291,10 +291,10 @@ async fn an_id_no_policy_was_minted_under_is_refused() {
     ];
 
     for (case, unknown) in &rows {
-        // Route 53 reports a traffic policy it does not hold per path: the LISTING
-        // states the refusal's sentence, while the version CREATE reports the same
-        // class by its identity alone (`Type` and `Code`, with no `Message`
-        // element) — so each path is asserted against the body it answers with.
+        // Route 53 reports an `Id` the account holds no policy under by the
+        // refusal's identity alone — `Type` and `Code`, with no `Message`
+        // element — on both of these paths, each of which names the `Id` and no
+        // version at all.
         let listed = list_versions(&router, unknown, "").await;
         let case = format!("ListTrafficPolicyVersions on {case}");
         assert_no_such_traffic_policy(&listed, &case);

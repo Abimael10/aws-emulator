@@ -1,19 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The error BODY of the two Route 53 traffic-policy not-found refusals, end to
+//! The error BODY of the Route 53 traffic-policy not-found refusals, end to
 //! end over the router.
 //!
-//! The rule under test: a traffic policy — or a traffic policy INSTANCE — the account
-//! does not hold is reported by that error's IDENTITY ALONE, HTTP 404 with
-//! `<ErrorResponse><Error><Type>Sender</Type><Code>NoSuchTrafficPolicy</Code>` (or
-//! `NoSuchTrafficPolicyInstance`) and NO `Message` child at all, on every operation that
-//! binds the error. Each holds whichever half of `(Id, Version)`
-//! the store does not hold and whatever form the requested id takes. The error shapes'
-//! documentation states the RULE each refusal reports ("No traffic policy exists with the
-//! specified ID", "No traffic policy instance exists with the specified ID",
+//! The rules under test — `NoSuchTrafficPolicy` is ONE error class, and WHICH of the two
+//! conditions raised it is what its body reports:
+//!
+//! 1. an `Id` the account holds NO traffic policy under — and a traffic policy INSTANCE id
+//!    the account does not hold — is reported by that error's IDENTITY ALONE, HTTP 404 with
+//!    `<ErrorResponse><Error><Type>Sender</Type><Code>NoSuchTrafficPolicy</Code>` (or
+//!    `NoSuchTrafficPolicyInstance`) and NO `Message` child at all, whatever form the
+//!    requested id takes, on every operation that binds the error;
+//! 2. a policy the account DOES hold, addressed at a `Version` that policy does not hold,
+//!    is HTTP 404 with the same `Type` and `Code` and the fixed sentence
+//!    [`NO_SUCH_POLICY_VERSION_MESSAGE`] — wholly fixed text, naming neither the id nor
+//!    the version — on every operation that addresses both halves of `(Id, Version)`.
+//!
+//! The error shapes' documentation states the RULE each refusal reports ("No traffic policy
+//! exists with the specified ID", "No traffic policy instance exists with the specified ID",
 //! smithy_query(query="shape",shape="NoSuchTrafficPolicy,NoSuchTrafficPolicyInstance"))
 //! rather than a sentence the service sends, and the `message` member both shapes carry is
-//! optional — so neither of them puts an element on the wire.
+//! optional — so which body a condition answers with is recorded behaviour.
 //!
 //! The rules are about the SHAPE of the body, so each is asserted over a table of
 //! requests rather than over the one that exposed it: every implemented operation
@@ -23,15 +30,15 @@
 //! version a policy never reached, the published maximum version, and a resource
 //! that existed until it was deleted.
 //!
-//! The other half of the rule is asserted too: a refusal of the SAME operations
+//! The other half of the rules is asserted too: a refusal of the SAME operations
 //! that is neither of these two carries its own message, so the body shape
 //! belongs to these two refusals rather than to the operations or to the
 //! service's error envelope.
 //!
-//! That the body carries no message at all is an INVARIANT over the pair a
-//! request names rather than a property of any one pair, so it is also asserted
-//! over drawn `(Id, Version)` pairs: whatever a request asked about, the refusal
-//! reports its code and nothing else.
+//! Which body a refusal carries is an INVARIANT over the pair a request names rather than a
+//! property of any one pair, so both rules are asserted over drawn `(Id, Version)` pairs
+//! as well: whatever a request asked about, what the refusal reports is decided by the half
+//! of the pair that named nothing.
 //!
 //! The harness (`router`, `call`, `Reply`) and the request builders come from the
 //! suites that own these operations, so these tests drive the service through the
@@ -56,6 +63,12 @@ const NO_SUCH_POLICY: &str = "NoSuchTrafficPolicy";
 
 /// The wire code of a traffic policy instance the account does not hold.
 const NO_SUCH_INSTANCE: &str = "NoSuchTrafficPolicyInstance";
+
+/// The fixed sentence Route 53 refuses a VERSION of a policy it DOES hold with.
+///
+/// Spelled out here rather than read from the service, so a wording regression fails this
+/// suite. `pub(crate)` so every suite driving that refusal asserts the one sentence.
+pub(crate) const NO_SUCH_POLICY_VERSION_MESSAGE: &str = "The policy does not exist.";
 
 /// The other published bound of `TrafficPolicyVersion`, which is `range 1..1000`
 /// (smithy_query(query="shape",shape="TrafficPolicyVersion")).
@@ -84,6 +97,41 @@ pub(crate) fn assert_identity_only(reply: &Reply, case: &str, code: &str) {
 /// this refusal asserts its body through this one check.
 pub(crate) fn assert_no_such_traffic_policy(reply: &Reply, case: &str) {
     assert_identity_only(reply, case, NO_SUCH_POLICY);
+}
+
+/// Assert that `reply` is the traffic-policy-VERSION not-found refusal: the same HTTP 404,
+/// `Type` `Sender` and code `NoSuchTrafficPolicy` as [`assert_no_such_traffic_policy`], and
+/// the fixed sentence [`NO_SUCH_POLICY_VERSION_MESSAGE`].
+///
+/// `pub(crate)` for the same reason the check beside it is: every suite that drives a
+/// version the policy does not hold asserts its body through this one check.
+pub(crate) fn assert_no_such_traffic_policy_version(reply: &Reply, case: &str) {
+    assert_eq!(
+        reply.status, 404,
+        "case {case:?}: expected HTTP 404, got {} with body {}",
+        reply.status, reply.body
+    );
+    assert_eq!(
+        reply.error_code(),
+        NO_SUCH_POLICY,
+        "case {case:?}: expected the code {NO_SUCH_POLICY:?}, got {:?}; body {}",
+        reply.error_code(),
+        reply.body
+    );
+    assert_eq!(
+        reply.first("Error/Type"),
+        Some("Sender"),
+        "case {case:?}: expected the fault Type \"Sender\", got {:?}; body {}",
+        reply.first("Error/Type"),
+        reply.body
+    );
+    let message = message_of(reply, case);
+    assert_eq!(
+        message, NO_SUCH_POLICY_VERSION_MESSAGE,
+        "case {case:?}: expected the message {NO_SUCH_POLICY_VERSION_MESSAGE:?}, got \
+         {message:?}; body {}",
+        reply.body
+    );
 }
 
 /// Every implemented operation that binds `NoSuchTrafficPolicy`.
@@ -178,7 +226,7 @@ async fn policy_id(router: &MultiServiceRouter, name: &str) -> String {
 }
 
 #[tokio::test]
-async fn a_traffic_policy_the_account_does_not_hold_is_refused_by_its_code_alone() {
+async fn each_half_of_a_pair_the_account_does_not_hold_is_refused_for_that_half() {
     let router = router();
     let zone = create_zone_ok(&router, "example.com", "ref-policy-identity-only").await;
     // A policy the account DOES hold, so the rows below ask about versions of a
@@ -210,8 +258,9 @@ async fn a_traffic_policy_the_account_does_not_hold_is_refused_by_its_code_alone
     }
 
     // The other half of `(Id, Version)`: a policy the account holds, addressed
-    // at a version it does not. The versions differ along how far past the one
-    // version the policy holds they are, up to the published maximum.
+    // at a version it does not, which states that the policy does not exist. The
+    // versions differ along how far past the one version the policy holds they
+    // are, up to the published maximum.
     let unknown_versions = [
         ("the version after the only one it holds", "2"),
         ("a version far past the ones it holds", "7"),
@@ -224,14 +273,16 @@ async fn a_traffic_policy_the_account_does_not_hold_is_refused_by_its_code_alone
         {
             let case = format!("{operation:?} on {case}");
             let reply = operation.send(&router, &zone, &held, version).await;
-            assert_no_such_traffic_policy(&reply, &case);
+            assert_no_such_traffic_policy_version(&reply, &case);
         }
     }
 
     // A version that DID exist until it was deleted is no longer one the account
     // holds either, so every VERSION-addressed operation but the one read the
     // documentation keeps (`GetTrafficPolicy`, which still reports a flagged
-    // version) refuses it the same way. The two operations addressed at the `Id`
+    // version) refuses it the same way — as a version of a policy whose id the
+    // account still holds, which is what the retained record keeps resolvable.
+    // The two operations addressed at the `Id`
     // alone are left out on purpose: the policy RECORD outlives its versions, so
     // `ListTrafficPolicyVersions` still answers — with an empty collection — and
     // a further version can still be created on it, which the deletion suite
@@ -250,7 +301,7 @@ async fn a_traffic_policy_the_account_does_not_hold_is_refused_by_its_code_alone
     {
         let case = format!("{operation:?} on a version a delete flagged");
         let reply = operation.send(&router, &zone, &deleted, "1").await;
-        assert_no_such_traffic_policy(&reply, &case);
+        assert_no_such_traffic_policy_version(&reply, &case);
     }
 }
 
@@ -429,7 +480,7 @@ fn drawn_policy_id(rng: &mut StdRng) -> String {
 }
 
 #[tokio::test]
-async fn the_refusal_carries_no_message_whatever_pair_the_request_named() {
+async fn the_refusal_reports_the_half_of_the_pair_that_named_nothing_whatever_it_named() {
     let router = router();
     let zone = create_zone_ok(&router, "example.com", "ref-policy-drawn-pairs").await;
     // A policy the account DOES hold, so each draw asks about a version of a real
@@ -474,7 +525,7 @@ async fn the_refusal_carries_no_message_whatever_pair_the_request_named() {
                  (seed {PAIR_SEED:#x}, draw {draw})"
             );
             let reply = operation.send(&router, &zone, &held, &unheld_version).await;
-            assert_no_such_traffic_policy(&reply, &case);
+            assert_no_such_traffic_policy_version(&reply, &case);
         }
     }
 }

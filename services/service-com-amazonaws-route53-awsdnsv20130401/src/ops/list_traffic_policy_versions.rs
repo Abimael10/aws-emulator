@@ -215,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The request addresses ONE policy and lists the versions OF it, so the
         // only `Id` with no versions to list is one the store holds no policy
         // record under — refused through the ONE place this service words a
-        // traffic policy it does not hold. A policy whose versions have all been
+        // policy id it holds no policy under. A policy whose versions have all been
         // flagged by a delete is still a policy record ("Route 53 never fully
         // deletes the traffic policy"), so its id keeps resolving and its
         // listing is an EMPTY collection rather than a missing resource.

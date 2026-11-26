@@ -97,9 +97,10 @@ use std::time::Instant;
 
 use crate::state::{
     canonical_dns_name, name_is_in_zone, name_not_permitted_in_zone_message, no_such_hosted_zone,
-    no_such_traffic_policy, normalize_zone_id, record_set_already_exists_message,
-    resource_location, zone_record_set_limit_message, RecordKey, StoredTrafficPolicyInstance,
-    MAX_RECORD_SETS_PER_ZONE, MAX_TRAFFIC_POLICY_INSTANCES, TRAFFIC_POLICY_INSTANCE_PROPAGATION,
+    no_such_traffic_policy, no_such_traffic_policy_version, normalize_zone_id,
+    record_set_already_exists_message, resource_location, zone_record_set_limit_message, RecordKey,
+    StoredTrafficPolicyInstance, MAX_RECORD_SETS_PER_ZONE, MAX_TRAFFIC_POLICY_INSTANCES,
+    TRAFFIC_POLICY_INSTANCE_PROPAGATION,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -204,19 +205,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that version's document is what fixes the `RRType` they carry
         // (`TrafficPolicyInstance$TrafficPolicyType`), so the type is read off
         // the stored policy version rather than taken from the request, which
-        // carries no type at all. A policy id the account does not hold and a
-        // version that policy does not hold are the same refusal: there is no
-        // such traffic policy version to generate record sets from. A version a
+        // carries no type at all. Each half of `(Id, Version)` names nothing in
+        // its own way: an `Id` the account holds no policy under is the
+        // refusal's identity alone, while a policy that IS held, at a version it
+        // does not hold, states that the policy does not exist. A version a
         // delete has flagged is not one the account holds either — its record is
         // retained only for `GetTrafficPolicy` — so no instance is built on one.
-        let traffic_policy_type = store
+        let policy = store
             .traffic_policies
             .get(&input.traffic_policy_id)
-            .and_then(|policy| policy.live_version(input.traffic_policy_version))
-            .map(|version| version.record_type.clone())
             .ok_or_else(|| {
                 CreateTrafficPolicyInstanceErrorModeled::NoSuchTrafficPolicy(
                     no_such_traffic_policy(),
+                )
+            })?;
+        let traffic_policy_type = policy
+            .live_version(input.traffic_policy_version)
+            .map(|version| version.record_type.clone())
+            .ok_or_else(|| {
+                CreateTrafficPolicyInstanceErrorModeled::NoSuchTrafficPolicy(
+                    no_such_traffic_policy_version(),
                 )
             })?;
 

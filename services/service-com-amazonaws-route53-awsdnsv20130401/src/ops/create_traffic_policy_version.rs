@@ -206,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refusal's IDENTITY ALONE — the `Error` element carries `Type` and
         // `Code` and no `Message` child — which `no_such_traffic_policy` is the
         // one place to word, for this path as for every other operation
-        // addressed at a traffic policy. A policy
+        // addressed at a policy id nothing minted. A policy
         // whose versions have all been flagged by a delete is still a policy
         // record: "Route 53 never fully deletes the traffic policy … if you
         // retain the ID of the policy", so its id keeps resolving and the

@@ -50,7 +50,9 @@ use crate::traffic_policies::{
 };
 use crate::traffic_policy_instance_deletion::delete_instance;
 use crate::traffic_policy_instances::create_instance;
-use crate::traffic_policy_not_found_envelope::assert_no_such_traffic_policy;
+use crate::traffic_policy_not_found_envelope::{
+    assert_no_such_traffic_policy, assert_no_such_traffic_policy_version,
+};
 use crate::traffic_policy_versions::create_version;
 
 /// The one sentence `TrafficPolicyInUse` reports, which names neither the
@@ -385,11 +387,12 @@ async fn each_deleted_version_stops_being_one_the_account_holds() {
             );
 
             // Deleting the same pair again has nothing left to delete, and
-            // neither has an update of its comment.
+            // neither has an update of its comment: the policy's id still
+            // resolves, so both are refused as a version it does not hold.
             let again = delete_policy(&router, &id, &version.to_string()).await;
-            assert_no_such_traffic_policy(&again, case);
+            assert_no_such_traffic_policy_version(&again, case);
             let updated = update_comment(&router, &id, &version.to_string(), "revived?").await;
-            assert_no_such_traffic_policy(&updated, case);
+            assert_no_such_traffic_policy_version(&updated, case);
             assert_reads_back(&router, case, &under_test[(version - 1) as usize]).await;
 
             // The bystander policy is untouched, whichever version went.
@@ -587,7 +590,15 @@ async fn an_id_or_version_the_account_does_not_hold_is_refused() {
 
     for (case, requested_id, version) in &rows {
         let reply = delete_policy(&case_router, requested_id, version).await;
-        assert_no_such_traffic_policy(&reply, case);
+        // Which body the one error class carries is decided by the half of the
+        // pair that named nothing: an id the account holds no policy under is the
+        // refusal's identity alone, while a version of the policy it DOES hold
+        // states that the policy does not exist.
+        if *requested_id == id {
+            assert_no_such_traffic_policy_version(&reply, case);
+        } else {
+            assert_no_such_traffic_policy(&reply, case);
+        }
     }
 
     // Nothing the refusals touched: both versions still read back and both are
@@ -768,7 +779,7 @@ async fn no_traffic_policy_instance_is_created_from_a_deleted_version() {
     );
 
     let refused = create_instance(&router, &zone, "one.example.net", 60, &id, 1).await;
-    assert_no_such_traffic_policy(&refused, case);
+    assert_no_such_traffic_policy_version(&refused, case);
 
     // The version that was NOT deleted still serves an instance, so the refusal
     // above is about the flagged version and not about the policy.

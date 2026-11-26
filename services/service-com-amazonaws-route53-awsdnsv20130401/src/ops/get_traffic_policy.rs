@@ -64,7 +64,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::no_such_traffic_policy;
+use crate::state::{no_such_traffic_policy, no_such_traffic_policy_version};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -145,22 +145,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // A traffic policy is addressed by both halves of `(Id, Version)`, so a
-        // policy the account does not hold and a version that policy does not
-        // hold are the same refusal: there is no such traffic policy version to
-        // report. A version a DELETE has flagged is still reported here, and
+        // A traffic policy is addressed by both halves of `(Id, Version)`, and
+        // each half names nothing in its own way: an `Id` the account holds no
+        // policy under is the refusal's identity alone, while a policy that IS
+        // held, at a version it does not hold, states that the policy does not
+        // exist. A version a DELETE has flagged is still reported here, and
         // only here: "Route 53 never fully deletes the traffic policy … if you
         // retain the ID of the policy, you can get information about the policy,
         // including the traffic policy document, by running GetTrafficPolicy."
         // A read, so nothing in the store is touched.
         let store = state.lock();
-        let traffic_policy = store
-            .traffic_policies
-            .get(&input.id)
-            .and_then(|policy| policy.to_traffic_policy(input.version))
-            .ok_or_else(|| {
-                GetTrafficPolicyErrorModeled::NoSuchTrafficPolicy(no_such_traffic_policy())
-            })?;
+        let policy = store.traffic_policies.get(&input.id).ok_or_else(|| {
+            GetTrafficPolicyErrorModeled::NoSuchTrafficPolicy(no_such_traffic_policy())
+        })?;
+        let traffic_policy = policy.to_traffic_policy(input.version).ok_or_else(|| {
+            GetTrafficPolicyErrorModeled::NoSuchTrafficPolicy(no_such_traffic_policy_version())
+        })?;
 
         Ok(GetTrafficPolicyOutput { traffic_policy })
     }
