@@ -164,13 +164,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let store = state.lock();
 
-        // The id the ARN addresses is what the store is keyed by; the stored plan's
-        // own ARN must then match the request's in full, so an ARN carrying that id
+        // The one reading every plan operation performs (`crate::state::recovery_plans`):
+        // the id the ARN addresses is what the store is keyed by, and the stored
+        // plan's own ARN must match the request's in full, so an ARN carrying that id
         // under another Region or account addresses no plan here.
-        let found = crate::state::recovery_plans::id_from_arn(&input.recovery_plan_arn)
-            .and_then(|id| store.recovery_plans.get(id))
-            .filter(|plan| plan.arn == input.recovery_plan_arn);
-        let Some(plan) = found else {
+        let Some(plan) = store.recovery_plan(&input.recovery_plan_arn) else {
             return Err(GetRecoveryPlanErrorModeled::ResourceNotFoundException(
                 crate::state::recovery_plans::not_found(&input.recovery_plan_arn),
             )

@@ -16,8 +16,8 @@
 //! operation shows no parameter-mismatch refusal and the model's `ConflictException`
 //! is not documented for one. A caller that means to change a plan updates it.
 //!
-//! A plan is created holding no steps, so it reports the status the model documents
-//! for a plan with no `SERVER` step (see `crate::state::recovery_plans`).
+//! A plan is created holding no steps, which is the state the service reports as
+//! executable (see `crate::state::recovery_plans`).
 //!
 //! ## Shape of an operation
 //!
@@ -239,8 +239,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now.clone(),
             updated_at: now,
             client_token: client_token.map(std::string::ToString::to_string),
-            // A plan is created holding no steps, which is what makes its status
-            // report a plan that cannot be executed until a `SERVER` step is added.
+            // A plan is created holding no steps: steps are added by the step
+            // operations, and only the steps a plan actually holds can make it
+            // unexecutable.
             steps: Vec::new(),
         };
 

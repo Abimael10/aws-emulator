@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRecoveryPlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRecoveryPlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRecoveryPlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes the plan the request's `recoveryPlanArn` addresses: the members the request
+//! NAMED are written to the stored plan, the ones it left out keep the values the plan
+//! already had, `updatedAt` is restamped with the instant of the call, and the STORED
+//! plan is reported — so a following `GetRecoveryPlan` reads back exactly what this
+//! call wrote.
+//!
+//! An ARN this store holds no plan for is the modelled `ResourceNotFoundException`
+//! (404), built where every plan operation builds it
+//! (`crate::state::recovery_plans::not_found`).
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +158,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRecoveryPlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRecoveryPlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRecoveryPlan"))
+        // `ctx` carries request metadata only: the plan is addressed by the ARN the
+        // request named, which already carries its Region and account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateRecoveryPlanErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        let Some(plan) = store.recovery_plan_mut(&input.recovery_plan_arn) else {
+            return Err(UpdateRecoveryPlanErrorModeled::ResourceNotFoundException(
+                crate::state::recovery_plans::not_found(&input.recovery_plan_arn),
+            )
+            .into());
+        };
+
+        // Both changeable members are optional, so this call changes exactly what it
+        // NAMED: a member the request left out is not a request to clear it, and the
+        // plan keeps what it held. `description` is modelled length 0..1024, so an
+        // empty string IS a value a caller can set.
+        if let Some(name) = input.name {
+            plan.name = name;
+        }
+        if let Some(description) = input.description {
+            plan.description = Some(description);
+        }
+        // `updatedAt` is "the timestamp when the Recovery Plan was last updated", and
+        // this call is that update. `createdAt` is never restamped.
+        plan.updated_at = crate::state::recovery_plans::now();
+
+        // Report the plan as it now stands IN the store, so the 200 can only describe
+        // what was persisted — never the request echoed past a failed write.
+        Ok(UpdateRecoveryPlanOutput {
+            recovery_plan: plan.to_wire(),
+        })
     }
 }

@@ -20,15 +20,16 @@
 //!    and tags the request supplied, stamps `createdAt` and `updatedAt` with the
 //!    instant of the call, and reports the STORED plan; `GetRecoveryPlan` on the
 //!    reported ARN reads back the same plan, repeatedly and unchanged.
-//! 2. A plan that holds no `SERVER` step reports the status the model documents for a
-//!    plan that cannot be executed, and that status is one of the model's own values.
+//! 2. A plan reports a status that is one of the model's own `RecoveryPlanStatus`
+//!    values, and a plan holding no steps — which is every plan a create mints — is
+//!    reported as executable.
 //! 3. `clientToken` is modelled `@idempotencyToken`: a create repeating a token reports
 //!    the plan that token already minted instead of minting a second one, while creates
 //!    carrying different tokens, or none, each mint their own.
 //! 4. An ARN this account holds no plan for — one never minted, or a stored plan's id
 //!    under another Region, another account or another resource type — is 404
-//!    `ResourceNotFoundException` naming the resource type and the ARN the request
-//!    asked for, and changes nothing.
+//!    `ResourceNotFoundException` naming the resource type, the ARN the request asked
+//!    for and the plan id that ARN addresses, and changes nothing.
 //! 5. A create outside a modelled bound on its members is refused and stores nothing;
 //!    the same create at the bound is served.
 //! 6. The store is bounded: it accepts the service's quota of plans and refuses the
@@ -55,19 +56,19 @@ const REGION: &str = "eu-west-1";
 
 /// How many Recovery Plans the store holds: the one read of this slice's state that no
 /// implemented operation can answer yet (see the module docs).
-fn stored_plans(engine: &Arc<engine::InMemoryEngine>) -> usize {
+pub(crate) fn stored_plans(engine: &Arc<engine::InMemoryEngine>) -> usize {
     engine.state::<DrsState>().lock().recovery_plans.len()
 }
 
 /// The `recoveryPlan` structure of a create or a read.
-fn plan_of(answer: &Answer) -> &Value {
+pub(crate) fn plan_of(answer: &Answer) -> &Value {
     answer
         .member("recoveryPlan")
         .unwrap_or_else(|| panic!("expected a recoveryPlan member, got {answer:?}"))
 }
 
 /// The ARN a reported plan carries.
-fn arn_of(answer: &Answer) -> String {
+pub(crate) fn arn_of(answer: &Answer) -> String {
     plan_of(answer)
         .get("recoveryPlanArn")
         .and_then(Value::as_str)
@@ -76,7 +77,7 @@ fn arn_of(answer: &Answer) -> String {
 }
 
 /// A string member of an answer's body, for an assertion that names the case.
-fn text(answer: &Answer, name: &str) -> String {
+pub(crate) fn text(answer: &Answer, name: &str) -> String {
     answer
         .member(name)
         .and_then(Value::as_str)
@@ -100,6 +101,19 @@ fn id_of(plan_arn: &str) -> &str {
         .1
 }
 
+/// What the service's not-found message names a plan an ARN addresses by: the plan id
+/// the ARN carries, or the value itself when the ARN addresses no plan at all.
+pub(crate) fn plan_subject_of(plan_arn: &str) -> &str {
+    plan_arn
+        .split_once(":recovery-plan/")
+        .map_or(plan_arn, |(_, id)| id)
+}
+
+/// The whole message a plan operation answers an ARN it holds no plan for with.
+pub(crate) fn not_found_message(plan_arn: &str) -> String {
+    format!("Recovery plan '{}' not found.", plan_subject_of(plan_arn))
+}
+
 /// Whether `value` is a `RecoveryPlanID`: the model gives it length 22..64 and the
 /// pattern `^plan-[0-9a-zA-Z]{17,59}$`, checked without pulling in a regex engine.
 fn is_plan_id(value: &str) -> bool {
@@ -111,7 +125,7 @@ fn is_plan_id(value: &str) -> bool {
 
 /// Whether `value` is an `ISO8601DatetimeString` as the model constrains `createdAt`
 /// and `updatedAt`: an RFC-3339 date-time in UTC.
-fn is_iso8601(value: &str) -> bool {
+pub(crate) fn is_iso8601(value: &str) -> bool {
     value.ends_with('Z')
         && ::aws_smithy_types::DateTime::from_str(
             value,
@@ -121,7 +135,7 @@ fn is_iso8601(value: &str) -> bool {
 }
 
 /// Create a plan, failing the test on anything but the modelled 201.
-async fn create(router: &MultiServiceRouter, region: &str, body: &Value) -> Answer {
+pub(crate) async fn create(router: &MultiServiceRouter, region: &str, body: &Value) -> Answer {
     let answer = call_in(router, region, "CreateRecoveryPlan", body).await;
     assert_eq!(
         answer.status, 201,
@@ -131,7 +145,7 @@ async fn create(router: &MultiServiceRouter, region: &str, body: &Value) -> Answ
 }
 
 /// Read a plan back by its ARN.
-async fn get(router: &MultiServiceRouter, region: &str, plan_arn: &str) -> Answer {
+pub(crate) async fn get(router: &MultiServiceRouter, region: &str, plan_arn: &str) -> Answer {
     call_in(
         router,
         region,
@@ -235,16 +249,16 @@ async fn a_created_plan_is_stored_and_read_back_unchanged() {
             "case {case}: a plan carries the tag set it was created with, got {plan}"
         );
 
-        // Rule 2: the model's `RecoveryPlanStatus` documents `INVALID` as "the plan
-        // has no `SERVER` type steps and cannot be executed", which is what a plan
-        // created without any step is.
+        // Rule 2: the model's `RecoveryPlanStatus` is exactly [ACTIVE, INVALID], and
+        // `INVALID` is documented for a plan whose steps cannot be executed — a plan
+        // holding no step at all is not composed yet, so a created plan is ACTIVE.
         let status = plan
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or_default();
         assert_eq!(
-            status, "INVALID",
-            "case {case}: a plan with no SERVER step cannot be executed, got {plan}"
+            status, "ACTIVE",
+            "case {case}: a created plan is reported as executable, got {plan}"
         );
         assert!(
             RECOVERY_PLAN_STATUS_VALUES.contains(&status),
@@ -383,10 +397,10 @@ async fn a_repeated_client_token_reports_the_plan_it_already_minted() {
 // ---------------------------------------------------------------------------
 
 /// `GetRecoveryPlan` on an ARN this store holds no plan for answers 404
-/// `ResourceNotFoundException`, reporting the service's name for the resource type and
-/// the ARN the request named verbatim. The rows are ARNs absent for different reasons:
-/// ids nothing minted, and a STORED plan's id addressed under another Region, another
-/// account or another resource type.
+/// `ResourceNotFoundException`, reporting the service's name for the resource type, the
+/// ARN the request named verbatim and the plan id that ARN addresses. The rows are ARNs
+/// absent for different reasons: ids nothing minted, and a STORED plan's id addressed
+/// under another Region, another account or another resource type.
 #[tokio::test]
 async fn an_arn_no_plan_answers_to_is_not_found() {
     let (router, engine) = drs_with_engine();
@@ -452,7 +466,7 @@ async fn an_arn_no_plan_answers_to_is_not_found() {
         );
         assert_eq!(
             text(&answer, "message"),
-            format!("Recovery Plan with Arn: '{arn}' was not found"),
+            not_found_message(arn),
             "case {case}: wrong message in {answer:?}"
         );
     }

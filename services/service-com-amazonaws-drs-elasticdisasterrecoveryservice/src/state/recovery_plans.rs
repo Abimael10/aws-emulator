@@ -10,11 +10,16 @@
 //!
 //! The ONE place a stored plan becomes a wire plan ([`RecoveryPlanRecord::to_wire`]),
 //! so a created plan and a plan read back cannot disagree about any member — and the
-//! one place a plan's `status` is decided, which is a FUNCTION of the steps the plan
-//! holds rather than a member anything stores.
+//! one place a plan's `status` is decided.
+//!
+//! The ONE place an ARN a request named becomes the stored plan it addresses, too
+//! ([`ComAmazonawsDrsElasticdisasterrecoveryserviceState::recovery_plan`] and its two
+//! siblings), so the read, the update and the delete of a plan cannot disagree about
+//! which plan an ARN names or about whether this service holds it.
 
 use std::collections::HashMap;
 
+use super::ComAmazonawsDrsElasticdisasterrecoveryserviceState;
 use crate::ops::types::{
     RecoveryPlan, RecoveryPlanStep, RecoveryPlanStepConfiguration, ResourceNotFoundException,
 };
@@ -40,7 +45,7 @@ pub const RESOURCE_TYPE: &str = "Recovery Plan";
 /// (see `crate::ops::types::RECOVERY_PLAN_STATUS_VALUES`), documented as "executable".
 pub const STATUS_ACTIVE: &str = "ACTIVE";
 
-/// The status of a plan that holds no `SERVER` step: the same enum documents
+/// The status of a plan whose steps cannot be executed: the same enum documents
 /// `INVALID` as a plan that "has no `SERVER` type steps and cannot be executed".
 pub const STATUS_INVALID: &str = "INVALID";
 
@@ -77,30 +82,34 @@ pub struct RecoveryPlanRecord {
     /// second one. `None` for a create that named no token.
     pub client_token: Option<String>,
     /// The steps this plan orchestrates, in step order. A plan is created holding
-    /// none — steps are added by the step operations — and which kinds of step a
-    /// plan holds is what decides its [`Self::status`].
+    /// none — steps are added by the step operations — and a plan that holds steps
+    /// has their composition judged by [`Self::status`].
     pub steps: Vec<RecoveryPlanStep>,
 }
 
 impl RecoveryPlanRecord {
-    /// The plan's `status`: [`STATUS_ACTIVE`] once it holds a `SERVER` step,
-    /// [`STATUS_INVALID`] while it holds none.
+    /// The plan's `status`: [`STATUS_ACTIVE`] for a plan whose steps do not make it
+    /// unexecutable, [`STATUS_INVALID`] for one whose step composition does.
     ///
-    /// Derived from the steps rather than stored, so a plan can never report a
-    /// status its steps contradict: the model documents `INVALID` as exactly "the
-    /// plan has no `SERVER` type steps and cannot be executed", which is the state
-    /// every freshly created plan is in.
+    /// A plan is executable from the moment it is created, and only the composition
+    /// of the steps it ACTUALLY holds can degrade it: the model documents `INVALID`
+    /// as "the plan has no `SERVER` type steps and cannot be executed", which is a
+    /// statement about a plan whose steps leave nothing to recover — a plan holding
+    /// no step at all is not yet composed, so there is nothing to judge and it
+    /// reports `ACTIVE`, as the service does for every plan a create has just
+    /// minted.
     pub fn status(&self) -> &'static str {
-        let executable = self.steps.iter().any(|step| {
-            matches!(
-                step.configuration,
-                RecoveryPlanStepConfiguration::serverStepConfiguration(_)
-            )
-        });
-        if executable {
-            STATUS_ACTIVE
-        } else {
+        let unexecutable = !self.steps.is_empty()
+            && !self.steps.iter().any(|step| {
+                matches!(
+                    step.configuration,
+                    RecoveryPlanStepConfiguration::serverStepConfiguration(_)
+                )
+            });
+        if unexecutable {
             STATUS_INVALID
+        } else {
+            STATUS_ACTIVE
         }
     }
 
@@ -143,16 +152,56 @@ pub fn id_from_arn(arn: &str) -> Option<&str> {
 ///
 /// The ONE place that refusal is built, so every plan operation reports the same
 /// `resourceType`, the same `resourceId` (the ARN the request named, verbatim) and
-/// the same message: the service's name for the resource type, then what it was
-/// asked for, then that it was not found.
+/// the same message.
+///
+/// The message names the plan the request asked for by its `recoveryPlanID` — the
+/// id [`id_from_arn`] reads out of the ARN — because that is the identifier of the
+/// resource the service could not find, and it is what a client parses back out of
+/// the text. An ARN carrying no plan id addresses no plan at all, so there is no id
+/// to name and the value the request supplied is reported instead.
 pub fn not_found(plan_arn: &str) -> ResourceNotFoundException {
+    let plan_id = id_from_arn(plan_arn).unwrap_or(plan_arn);
     ResourceNotFoundException {
-        message: Some(format!(
-            "{RESOURCE_TYPE} with Arn: '{plan_arn}' was not found"
-        )),
+        message: Some(format!("Recovery plan '{plan_id}' not found.")),
         code: None,
         resource_id: Some(plan_arn.to_string()),
         resource_type: Some(RESOURCE_TYPE.to_string()),
+    }
+}
+
+impl ComAmazonawsDrsElasticdisasterrecoveryserviceState {
+    /// The stored plan `plan_arn` addresses, or `None` for an ARN this service holds
+    /// no plan for.
+    ///
+    /// The ONE reading every plan operation performs: the id the ARN carries is what
+    /// the store is keyed by, and the stored plan's own ARN has to equal the one the
+    /// request named in full — so an ARN carrying a stored plan's id under another
+    /// partition, Region or account addresses nothing here.
+    pub fn recovery_plan(&self, plan_arn: &str) -> Option<&RecoveryPlanRecord> {
+        id_from_arn(plan_arn)
+            .and_then(|id| self.recovery_plans.get(id))
+            .filter(|plan| plan.arn == plan_arn)
+    }
+
+    /// The same plan, to CHANGE: what an operation that updates a plan mutates, so
+    /// the write lands on the record every read reports.
+    pub fn recovery_plan_mut(&mut self, plan_arn: &str) -> Option<&mut RecoveryPlanRecord> {
+        id_from_arn(plan_arn)
+            .and_then(|id| self.recovery_plans.get_mut(id))
+            .filter(|plan| plan.arn == plan_arn)
+    }
+
+    /// Take the plan `plan_arn` addresses OUT of the store, answering the record that
+    /// was removed, or `None` when this service holds no such plan.
+    ///
+    /// The plan's tags live on the record (`crate::state::tags`), so they leave with
+    /// it: nothing of a deleted plan is left for a later read to report.
+    pub fn remove_recovery_plan(&mut self, plan_arn: &str) -> Option<RecoveryPlanRecord> {
+        // The same full-ARN reading as the lookups above, performed BEFORE the
+        // removal: an ARN that addresses no plan of this account must not remove the
+        // plan that happens to carry its id.
+        let id = self.recovery_plan(plan_arn)?.id.clone();
+        self.recovery_plans.remove(&id)
     }
 }
 
