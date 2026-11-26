@@ -48,6 +48,15 @@
 pub mod utilities;
 pub mod values;
 
+/// The `$util.list` and `$util.map` helper families: the collection half of the `$util`
+/// library the registry in [`utilities`] dispatches to.
+pub mod collections;
+/// The `$util.str` and `$util.math` helper families: the scalar half of that library.
+pub mod strings_math;
+/// The `$util.transform` helper family, which builds the DynamoDB expression document a
+/// filter a caller stated comes to.
+pub mod transform;
+
 #[cfg(test)]
 mod tests;
 mod syntax;
@@ -932,6 +941,21 @@ pub(crate) fn weigh(value: &Json, depth: usize) -> Result<usize, String> {
         return Err(format!("{TOO_LARGE_A_VALUE} {MAX_VALUE_BYTES} bytes."));
     }
     Ok(weight)
+}
+
+/// Whether a value this evaluation is ABOUT TO build may be held at all, by the size it will
+/// take: the same ceiling [`weigh`] holds a built value to ([`MAX_VALUE_BYTES`]), asked BEFORE
+/// the allocation rather than after it.
+///
+/// A helper whose answer can be far larger than the arguments it was given — a replacement
+/// that rewrites every occurrence of a short pattern as a long one — computes the size of its
+/// result first and asks this, so the allocation a run is refused for is never made; `weigh`
+/// stays the backstop over the value that was built.
+pub(crate) fn within_value_bytes(projected: usize) -> Result<(), String> {
+    if projected > MAX_VALUE_BYTES {
+        return Err(format!("{TOO_LARGE_A_VALUE} {MAX_VALUE_BYTES} bytes."));
+    }
+    Ok(())
 }
 
 /// How a template that does not PARSE is reported: the diagnostic the Velocity parser states

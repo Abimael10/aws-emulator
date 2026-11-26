@@ -159,6 +159,18 @@ pub fn filter_expression(stated: &Json) -> Result<Json, String> {
     expressions::predicate(stated, FILTER_MEMBER)
 }
 
+/// The same filter expression, written in the form the `$util.transform` helper AppSync
+/// publishes answers it in: the attribute and the operator name each placeholder and every
+/// comparison is parenthesised, which is what a mapping template reading that answer sees.
+///
+/// The same ONE translation as [`filter_expression`] — one reading of the language, two forms
+/// of the document it is written into ([`expressions::published_predicate`]) — reached by the
+/// transformation helper of the template language
+/// (`crate::service::graphql_api::mapping_template::transform`).
+pub fn published_filter_expression(stated: &Json) -> Result<Json, String> {
+    expressions::published_predicate(stated, FILTER_MEMBER)
+}
+
 /// The members every SELECTION of a page states: what it filters by, which index it reads, how
 /// many values, whether the read is consistent, what it selects, which attributes it projects
 /// and where the previous page left off.

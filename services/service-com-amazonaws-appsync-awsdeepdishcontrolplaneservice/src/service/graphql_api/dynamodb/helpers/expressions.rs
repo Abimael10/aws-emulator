@@ -41,7 +41,25 @@ const MAX_CONDITION_DEPTH: usize = 16;
 ///
 /// `member` is the member of the payload the predicate was stated in, which a refusal names.
 pub(super) fn predicate(stated: &Json, member: &str) -> Result<Json, String> {
-    let mut parameters = Parameters::default();
+    written_predicate(stated, member, Dialect::Indexed)
+}
+
+/// The same predicate, written in the dialect the `$util.transform` helper AppSync publishes
+/// answers it in ([`Dialect::Published`]) rather than in the request object's own.
+///
+/// The one place that helper's answer is built, so the filter language has ONE reading here
+/// whichever of the two forms it is written out in.
+pub(super) fn published_predicate(stated: &Json, member: &str) -> Result<Json, String> {
+    written_predicate(stated, member, Dialect::Published)
+}
+
+/// See [`predicate`] and [`published_predicate`]: one walk of the language, over the dialect
+/// the caller's own answer is written in.
+fn written_predicate(stated: &Json, member: &str, dialect: Dialect) -> Result<Json, String> {
+    let mut parameters = Parameters {
+        dialect,
+        ..Parameters::default()
+    };
     let expression = conjunction(&mut parameters, stated, member, 0)?;
     if expression.is_empty() {
         return Err(format!("{A_PREDICATE_STATES} {member}."));
@@ -113,6 +131,11 @@ fn clause_of(
     assigned: &Json,
     member: &str,
 ) -> Result<(&'static str, String), String> {
+    // An update's operands belong to no comparison of an attribute, so nothing names their
+    // placeholders after one: the pair a comparison leaves behind is cleared here rather than
+    // left to be read by the next operand ([`Parameters::marshalled`]).
+    parameters.subject = None;
+    parameters.operator = None;
     let Some((operation, arguments)) = super::operation_stated(assigned) else {
         // An attribute assigned a plain value is SET to it, which is what an update of a
         // value rather than of a change states.
@@ -264,6 +287,9 @@ fn compared(
     if operators.is_empty() {
         return Err(format!("{A_COMPARISON_NAMES_AN_OPERATOR} {member}."));
     }
+    // The attribute every operand of these comparisons belongs to, which is half of what names
+    // an operand's placeholder in the published dialect.
+    parameters.subject = Some(attribute.to_string());
     let mut clauses = Vec::with_capacity(operators.len());
     for (operator, operand) in operators {
         clauses.push(clause(parameters, &path, operator, operand, member)?);
@@ -286,8 +312,15 @@ fn clause(
     operand: &Json,
     member: &str,
 ) -> Result<String, String> {
+    let dialect = parameters.dialect;
+    // The operator every operand of THIS comparison is compared under, which is the other half
+    // of what names an operand's placeholder in the published dialect.
+    parameters.operator = Some(operator.to_string());
     let compared = |parameters: &mut Parameters, symbol: &str| -> Result<String, String> {
-        Ok(format!("{path} {symbol} {}", parameters.value(operand)?))
+        Ok(dialect.held(format!(
+            "{path} {symbol} {}",
+            parameters.value(operand)?
+        )))
     };
     match operator {
         "eq" => compared(parameters, "="),
@@ -303,31 +336,37 @@ fn clause(
             }) else {
                 return Err(format!("{A_RANGE_IS_TWO_VALUES} {member}."));
             };
-            Ok(format!(
+            Ok(dialect.held(format!(
                 "{path} BETWEEN {} AND {}",
                 parameters.value(&low)?,
                 parameters.value(&high)?
-            ))
+            )))
         }
-        "beginsWith" => Ok(format!(
-            "begins_with({path}, {})",
-            parameters.value(operand)?
-        )),
-        "contains" => Ok(format!("contains({path}, {})", parameters.value(operand)?)),
-        "notContains" => Ok(format!(
-            "NOT contains({path}, {})",
-            parameters.value(operand)?
-        )),
+        "beginsWith" => Ok(dialect.held(dialect.called(
+            "begins_with",
+            path,
+            &parameters.value(operand)?,
+        ))),
+        "contains" => Ok(dialect.held(dialect.called(
+            "contains",
+            path,
+            &parameters.value(operand)?,
+        ))),
+        "notContains" => Ok(dialect.held(format!(
+            "NOT {}",
+            dialect.called("contains", path, &parameters.value(operand)?)
+        ))),
         "attributeExists" => match operand.as_bool() {
-            Some(true) => Ok(format!("attribute_exists({path})")),
-            Some(false) => Ok(format!("attribute_not_exists({path})")),
+            Some(true) => Ok(dialect.held(format!("attribute_exists({path})"))),
+            Some(false) => Ok(dialect.held(format!("attribute_not_exists({path})"))),
             None => Err(format!("{AN_EXISTENCE_IS_A_FLAG} {member}.")),
         },
         "attributeType" => match operand.as_str() {
-            Some(_) => Ok(format!(
-                "attribute_type({path}, {})",
-                parameters.value(operand)?
-            )),
+            Some(_) => Ok(dialect.held(dialect.called(
+                "attribute_type",
+                path,
+                &parameters.value(operand)?,
+            ))),
             None => Err(format!("{A_TYPE_IS_A_NAME} {member}.")),
         },
         "in" => {
@@ -338,7 +377,7 @@ fn clause(
             for value in values {
                 written.push(parameters.value(value)?);
             }
-            Ok(format!("{path} IN ({})", written.join(", ")))
+            Ok(dialect.held(format!("{path} IN ({})", written.join(", "))))
         }
         // The LENGTH of what the attribute holds, compared the way the attribute itself is:
         // the operand is a comparison of its own.
@@ -360,6 +399,46 @@ fn clause(
     }
 }
 
+/// How one expression is WRITTEN OUT: the two forms this service produces of the one filter
+/// language above.
+///
+/// The language is one — the same entries, the same operators, the same groups, read by the one
+/// walk in this module — but the two answers it is written into are not the same document. The
+/// `filter` of a REQUEST OBJECT is parameterised however this emulator likes, because nothing
+/// publishes those placeholders; the answer the `$util.transform` helper gives a mapping
+/// template IS published, down to the placeholder each name and operand travels under and the
+/// parentheses around each comparison, so a template that reads the answer sees what the
+/// reference states. Hence a dialect rather than a second translation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Dialect {
+    /// The request object's own: placeholders numbered as they are minted, comparisons written
+    /// bare.
+    #[default]
+    Indexed,
+    /// The published transform helper's: the ATTRIBUTE names a name's placeholder and the
+    /// attribute with the operator names an operand's, and every comparison is parenthesised.
+    Published,
+}
+
+impl Dialect {
+    /// One comparison as this dialect writes it.
+    fn held(self, clause: String) -> String {
+        match self {
+            Self::Indexed => clause,
+            Self::Published => format!("({clause})"),
+        }
+    }
+
+    /// One call of a function of DynamoDB's expression language over an attribute and an
+    /// operand, as this dialect writes it.
+    fn called(self, function: &str, path: &str, operand: &str) -> String {
+        match self {
+            Self::Indexed => format!("{function}({path}, {operand})"),
+            Self::Published => format!("{function}({path},{operand})"),
+        }
+    }
+}
+
 /// The names and the values ONE expression is parameterised by, as they are gathered while it
 /// is written.
 #[derive(Debug, Default)]
@@ -371,6 +450,16 @@ struct Parameters {
     /// The placeholder already bound to an attribute name, so one name that appears twice in
     /// an expression travels once.
     placeholders: BTreeMap<String, String>,
+    /// How this expression is written out ([`Dialect`]).
+    dialect: Dialect,
+    /// How many placeholders each STEM has already minted, so the next free one is looked up
+    /// rather than searched for: the published dialect names placeholders after the attribute
+    /// and the operator, which two comparisons can share.
+    minted: BTreeMap<String, usize>,
+    /// The attribute the comparison being written is about, and the operator it compares
+    /// under: what the published dialect names an operand's placeholder after.
+    subject: Option<String>,
+    operator: Option<String>,
 }
 
 impl Parameters {
@@ -401,7 +490,16 @@ impl Parameters {
         if let Some(bound) = self.placeholders.get(name) {
             return bound.clone();
         }
-        let placeholder = format!("#{NAME_PLACEHOLDER_PREFIX}{}", self.placeholders.len());
+        let placeholder = match self.dialect {
+            Dialect::Indexed => format!("#{NAME_PLACEHOLDER_PREFIX}{}", self.placeholders.len()),
+            // The published dialect names a placeholder after the attribute itself
+            // (`#title`), so a name carrying a character a placeholder cannot is written with
+            // that character replaced, and a name that would collide with another's takes the
+            // next free one.
+            Dialect::Published => {
+                self.free('#', &placeholder_text(name, NAME_PLACEHOLDER_PREFIX))
+            }
+        };
         self.placeholders
             .insert(name.to_string(), placeholder.clone());
         self.names
@@ -427,9 +525,56 @@ impl Parameters {
     /// Bind an operand that is ALREADY an attribute value — one this module wrote itself, such
     /// as the zero an increment counts from — and answer its placeholder.
     fn marshalled(&mut self, value: Json) -> String {
-        let placeholder = format!(":{VALUE_PLACEHOLDER_PREFIX}{}", self.values.len());
+        let placeholder = match self.dialect {
+            Dialect::Indexed => format!(":{VALUE_PLACEHOLDER_PREFIX}{}", self.values.len()),
+            // The published dialect names an operand's placeholder after the attribute and the
+            // operator it is compared under (`:title_contains`).
+            Dialect::Published => {
+                let stem = match (self.subject.clone(), self.operator.clone()) {
+                    (Some(subject), Some(operator)) => format!(
+                        "{}_{operator}",
+                        placeholder_text(&subject, VALUE_PLACEHOLDER_PREFIX)
+                    ),
+                    // An operand of no comparison of an attribute — one a section of an update
+                    // states — is numbered, since there is nothing to name it after.
+                    _ => format!("{VALUE_PLACEHOLDER_PREFIX}{}", self.values.len()),
+                };
+                self.free(':', &stem)
+            }
+        };
         self.values.insert(placeholder.clone(), value);
         placeholder
+    }
+
+    /// The next free placeholder of one stem: the stem itself the first time and the stem with
+    /// the count of the ones already minted after it every time after, counted per stem so
+    /// nothing is searched for.
+    fn free(&mut self, prefix: char, stem: &str) -> String {
+        let minted = self.minted.entry(stem.to_string()).or_insert(0);
+        let at = *minted;
+        *minted = at.saturating_add(1);
+        match at {
+            0 => format!("{prefix}{stem}"),
+            taken => format!("{prefix}{stem}_{taken}"),
+        }
+    }
+}
+
+/// `name` as the text a published placeholder is named after: its own characters, with every
+/// one a DynamoDB placeholder cannot carry replaced, so the name itself always travels in
+/// `expressionNames` rather than in the expression text. A name made of nothing a placeholder
+/// can carry falls back to `fallback`, which is what the indexed dialect names one by.
+fn placeholder_text(name: &str, fallback: &str) -> String {
+    let written: String = name
+        .chars()
+        .map(|character| match character.is_ascii_alphanumeric() || character == '_' {
+            true => character,
+            false => '_',
+        })
+        .collect();
+    match written.trim_matches('_').is_empty() {
+        true => fallback.to_string(),
+        false => written,
     }
 }
 

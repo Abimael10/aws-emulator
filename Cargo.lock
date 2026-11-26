@@ -10841,6 +10841,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "unicode-normalization",
  "url",
  "uuid",
  "webpki-roots",

@@ -6,7 +6,10 @@
 //! One function per helper, over the same JSON value model the rest of the language works
 //! in ([`super::values`]). The `$util.dynamodb` family — the helpers that MARSHAL a value as
 //! the attribute value DynamoDB holds it as — lives in [`dynamodb`], one module for one
-//! family. Four of them are not values at all and are answered as their own
+//! family, and the other families this registry dispatches to live beside this module: the
+//! scalar ones in [`super::strings_math`], the collection ones in [`super::collections`] and
+//! the transformation one in [`super::transform`]. Four of them are not values at all and
+//! are answered as their own
 //! outcome: `$util.quiet` produces nothing, `$util.log.info` / `$util.log.error` write a line
 //! the response reports, and `$util.error` and `$util.unauthorized` RAISE — "throws a custom
 //! error", which is how a template refuses the field it is resolving.
@@ -301,11 +304,15 @@ pub fn call(path: &[String], args: &[Json]) -> Result<Answer, String> {
         // expressionValues}` the request object's own `filter` member carries, serialized, so a
         // template inlines it where that member goes. It is the same translation an APPSYNC_JS
         // resolver's filter travels through
-        // ([`super::super::dynamodb::helpers::filter_expression`]), so a filter stated in a
-        // template and the same filter stated in code select on the same expression.
-        ["transform", "toDynamoDBFilterExpression"] => value(Json::String(
-            super::super::dynamodb::helpers::filter_expression(&argument(0))?.to_string(),
-        )),
+        // ([`super::super::dynamodb::helpers::published_filter_expression`]), so a filter
+        // stated in a template and the same filter stated in code select on the same
+        // expression. It is the one helper of this library whose own FAILURE is a classified
+        // error of the FIELD rather than a fault of the evaluation, so the family answers the
+        // outcome itself ([`super::transform`]).
+        ["transform", helper] => match super::transform::call(helper, args) {
+            Some(answered) => Ok(answered),
+            None => Err(format!("{NO_SUCH_HELPER}$util.transform.{helper}")),
+        },
         // The relational-database helpers: the statement builders a request template writes
         // its statements with, and the reading of the result one produced
         // ([`super::super::relational_database::utilities`]), which is the same reading an
@@ -316,9 +323,31 @@ pub fn call(path: &[String], args: &[Json]) -> Result<Answer, String> {
                 None => Err(format!("{NO_SUCH_HELPER}$util.rds.{helper}")),
             }
         }
+        // The string and math helpers, which compute one scalar out of the scalars the call
+        // named ([`super::strings_math`]).
+        ["str", helper] => match super::strings_math::string_call(helper, args)? {
+            Some(produced) => value(produced),
+            None => Err(format!("{NO_SUCH_HELPER}$util.str.{helper}")),
+        },
+        ["math", helper] => match super::strings_math::math_call(helper, args)? {
+            Some(produced) => value(produced),
+            None => Err(format!("{NO_SUCH_HELPER}$util.math.{helper}")),
+        },
+        // The list and map helpers, each of which answers a COPY of the collection it was
+        // handed ([`super::collections`]).
+        ["list", helper] => match super::collections::list_call(helper, args)? {
+            Some(produced) => value(produced),
+            None => Err(format!("{NO_SUCH_HELPER}$util.list.{helper}")),
+        },
+        ["map", helper] => match super::collections::map_call(helper, args)? {
+            Some(produced) => value(produced),
+            None => Err(format!("{NO_SUCH_HELPER}$util.map.{helper}")),
+        },
         // The clock helpers, which read the one clock this process has.
         ["time", "nowISO8601"] => value(Json::String(now_iso8601())),
-        ["time", "nowEpochSeconds"] => value(values::number(unix_millis() as f64 / 1000.0)),
+        // The epoch SECOND, which is a whole number of seconds rather than the millisecond
+        // reading divided down.
+        ["time", "nowEpochSeconds"] => value(values::number((unix_millis() / 1000) as f64)),
         ["time", "nowEpochMilliSeconds"] => value(values::number(unix_millis() as f64)),
         unknown => Err(format!("{NO_SUCH_HELPER}$util.{}", unknown.join("."))),
     }

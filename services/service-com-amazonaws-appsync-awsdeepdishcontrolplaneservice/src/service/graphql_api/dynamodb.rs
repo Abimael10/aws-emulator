@@ -1254,9 +1254,15 @@ const CONDITION_MEMBER: &str = "condition";
 const QUERY_MEMBER: &str = "query";
 const FILTER_MEMBER: &str = "filter";
 const PROJECTION_MEMBER: &str = "projection";
-const EXPRESSION_MEMBER: &str = "expression";
-const EXPRESSION_NAMES_MEMBER: &str = "expressionNames";
-const EXPRESSION_VALUES_MEMBER: &str = "expressionValues";
+/// The three members an EXPRESSION document carries, which is both what this data source's
+/// request object states a predicate in and what the `$util.transform` helper that builds one
+/// answers ([`crate::service::graphql_api::mapping_template::transform`]): one reading of the
+/// names, so the builder and the reader cannot disagree about one document.
+pub(super) const EXPRESSION_MEMBER: &str = "expression";
+/// See [`EXPRESSION_MEMBER`].
+pub(super) const EXPRESSION_NAMES_MEMBER: &str = "expressionNames";
+/// See [`EXPRESSION_MEMBER`].
+pub(super) const EXPRESSION_VALUES_MEMBER: &str = "expressionValues";
 const INDEX_MEMBER: &str = "index";
 const LIMIT_MEMBER: &str = "limit";
 const CONSISTENT_READ_MEMBER: &str = "consistentRead";

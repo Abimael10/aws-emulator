@@ -940,7 +940,7 @@ pub const DATA_SOURCE_NOT_FOUND_MESSAGE: &str = "Data source not found.";
 /// already taken within the API: the name, which is the member the caller has to
 /// change.
 pub fn data_source_exists_message(name: &str) -> String {
-    format!("Data source with name {name} already exists.")
+    format!("Data source with name {name} already exists")
 }
 
 /// The text a `BadRequestException` (HTTP 400) carries for a data source whose type
@@ -953,12 +953,12 @@ pub fn data_source_exists_message(name: &str) -> String {
 /// DynamoDB configuration states, i.e. the product's name without the vendor prefix the
 /// member's doc writes ("the new Amazon DynamoDB configuration"). The other members take
 /// the subject of their own doc on `CreateDataSourceRequest` /
-/// `UpdateDataSourceRequest` — `lambdaConfig` "the new Lambda configuration",
-/// `elasticsearchConfig` and `openSearchServiceConfig` "the new OpenSearch
-/// configuration", `httpConfig` "the new HTTP endpoint configuration",
+/// `UpdateDataSourceRequest` with the same vendor prefix dropped — `lambdaConfig` "the new
+/// Lambda configuration", `elasticsearchConfig` and `openSearchServiceConfig` "the new
+/// OpenSearch configuration", `httpConfig` "the new HTTP endpoint configuration",
 /// `relationalDatabaseConfig` "the new relational database configuration" and
-/// `eventBridgeConfig` "the new Amazon EventBridge settings". A configuration member
-/// added to the request later falls back to its own name.
+/// `eventBridgeConfig` "the new Amazon EventBridge settings", stated as `EventBridge`. A
+/// configuration member added to the request later falls back to its own name.
 pub fn missing_data_source_config_message(member: &str) -> String {
     let subject = match member {
         "lambdaConfig" => "Lambda",
@@ -966,7 +966,7 @@ pub fn missing_data_source_config_message(member: &str) -> String {
         "elasticsearchConfig" | "openSearchServiceConfig" => "OpenSearch",
         "httpConfig" => "HTTP endpoint",
         "relationalDatabaseConfig" => "relational database",
-        "eventBridgeConfig" => "Amazon EventBridge",
+        "eventBridgeConfig" => "EventBridge",
         other => other,
     };
     format!("Missing {subject} data source config")

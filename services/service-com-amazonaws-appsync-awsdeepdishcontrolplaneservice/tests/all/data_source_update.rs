@@ -48,11 +48,12 @@ const DESCRIPTIONS: &[Option<&str>] = &[Some("the new description"), Some(""), N
 const METRICS_CONFIGS: &[Option<&str>] = &[Some("ENABLED"), Some("DISABLED"), None];
 
 /// The text the configuration refusal carries for each configuration member of
-/// `UpdateDataSourceRequest`: it names the backend that member's own doc names — "the
-/// new Lambda configuration", "the new Amazon DynamoDB configuration", "the new
-/// OpenSearch configuration" (both the deprecated `elasticsearchConfig` and
-/// `openSearchServiceConfig`), "the new HTTP endpoint configuration", "the new
-/// relational database configuration" and "the new Amazon EventBridge settings".
+/// `UpdateDataSourceRequest`: it names the backend that member's own doc names, with the
+/// vendor prefix dropped — "the new Lambda configuration", "the new Amazon DynamoDB
+/// configuration", "the new OpenSearch configuration" (both the deprecated
+/// `elasticsearchConfig` and `openSearchServiceConfig`), "the new HTTP endpoint
+/// configuration", "the new relational database configuration" and "the new Amazon
+/// EventBridge settings".
 const MISSING_CONFIG_REFUSALS: &[(&str, &str)] = &[
     ("lambdaConfig", "Missing Lambda data source config"),
     ("dynamodbConfig", "Missing DynamoDB data source config"),
@@ -65,7 +66,7 @@ const MISSING_CONFIG_REFUSALS: &[(&str, &str)] = &[
     ),
     (
         "eventBridgeConfig",
-        "Missing Amazon EventBridge data source config",
+        "Missing EventBridge data source config",
     ),
 ];
 
