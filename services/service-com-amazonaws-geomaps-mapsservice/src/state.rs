@@ -420,10 +420,11 @@ pub enum IconShape {
 /// its shape and its colour.
 ///
 /// The rectangle is a width AND a height because a published sheet's icons are
-/// not square: a map pin is taller than it is wide, a route shield is wider than
-/// it is tall, and several icons have a footprint of their own inside their
-/// family. It carries an `x`/`y` as well because an icon's offset in the sheet
-/// is part of the published index rather than something a request recomputes.
+/// not square: a one-way arrow is far wider than it is tall, a route shield is
+/// wider than it is tall, and several icons have a footprint of their own
+/// inside their family. It carries an `x`/`y` as well because an icon's offset
+/// in the sheet is part of the published index rather than something a request
+/// recomputes.
 #[derive(Debug, Clone)]
 pub struct IconSpec {
     pub name: String,
@@ -439,7 +440,7 @@ pub struct IconSpec {
 
 impl IconSpec {
     /// One icon of a family, not yet placed on a sheet: its name, its box and
-    /// how it is drawn. [`place_icons_in_rows`] gives it its offset.
+    /// how it is drawn. [`place_icons_on_sheet`] gives it its offset.
     fn new(name: &str, width: u32, height: u32, shape: IconShape, tint: Rgba) -> Self {
         Self {
             name: name.to_string(),
@@ -1065,15 +1066,22 @@ fn seed_sprite_sheet(
     variant: VariantKind,
 ) -> SpriteSheetRecord {
     let p = palette(style, scheme);
-    // The sheet's first row: the symbol iconography — places, traffic
-    // incidents, city dots and map pins — in the order the published index
-    // lists it.
-    let mut symbols = Vec::with_capacity(
-        PLACE_ICONS.len() + INCIDENT_ICONS.len() + CITY_DOT_ICONS.len() + MARKER_ICONS.len(),
+    // The whole iconography of the sheet: places, traffic incidents, city dots,
+    // map pins, route shields and the heavy-goods-vehicle restriction signs.
+    // One sequence, because the published sheet packs them as one — not a row
+    // per family.
+    let shields = route_shield_icons(style, scheme, variant);
+    let mut icons = Vec::with_capacity(
+        PLACE_ICONS.len()
+            + INCIDENT_ICONS.len()
+            + CITY_DOT_ICONS.len()
+            + MARKER_ICONS.len()
+            + shields.len()
+            + RESTRICTION_SHIELD_ICONS.len(),
     );
     for name in PLACE_ICONS {
         let (width, height) = place_icon_box(name);
-        symbols.push(IconSpec::new(
+        icons.push(IconSpec::new(
             name,
             width,
             height,
@@ -1082,7 +1090,7 @@ fn seed_sprite_sheet(
         ));
     }
     for name in INCIDENT_ICONS {
-        symbols.push(IconSpec::new(
+        icons.push(IconSpec::new(
             name,
             INCIDENT_ICON_BOX,
             INCIDENT_ICON_BOX,
@@ -1092,7 +1100,7 @@ fn seed_sprite_sheet(
     }
     for name in CITY_DOT_ICONS {
         let box_size = city_dot_box(name);
-        symbols.push(IconSpec::new(
+        icons.push(IconSpec::new(
             name,
             box_size,
             box_size,
@@ -1101,83 +1109,82 @@ fn seed_sprite_sheet(
         ));
     }
     for name in MARKER_ICONS {
-        symbols.push(IconSpec::new(
+        icons.push(IconSpec::new(
             name,
-            MARKER_WIDTH,
-            MARKER_HEIGHT,
+            MARKER_BOX,
+            MARKER_BOX,
             IconShape::Pin,
             p.marker.rgba(),
         ));
     }
-    symbols.sort_by(|left, right| published_symbol_order(left).cmp(&published_symbol_order(right)));
-
-    // The route shields, and then the heavy-goods-vehicle restriction signs:
-    // each of those families starts a row of its own on the published sheet.
-    let mut shields: Vec<IconSpec> = route_shield_icons(style, scheme, variant)
-        .into_iter()
-        .map(|name| {
-            IconSpec::new(
-                name,
-                route_shield_width(name),
-                SHIELD_HEIGHT,
-                IconShape::Square,
-                p.building.rgba(),
-            )
-        })
-        .collect();
-    shields.sort_by(|left, right| left.name.cmp(&right.name));
-    let mut restrictions: Vec<IconSpec> = RESTRICTION_SHIELD_ICONS
-        .iter()
-        .map(|name| {
-            IconSpec::new(
-                name,
-                RESTRICTION_SHIELD_BOX,
-                RESTRICTION_SHIELD_BOX,
-                IconShape::Square,
-                p.road.rgba(),
-            )
-        })
-        .collect();
-    restrictions.sort_by(|left, right| left.name.cmp(&right.name));
+    for name in shields {
+        icons.push(IconSpec::new(
+            name,
+            route_shield_width(name),
+            SHIELD_HEIGHT,
+            IconShape::Square,
+            p.building.rgba(),
+        ));
+    }
+    for name in RESTRICTION_SHIELD_ICONS {
+        icons.push(IconSpec::new(
+            name,
+            RESTRICTION_SHIELD_BOX,
+            RESTRICTION_SHIELD_BOX,
+            IconShape::Square,
+            p.road.rgba(),
+        ));
+    }
+    icons.sort_by(|left, right| published_icon_order(left).cmp(&published_icon_order(right)));
 
     SpriteSheetRecord {
         style,
         color_scheme: scheme,
         variant,
-        icons: place_icons_in_rows(vec![symbols, shields, restrictions]),
+        icons: place_icons_on_sheet(icons),
         cache_control: "max-age=86400".to_string(),
     }
 }
 
-/// Give every icon its offset on the sheet, one row per family.
+/// Give every icon its offset on the sheet: one sequence of icons, in the
+/// published listing order, packed left to right and wrapped at the sheet's
+/// width.
 ///
-/// Within a row the icons abut from the sheet's left edge, and a row sits
-/// directly below the one before it and is as tall as its tallest icon — which
-/// is what the published index reports: the entries of a row share a `y`, and
-/// each entry's `x` is the previous one's `x` plus that entry's width.
-fn place_icons_in_rows(rows: Vec<Vec<IconSpec>>) -> Vec<IconSpec> {
-    let mut placed = Vec::new();
+/// Each icon abuts the one listed before it, so an entry's `x` is the previous
+/// entry's `x` plus that entry's own width; an icon that no longer fits starts a
+/// new row directly below, as tall as the tallest icon of the row it closes.
+/// The families are NOT rows of their own: the published index runs the shields
+/// on from the symbol iconography in the same row and wraps in the middle of
+/// them, which is why the offsets follow the listing order and the sheet's
+/// width rather than the family an icon belongs to.
+fn place_icons_on_sheet(icons: Vec<IconSpec>) -> Vec<IconSpec> {
+    let mut placed = Vec::with_capacity(icons.len());
+    let mut x = 0;
     let mut y = 0;
-    for row in rows {
-        let mut x = 0;
-        let mut row_height = 0;
-        for mut icon in row {
-            icon.x = x;
-            icon.y = y;
-            x += icon.width;
-            row_height = row_height.max(icon.height);
-            placed.push(icon);
+    let mut row_height = 0;
+    for mut icon in icons {
+        if x > 0 && x + icon.width > SPRITE_SHEET_WIDTH {
+            x = 0;
+            y += row_height;
+            row_height = 0;
         }
-        y += row_height;
+        icon.x = x;
+        icon.y = y;
+        x += icon.width;
+        row_height = row_height.max(icon.height);
+        placed.push(icon);
     }
     placed
 }
 
-/// Where the published index lists one symbol icon inside the sheet's first
-/// row: at its FAMILY's place in the row — a city dot is listed where the
-/// family name sorts, whichever of the four dots it is — then widest box first
-/// within a family, then by name.
-fn published_symbol_order(icon: &IconSpec) -> (&str, std::cmp::Reverse<u32>, &str) {
+/// Where the published index lists one icon: by name, except that a city dot is
+/// listed at its FAMILY's place — whichever of the four dots it is — widest box
+/// first within that family.
+///
+/// Every other icon is its own family, so for those the name decides the place
+/// and the width tiebreak never comes into it: the city dots are the one family
+/// the index keeps together.
+fn published_icon_order(icon: &IconSpec) -> (&str, std::cmp::Reverse<u32>, &str) {
     let family = if icon.name.starts_with(CITY_DOT_FAMILY) {
         CITY_DOT_FAMILY
     } else {
@@ -1190,6 +1197,23 @@ fn published_symbol_order(icon: &IconSpec) -> (&str, std::cmp::Reverse<u32>, &st
 // The published sprite-sheet iconography
 // ---------------------------------------------------------------------------
 
+/// How wide the published sheet is, in style pixels: the width the published
+/// index's rows wrap at.
+///
+/// Source for this, as for every footprint and name in this section: the
+/// `sprites.json` index the Maps asset endpoint serves for a sheet — the icon
+/// catalog `GetSprites`' own model documentation points at ("Style iconography
+/// with sprites" in the Amazon Location Service Developer Guide). The index
+/// reports the symbol iconography and the route shields through the Korean
+/// expressway shields on the first row, and the rest of the shields on the
+/// next, so the sheet is this wide and not as wide as its whole iconography.
+///
+/// Where a row ENDS follows from this width AND from the footprints before it,
+/// so this constant and the footprints in this section are one piece of catalog
+/// data: a footprint corrected here moves the wrap, and the two are read from
+/// the published index together.
+pub const SPRITE_SHEET_WIDTH: u32 = 1920;
+
 /// The box most place (point-of-interest) icons occupy at `pixelRatio` 1: the
 /// published index reports this square for every place icon that does not
 /// appear in [`PLACE_ICON_BOXES`] (`accommodation` and `airport` are 21x21).
@@ -1199,14 +1223,15 @@ pub const PLACE_ICON_BOX: u32 = 21;
 /// rather than at the family's square [`PLACE_ICON_BOX`]: a published sheet's
 /// icons are drawn art, so an icon is as wide and as tall as its own artwork.
 ///
-/// Source for these, as for every name in this section: the `sprites.json`
-/// index the Maps asset endpoint serves for a sheet — the icon catalog
-/// `GetSprites`' own model documentation points at ("Style iconography with
-/// sprites" in the Amazon Location Service Developer Guide).
+/// `oneway` is a wide, short arrow drawn along the road it marks, and `other`
+/// is the generic place glyph, drawn at the size of a traffic-incident icon
+/// rather than of a place icon.
 const PLACE_ICON_BOXES: &[(&str, u32, u32)] = &[
     ("bicycle", 22, 20),
     ("bus", 20, 20),
     ("entrance", 20, 20),
+    ("oneway", 50, 29),
+    ("other", 32, 32),
 ];
 
 /// The box the place icon `name` occupies at `pixelRatio` 1: its own published
@@ -1237,10 +1262,10 @@ pub const CITY_DOT_FAMILY: &str = "citydot";
 pub const CITY_DOT_BOX: u32 = 5;
 pub const CITY_DOT_OPEN_BOX: u32 = 6;
 
-/// The box a map pin (`marker`, `marker_*`) occupies: a pin is taller than it
-/// is wide, head plus stem.
-pub const MARKER_WIDTH: u32 = 24;
-pub const MARKER_HEIGHT: u32 = 32;
+/// The box a map pin (`marker`, `marker_*`) occupies: the published index
+/// reports every pin of the family at this square, the same box as a place
+/// icon.
+pub const MARKER_BOX: u32 = 21;
 
 /// A route shield's height, and the width of the box that holds a two-digit
 /// route number. A shield grows by [`SHIELD_DIGIT_WIDTH`] for every digit
@@ -1392,13 +1417,17 @@ const MARKER_ICONS: &[&str] = &[
 /// network's own namespaced identifier (`shield-AU:NH`, `shield-JP:prefectural`,
 /// `shield-ch:national`) where the network has one, and the shield's shape or
 /// route family (`shield-rectangle-blue`, `shield-US-Hwy-1-2`) where it does
-/// not.
+/// not. A few networks are carried under a SECOND, short name as well — the
+/// route or the local word for it (`shield-AE`, `shield-BAB`,
+/// `shield-NL-ring`) — so a style layer that asks for either name resolves.
 const ROUTE_SHIELD_ICONS: &[&str] = &[
+    "shield-AE",
     "shield-AE:E-route",
     "shield-AU:MR",
     "shield-AU:NH",
     "shield-AU:S",
     "shield-AU:T",
+    "shield-BAB",
     "shield-BR",
     "shield-CA",
     "shield-CN:expressway",
@@ -1421,6 +1450,7 @@ const ROUTE_SHIELD_ICONS: &[&str] = &[
     "shield-MX-Federal-3-4",
     "shield-MY",
     "shield-NL",
+    "shield-NL-ring",
     "shield-NL:binnenstedelijke_ring",
     "shield-PH:E",
     "shield-PK:motorway",

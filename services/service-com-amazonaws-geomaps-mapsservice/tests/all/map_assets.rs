@@ -30,8 +30,8 @@ use service_com_amazonaws_geomaps_mapsservice::state::assets;
 use service_com_amazonaws_geomaps_mapsservice::state::vector_tile::Tile;
 use service_com_amazonaws_geomaps_mapsservice::state::{
     route_shield_width, ColorSchemeKind, Hsla, MapStyleKind, TileFormat, VariantKind, CITY_DOT_BOX,
-    CITY_DOT_OPEN_BOX, INCIDENT_ICON_BOX, MARKER_HEIGHT, MARKER_WIDTH, PLACE_ICON_BOX,
-    RESTRICTION_SHIELD_BOX, SHIELD_BASE_WIDTH, SHIELD_DIGIT_WIDTH,
+    CITY_DOT_FAMILY, CITY_DOT_OPEN_BOX, INCIDENT_ICON_BOX, MARKER_BOX, PLACE_ICON_BOX,
+    RESTRICTION_SHIELD_BOX, SHIELD_BASE_WIDTH, SHIELD_DIGIT_WIDTH, SPRITE_SHEET_WIDTH,
 };
 use service_com_amazonaws_geomaps_mapsservice::{
     ComAmazonawsGeomapsMapsserviceState, EmulatedService,
@@ -1834,7 +1834,7 @@ async fn the_sprite_index_lists_the_published_iconography() {
         ("citydot", CITY_DOT_BOX, CITY_DOT_BOX),
         ("citydot_lowrank", CITY_DOT_BOX, CITY_DOT_BOX),
         ("citydot-open", CITY_DOT_OPEN_BOX, CITY_DOT_OPEN_BOX),
-        ("marker_transit", MARKER_WIDTH, MARKER_HEIGHT),
+        ("marker_transit", MARKER_BOX, MARKER_BOX),
         (
             "shield-hgv-weight_restriction",
             RESTRICTION_SHIELD_BOX,
@@ -2097,11 +2097,11 @@ async fn the_sprite_index_reports_the_sheets_stored_geometry() {
 async fn a_published_icon_keeps_its_own_footprint() {
     let emulator = Emulator::new();
     // Rows: one icon of every footprint the published index reports, including
-    // the icons that differ from their family's square and the two city-dot
-    // sizes. Source: the `sprites.json` index the Maps asset endpoint publishes
-    // for a sheet (`accident`, `airport` and `marker` are not in the issue's
-    // divergence list).
-    let footprints: [(&str, u32, u32); 11] = [
+    // the icons that differ from their family's square, the two city-dot sizes,
+    // the whole map-pin family and the two glyphs the index reports larger than
+    // their family. Source: the `sprites.json` index the Maps asset endpoint
+    // publishes for a sheet.
+    let footprints: [(&str, u32, u32); 18] = [
         ("accommodation", 21, 21),
         ("airport", 21, 21),
         ("bicycle", 22, 20),
@@ -2112,7 +2112,14 @@ async fn a_published_icon_keeps_its_own_footprint() {
         ("citydot-open", 6, 6),
         ("citydot-open_lowrank", 6, 6),
         ("accident", 32, 32),
-        ("marker", 24, 32),
+        ("oneway", 50, 29),
+        ("other", 32, 32),
+        ("marker", 21, 21),
+        ("marker_arts_entertainment", 21, 21),
+        ("marker_food_drink", 21, 21),
+        ("marker_recreation", 21, 21),
+        ("marker_stores_services", 21, 21),
+        ("marker_transit", 21, 21),
     ];
 
     for style in MapStyleKind::ALL {
@@ -2138,61 +2145,170 @@ async fn a_published_icon_keeps_its_own_footprint() {
     }
 }
 
-/// The symbol iconography — places, traffic incidents, city dots and map pins —
-/// shares the sheet's first row: every one of those icons is at `y` 0, they
-/// abut from the sheet's left edge, and the shield families follow on later
-/// rows instead of wrapping into the first one.
+/// The sheet is ONE packing of its whole iconography: the entries abut along a
+/// row in the order the index lists them, a row is as tall as its tallest icon,
+/// and a row ends only where the next icon no longer fits the sheet's width.
+/// Nothing is laid out per family, so no family starts a row of its own.
 #[tokio::test]
-async fn the_symbol_iconography_abuts_along_the_sheets_first_row() {
+async fn the_iconography_abuts_in_listing_order_and_wraps_at_the_sheet_width() {
     let emulator = Emulator::new();
     for style in MapStyleKind::ALL {
         for scheme in ColorSchemeKind::ALL {
-            // Rows: both pixel ratios, so the row holds at both scales.
+            // Rows: both pixel ratios, so the packing holds at both scales.
             for (file, ratio) in [("sprites.json", 1_u32), ("sprites@2x.json", 2)] {
                 let case = format!("{}/{}/{file}", style.as_wire(), scheme.as_wire());
                 let index = sprite_index(&emulator, style, scheme, file).await;
+                let sheet_width = SPRITE_SHEET_WIDTH * ratio;
 
-                let mut symbols: Vec<(String, u32, u32, u32)> = Vec::new();
-                let mut shields: Vec<(String, u32)> = Vec::new();
-                for (name, entry) in &index {
-                    let (x, y, width, height) = entry_rectangle(&case, name, entry);
-                    if name.starts_with("shield-") {
-                        shields.push((name.clone(), y));
-                    } else {
-                        symbols.push((name.clone(), x, y, width));
-                        assert!(
-                            height <= INCIDENT_ICON_BOX * ratio,
-                            "case {case:?}: {name} is {height} tall, taller than the first row"
-                        );
-                    }
-                }
-                symbols.sort_by_key(|(_, x, _, _)| *x);
+                let mut boxes: Vec<(String, u32, u32, u32, u32)> = index
+                    .iter()
+                    .map(|(name, entry)| {
+                        let (x, y, width, height) = entry_rectangle(&case, name, entry);
+                        (name.clone(), x, y, width, height)
+                    })
+                    .collect();
+                boxes.sort_by_key(|(_, x, y, _, _)| (*y, *x));
 
                 let mut cursor = 0;
-                for (name, x, y, width) in &symbols {
-                    assert_eq!(
-                        *y, 0,
-                        "case {case:?}: {name} must sit on the sheet's first row, got y {y}"
+                let mut row_y = 0;
+                let mut row_height = 0;
+                for (name, x, y, width, height) in &boxes {
+                    assert!(
+                        x + width <= sheet_width,
+                        "case {case:?}: {name} ends at {}, past the {sheet_width}-pixel sheet",
+                        x + width
                     );
+                    if *y != row_y {
+                        assert_eq!(
+                            *y,
+                            row_y + row_height,
+                            "case {case:?}: {name}'s row must follow the row above it at {}, \
+                             got {y}",
+                            row_y + row_height
+                        );
+                        assert!(
+                            cursor + width > sheet_width,
+                            "case {case:?}: {name} still fits the row above at {cursor}, \
+                             so it must not start a new row"
+                        );
+                        row_y = *y;
+                        row_height = 0;
+                        cursor = 0;
+                    }
                     assert_eq!(
                         *x, cursor,
                         "case {case:?}: {name} must abut the icon before it at {cursor}, got {x}"
                     );
                     cursor += width;
+                    row_height = row_height.max(*height);
                 }
-                // The published first row runs well past 558 style pixels —
-                // the offset the published index reports for `ferry` — so
-                // nothing wraps out of it early.
                 assert!(
-                    cursor > 558 * ratio,
-                    "case {case:?}: the first row holds the whole symbol iconography, \
-                     got a row {cursor} wide"
+                    row_y > 0,
+                    "case {case:?}: the iconography is wider than the sheet, so it must wrap, \
+                     got every icon on one row"
                 );
-                for (name, y) in &shields {
-                    assert!(
-                        *y >= INCIDENT_ICON_BOX * ratio,
-                        "case {case:?}: {name} belongs to a later row, got y {y}"
-                    );
+            }
+        }
+    }
+}
+
+/// The packing runs the whole iconography through ONE listing order, so an icon
+/// the index lists later never sits earlier on the sheet: the road shields are
+/// packed between the symbol icons whose names surround them, and the row wraps
+/// in the middle of them rather than at a family boundary.
+#[tokio::test]
+async fn the_packing_follows_the_published_listing_order() {
+    let emulator = Emulator::new();
+    for style in MapStyleKind::ALL {
+        for scheme in ColorSchemeKind::ALL {
+            let case = format!("{}/{}", style.as_wire(), scheme.as_wire());
+            let index = sprite_index(&emulator, style, scheme, "sprites.json").await;
+            // The four city dots are the one family the index lists together,
+            // widest ring first, so they are not part of this walk.
+            let mut listed: Vec<(String, u32, u32)> = index
+                .iter()
+                .filter(|(name, _)| !name.starts_with(CITY_DOT_FAMILY))
+                .map(|(name, entry)| {
+                    let (x, y, _, _) = entry_rectangle(&case, name, entry);
+                    (name.clone(), y, x)
+                })
+                .collect();
+            listed.sort_by(|left, right| left.0.cmp(&right.0));
+            for pair in listed.windows(2) {
+                let (before, after) = (&pair[0], &pair[1]);
+                assert!(
+                    (before.1, before.2) < (after.1, after.2),
+                    "case {case:?}: {} is listed before {} and must not sit after it, got \
+                     {},{} then {},{}",
+                    before.0,
+                    after.0,
+                    before.2,
+                    before.1,
+                    after.2,
+                    after.1
+                );
+            }
+
+            let shield_rows: BTreeSet<u32> = listed
+                .iter()
+                .filter(|(name, _, _)| name.starts_with("shield-"))
+                .map(|(_, y, _)| *y)
+                .collect();
+            assert!(
+                shield_rows.contains(&0),
+                "case {case:?}: the shields continue the sheet's first row, got rows \
+                 {shield_rows:?}"
+            );
+            assert!(
+                shield_rows.len() > 1,
+                "case {case:?}: the shields are wider than one row, so they must wrap, got rows \
+                 {shield_rows:?}"
+            );
+        }
+    }
+}
+
+/// The index describes a sheet a client can cut icons out of: every rectangle
+/// it reports is disjoint from every other, so no icon is drawn over its
+/// neighbour.
+#[tokio::test]
+async fn no_two_published_icons_share_a_pixel() {
+    let emulator = Emulator::new();
+    for style in MapStyleKind::ALL {
+        for scheme in ColorSchemeKind::ALL {
+            // Rows: both pixel ratios, because scaling the sheet must not make
+            // two rectangles meet.
+            for file in ["sprites.json", "sprites@2x.json"] {
+                let case = format!("{}/{}/{file}", style.as_wire(), scheme.as_wire());
+                let index = sprite_index(&emulator, style, scheme, file).await;
+                let boxes: Vec<(String, u32, u32, u32, u32)> = index
+                    .iter()
+                    .map(|(name, entry)| {
+                        let (x, y, width, height) = entry_rectangle(&case, name, entry);
+                        (name.clone(), x, y, width, height)
+                    })
+                    .collect();
+                for (index_of_left, left) in boxes.iter().enumerate() {
+                    for right in &boxes[index_of_left + 1..] {
+                        let overlaps = left.1 < right.1 + right.3
+                            && right.1 < left.1 + left.3
+                            && left.2 < right.2 + right.4
+                            && right.2 < left.2 + left.4;
+                        assert!(
+                            !overlaps,
+                            "case {case:?}: {} at {},{} {}x{} overlaps {} at {},{} {}x{}",
+                            left.0,
+                            left.1,
+                            left.2,
+                            left.3,
+                            left.4,
+                            right.0,
+                            right.1,
+                            right.2,
+                            right.3,
+                            right.4
+                        );
+                    }
                 }
             }
         }
@@ -2200,8 +2316,9 @@ async fn the_symbol_iconography_abuts_along_the_sheets_first_row() {
 }
 
 /// A road shield is published under the name of the NETWORK it signs, written
-/// as that network's own namespaced identifier, rather than under a
-/// country-code spelling of its own.
+/// as that network's own namespaced identifier; a few of those networks are
+/// published under a short second name as well, and a bare country code is
+/// never one of them.
 #[tokio::test]
 async fn a_road_shield_is_published_under_its_network_name() {
     let emulator = Emulator::new();
@@ -2221,24 +2338,20 @@ async fn a_road_shield_is_published_under_its_network_name() {
         "shield-ch:national",
         "shield-md:national",
     ];
-    // A country-code spelling that stands in for one of those networks is not
-    // a published icon name: a style's icon-image lookup resolves the
-    // network's own name.
-    let unpublished: [&str; 6] = [
-        "shield-AE",
-        "shield-AU",
-        "shield-BAB",
-        "shield-DE",
-        "shield-JP",
-        "shield-NL-ring",
-    ];
+    // A network whose shield the index carries under a SECOND, short name as
+    // well: the route it signs, or the local word for the network. Source: the
+    // published `sprites.json` index.
+    let aliases: [&str; 3] = ["shield-AE", "shield-BAB", "shield-NL-ring"];
+    // A bare country code is not one of those short names: a style's
+    // icon-image lookup resolves the network's own name.
+    let unpublished: [&str; 3] = ["shield-AU", "shield-DE", "shield-JP"];
 
     for style in MapStyleKind::ALL {
         for scheme in ColorSchemeKind::ALL {
             for file in ["sprites.json", "sprites@2x.json"] {
                 let case = format!("{}/{}/{file}", style.as_wire(), scheme.as_wire());
                 let index = sprite_index(&emulator, style, scheme, file).await;
-                for name in networked {
+                for name in networked.into_iter().chain(aliases) {
                     assert!(
                         index.contains_key(name),
                         "case {case:?}: the index must carry {name}, \
@@ -2297,9 +2410,11 @@ async fn the_first_row_reports_the_published_offsets() {
     let emulator = Emulator::new();
     // Rows: the `x` the published index reports for icons spread across the
     // first row — before the city dots, the four dots themselves (the open ring
-    // is listed first), and the run after them. Source: the published
-    // `sprites.json` index.
-    let offsets: [(&str, u32); 12] = [
+    // is listed first), the run after them, and the run past the map pins and
+    // the two glyphs the index reports larger than their family, whose own
+    // footprints every later offset of the row depends on. Source: the
+    // published `sprites.json` index.
+    let offsets: [(&str, u32); 17] = [
         ("book", 117),
         ("bus", 138),
         ("citydot-open", 305),
@@ -2312,6 +2427,11 @@ async fn the_first_row_reports_the_published_offsets() {
         ("education", 475),
         ("entrance", 496),
         ("ferry", 558),
+        ("marker_arts_entertainment", 831),
+        ("metro", 936),
+        ("oneway", 1062),
+        ("other", 1112),
+        ("place-of-worship", 1228),
     ];
 
     for style in MapStyleKind::ALL {

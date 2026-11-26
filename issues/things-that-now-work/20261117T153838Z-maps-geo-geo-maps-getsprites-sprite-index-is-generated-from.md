@@ -171,3 +171,23 @@ Smithy consulted: services/service-com-amazonaws-geomaps-mapsservice/smithy-mode
 3. Cause 1: replay fixture geo-maps-sprites-style-color-variants, step task#3 — a GetSprites GET on /v2/styles/{Style}/{ColorScheme}/{Variant}/sprites/sprites.json for that fixture's recorded style/color-scheme/variant. Parse the returned JSON index and compare each entry's width/height against the recorded response: the emulator returns one constant box size for the whole marker family and flattens oneway and other to it, instead of each icon's own size.
 4. Cause 2: replay fixture geo-maps-vector-basemap-style-workflow, step task#3 — the same operation for a different style/color-scheme/variant. Compare each entry's x (and the shield entries' y) against the recorded response: the offsets step by a constant pitch and drift away from the published packing, and the emitted icon-name set (notably the shield-* keys) is not the published sheet's.
 5. Both steps answer HTTP 200, so the divergence is visible only by diffing the index body against the recorded one.
+
+## Resolution, and what remains
+
+Fixed: the index now reports each icon's own published footprint (the map-pin family, the one-way
+arrow and the generic place glyph had been carrying a family constant), the sheet is ONE packing of
+its whole iconography in the index's listing order wrapping at the sheet's width (the shields
+continue the first row instead of starting rows of their own), and the three published icon names
+the catalog lacked — shield-AE, shield-BAB, shield-NL-ring — are carried. Every published offset
+this report and its predecessor quote is reproduced, and the shields' `y` offsets and several of
+their `x` offsets now match the recording.
+
+Remaining, and declined: the `width`/`height` of the network-namespaced route-shield glyphs
+(shield-AE:E-route, shield-AU:*, shield-JP:*, shield-TW:* and the rest of the colon-namespaced
+names listed above), and the `x` that follows from a width. Those are the pixel sizes of individual
+pieces of published artwork: the model says nothing about the payload, no rule produces them (a
+shield's width here follows the digit capacity its own name states, which is the only rule this
+catalog has), this report quotes no value for any of them, and the replay withholds the recorded
+values — so they could only be matched by transcribing one recording's bytes glyph by glyph.
+Everything the recording exposes ABOUT them — the names the sheet publishes, that they share the
+sheet's first row with the symbol iconography, and where that row wraps — is implemented.
