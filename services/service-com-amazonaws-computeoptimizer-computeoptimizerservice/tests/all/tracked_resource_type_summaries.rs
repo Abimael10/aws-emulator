@@ -3,11 +3,11 @@
 //! The ORDER `GetRecommendationSummaries` rolls an account's findings up in, and the
 //! vocabulary that order walks.
 //!
-//! The rule under test: the groups a summary page reports are the whole
+//! The rule under test: the groups a summary walk reports are the whole
 //! `RecommendationSourceType` vocabulary `RecommendationSummary$recommendationResourceType`
-//! names, in the order the model declares it, and that vocabulary BOUNDS the answer — so a
-//! client that indexes the response, or derives the tracked resource-type set from it, reads
-//! the same groups in the same places whatever size it asks for.
+//! names, in the order the model declares it, and that vocabulary BOUNDS the walk — so a
+//! client that walks the pages, or derives the tracked resource-type set from them, reads the
+//! same groups in the same order whatever size it asks for.
 //!
 //! That the entries exist at all for an account whose analysis has produced nothing, and what
 //! each of them counts, is asserted in `tests/all/summary_resource_type_surface.rs` and
@@ -47,8 +47,8 @@ fn the_tracked_resource_types_are_the_modelled_vocabulary() {
 }
 
 /// One answer reports the tracked vocabulary in the order the model declares it, and the size
-/// a request asks for changes neither the order nor the set: the summary set is bounded by
-/// that vocabulary, so it is answered whole with no `nextToken` to walk.
+/// a request asks for changes neither the order nor the set: it bounds how many groups one
+/// answer carries, and walking the pages reports every group once, in that order.
 #[tokio::test]
 async fn the_summaries_are_reported_in_the_tracked_order() {
     let (router, engine) = emulator_with_engine();
@@ -66,24 +66,40 @@ async fn the_summaries_are_reported_in_the_tracked_order() {
     );
 
     // Rows: sizes smaller than the vocabulary, one that divides it unevenly, and one holding
-    // the lot — none of which moves a group out of the reported order.
+    // the lot — none of which moves a group out of the reported order: a size bounds how many
+    // groups one answer carries, and the walk reports them in that order.
     for max_results in [1, 3, 5, TRACKED_SOURCE_TYPES.len()] {
         let case = format!("maxResults={max_results}");
-        let answer = summary_set(&router, &case, json!({"maxResults": max_results})).await;
-        assert!(
-            answer["nextToken"].is_null(),
-            "case {case:?}: the whole vocabulary is answered, so there is no page to advance \
-             to, got {answer}"
-        );
+        let mut walked: Vec<String> = Vec::new();
+        let mut next_token: Option<String> = None;
+        loop {
+            let mut request = json!({"maxResults": max_results});
+            if let Some(token) = &next_token {
+                request["nextToken"] = json!(token);
+            }
+            let answer = summary_set(&router, &case, request).await;
+            let page = summary_resource_types(&case, &answer);
+            assert!(
+                page.len() <= max_results,
+                "case {case:?}: an answer carries at most the {max_results} groups asked for, \
+                 got {page:?}"
+            );
+            walked.extend(page);
+            next_token = answer["nextToken"].as_str().map(ToString::to_string);
+            if next_token.is_none() {
+                break;
+            }
+            assert!(
+                walked.len() <= TRACKED_SOURCE_TYPES.len(),
+                "case {case:?}: a walk cannot report more than the tracked vocabulary, got \
+                 {walked:?}"
+            );
+        }
         assert_eq!(
-            summary_resource_types(&case, &answer),
+            walked,
             TRACKED_SOURCE_TYPES.to_vec(),
-            "case {case:?}: the answer must be exactly the tracked vocabulary, in the tracked \
-             order"
-        );
-        assert_eq!(
-            answer, whole,
-            "case {case:?}: the size asked for must not change what each summary says"
+            "case {case:?}: the walk must report exactly the tracked vocabulary, in the \
+             tracked order"
         );
     }
 }

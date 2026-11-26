@@ -3730,14 +3730,15 @@ pub const METRIC_REASON_MEMORY_OVERPROVISIONED: &str = "MemoryOverprovisioned";
 /// See [`METRIC_REASON_MEMORY_OVERPROVISIONED`].
 pub const METRIC_REASON_MEMORY_UNDERPROVISIONED: &str = "MemoryUnderprovisioned";
 
-/// The `nextToken` shape `GetRecommendationSummaries` RESUMES a read at: the
-/// `RecommendationSourceType` the answer starts from, hex-encoded so a client can neither
+/// The `nextToken` shape `GetRecommendationSummaries` pages its answer with: the
+/// `RecommendationSourceType` the next page starts from, hex-encoded so a client can neither
 /// read nor construct one.
 ///
-/// The operation answers the whole summary set at once ([`TRACKED_SOURCE_TYPES`]) and so hands
-/// no token out; the format lives here beside [`decode_summary_page_token`] so the two cannot
-/// drift apart, and a token from the other paginated reader decodes to nothing here (and this
-/// one to nothing there), so neither can resume the other's walk.
+/// The sequence that operation walks is the fixed vocabulary in its reported order
+/// ([`TRACKED_SOURCE_TYPES`]), so the group a token names is the same position in every walk of
+/// it, whatever the account holds; the format lives here beside [`decode_summary_page_token`]
+/// so the two cannot drift apart, and a token from the other paginated readers decodes to
+/// nothing here (and this one to nothing there), so neither can resume the other's walk.
 pub fn encode_summary_page_token(resource_type: &str) -> String {
     ::hex::encode(::serde_json::json!({ "summariesFrom": resource_type }).to_string())
 }

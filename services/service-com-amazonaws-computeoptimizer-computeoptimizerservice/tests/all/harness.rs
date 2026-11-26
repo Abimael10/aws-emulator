@@ -1037,8 +1037,9 @@ pub(crate) fn make_analysis_due(engine: &Arc<engine::InMemoryEngine>) {
         Some(DateTime::from_secs_f64(written - ANALYSIS_DELAY.as_secs_f64()));
 }
 
-/// Read the recommendation summaries, asserting the call succeeded. The summary set is
-/// answered whole, so ONE call is the whole set.
+/// Read the recommendation summaries, asserting the call succeeded. ONE call is ONE page: a
+/// suite that wants the whole set either asks for no size (the default page holds it) or walks
+/// the `nextToken`.
 pub(crate) async fn summary_set(
     router: &MultiServiceRouter,
     case: &str,

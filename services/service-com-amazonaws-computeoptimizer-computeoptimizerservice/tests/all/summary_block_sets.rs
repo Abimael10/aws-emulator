@@ -8,14 +8,18 @@
 //!
 //! Two rules are under test.
 //!
-//! * The summary set is BOUNDED by the resource-type vocabulary — one row per
-//!   `RecommendationSourceType` the service reports on, whatever the account holds of it — so
-//!   the whole set is answered at once: a request is answered with every row and no
-//!   `nextToken`, whatever `maxResults` it asks for. The rule generalises over the size asked
-//!   for, so the rows below are the forms `maxResults` can take: absent, the modelled range's
-//!   bounds, a size smaller than the set, exactly its size, and one larger. The `nextToken`
-//!   cursor stays the one the model declares: a token naming a group resumes the answer at
-//!   it, and a value that is not one of this operation's tokens is refused.
+//! * `maxResults` bounds ONE answer and the `nextToken` walks the rest. The summary set is the
+//!   resource-type vocabulary — one row per `RecommendationSourceType` the service reports on,
+//!   whatever the account holds of it — and `maxResults` is "The maximum number of
+//!   recommendation summaries to return with a single request. To retrieve the remaining
+//!   results, make another request with the returned nextToken value.", so an answer carries
+//!   at most that many rows, a token is handed out exactly while rows remain past the page,
+//!   and walking the pages reports the same rows, in the same order, as an unpaged read. The
+//!   rule generalises over the size asked for, so the rows below are the forms `maxResults`
+//!   can take: absent, the modelled range's bounds, a size smaller than the set, one that
+//!   divides it unevenly, exactly its size, and one larger. The `nextToken` cursor is the one
+//!   the model declares: a token naming a group resumes the answer at it, and a value that is
+//!   not one of this operation's tokens is refused.
 //! * A summary row counts the account's resources at the finding vocabulary of THAT resource
 //!   type's own recommendations, which is not narrowed to the values the model's `Finding`
 //!   enum lists: a commercial software license is counted at the three `LicenseFinding`
@@ -28,9 +32,9 @@
 
 use std::collections::BTreeMap;
 
-use serde_json::json;
+use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    encode_summary_page_token, TRACKED_SOURCE_TYPES,
+    encode_summary_page_token, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, TRACKED_SOURCE_TYPES,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -46,40 +50,224 @@ use crate::harness::{
 /// `finding` from.
 const LICENSE_FINDINGS: &[&str] = &["Optimized", "NotOptimized", "InsufficientMetrics"];
 
-/// Whatever page size a request asks for, the answer is the WHOLE summary set — one row per
-/// resource type the service reports on, in one answer, with no `nextToken` to walk.
+/// The resource types a list of summaries covers, in the order reported.
+fn summary_types(case: &str, summaries: &[Value]) -> Vec<String> {
+    summaries
+        .iter()
+        .map(|summary| {
+            summary["recommendationResourceType"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: a summary names its resource type, got {summary}")
+                })
+                .to_string()
+        })
+        .collect()
+}
+
+/// One reading of the summaries, `max_results` at a time, walking the `nextToken` to the last
+/// page: every summary reported, in order, and the size of each page that reported them.
+///
+/// `max_results` is `None` for a request that names no size at all, so the row that asks for
+/// none drives exactly the same walk as the rows that do.
+async fn walk(
+    router: &MultiServiceRouter,
+    case: &str,
+    max_results: Option<i64>,
+) -> (Vec<Value>, Vec<usize>) {
+    let mut summaries: Vec<Value> = Vec::new();
+    let mut page_sizes: Vec<usize> = Vec::new();
+    let mut next_token: Option<String> = None;
+    loop {
+        let mut request = json!({});
+        if let Some(size) = max_results {
+            request["maxResults"] = json!(size);
+        }
+        if let Some(token) = &next_token {
+            request["nextToken"] = json!(token);
+        }
+        let body = summary_set(router, case, request).await;
+        let page = body["recommendationSummaries"]
+            .as_array()
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: recommendationSummaries must be a list, got {body}")
+            });
+        page_sizes.push(page.len());
+        summaries.extend(page);
+        next_token = body["nextToken"].as_str().map(ToString::to_string);
+        if next_token.is_none() {
+            return (summaries, page_sizes);
+        }
+        assert!(
+            summaries.len() <= TRACKED_SOURCE_TYPES.len(),
+            "case {case:?}: a token is handed out only while summaries remain, so a walk \
+             cannot report more than the {} the service reports on, got {} over pages {:?}",
+            TRACKED_SOURCE_TYPES.len(),
+            summaries.len(),
+            page_sizes
+        );
+    }
+}
+
+/// The page sizes a walk of `total` items `page_size` at a time reports, in order: the full
+/// pages, then whatever is left over, and one empty page for nothing at all.
+fn expected_page_sizes(total: usize, page_size: usize) -> Vec<usize> {
+    if total == 0 {
+        return vec![0];
+    }
+    let mut sizes: Vec<usize> = vec![page_size; total / page_size];
+    if !total.is_multiple_of(page_size) {
+        sizes.push(total % page_size);
+    }
+    sizes
+}
+
+/// `maxResults` bounds a page and the `nextToken` walks the rest: whatever size a request asks
+/// for, no answer carries more rows than it, a token is handed out exactly while rows remain,
+/// and the walk reports the same summaries in the same order as a request that asks for no size.
 #[tokio::test]
-async fn the_whole_summary_set_is_answered_whatever_max_results_asks_for() {
+async fn max_results_bounds_a_page_and_the_next_token_walks_the_rest() {
     let router = emulator();
     opt_in(&router).await;
 
-    let unsized_answer = summary_set(&router, "no maxResults", json!({})).await;
+    let (whole, unsized_pages) = walk(&router, "no maxResults", None).await;
     assert_eq!(
-        summary_resource_types("no maxResults", &unsized_answer),
+        summary_types("no maxResults", &whole),
         TRACKED_SOURCE_TYPES.to_vec(),
-        "expected one summary per resource type the service reports on, got {unsized_answer}"
+        "expected one summary per resource type the service reports on, got {whole:?}"
+    );
+    // The set is smaller than this service's default page, so a request that asks for no size
+    // reads it in one answer: the default bounds a page, it does not split one.
+    assert_eq!(
+        unsized_pages,
+        expected_page_sizes(whole.len(), DEFAULT_PAGE_SIZE),
+        "case \"no maxResults\": expected the default page of {DEFAULT_PAGE_SIZE}"
     );
 
-    // Rows: the forms `maxResults` can take — the modelled range's lower bound, the smallest
-    // size, a size that divides the set unevenly, one short of the set, exactly its size, one
-    // past it, and the modelled upper bound.
+    // Rows: the forms `maxResults` can take, each with the page size it asks for. `0` is the
+    // modelled range's lower bound, which the service documents no meaning for, so it reads as
+    // "no size asked for" like an absent member; `1000` is its upper bound, which is this
+    // service's page ceiling as well.
     let set = TRACKED_SOURCE_TYPES.len() as i64;
-    for max_results in [0, 1, 3, set - 1, set, set + 1, 1000] {
+    let rows: [(Option<i64>, usize); 8] = [
+        (None, DEFAULT_PAGE_SIZE),
+        (Some(0), DEFAULT_PAGE_SIZE),
+        (Some(1), 1),
+        (Some(3), 3),
+        (Some(set - 1), (set - 1) as usize),
+        (Some(set), set as usize),
+        (Some(set + 1), (set + 1) as usize),
+        (Some(MAX_PAGE_SIZE as i64), MAX_PAGE_SIZE),
+    ];
+    for (max_results, asked_for) in rows {
+        let case = format!("maxResults={max_results:?}");
+        let (walked, pages) = walk(&router, &case, max_results).await;
+        for page in &pages {
+            assert!(
+                *page <= asked_for,
+                "case {case:?}: an answer carries at most the {asked_for} summaries asked \
+                 for, got pages {pages:?}"
+            );
+        }
+        assert_eq!(
+            pages,
+            expected_page_sizes(whole.len(), asked_for),
+            "case {case:?}: expected the set of {} walked {asked_for} at a time, got {pages:?}",
+            whole.len()
+        );
+        assert_eq!(
+            walked, whole,
+            "case {case:?}: the size asked for changes how many summaries one answer carries, \
+             never which ones or in what order"
+        );
+    }
+}
+
+/// A bounded answer is OBSERVABLE: a request for one summary is answered with exactly one and
+/// a token, that token reports the next one, and asking again reports the same first page — so
+/// a client reads the bound it asked for, and reading a page changes nothing a later caller
+/// sees.
+#[tokio::test]
+async fn a_page_of_one_carries_one_summary_and_a_token_to_the_next() {
+    let router = emulator();
+    opt_in(&router).await;
+
+    let first = summary_set(&router, "a page of one", json!({"maxResults": 1})).await;
+    assert_eq!(
+        summary_resource_types("a page of one", &first),
+        vec![TRACKED_SOURCE_TYPES[0]],
+        "case \"a page of one\": expected the first group of the reported order alone, got \
+         {first}"
+    );
+    let token = first["nextToken"].as_str().unwrap_or_else(|| {
+        panic!(
+            "case \"a page of one\": summaries remain, so a token must be handed out, got \
+             {first}"
+        )
+    });
+
+    let second = summary_set(
+        &router,
+        "the second page of one",
+        json!({"maxResults": 1, "nextToken": token}),
+    )
+    .await;
+    assert_eq!(
+        summary_resource_types("the second page of one", &second),
+        vec![TRACKED_SOURCE_TYPES[1]],
+        "case \"the second page of one\": expected the group after the first page alone, got \
+         {second}"
+    );
+
+    let again = summary_set(&router, "the first page again", json!({"maxResults": 1})).await;
+    assert_eq!(
+        again, first,
+        "case \"the first page again\": reading a page must not change what a later caller sees"
+    );
+}
+
+/// The last page of a walk hands out no token — "This value is null when there are no more
+/// pages of recommendation summaries to return" — and every page before it does, whichever
+/// size the walk uses to reach it.
+#[tokio::test]
+async fn a_token_is_handed_out_exactly_while_summaries_remain() {
+    let router = emulator();
+    opt_in(&router).await;
+
+    // Rows: a size that divides the set unevenly, one that divides it evenly, one short of it,
+    // exactly it, and one past it.
+    let set = TRACKED_SOURCE_TYPES.len() as i64;
+    for max_results in [3, 4, set - 1, set, set + 1] {
         let case = format!("maxResults={max_results}");
-        let answer = summary_set(&router, &case, json!({"maxResults": max_results})).await;
-        assert!(
-            answer["nextToken"].is_null(),
-            "case {case:?}: the summary set is answered whole, so there is no page to \
-             advance to, got {answer}"
-        );
+        let mut next_token: Option<String> = None;
+        let mut reported = 0usize;
+        loop {
+            let mut request = json!({"maxResults": max_results});
+            if let Some(token) = &next_token {
+                request["nextToken"] = json!(token);
+            }
+            let body = summary_set(&router, &case, request).await;
+            reported += body["recommendationSummaries"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or_default();
+            next_token = body["nextToken"].as_str().map(ToString::to_string);
+            let remaining = TRACKED_SOURCE_TYPES.len().saturating_sub(reported);
+            assert_eq!(
+                next_token.is_some(),
+                remaining > 0,
+                "case {case:?}: a token is handed out exactly while summaries remain \
+                 ({remaining} left after {reported}), got {body}"
+            );
+            if next_token.is_none() {
+                break;
+            }
+        }
         assert_eq!(
-            summary_resource_types(&case, &answer),
-            TRACKED_SOURCE_TYPES.to_vec(),
-            "case {case:?}: expected every resource type the service reports on, got {answer}"
-        );
-        assert_eq!(
-            answer, unsized_answer,
-            "case {case:?}: the size asked for must not change what is answered"
+            reported,
+            TRACKED_SOURCE_TYPES.len(),
+            "case {case:?}: a walk reports every summary exactly once, got {reported}"
         );
     }
 }

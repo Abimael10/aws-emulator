@@ -577,12 +577,12 @@ async fn account_ids_selects_one_account_and_refuses_more_than_one() {
     }
 }
 
-/// `maxResults` never changes WHAT is summarised: the summary set is bounded by the
-/// resource-type vocabulary, so every request is answered with the whole set in one answer,
-/// in the same order and with no `nextToken` — whatever size it asks for. A token, which this
-/// operation therefore never hands out, is refused.
+/// `maxResults` never changes WHAT is summarised, only how many rows one answer carries: the
+/// summary set is reported in the same order whatever size is asked for, walked by the
+/// `nextToken` the service hands out while rows remain. A token this service did not issue is
+/// refused.
 #[tokio::test]
-async fn the_summary_set_is_answered_whole_whatever_size_is_asked_for() {
+async fn the_summary_set_is_walked_whatever_size_is_asked_for() {
     let router = analysed_emulator().await;
 
     let unpaged = summaries_of(&get_summaries(&router, json!({})).await);
@@ -605,20 +605,42 @@ async fn the_summary_set_is_answered_whole_whatever_size_is_asked_for() {
     ];
     for page_size in page_sizes {
         let case = format!("maxResults={page_size:?}");
-        let mut request = json!({});
-        if let Some(size) = page_size {
-            request["maxResults"] = json!(size);
+        let mut walked = Vec::new();
+        let mut next_token: Option<String> = None;
+        loop {
+            let mut request = json!({});
+            if let Some(size) = page_size {
+                request["maxResults"] = json!(size);
+            }
+            if let Some(token) = &next_token {
+                request["nextToken"] = json!(token);
+            }
+            let body = get_summaries(&router, request).await;
+            let page = summaries_of(&body);
+            if let Some(size) = page_size.filter(|size| *size > 0) {
+                assert!(
+                    page.len() as i64 <= size,
+                    "case {case:?}: an answer carries at most the size asked for, got {} \
+                     summaries",
+                    page.len()
+                );
+            }
+            walked.extend(page);
+            next_token = body["nextToken"].as_str().map(ToString::to_string);
+            if next_token.is_none() {
+                break;
+            }
+            assert!(
+                walked.len() <= unpaged.len(),
+                "case {case:?}: a walk cannot report more than the {} summaries the service \
+                 reports on, got {}",
+                unpaged.len(),
+                walked.len()
+            );
         }
-        let body = get_summaries(&router, request).await;
         assert_eq!(
-            summaries_of(&body),
-            unpaged,
+            walked, unpaged,
             "case {case:?}: the size asked for must not change what is summarised"
-        );
-        assert!(
-            body["nextToken"].is_null(),
-            "case {case:?}: the whole set is answered, so there is no page to advance to, \
-             got {body}"
         );
     }
 

@@ -29,10 +29,11 @@
 //! Nothing here asserts a page size the recorded calls happened to use; what is asserted is
 //! that no reader answers a page size differently from the others.
 //!
-//! `GetRecommendationSummaries` is NOT one of them: its answer is one row per
-//! `RecommendationSourceType` the service reports on, a set the vocabulary BOUNDS rather than
-//! the account's resources growing, so it is answered whole and hands out no page boundary
-//! at all (`tests/all/summary_block_sets.rs` states that rule).
+//! `GetRecommendationSummaries` is NOT one of the rows below, because the sequence it walks is
+//! the `RecommendationSourceType` vocabulary the service reports on rather than records the
+//! account's resources grow, so its cursor names the GROUP a page resumes at instead of an
+//! offset into a selection; it applies the same page-size rule, pinned over its own table of
+//! sizes in `tests/all/summary_block_sets.rs`.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
