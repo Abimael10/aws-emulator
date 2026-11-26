@@ -11,22 +11,30 @@
 //! render but never fetch, and the round trip then fails for what was announced rather than
 //! for how it is routed.
 //!
-//! Which address that is, is a property of the PROCESS rather than of the request:
+//! Which address that is, is read off the ANSWERING REQUEST first, and off this process
+//! second:
 //!
+//! * the authority that request ARRIVED on is, by construction, an address that reaches this
+//!   process: the client dialled it and got here, so a fetch it sends there arrives the same
+//!   way — through whatever stands between the two, a published container port or a
+//!   forwarding front end included, which the process cannot see and whose address is then
+//!   the only one that leads back to it. The HOST SPELLING the client dialled is kept
+//!   (`localhost` stays `localhost`), since that is the name it resolved to get here. It is
+//!   published only where it CAN lead back ([`leads_back_here`]);
 //! * the endpoint this emulator is SERVED at — the data port's own published base
 //!   ([`::smithy_server_runtime::OperationContext::endpoint`], "the base URL a later request
-//!   addresses… Callers send normally signed requests to it"), which is the socket this
-//!   process accepts requests on;
-//! * an authority a request merely CARRIED is published only where it addresses that same
-//!   socket ([`answers_requests_here`]), because a carried authority is whatever the client
-//!   was pointed at — a forwarding front end, an endpoint of an earlier run, one of AWS's
-//!   own names — and re-announcing one of those hands the next fetch an address this process
-//!   does not answer on. Where it does address this socket, the HOST SPELLING the client
-//!   dialled is kept (`localhost` stays `localhost`), since that is the name that client
-//!   resolved to get here;
+//!   addresses… Callers send normally signed requests to it") — stands behind it, for the
+//!   request that states no authority a fetch can lead back here by: one addressed to a host
+//!   of AWS's own, which is an in-process call of another service, and one naming no port
+//!   where this process is not served on the port `https` implies;
 //! * for a process served on no port at all (embedded in another process, or a test) there
 //!   is no address of this process to publish, so the authority the caller addressed is the
 //!   only one that can lead back here, and the unserved base names it otherwise.
+//!
+//! That ordering — the endpoint a request addressed, else the one this process is served at —
+//! is the tree's own for every address published for a plane served at the front door
+//! (`service_common::data_plane_addressing::reached_emulator_host_and_port`), so this service
+//! announces its planes where every other service announces its own.
 //!
 //! Every reading of an address below is the tree's own
 //! (`service_common::data_plane_addressing`) and is CALLED here rather than written again, so
@@ -56,9 +64,9 @@ pub(super) fn announced_base(parts: &::http::request::Parts, served_base: &str) 
     )
 }
 
-/// The `host[:port]` a published address names: the authority this emulator is served at,
-/// the one the request carried where that addresses the same socket, and the authority of the
-/// base itself for a process served on no port.
+/// The `host[:port]` a published address names: the authority the answering request arrived
+/// on where that can lead back here, the authority this emulator is served at otherwise, and
+/// the authority of the base itself for a process served on no port.
 fn announced_authority(parts: &::http::request::Parts, served_base: &str) -> String {
     use ::service_common::data_plane_addressing as addressing;
     let carried = addressing::reached_emulator_endpoint_of_parts(parts);
@@ -69,30 +77,34 @@ fn announced_authority(parts: &::http::request::Parts, served_base: &str) -> Str
                 .to_string()
         });
     };
-    match carried.filter(|carried| answers_requests_here(carried, &served)) {
+    match carried.filter(|carried| leads_back_here(carried, &served)) {
         Some(carried) => carried,
         None => served,
     }
 }
 
-/// Whether the authority `carried` a request stated addresses the SOCKET this emulator is
-/// served at (`served`), which is what makes it publishable as an address a fetch of this
-/// service's media is answered at.
+/// Whether the authority `carried` a request stated can lead a later fetch BACK to this
+/// process, which is what makes it publishable as an address this service's media is answered
+/// at — rather than the base this process is served at (`served`).
 ///
 /// Two readings, both the tree's own:
 ///
-/// * the PORT dialled has to be the one this process is served on ([`dialled_port`]) — a
-///   different port is a different socket, which this process does not answer on however the
-///   request reached it (a forwarding front end in between, an address left over from an
-///   earlier run);
-/// * the HOST has to be one this emulator answers that port on
+/// * the HOST has to be one this emulator answers on
 ///   (`service_common::data_plane_addressing::host_names_the_bound_interface`, "whether
 ///   `host` names the interface this emulator's listeners are BOUND on"), so a name that
-///   merely reached this process through something else is not re-announced as the address of
-///   the socket.
-fn answers_requests_here(carried: &str, served: &str) -> bool {
-    ::service_common::data_plane_addressing::host_names_the_bound_interface(carried)
-        && dialled_port(carried) == dialled_port(served)
+///   merely reached this process through something that resolves it — a name of AWS's own,
+///   an operator's alias — is not re-announced as an address of this emulator;
+/// * the authority has to name the PORT the client dialled ([`dialled_port`]), because that
+///   port is the one thing about the request that says which socket the fetch has to arrive
+///   at: it need not be the port this process is SERVED on, since a published container port
+///   or a forwarding front end reaches this one from another, but an authority naming NO port
+///   names the port `https` implies, which this process answers on only when that is the port
+///   it is served on.
+fn leads_back_here(carried: &str, served: &str) -> bool {
+    use ::service_common::data_plane_addressing as addressing;
+    addressing::host_names_the_bound_interface(carried)
+        && (addressing::addressed_port(Some(carried)).is_some()
+            || dialled_port(served) == addressing::IMPLICIT_HTTPS_PORT)
 }
 
 /// The port an authority is DIALLED on: the one it names, or the port `https` implies for an
@@ -123,17 +135,17 @@ mod tests {
             .0
     }
 
-    /// RULE: a published address names the authority this process is SERVED at, and an
-    /// authority the request carried only where that addresses the very socket this process
-    /// is served on.
+    /// RULE: a published address names the authority the answering request ARRIVED on where
+    /// that can lead a fetch back here, and the authority this process is served at where it
+    /// cannot.
     ///
     /// The rows differ along what the reading generalises over: the form of the served base
     /// (a loopback literal, a loopback NAME, a bracketed IPv6 literal, a base with a trailing
     /// separator, a process served on no port at all) and what the request carried (nothing,
-    /// the served authority, another spelling of the same socket, a port this process does not
-    /// serve, no port at all, and one of AWS's own endpoint hosts).
+    /// the served authority, another spelling of the same socket, a port this process is not
+    /// served on, no port at all, and one of AWS's own endpoint hosts).
     #[test]
-    fn a_published_address_names_the_socket_this_process_is_served_on() {
+    fn a_published_address_names_the_authority_the_request_arrived_on() {
         let cases: &[(&str, &str, Option<&str>, &str)] = &[
             (
                 "no authority carried at all",
@@ -154,16 +166,22 @@ mod tests {
                 "https://localhost:9297",
             ),
             (
-                "a port this process does not serve",
+                "a port this process is not served on, which reached it all the same",
                 "https://127.0.0.1:36637",
                 Some("127.0.0.1:38377"),
-                "https://127.0.0.1:36637",
+                "https://127.0.0.1:38377",
             ),
             (
                 "an authority naming no port at all",
                 "https://127.0.0.1:36637",
                 Some("127.0.0.1"),
                 "https://127.0.0.1:36637",
+            ),
+            (
+                "an authority naming no port, this process served on the implicit one",
+                "https://127.0.0.1:443",
+                Some("127.0.0.1"),
+                "https://127.0.0.1",
             ),
             (
                 "one of AWS's own endpoint hosts",
@@ -187,7 +205,19 @@ mod tests {
                 "a bracketed IPv6 request on another port",
                 "https://[::1]:8443",
                 Some("[::1]:9443"),
-                "https://[::1]:8443",
+                "https://[::1]:9443",
+            ),
+            (
+                "a loopback name on a port this process is not served on",
+                "https://127.0.0.1:9297",
+                Some("localhost:39355"),
+                "https://localhost:39355",
+            ),
+            (
+                "one of AWS's own endpoint hosts carrying the served port",
+                "https://127.0.0.1:9297",
+                Some("discovery-marketplace.us-east-1.amazonaws.com:9297"),
+                "https://127.0.0.1:9297",
             ),
             (
                 "a served base with a trailing separator",

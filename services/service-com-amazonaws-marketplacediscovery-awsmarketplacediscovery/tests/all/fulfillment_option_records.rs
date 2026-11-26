@@ -798,19 +798,20 @@ async fn only_a_published_address_is_served_as_a_buyer_facing_page() {
 }
 
 /// The addresses a client can have DIALLED to reach this emulator, with whether that address
-/// is the SOCKET this process is served on — the one every caller of this emulator reaches it
-/// at.
+/// can lead a later fetch BACK to this process — which is what makes it the one a published
+/// page address names.
 ///
-/// One row each, because a published page address names that socket: the address a client
-/// that dialled it stated (its own spelling of it included), and otherwise the address this
-/// process is served at — never a port this process does not answer on (a forwarding front
-/// end in between, an address left over from an earlier run) and never a host AWS publishes
-/// its own service endpoints at.
-const DIALLED_HOSTS: [(&str, bool); 5] = [
+/// One row each: the authority a client that dialled this emulator stated (its own spelling of
+/// it, and a port this process is not served on but was reached through, as a published
+/// container port or a forwarding front end reaches it), and otherwise the address this process
+/// is served at — for an authority naming no port where this process is not served on the one
+/// `https` implies, and for a host AWS publishes its own service endpoints at.
+const DIALLED_HOSTS: [(&str, bool); 6] = [
     ("127.0.0.1:9297", true),
     ("localhost:9297", true),
-    ("localhost:39355", false),
-    ("[::1]:8443", false),
+    ("localhost:39355", true),
+    ("[::1]:8443", true),
+    ("127.0.0.1", false),
     ("discovery-marketplace.us-east-1.amazonaws.com", false),
 ];
 
@@ -843,13 +844,14 @@ async fn options_dialled_at(
     array(&body, "fulfillmentOptions")
 }
 
-/// RULE: the address a published page is announced on is the socket this process is served on
-/// — stated as the client that dialled that socket spelled it, and as the address this process
-/// is served at for every other request — so a client holding the URL can dial it again.
+/// RULE: the address a published page is announced on is the authority the answering request
+/// arrived on — as the client that dialled it spelled it — and the address this process is
+/// served at for a request carrying no authority that can lead back here, so a client holding
+/// the URL can dial it again.
 #[tokio::test]
-async fn a_published_address_names_the_socket_this_process_is_served_on() {
-    // The emulator is served on a port of its own, which is the address every other caller
-    // reaches it at.
+async fn a_published_address_names_the_authority_the_request_arrived_on() {
+    // The emulator is served on a port of its own, which is the address a caller that reached
+    // it any other way is told about.
     let served = "https://127.0.0.1:9297";
     let router = router_served_at(served);
     let product_id = saas_options(&router)
@@ -858,8 +860,8 @@ async fn a_published_address_names_the_socket_this_process_is_served_on() {
         .map(|(product_id, _, _)| product_id.clone())
         .expect("the catalog holds a product fulfilled as SaaS");
 
-    for (host, dialled_the_served_socket) in DIALLED_HOSTS {
-        let expected_base = if dialled_the_served_socket {
+    for (host, leads_back_here) in DIALLED_HOSTS {
+        let expected_base = if leads_back_here {
             format!("https://{host}")
         } else {
             served.to_string()
@@ -879,8 +881,8 @@ async fn a_published_address_names_the_socket_this_process_is_served_on() {
             assert_eq!(
                 published,
                 format!("{expected_base}{PLANE_PREFIX}/{option_id}/register"),
-                "case dialled {host}: expected the page announced on the socket this process is \
-                 served on, got {published:?}"
+                "case dialled {host}: expected the page announced on the authority this request \
+                 arrived on, got {published:?}"
             );
             let page = fetch(&router, "GET", published).await;
             assert_eq!(

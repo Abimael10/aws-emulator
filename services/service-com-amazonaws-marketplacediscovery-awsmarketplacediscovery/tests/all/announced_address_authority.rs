@@ -6,20 +6,20 @@
 //! `ListingSummary$logoThumbnailUrl` and `GetListing`/`GetProduct`'s own
 //! (`URL`, `@required`, `@length(1..2048)`, `@pattern ^https?://.*$`),
 //! `ReviewSourceSummary$sourceUrl` (the same `URL`, optional) and a SaaS fulfillment option's
-//! `fulfillmentUrl` — is published on the SOCKET this process is served on, because that is
-//! the socket this emulator answers a fetch of it at:
+//! `fulfillmentUrl` — is published on the authority the ANSWERING REQUEST ARRIVED ON, because
+//! that authority is one that demonstrably reaches this process:
 //!
-//! * a client that dialled that socket is handed its own spelling of it, so the name it
-//!   resolved to get here is the name it dials again;
-//! * a request that states any OTHER authority — a port this process does not serve (a
-//!   forwarding front end in between, an address left over from an earlier run), an
-//!   authority naming no port, or one of the hosts AWS publishes its own endpoints at — is
-//!   answered with the address this process is served at, never with the authority it
-//!   carried, since nothing answers a fetch there.
+//! * a client is handed its own spelling of the authority it dialled, so the name it resolved
+//!   to get here is the name it dials again — including a port this process is not itself
+//!   served on, which is how a published container port or a forwarding front end reaches it;
+//! * a request that states an authority which cannot lead back here — one of the hosts AWS
+//!   publishes its own endpoints at, or an authority naming no port where this process is not
+//!   served on the one `https` implies — is answered with the address this process IS served
+//!   at, since that is the only address of this process left to publish.
 //!
 //! [`crate::listing_media_addresses`] and [`crate::search_page_media_addresses`] pin which
 //! RECORD each published address belongs to and that a fetch of it is served here; this suite
-//! pins the one thing that is a property of the PROCESS rather than of the record — which
+//! pins the one thing that is a property of the ADDRESSING rather than of the record — which
 //! authority the address is published on — over the authorities a client can state and over
 //! every operation of this service that publishes one.
 //!
@@ -38,23 +38,24 @@ use crate::catalog_drilldown::{array, text, AUTHORIZATION};
 use crate::listing_media_addresses::{fetch, review_source, router_served_at, PNG_SIGNATURE};
 
 /// The base this emulator is SERVED at in every row below: the one socket it accepts requests
-/// on, which is the address a published URL has to name.
+/// on directly, which is the address a published URL names when the request carries none that
+/// can lead back here.
 const SERVED_BASE: &str = "https://127.0.0.1:9297";
 
 /// The authorities a client can state, each with the base the addresses of the response it
 /// gets have to be published on.
 ///
 /// The rows differ along what the rule generalises over: the served authority itself, another
-/// spelling of that same socket, a port this process does not serve (the authority of a
-/// forwarding front end, which is the shape of the defect), an authority naming no port at
-/// all, a loopback name on another port, a host AWS publishes its own endpoints at, and one of
-/// those hosts carrying the served port.
+/// spelling of that same socket, a port this process is not served on but was reached through
+/// (the shape of the defect this pins), a loopback name on such a port, an authority naming no
+/// port at all, a host AWS publishes its own endpoints at, and one of those hosts carrying the
+/// served port.
 const DIALLED: [(&str, &str); 7] = [
     ("127.0.0.1:9297", "https://127.0.0.1:9297"),
     ("localhost:9297", "https://localhost:9297"),
-    ("127.0.0.1:38377", SERVED_BASE),
+    ("127.0.0.1:38377", "https://127.0.0.1:38377"),
+    ("localhost:39355", "https://localhost:39355"),
     ("127.0.0.1", SERVED_BASE),
-    ("localhost:39355", SERVED_BASE),
     ("discovery-marketplace.us-east-1.amazonaws.com", SERVED_BASE),
     (
         "discovery-marketplace.us-east-1.amazonaws.com:9297",
@@ -74,7 +75,7 @@ const MAX_PAGE: u64 = 100;
 /// Call `operation` as a client that DIALLED `host`: the authority it resolved to get here,
 /// carried both in the `Host` header and in the request URI, exactly as a client reaching the
 /// emulator over a socket states it.
-async fn dialled_at(
+pub(crate) async fn dialled_at(
     router: &MultiServiceRouter,
     host: &str,
     operation: &str,
@@ -112,8 +113,8 @@ fn assert_is_a_url(case: &str, member: &str, url: &str) {
 }
 
 /// RULE: a published address is announced on `expected_base` and on nothing else — in
-/// particular not on the authority the request merely carried, where that is not the socket
-/// this process is served on.
+/// particular not on an authority the request merely carried that cannot lead a fetch back
+/// here.
 fn assert_announced_on(case: &str, member: &str, expected_base: &str, dialled: &str, url: &str) {
     assert_is_a_url(case, member, url);
     assert!(
@@ -129,20 +130,20 @@ fn assert_announced_on(case: &str, member: &str, expected_base: &str, dialled: &
             .unwrap_or_default();
         assert_ne!(
             announced, dialled,
-            "case {case} {member}: the authority the request carried names no socket this \
-             process serves, so it may not be published, got {url:?}"
+            "case {case} {member}: the authority the request carried cannot lead a fetch back \
+             here, so it may not be published, got {url:?}"
         );
     }
 }
 
 /// RULE: the addresses a `SearchListings` page publishes — every summary's `logoThumbnailUrl`
 /// and the `sourceUrl` of every summary whose review source keeps a reviews page — are
-/// announced on the socket this process is served on, carry the record's own path, and are
+/// announced on the authority the request arrived on, carry the record's own path, and are
 /// served HERE on that same authority.
 ///
 /// Rows: every authority of [`DIALLED`], over every summary of a whole catalog page.
 #[tokio::test]
-async fn a_search_page_publishes_its_addresses_on_the_socket_this_process_is_served_on() {
+async fn a_search_page_publishes_its_addresses_on_the_authority_the_request_arrived_on() {
     let (source_id, _source_name) = REVIEW_SOURCE;
     let router = router_served_at(SERVED_BASE);
 
@@ -239,7 +240,7 @@ async fn a_search_page_publishes_its_addresses_on_the_socket_this_process_is_ser
 /// `FulfillmentOptionSummary$fulfillmentOptionType` is "The machine-readable type of the
 /// fulfillment option, such as `SAAS`" — which is the record whose `ListFulfillmentOptions`
 /// read publishes a buyer-facing page.
-fn first_saas_listing(summaries: &[Value]) -> Value {
+pub(crate) fn first_saas_listing(summaries: &[Value]) -> Value {
     summaries
         .iter()
         .find(|summary| {
@@ -251,20 +252,21 @@ fn first_saas_listing(summaries: &[Value]) -> Value {
         .expect("the seeded catalog holds a listing fulfilled as SaaS")
 }
 
-/// RULE: the authority is a property of this PROCESS, not of the operation, so every
+/// RULE: the authority is a property of the ADDRESSING, not of the operation, so every
 /// operation of this service that publishes a fetchable address publishes it on the same
-/// socket — the one this process is served on.
+/// authority — the one the answering request arrived on.
 ///
 /// Rows: the two authorities a client can state that differ in kind — the served socket
-/// itself, and a port this process does not serve — each walked through the whole drill-down
-/// chain `SearchListings` -> `GetListing` -> `GetProduct` -> `ListFulfillmentOptions`.
+/// itself, and a port this process is not served on but was reached through — each walked
+/// through the whole drill-down chain `SearchListings` -> `GetListing` -> `GetProduct` ->
+/// `ListFulfillmentOptions`.
 #[tokio::test]
-async fn every_operation_publishes_its_addresses_on_that_same_socket() {
+async fn every_operation_publishes_its_addresses_on_that_same_authority() {
     let router = router_served_at(SERVED_BASE);
 
     for (dialled, expected_base) in [
         ("127.0.0.1:9297", "https://127.0.0.1:9297"),
-        ("127.0.0.1:38377", SERVED_BASE),
+        ("127.0.0.1:38377", "https://127.0.0.1:38377"),
     ] {
         let page = dialled_at(
             &router,
