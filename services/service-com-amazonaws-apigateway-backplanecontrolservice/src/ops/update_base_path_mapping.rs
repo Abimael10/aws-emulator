@@ -113,6 +113,10 @@ impl From<&BasePathMappingEntry> for UpdateBasePathMappingOutput {
 // reference spells the remap `op=replace,path=/restapiId,value=<api-id>`), which is the
 // member `BasePathMapping$restApiId` reports.
 
+/// The patch path that POINTS THE MAPPING AT ANOTHER API, in the spelling the note above
+/// quotes: named once, so the handler and [`apply_patch`] read one member name.
+const REST_API_ID_MEMBER: &str = "restapiId";
+
 /// Apply one patch to a COPY of a stored mapping.
 fn apply_patch(entry: &mut BasePathMappingEntry, patch: &Patch) -> Result<(), PatchFailure> {
     match patch.member() {
@@ -145,7 +149,7 @@ fn apply_patch(entry: &mut BasePathMappingEntry, patch: &Patch) -> Result<(), Pa
         // API it sends calls to, so the member can be replaced but neither removed nor
         // emptied. Whether the new identifier resolves to a stored API is checked by the
         // handler, which is what holds the records.
-        "restapiId" => patch_required_string(&mut entry.rest_api_id, patch, MAX_STRING_CHARS),
+        REST_API_ID_MEMBER => patch_required_string(&mut entry.rest_api_id, patch, MAX_STRING_CHARS),
         // "The name of the associated stage" is optional — a mapping created without one
         // names no stage, and `(none)` is the spelling for a mapping whose callers name
         // the stage themselves — so a `remove`, like an empty value, clears it back to
@@ -257,6 +261,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let domain_key =
             crate::state::domain_name_key(&input.domain_name, input.domain_name_id.as_deref());
         let base_path = base_path_key(Some(&input.base_path));
+
+        // A patch that POINTS THE MAPPING AT ANOTHER API is the same write `CreateBasePathMapping`
+        // makes, so it spends the same span this service spends writing a mapping
+        // (`crate::state::BASE_PATH_MAPPING_WRITE_SPAN`) before the record is stored: a
+        // `DeleteRestApi` of that API arriving beside this patch reads the mappings before
+        // this one names it and is ACCEPTED, and the patched record is then written against
+        // state that still held the API (`crate::state::rest_api_referenceable`). A patch
+        // that leaves the reference where it is writes no new reference for such a read to
+        // miss, so it is served straight away.
+        if patches
+            .iter()
+            .any(|patch| patch.member() == REST_API_ID_MEMBER)
+        {
+            ::tokio::time::sleep(crate::state::BASE_PATH_MAPPING_WRITE_SPAN).await;
+        }
 
         let mut store = state.lock();
         let stored = store

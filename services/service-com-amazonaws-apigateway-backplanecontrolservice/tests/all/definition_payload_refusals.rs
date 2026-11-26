@@ -61,10 +61,11 @@ const UNDETERMINED_VERSION: &str = "Unable to determine OAS/Swagger version";
 const INVALID_DEFINITION: &str = "Invalid OpenAPI input.";
 
 /// The sentence both definition imports state for a body that is no DOCUMENT at all: one no
-/// reader could parse in either spelling.
+/// reader could parse in either spelling — the same fixed sentence a document that parsed and
+/// is no valid definition earns, trailing period included.
 ///
 /// Source: `crate::ops::put_rest_api::UNPARSEABLE_DEFINITION`.
-const UNPARSEABLE_DEFINITION: &str = "Invalid OAS input";
+const UNPARSEABLE_DEFINITION: &str = "Invalid OpenAPI input.";
 
 /// The `message` an answer carries, or a panic naming the case.
 fn message(answer: &Answer, case: &str) -> String {

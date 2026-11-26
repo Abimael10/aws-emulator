@@ -4866,6 +4866,12 @@ pub mod log_delivery_role;
 mod rest_api_deletion;
 pub use rest_api_deletion::*;
 
+/// How long writing a base path mapping takes — the span a `DeleteRestApi` arriving beside
+/// such a write takes its own read of the mappings in; re-exported whole, so a handler still
+/// reaches each name as `crate::state::…`.
+mod base_path_mapping_write;
+pub use base_path_mapping_write::*;
+
 /// WHAT THIS EMULATOR ACCEPTS, read off a handle onto it — the one reading both planes that
 /// have to know whether a signature is verified ask; re-exported whole, so a reader still
 /// reaches each name as `crate::state::…`.

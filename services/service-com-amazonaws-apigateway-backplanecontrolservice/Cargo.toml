@@ -231,6 +231,11 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 # Declares tests/all/main.rs's suite modules, one per tests/all/<name>.rs.
 automod = { workspace = true }
+# `test-util`: the span a base path mapping write spends before the record is stored runs on
+# the runtime's clock (`crate::state::BASE_PATH_MAPPING_WRITE_SPAN`), so the suite that
+# issues such a write beside a `DeleteRestApi` drives that span on a PAUSED clock instead of
+# waiting for it (`tests/all/base_path_mapping_write_beside_a_rest_api_delete.rs`).
+tokio = { workspace = true, features = ["test-util", "time"] }
 # A deployed method whose integration is `AWS_PROXY` is served by invoking a Lambda
 # function, and what the handler wrote is asserted where a client reads it — in the
 # DynamoDB table the handler put the item in — so both services are mounted on the test's

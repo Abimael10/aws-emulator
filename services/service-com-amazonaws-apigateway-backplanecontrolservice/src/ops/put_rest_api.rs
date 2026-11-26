@@ -400,10 +400,10 @@ pub struct ImportedModel {
 /// not a valid one of those", which is what this one sentence states: it names no member and
 /// no position.
 ///
-/// The two sentences beside it are for the earlier steps: a body that never parsed at all
-/// ([`UNPARSEABLE_DEFINITION`]) and a document that parsed and declares no version
-/// ([`UNDETERMINED_VERSION`]). A caller has to be able to tell "these bytes are not a
-/// document" from "nothing here says what this is" from "this is not a valid one of those".
+/// The sentence beside it is for the step in front of both: a document that parsed and
+/// declares no version ([`UNDETERMINED_VERSION`]). A caller has to be able to tell "nothing
+/// here says what this is" from "this is no valid definition", which is what the body that
+/// never parsed at all is answered as too ([`UNPARSEABLE_DEFINITION`]).
 ///
 /// The emulator's own resource guards keep their own wording instead, because they are this
 /// emulator's bounds rather than anything the service publishes, and a caller has to be able
@@ -416,10 +416,14 @@ pub const INVALID_DEFINITION: &str = "Invalid OpenAPI input.";
 /// The parse is the FIRST of the three steps an import reads a body in (see
 /// [`INVALID_DEFINITION`]), and a body that fails it yields no document — so nothing of what
 /// those bytes happen to contain has been read, no version member among them, and the
-/// refusal can state no more than that the input is no API definition. API Gateway states it
-/// with this one fixed sentence, which names the specification by its own acronym and carries
-/// nothing from the request: not the position the reading stopped at, and not the parser's
-/// own complaint.
+/// refusal can state no more than that the input is no API definition. That is the SAME
+/// thing the last step has to state about a document that parsed and is no valid definition
+/// of the format it declares, and API Gateway states both with the one fixed sentence
+/// [`INVALID_DEFINITION`] carries — entirely fixed text, trailing period included, naming
+/// the specification as the specification names itself and carrying nothing from the
+/// request: not the position the reading stopped at, and not the parser's own complaint.
+/// Keeping the two steps' refusals as separate names is what lets the reader say WHICH step
+/// failed while answering a caller the one sentence the service answers.
 ///
 /// It is the sentence for a body the reading could not finish — a truncated document, an
 /// unterminated collection or scalar, text that is no document — that DID write one of the
@@ -427,7 +431,7 @@ pub const INVALID_DEFINITION: &str = "Invalid OpenAPI input.";
 /// that these bytes are no document of it. A body that did not finish AND writes neither
 /// member declares no version at all and earns [`UNDETERMINED_VERSION`] instead, because
 /// detection is the step that answers first ([`declares_version_in_text`]).
-pub const UNPARSEABLE_DEFINITION: &str = "Invalid OAS input";
+pub const UNPARSEABLE_DEFINITION: &str = INVALID_DEFINITION;
 
 /// The refusal for a document that PARSED and declares no OAS/Swagger version.
 ///
@@ -444,9 +448,9 @@ pub const UNPARSEABLE_DEFINITION: &str = "Invalid OAS input";
 /// ([`declares_version_in_text`]). A body that writes one of the two members has its format
 /// settled, and is refused by whichever step then failed instead: as no readable document
 /// ([`UNPARSEABLE_DEFINITION`]) or as no valid definition of that format
-/// ([`INVALID_DEFINITION`]). A caller has to be able to tell "nothing here says what this
-/// is" from "these bytes are no document" from "this is not a valid document of the format
-/// it says it is".
+/// ([`INVALID_DEFINITION`]), which are the one sentence. A caller has to be able to tell
+/// "nothing here says what this is" from "this is no valid definition of the format it says
+/// it is".
 ///
 /// Whatever the document carries BESIDE those two members — an `info`, paths, a member
 /// whose name merely resembles the version field — and whichever shape it parsed to, it

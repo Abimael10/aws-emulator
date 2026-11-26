@@ -181,9 +181,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // delete is refused while the reference stands and the API survives, exactly as
         // the delete of one STAGE of it is (`DeleteStage`); dropping the mapping is the
         // mapping's own operations' call, not something this one does on the caller's
-        // behalf. What a caller RACING the two calls gets instead is the orphan the guard
-        // exists to prevent: a mapping written while the accepted removal is still in
-        // flight resolved the id against state that still held the API
+        // behalf. The guard is a READ of the stored mappings, and nothing evaluates it
+        // against another request's mapping write: a write still being served when this
+        // delete arrives is not in the state this read resolves
+        // (`crate::state::BASE_PATH_MAPPING_WRITE_SPAN`), so a mapping created or repointed
+        // beside this delete is admitted WITH it. What a caller RACING the two calls gets is
+        // then the orphan the guard exists to keep a caller issuing them in order from
+        // creating: a mapping written while the accepted removal is still in flight resolved
+        // the id against state that still held the API
         // (`crate::state::rest_api_referenceable`).
         let holding = store.domain_names_mapping_rest_api(&input.rest_api_id, None);
         if !holding.is_empty() {

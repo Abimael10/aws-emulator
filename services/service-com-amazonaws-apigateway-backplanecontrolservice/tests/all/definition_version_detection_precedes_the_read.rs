@@ -28,10 +28,11 @@ const BAD_REQUEST: &str = "BadRequestException";
 /// Source: `crate::ops::put_rest_api::UNDETERMINED_VERSION`.
 const UNDETERMINED_VERSION: &str = "Unable to determine OAS/Swagger version";
 
-/// The sentence for a body whose format IS declared and that is no document.
+/// The sentence for a body whose format IS declared and that is no document — the same
+/// fixed sentence a document that is no valid definition earns, trailing period included.
 ///
 /// Source: `crate::ops::put_rest_api::UNPARSEABLE_DEFINITION`.
-const UNPARSEABLE_DEFINITION: &str = "Invalid OAS input";
+const UNPARSEABLE_DEFINITION: &str = "Invalid OpenAPI input.";
 
 /// The sentence for a document that read whole under the format it declares and is no
 /// valid definition of it.

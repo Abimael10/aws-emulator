@@ -6,7 +6,8 @@
 //! one) resolves to, so a later `GetBasePathMapping` of that base path no longer finds it
 //! and the base path is free to map again; answers `NotFoundException` when the
 //! identifiers resolve to no domain name record, and when that record holds no mapping at
-//! the base path.
+//! the base path, and `BadRequestException` when the mapping names a REST API that resolves
+//! to none.
 //!
 //! ## Shape of an operation
 //!
@@ -182,11 +183,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // name's own missing-resource refusal rather than the mapping's.
         let domain_key =
             crate::state::domain_name_key(&input.domain_name, input.domain_name_id.as_deref());
-        let domain = store.domain_names.get_mut(&domain_key).ok_or_else(|| {
-            DeleteBasePathMappingErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::NO_SUCH_DOMAIN_NAME.to_string()),
-            })
-        })?;
+        if !store.domain_names.contains_key(&domain_key) {
+            return Err(DeleteBasePathMappingErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::NO_SUCH_DOMAIN_NAME.to_string()),
+                },
+            )
+            .into());
+        }
 
         // The `basePath` label addresses ONE mapping of that domain name, under the
         // spelling the record was stored with: `(none)` is the base path a caller reaches
@@ -201,14 +205,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolve to one success and one 404. The lookup and the removal share ONE hold of
         // the store lock, so two concurrent deletes cannot both remove it.
         let base_path = crate::state::base_path_key(Some(&input.base_path));
-        if domain.base_path_mappings.remove(&base_path).is_none() {
+        let mapped_rest_api = store
+            .domain_names
+            .get(&domain_key)
+            .and_then(|domain| domain.base_path_mappings.get(&base_path))
+            .map(|mapping| mapping.rest_api_id.clone());
+        let Some(mapped_rest_api) = mapped_rest_api else {
             return Err(DeleteBasePathMappingErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(crate::state::NO_SUCH_BASE_PATH_MAPPING.to_string()),
                 },
             )
             .into());
+        };
+
+        // The mapping NAMES a REST API, and deleting it resolves that identifier: a mapping
+        // whose API is gone — the orphan a mapping written while that API's accepted removal
+        // was in flight leaves behind — names an identifier that resolves to no stored API,
+        // and this operation's own reading of such an identifier is its BAD REQUEST, the
+        // sentence `crate::state::INVALID_REST_API_IDENTIFIER` is for, the same one the
+        // operations that POINT a mapping at an API answer. So the orphan is not released by
+        // its own delete; what releases it is the record it belongs to, the domain name,
+        // whose delete takes its mappings with it (`DeleteDomainName`).
+        if !store.rest_apis.contains_key(&mapped_rest_api) {
+            return Err(DeleteBasePathMappingErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::INVALID_REST_API_IDENTIFIER.to_string()),
+                },
+            )
+            .into());
         }
+
+        // The record the lookup above found, removed under the SAME hold of the store lock:
+        // nothing could have taken it meanwhile, which is what makes a second delete of one
+        // mapping, or two concurrent ones, resolve to one success and one 404.
+        let domain = store
+            .domain_names
+            .get_mut(&domain_key)
+            .ok_or_else(crate::state::state_unavailable)?;
+        domain.base_path_mappings.remove(&base_path);
         // The store lock is released before the outcome is recorded: the critical section
         // covers the state change only.
         drop(store);

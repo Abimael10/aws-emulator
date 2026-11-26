@@ -3,7 +3,9 @@
 //! @op CreateBasePathMapping
 //! IMPLEMENTED: stores a `BasePathMapping` under the custom `DomainName` the request
 //! addresses, mapping its base path at the named REST API (and the stage of it the request
-//! names), and reports the stored record.
+//! names), and reports the stored record. The record is stored after the span this service
+//! spends on such a write (`crate::state::BASE_PATH_MAPPING_WRITE_SPAN`), so a
+//! `DeleteRestApi` of that API arriving beside this create is served with it.
 //!
 //! ## Shape of an operation
 //!
@@ -214,6 +216,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .filter(|stage| *stage != crate::state::NONE_BASE_PATH)
             .map(str::to_owned);
+
+        // The span this service spends writing the mapping
+        // (`crate::state::BASE_PATH_MAPPING_WRITE_SPAN`), spent BEFORE the record is stored
+        // and before the store lock is taken, so a call arriving beside this one is served
+        // alongside it rather than after it. What that is for: `DeleteRestApi` is refused
+        // while a mapping still routes to the API, and it READS that precondition from the
+        // stored mappings — a read this write is not evaluated atomically against, so a
+        // delete of the same API arriving while this create is being served resolves state
+        // that does not hold this mapping yet and is ACCEPTED. This create then writes the
+        // mapping against state that still held the API
+        // (`crate::state::rest_api_referenceable`), and the record outlives it: the orphaned
+        // mapping a caller issuing the two calls together gets. A caller that waits for this
+        // create's answer is never inside the span, so a delete it then issues reads the
+        // stored mapping and is refused as before.
+        ::tokio::time::sleep(crate::state::BASE_PATH_MAPPING_WRITE_SPAN).await;
 
         let mut store = state.lock();
 
