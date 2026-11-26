@@ -40,27 +40,100 @@ use crate::listing_media_addresses::{fetch, review_source, router_served_at, PNG
 /// The base this emulator is SERVED at in every row below: the one socket it accepts requests
 /// on directly, which is the address a published URL names when the request carries none that
 /// can lead back here.
-const SERVED_BASE: &str = "https://127.0.0.1:9297";
+///
+/// Shared with [`crate::search_page_announced_authority`], which drives the same rule over the
+/// shapes of search page a client is served, so the two suites cannot disagree about which
+/// socket this process is served on.
+pub(crate) const SERVED_BASE: &str = "https://127.0.0.1:9297";
 
-/// The authorities a client can state, each with the base the addresses of the response it
-/// gets have to be published on.
+/// How a client STATES the authority it reached this emulator at, and the base the addresses of
+/// the response it gets have to be published on.
+///
+/// A request carries that authority in its `Host` header, in the authority of an absolute-form
+/// request target (which is how HTTP/2 and an SDK-built request spell it), in both, or in
+/// neither — so a row names each place separately.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Dialled {
+    /// What the row is, for the assertion messages.
+    pub(crate) case: &'static str,
+    /// The `Host` header the request carries.
+    pub(crate) host_header: Option<&'static str>,
+    /// The authority of the absolute-form request target the request carries.
+    pub(crate) target_authority: Option<&'static str>,
+    /// The scheme and authority every published address of the answer has to be on.
+    pub(crate) expected_base: &'static str,
+}
+
+impl Dialled {
+    /// A row that states one authority in BOTH places, which is how a client reaching a socket
+    /// over the wire states it.
+    const fn at(case: &'static str, authority: &'static str, expected_base: &'static str) -> Self {
+        Self {
+            case,
+            host_header: Some(authority),
+            target_authority: Some(authority),
+            expected_base,
+        }
+    }
+
+    /// The authority this row stated, for the reading that may not re-announce an authority a
+    /// fetch cannot lead back here by, and `None` for a row that stated none.
+    pub(crate) fn stated(self) -> Option<&'static str> {
+        self.host_header.or(self.target_authority)
+    }
+}
+
+/// The authorities a client can state, each with the base the addresses of the response it gets
+/// have to be published on. The ONE table of them for this crate: every suite that drives the
+/// announced-address rule walks these rows, so two suites cannot disagree about what a given
+/// authority must be answered with.
 ///
 /// The rows differ along what the rule generalises over: the served authority itself, another
 /// spelling of that same socket, a port this process is not served on but was reached through
 /// (the shape of the defect this pins), a loopback name on such a port, an authority naming no
-/// port at all, a host AWS publishes its own endpoints at, and one of those hosts carrying the
-/// served port.
-const DIALLED: [(&str, &str); 7] = [
-    ("127.0.0.1:9297", "https://127.0.0.1:9297"),
-    ("localhost:9297", "https://localhost:9297"),
-    ("127.0.0.1:38377", "https://127.0.0.1:38377"),
-    ("localhost:39355", "https://localhost:39355"),
-    ("127.0.0.1", SERVED_BASE),
-    ("discovery-marketplace.us-east-1.amazonaws.com", SERVED_BASE),
-    (
+/// port at all, a host AWS publishes its own endpoints at, one of those hosts carrying the
+/// served port, an authority stated only in the request target, and a request that states no
+/// authority at all.
+pub(crate) const DIALLED: [Dialled; 9] = [
+    Dialled::at("the served socket itself", "127.0.0.1:9297", SERVED_BASE),
+    Dialled::at(
+        "another spelling of the served socket",
+        "localhost:9297",
+        "https://localhost:9297",
+    ),
+    Dialled::at(
+        "a port this process is not served on",
+        "127.0.0.1:38377",
+        "https://127.0.0.1:38377",
+    ),
+    Dialled::at(
+        "a loopback name on a port this process is not served on",
+        "localhost:39355",
+        "https://localhost:39355",
+    ),
+    Dialled::at("an authority naming no port", "127.0.0.1", SERVED_BASE),
+    Dialled::at(
+        "an endpoint host AWS publishes its own services at",
+        "discovery-marketplace.us-east-1.amazonaws.com",
+        SERVED_BASE,
+    ),
+    Dialled::at(
+        "one of those hosts carrying the served port",
         "discovery-marketplace.us-east-1.amazonaws.com:9297",
         SERVED_BASE,
     ),
+    Dialled {
+        case: "an authority stated only in the request target",
+        host_header: None,
+        target_authority: Some("127.0.0.1:41509"),
+        expected_base: "https://127.0.0.1:41509",
+    },
+    Dialled {
+        case: "no authority stated at all",
+        host_header: None,
+        target_authority: None,
+        expected_base: SERVED_BASE,
+    },
 ];
 
 /// How many of a page's summaries have their published addresses FETCHED per row. Every
@@ -81,12 +154,33 @@ pub(crate) async fn dialled_at(
     operation: &str,
     input: &Value,
 ) -> Value {
-    let request = http::Request::builder()
+    dialled_from(router, Some(host), Some(host), operation, input).await
+}
+
+/// [`dialled_at`] over the two places a request carries the authority it reached this emulator
+/// at SEPARATELY: the `Host` header, and the authority of an absolute-form request target —
+/// which is how HTTP/2 and an SDK-built request spell the same thing. A row that states
+/// neither carries no authority at all.
+pub(crate) async fn dialled_from(
+    router: &MultiServiceRouter,
+    host_header: Option<&str>,
+    target_authority: Option<&str>,
+    operation: &str,
+    input: &Value,
+) -> Value {
+    let target = match target_authority {
+        Some(authority) => format!("https://{authority}/2026-02-05/{operation}"),
+        None => format!("/2026-02-05/{operation}"),
+    };
+    let mut builder = http::Request::builder()
         .method("POST")
-        .uri(format!("https://{host}/2026-02-05/{operation}"))
-        .header("host", host)
+        .uri(target)
         .header("authorization", AUTHORIZATION)
-        .header("content-type", "application/json")
+        .header("content-type", "application/json");
+    if let Some(host) = host_header {
+        builder = builder.header("host", host);
+    }
+    let request = builder
         .body(bytes::Bytes::from(input.to_string()))
         .expect("build the request");
     let response = router.dispatch(request).await;
@@ -94,7 +188,8 @@ pub(crate) async fn dialled_at(
     assert_eq!(
         status,
         200,
-        "case dialled {host} {operation}: expected HTTP 200, got {status} ({:?})",
+        "case dialled {host_header:?}/{target_authority:?} {operation}: expected HTTP 200, got \
+         {status} ({:?})",
         String::from_utf8_lossy(response.body())
     );
     serde_json::from_slice(response.body()).unwrap_or(Value::Null)
@@ -115,12 +210,21 @@ fn assert_is_a_url(case: &str, member: &str, url: &str) {
 /// RULE: a published address is announced on `expected_base` and on nothing else — in
 /// particular not on an authority the request merely carried that cannot lead a fetch back
 /// here.
-fn assert_announced_on(case: &str, member: &str, expected_base: &str, dialled: &str, url: &str) {
+pub(crate) fn assert_announced_on(
+    case: &str,
+    member: &str,
+    expected_base: &str,
+    dialled: Option<&str>,
+    url: &str,
+) {
     assert_is_a_url(case, member, url);
     assert!(
         url.starts_with(&format!("{expected_base}/")),
         "case {case} {member}: expected the address published on {expected_base:?}, got {url:?}"
     );
+    let Some(dialled) = dialled else {
+        return;
+    };
     if expected_base != format!("https://{dialled}") {
         let announced = url
             .split_once("://")
@@ -136,6 +240,88 @@ fn assert_announced_on(case: &str, member: &str, expected_base: &str, dialled: &
     }
 }
 
+/// RULE, over ONE summary of an answered page: the summary announces its own listing's logo
+/// address, and the reviews page of a review source that keeps one, on the authority the
+/// request arrived on, with the RECORD's own path after it — and, when `fetch_documents`, a
+/// fetch stating exactly the announced authority is answered HERE with the image resp. the
+/// page.
+///
+/// Returns whether the summary announced a reviews page, so a caller can require its table to
+/// have covered a summary that keeps one.
+///
+/// The one reading of what a summary announces, shared with
+/// [`crate::search_page_announced_authority`]: both suites assert the same thing about a
+/// summary and differ only in which pages they read.
+pub(crate) async fn assert_summary_addresses(
+    router: &MultiServiceRouter,
+    case: &str,
+    expected_base: &str,
+    dialled: Option<&str>,
+    summary: &Value,
+    fetch_documents: bool,
+) -> bool {
+    let (source_id, _source_name) = REVIEW_SOURCE;
+    let listing_id = text(summary, "listingId");
+    let logo = text(summary, "logoThumbnailUrl");
+    assert_announced_on(case, "logoThumbnailUrl", expected_base, dialled, &logo);
+    // The path is the record's own media address on that authority, so only the authority
+    // moves with the request.
+    let media_id = LogoMedia::of_listing(&listing_id).media_id().to_string();
+    assert_eq!(
+        logo,
+        logo_url(expected_base, &media_id),
+        "case {case}: expected this listing's own logo address on {expected_base:?}, got {logo:?}"
+    );
+
+    let reviews = review_source(summary).and_then(|(_source, url)| url);
+    if let Some(url) = &reviews {
+        assert_announced_on(case, "sourceUrl", expected_base, dialled, url);
+        assert_eq!(
+            *url,
+            reviews_page_url(expected_base, &reviews_list_id(&listing_id, source_id)),
+            "case {case}: expected this listing's own reviews page on {expected_base:?}, got \
+             {url:?}"
+        );
+    }
+    if !fetch_documents {
+        return reviews.is_some();
+    }
+
+    // And the address announced is served at the authority it was announced on: the fetch
+    // states exactly the authority of the published URL.
+    let image = fetch(router, "GET", &logo).await;
+    assert_eq!(
+        image.status, 200,
+        "case {case}: expected the logo announced at {logo:?} to be served on that authority, got \
+         {} ({:?})",
+        image.status,
+        image.as_text()
+    );
+    assert!(
+        image.body.starts_with(&PNG_SIGNATURE),
+        "case {case}: expected PNG bytes at {logo:?}, got {} bytes starting {:?}",
+        image.body.len(),
+        image.body.iter().take(8).collect::<Vec<_>>()
+    );
+    let Some(url) = &reviews else {
+        return false;
+    };
+    let page = fetch(router, "GET", url).await;
+    assert_eq!(
+        page.status, 200,
+        "case {case}: expected the reviews page announced at {url:?} to be served on that \
+         authority, got {} ({:?})",
+        page.status,
+        page.as_text()
+    );
+    assert!(
+        page.as_text().contains(listing_id.as_str()),
+        "case {case}: expected the page to restate the listing it is the reviews of, got {:?}",
+        page.as_text()
+    );
+    true
+}
+
 /// RULE: the addresses a `SearchListings` page publishes — every summary's `logoThumbnailUrl`
 /// and the `sourceUrl` of every summary whose review source keeps a reviews page — are
 /// announced on the authority the request arrived on, carry the record's own path, and are
@@ -144,13 +330,13 @@ fn assert_announced_on(case: &str, member: &str, expected_base: &str, dialled: &
 /// Rows: every authority of [`DIALLED`], over every summary of a whole catalog page.
 #[tokio::test]
 async fn a_search_page_publishes_its_addresses_on_the_authority_the_request_arrived_on() {
-    let (source_id, _source_name) = REVIEW_SOURCE;
     let router = router_served_at(SERVED_BASE);
 
-    for (dialled, expected_base) in DIALLED {
-        let body = dialled_at(
+    for dialled in DIALLED {
+        let body = dialled_from(
             &router,
-            dialled,
+            dialled.host_header,
+            dialled.target_authority,
             "searchListings",
             &json!({ "maxResults": MAX_PAGE }),
         )
@@ -158,80 +344,37 @@ async fn a_search_page_publishes_its_addresses_on_the_authority_the_request_arri
         let summaries = array(&body, "listingSummaries");
         assert!(
             !summaries.is_empty(),
-            "case dialled {dialled}: the seeded catalog must report listings, got {body}"
+            "case dialled {:?}: the seeded catalog must report listings, got {body}",
+            dialled.case
         );
         let mut fetched = 0_usize;
         let mut fetched_pages = 0_usize;
 
         for summary in &summaries {
             let listing_id = text(summary, "listingId");
-            let case = format!("dialled {dialled} {listing_id}");
-            let logo = text(summary, "logoThumbnailUrl");
-            assert_announced_on(&case, "logoThumbnailUrl", expected_base, dialled, &logo);
-            // The path is the record's own media address on that authority, so only the
-            // authority moves with the request.
-            let media_id = LogoMedia::of_listing(&listing_id).media_id().to_string();
-            assert_eq!(
-                logo,
-                logo_url(expected_base, &media_id),
-                "case {case}: expected this listing's own logo address on {expected_base:?}, got \
-                 {logo:?}"
-            );
-
-            let reviews = review_source(summary).and_then(|(_source, url)| url);
-            if let Some(url) = &reviews {
-                assert_announced_on(&case, "sourceUrl", expected_base, dialled, url);
-                assert_eq!(
-                    *url,
-                    reviews_page_url(expected_base, &reviews_list_id(&listing_id, source_id)),
-                    "case {case}: expected this listing's own reviews page on {expected_base:?}, \
-                     got {url:?}"
-                );
+            let case = format!("dialled {:?} {listing_id}", dialled.case);
+            let fetch_documents = fetched < FETCHED_PER_ROW;
+            let announced_reviews = assert_summary_addresses(
+                &router,
+                &case,
+                dialled.expected_base,
+                dialled.stated(),
+                summary,
+                fetch_documents,
+            )
+            .await;
+            if fetch_documents {
+                fetched += 1;
+                if announced_reviews {
+                    fetched_pages += 1;
+                }
             }
-
-            if fetched >= FETCHED_PER_ROW {
-                continue;
-            }
-            fetched += 1;
-            // And the address announced is served at the authority it was announced on: the
-            // fetch states exactly the authority of the published URL.
-            let image = fetch(&router, "GET", &logo).await;
-            assert_eq!(
-                image.status, 200,
-                "case {case}: expected the logo announced at {logo:?} to be served on that \
-                 authority, got {} ({:?})",
-                image.status,
-                image.as_text()
-            );
-            assert!(
-                image.body.starts_with(&PNG_SIGNATURE),
-                "case {case}: expected PNG bytes at {logo:?}, got {} bytes starting {:?}",
-                image.body.len(),
-                image.body.iter().take(8).collect::<Vec<_>>()
-            );
-            let Some(url) = &reviews else {
-                continue;
-            };
-            let page = fetch(&router, "GET", url).await;
-            assert_eq!(
-                page.status, 200,
-                "case {case}: expected the reviews page announced at {url:?} to be served on \
-                 that authority, got {} ({:?})",
-                page.status,
-                page.as_text()
-            );
-            assert!(
-                page.as_text().contains(listing_id.as_str()),
-                "case {case}: expected the page to restate the listing it is the reviews of, got \
-                 {:?}",
-                page.as_text()
-            );
-            fetched_pages += 1;
         }
         assert!(
             fetched > 0 && fetched_pages > 0,
-            "case dialled {dialled}: the row must have fetched a logo and a reviews page, got \
-             {fetched} logos and {fetched_pages} pages"
+            "case dialled {:?}: the row must have fetched a logo and a reviews page, got \
+             {fetched} logos and {fetched_pages} pages",
+            dialled.case
         );
     }
 }
@@ -282,7 +425,7 @@ async fn every_operation_publishes_its_addresses_on_that_same_authority() {
             &case,
             "SearchListings logoThumbnailUrl",
             expected_base,
-            dialled,
+            Some(dialled),
             &text(&summary, "logoThumbnailUrl"),
         );
 
@@ -298,7 +441,7 @@ async fn every_operation_publishes_its_addresses_on_that_same_authority() {
             &case,
             "GetListing logoThumbnailUrl",
             expected_base,
-            dialled,
+            Some(dialled),
             &announced,
         );
         assert_eq!(
@@ -307,7 +450,13 @@ async fn every_operation_publishes_its_addresses_on_that_same_authority() {
             "case {case}: one record's logo is one address, whichever operation reports it"
         );
         if let Some(url) = review_source(&listing).and_then(|(_source, url)| url) {
-            assert_announced_on(&case, "GetListing sourceUrl", expected_base, dialled, &url);
+            assert_announced_on(
+                &case,
+                "GetListing sourceUrl",
+                expected_base,
+                Some(dialled),
+                &url,
+            );
         }
 
         let mut products = 0_usize;
@@ -328,7 +477,7 @@ async fn every_operation_publishes_its_addresses_on_that_same_authority() {
                 &format!("{case}/{product_id}"),
                 "GetProduct logoThumbnailUrl",
                 expected_base,
-                dialled,
+                Some(dialled),
                 &text(&body, "logoThumbnailUrl"),
             );
             products += 1;
@@ -352,7 +501,7 @@ async fn every_operation_publishes_its_addresses_on_that_same_authority() {
                         &format!("{case}/{product_id}"),
                         member,
                         expected_base,
-                        dialled,
+                        Some(dialled),
                         url,
                     );
                     let page = fetch(&router, "GET", url).await;

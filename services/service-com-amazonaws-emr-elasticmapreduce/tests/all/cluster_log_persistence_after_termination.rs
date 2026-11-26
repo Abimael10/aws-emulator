@@ -279,24 +279,26 @@ async fn awaited_cluster_state<F: Fn(&str) -> bool>(
     }
 }
 
-/// Poll `ListObjectsV2` until the cluster's log destination holds a file, answering every key
-/// it holds then.
+/// Poll `ListObjectsV2` until the cluster's log destination holds exactly the files `expected`,
+/// answering every key it holds then — and answering what it holds at the [`DEADLINE`] when they
+/// never all arrive, so the caller's own comparison reports which file is missing.
+///
+/// The condition is the whole SET, not the first file: a step's delivery is owed per file and
+/// per step, so a listing that already holds one file says nothing about the rest, and waiting
+/// for the first one only makes the comparison that follows depend on how fast the host ran.
 async fn delivered_keys(
     case: &str,
     router: &MultiServiceRouter,
     cluster_id: &str,
     prefix: &str,
+    expected: &BTreeSet<String>,
 ) -> BTreeSet<String> {
     let deadline = Instant::now() + DEADLINE;
     loop {
         let keys = keys_under(router, case, prefix).await;
-        if !keys.is_empty() {
+        if keys == *expected || Instant::now() >= deadline {
             return keys;
         }
-        assert!(
-            Instant::now() < deadline,
-            "case {case:?}: expected log files under {prefix}, got none"
-        );
         // The delivery is owed from the instant a step ended, and whichever call reports the
         // cluster next is what drains it — which is what a client's own poll does.
         emr_ok(router, "ListSteps", json!({ "ClusterId": cluster_id })).await;
@@ -358,7 +360,6 @@ async fn a_terminated_cluster_leaves_its_log_files_in_amazon_s3() {
 
         // (3) The log files are there while the cluster still is: one directory per step that
         // ran, holding exactly the files a step's run produces.
-        let before = delivered_keys(label, &router, &cluster_id, &prefix).await;
         let mut expected: BTreeSet<String> = BTreeSet::new();
         for step in &settled {
             let step_id = step["Id"].as_str().unwrap_or_default();
@@ -366,6 +367,7 @@ async fn a_terminated_cluster_leaves_its_log_files_in_amazon_s3() {
                 expected.insert(format!("{prefix}{STEPS_SEGMENT}/{step_id}/{name}"));
             }
         }
+        let before = delivered_keys(label, &router, &cluster_id, &prefix, &expected).await;
         assert_eq!(
             before, expected,
             "case {label:?}: expected exactly {expected:?} under {prefix}, got {before:?}"
