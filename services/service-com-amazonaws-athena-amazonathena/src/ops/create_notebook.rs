@@ -252,6 +252,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_modified_at: now,
             // Nothing has updated the notebook's content yet, so no token stands behind it.
             last_update_token: None,
+            // Nor its name: the create is what gave the notebook the name it carries.
+            last_metadata_token: None,
         };
         let notebook_id = record.id.clone();
         store.notebooks.insert(record, input.client_request_token);

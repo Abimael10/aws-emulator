@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateNotebookMetadata
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateNotebookMetadata`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateNotebookMetadata::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The METADATA of a notebook, updated where it is stored: the request renames the notebook
+//! its `NotebookId` names and moves that notebook's `LastModifiedTime` to the instant of the
+//! write, so `GetNotebookMetadata`, `ExportNotebook` and the workgroup's listing report the
+//! new name out of the same [`crate::state::NotebookRecord`] afterwards. Nothing else moves
+//! — the content the notebook holds, the id it was minted under, the workgroup it lives in
+//! and when it was created are not members of this request. A name a SECOND notebook of that
+//! workgroup already carries is refused, as it is on a create or an import, and an id no
+//! create or import minted names no notebook whose metadata could be updated.
 //!
 //! ## Shape of an operation
 //!
@@ -146,20 +146,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateNotebookMetadata` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateNotebookMetadataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateNotebookMetadata"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal("Athena state is not reachable on this engine"));
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // "Updates the metadata for a notebook": the metadata belongs to the notebook the
+        // `NotebookId` names, so an id no create or import minted names nothing whose
+        // metadata could be updated — the one refusal every operation of this service that
+        // addresses ONE notebook states for that miss.
+        let Some(record) = store.notebooks.notebook(&input.notebook_id) else {
+            return Err(UpdateNotebookMetadataError::invalid_request(
+                crate::state::ERROR_CODE_NOTEBOOK_NOT_FOUND,
+                crate::state::notebook_not_found(&input.notebook_id),
+            ));
+        };
+
+        // `ClientRequestToken` is "a unique case-sensitive string used to ensure the request
+        // ... is idempotent (executes only once)", so a repeat under the token this
+        // notebook's name already stands under writes nothing further: the notebook keeps
+        // the instant of that one write rather than being modified again. The same token
+        // carrying ANOTHER name describes another update, which is what this service's
+        // `ClientRequestToken` refusal reports.
+        if let Some(token) = input.client_request_token.as_deref() {
+            if record.last_metadata_token.as_deref() == Some(token) {
+                if record.name != input.name {
+                    return Err(invalid_request(
+                        crate::state::IDEMPOTENT_PARAMETERS_DO_NOT_MATCH,
+                    ));
+                }
+                return Ok(UpdateNotebookMetadataOutput {});
+            }
+        }
+
+        // A notebook's name identifies it within the workgroup it lives in — "if an ipynb
+        // file with the same name already exists in the workgroup, throws an error" is the
+        // rule a create and an import are held to — so a rename onto a name a SECOND
+        // notebook of that same workgroup already carries is refused, while renaming a
+        // notebook to the name it already carries collides with nothing.
+        let work_group = record.work_group.clone();
+        if store
+            .notebooks
+            .holds_name_other_than(&work_group, &input.name, &input.notebook_id)
+        {
+            return Err(invalid_request(crate::state::notebook_name_exists(
+                &work_group,
+                &input.name,
+            )));
+        }
+
+        let Some(record) = store.notebooks.notebook_mut(&input.notebook_id) else {
+            // Unreachable: the notebook was read above under this same guard, which nothing
+            // else can take in between.
+            return Err(internal("the notebook to update is no longer stored"));
+        };
+        record.rename(input.name, input.client_request_token, now);
+
+        // "Updates the metadata for a notebook" and reports nothing back: the name the
+        // update wrote is read through `GetNotebookMetadata`, `ExportNotebook` and the
+        // workgroup's listing.
+        Ok(UpdateNotebookMetadataOutput {})
     }
+}
+
+/// The operation's own client error (HTTP 400), carrying `message`.
+///
+/// Each refusal above is a bad request rather than an unwritten operation, and
+/// `InvalidRequestException` is the client error this operation models: "Indicates that
+/// something is wrong with the input to the request." Each one is caused by the request
+/// itself, which is the class [`crate::state::ERROR_CODE_INVALID_INPUT`] names.
+fn invalid_request(message: impl Into<String>) -> UpdateNotebookMetadataError {
+    UpdateNotebookMetadataError::invalid_request(crate::state::ERROR_CODE_INVALID_INPUT, message)
+}
+
+/// The operation's own server error (HTTP 500): "Indicates a platform issue, which may be
+/// due to a transient condition or outage."
+///
+/// What this operation answers when the store it writes cannot be reached at all — a
+/// condition of the emulator rather than of the request, so it is not stated as a bad one.
+fn internal(message: impl Into<String>) -> UpdateNotebookMetadataError {
+    UpdateNotebookMetadataErrorModeled::InternalServerException(InternalServerException {
+        message: Some(message.into()),
+    })
+    .into()
 }

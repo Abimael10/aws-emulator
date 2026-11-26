@@ -110,6 +110,15 @@ pub struct NotebookRecord {
     /// nothing has updated, and on one whose last update carried no token — a write nothing
     /// identifies cannot be recognised as a repeat.
     pub last_update_token: Option<String>,
+    /// The `ClientRequestToken` the last update of this notebook's METADATA carried, when it
+    /// carried one.
+    ///
+    /// Its own field beside [`Self::last_update_token`]: a token identifies the ONE request
+    /// it was sent with, so a token that wrote this notebook's content stands behind no
+    /// update of its name, and a repeat is recognised against the request it repeats. `None`
+    /// on a notebook whose name nothing has changed, and on one whose last rename carried no
+    /// token.
+    pub last_metadata_token: Option<String>,
 }
 
 impl NotebookRecord {
@@ -144,6 +153,20 @@ impl NotebookRecord {
         self.notebook_type = notebook_type;
         self.last_modified_at = now;
         self.last_update_token = token;
+    }
+
+    /// Rename the notebook to `name` as of `now`, remembering `token` as the request that
+    /// renamed it.
+    ///
+    /// The one place a stored notebook's NAME changes. `LastModifiedTime` is "the time when
+    /// the notebook was last modified" (`NotebookMetadata$LastModifiedTime`) and a rename
+    /// modifies the notebook, so the instant moves with the name; the content the notebook
+    /// holds, the id it was minted under, the workgroup it lives in and when it was created
+    /// are left as they were — an update of the metadata carries none of them.
+    pub fn rename(&mut self, name: String, token: Option<String>, now: SystemTime) {
+        self.name = name;
+        self.last_modified_at = now;
+        self.last_metadata_token = token;
     }
 }
 
@@ -194,9 +217,27 @@ impl NotebookRegistry {
     /// within ONE workgroup, and the same name in another workgroup names another
     /// notebook. Case-sensitive, as `NotebookName` is.
     pub fn holds_name(&self, work_group: &str, name: &str) -> bool {
+        self.named(work_group, name).is_some()
+    }
+
+    /// The notebook of `work_group` called `name`, or `None` when the workgroup holds none.
+    ///
+    /// One lookup behind every reader of that uniqueness rule, so a create, an import and a
+    /// rename all decide whether a workgroup already holds a name the same way.
+    pub fn named(&self, work_group: &str, name: &str) -> Option<&NotebookRecord> {
         self.notebooks
             .values()
-            .any(|record| record.work_group == work_group && record.name == name)
+            .find(|record| record.work_group == work_group && record.name == name)
+    }
+
+    /// Whether a notebook OTHER than `id` already holds `name` in `work_group`.
+    ///
+    /// What a RENAME weighs: the name is unique within one workgroup ([`Self::holds_name`]),
+    /// and the notebook being renamed is the one notebook that may already carry the name —
+    /// renaming a notebook to the name it already has collides with nothing.
+    pub fn holds_name_other_than(&self, work_group: &str, name: &str, id: &str) -> bool {
+        self.named(work_group, name)
+            .is_some_and(|record| record.id != id)
     }
 
     /// How many notebooks are held, the count [`MAX_NOTEBOOKS`] bounds.
