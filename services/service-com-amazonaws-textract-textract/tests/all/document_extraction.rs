@@ -105,7 +105,7 @@ pub(crate) fn block_type(block: &Value) -> &str {
         .unwrap_or_default()
 }
 
-fn block_text(block: &Value) -> &str {
+pub(crate) fn block_text(block: &Value) -> &str {
     block.get("Text").and_then(Value::as_str).unwrap_or_default()
 }
 
@@ -120,11 +120,11 @@ pub(crate) fn of_type<'a>(blocks: &'a [Value], wanted: &str) -> Vec<&'a Value> {
         .collect()
 }
 
-fn child_ids(block: &Value) -> Vec<String> {
+pub(crate) fn child_ids(block: &Value) -> Vec<String> {
     related_ids(block, "CHILD")
 }
 
-fn related_ids(block: &Value, kind: &str) -> Vec<String> {
+pub(crate) fn related_ids(block: &Value, kind: &str) -> Vec<String> {
     block
         .get("Relationships")
         .and_then(Value::as_array)
@@ -182,7 +182,7 @@ pub(crate) fn drawn_lines(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn find<'a>(blocks: &'a [Value], id: &str) -> Option<&'a Value> {
+pub(crate) fn find<'a>(blocks: &'a [Value], id: &str) -> Option<&'a Value> {
     blocks.iter().find(|block| block_id(block) == id)
 }
 

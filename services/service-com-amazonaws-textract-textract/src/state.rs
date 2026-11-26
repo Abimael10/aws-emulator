@@ -78,6 +78,22 @@
 //!   around them, and their own outline — the extreme marks themselves, clockwise
 //!   from the corner the characters were read from — which follows the item's shape
 //!   instead of restating the box's corners.
+//!
+//! ## What the analysis-only blocks ARE
+//!
+//! An analysis adds blocks on top of that text layer for the requested `FeatureTypes`, and
+//! what each of them is — its `BlockType`, its `EntityTypes` and the blocks it is linked
+//! to — comes from the structure DETECTED on the page, never from a fixed layout:
+//!
+//! * a line that labels a value is the one `KEY_VALUE_SET` pair of that field
+//!   ([`form_blocks`] over [`labelled_split`]): the KEY half parents the words that label,
+//!   carries the `VALUE` link to the other half, and the VALUE half parents the words of
+//!   the value itself;
+//! * a contiguous run of rows is one `TABLE` whose `CELL`s parent the words read in them
+//!   ([`table_blocks`]), and the run's own rows say what those blocks are: the cells of a
+//!   row that heads the columns beneath it are that table's column headers
+//!   ([`heads_its_columns`]) and the table reports whether it is a structured one
+//!   ([`table_entity_type`]).
 
 pub mod ocr;
 pub mod s3_source;
@@ -2239,6 +2255,13 @@ pub fn blocks(key: &str, content: &DocumentContent, features: FeatureSet) -> Vec
                 let mut word_block = new_block("WORD", word.id.clone(), page_number);
                 word_block.text = Some(word.text.clone());
                 word_block.confidence = Some(word.confidence);
+                // `Block$TextType` is "the kind of text that Amazon Textract has detected.
+                // Can check for handwritten text and printed text", so it reports which of
+                // the two a word was recognised AS. Every word this service reads was
+                // matched against the printed faces [`ocr::glyphs`] holds templates for —
+                // it holds no handwriting templates, and ink it matches to none of its
+                // glyphs is reported as no word at all — so a word that came back is a word
+                // read off printed characters.
                 word_block.text_type = Some("PRINTED".to_string());
                 let mut word_geometry = word.region.geometry();
                 // `Geometry$RotationAngle` is "a numerical value corresponding to the
@@ -2504,10 +2527,52 @@ fn cell_regions(line: &LineLayout) -> Vec<Region> {
         .collect()
 }
 
+/// Whether a table's first row HEADS the columns beneath it, which is what makes each of
+/// its cells a column header.
+///
+/// AWS states `COLUMN_HEADER` as "identifies a cell that is a header of a column", so a
+/// header row is one that NAMES what stands under it rather than carrying data of its
+/// own. What tells a name from the data it stands against, on a page this service reads,
+/// is already stated once for a labelled line ([`carries_figure`]): the figures are the
+/// data. So a run's first row heads its columns exactly when it carries no figure at all
+/// and some row beneath it does — a run of nothing but names has no data for a header to
+/// stand against, and a first row that carries figures is data itself.
+fn heads_its_columns(run: &[LineLayout]) -> bool {
+    let Some((header, body)) = run.split_first() else {
+        return false;
+    };
+    let carries_figures =
+        |line: &LineLayout| line.words.iter().any(|word| carries_figure(&word.text));
+    !carries_figures(header) && body.iter().any(carries_figures)
+}
+
+/// Which KIND of table a run of rows makes up, as the one `EntityTypes` entry its `TABLE`
+/// block reports.
+///
+/// AWS states `STRUCTURED_TABLE` as "identifies a table with column headers where the
+/// content of each row corresponds to the headers" and `SEMI_STRUCTURED_TABLE` as
+/// "identifies a non-structured table", so a run is structured exactly when it HAS a
+/// header row ([`heads_its_columns`]) and every one of its rows breaks into the same
+/// columns that header names. A run that heads nothing, or whose rows do not line up with
+/// its first one, is the non-structured table.
+fn table_entity_type(run: &[LineLayout], headed: bool) -> &'static str {
+    let columns = run.first().map_or(0, |line| line.cells.len());
+    if headed && run.iter().all(|line| line.cells.len() == columns) {
+        "STRUCTURED_TABLE"
+    } else {
+        "SEMI_STRUCTURED_TABLE"
+    }
+}
+
 /// `TABLE` and `CELL` blocks for the page's tab-separated rows, and the table ids.
 ///
 /// A contiguous run of tab-separated lines is one table; a cell's `RowIndex` and
 /// `ColumnIndex` are 1-based, as the `Block` docs state.
+///
+/// What each of those blocks IS — the `EntityTypes` AWS documents as "returned by TABLES
+/// analysis" — is read off the run's own rows rather than left out: the cells of the row
+/// that heads the columns beneath it are that table's column headers, and the table
+/// reports whether those headers and its rows make it a structured table.
 fn table_blocks(
     key: &str,
     page_index: usize,
@@ -2525,6 +2590,9 @@ fn table_blocks(
             continue;
         };
         let table_id = block_id(key, "TABLE", &[page_index, table_index]);
+        // Read once per table, not once per cell: whether the run's first row heads its
+        // columns is a property of the whole run.
+        let headed = heads_its_columns(run);
         let mut cell_blocks = Vec::new();
         let mut cell_ids = Vec::new();
         for (row, line) in run.iter().enumerate() {
@@ -2540,6 +2608,9 @@ fn table_blocks(
                 cell.column_span = Some(1);
                 cell.confidence = Some(words_confidence(line, &cell_words));
                 cell.geometry = regions.get(column).map(Region::geometry);
+                if headed && row == 0 {
+                    cell.entity_types = Some(vec!["COLUMN_HEADER".to_string()]);
+                }
                 if !cell_words.is_empty() {
                     cell.relationships = Some(vec![relationship(
                         "CHILD",
@@ -2561,6 +2632,7 @@ fn table_blocks(
         .as_ref()
         .map(Region::geometry);
         table.relationships = Some(vec![relationship("CHILD", cell_ids)]);
+        table.entity_types = Some(vec![table_entity_type(run, headed).to_string()]);
 
         ids.push(table_id);
         out.push(table);
