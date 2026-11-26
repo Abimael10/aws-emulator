@@ -979,7 +979,7 @@ dependencies = [
 name = "aws-emulator-smithy-schema-server"
 version = "0.1.0"
 dependencies = [
- "aws-smithy-cbor",
+ "aws-smithy-cbor 0.62.2",
  "aws-smithy-eventstream 0.60.21",
  "aws-smithy-json 0.63.1",
  "aws-smithy-runtime-api",
@@ -1398,6 +1398,35 @@ dependencies = [
  "aws-smithy-types",
  "aws-types",
  "fastrand",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-cloudwatch"
+version = "1.144.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8f8fe67464c18d0018cb16b9743e9be25603d30f2615ff15fdaced55d8e5b54"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-cbor 0.64.2",
+ "aws-smithy-compression",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.1",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.2.0",
+ "aws-smithy-types",
+ "aws-types",
+ "fastrand",
+ "flate2",
+ "http",
+ "http-body",
+ "http-body-util",
  "regex-lite",
  "tracing",
 ]
@@ -2494,6 +2523,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-smithy-cbor"
+version = "0.64.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4266fb224b57a8fdab0aae88ec9948e530c2a007409fd7c6eee38da40591b307"
+dependencies = [
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.2.0",
+ "aws-smithy-types",
+ "bigdecimal",
+ "minicbor",
+ "num-bigint 0.4.8",
+]
+
+[[package]]
 name = "aws-smithy-checksums"
 version = "0.65.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2511,6 +2554,24 @@ dependencies = [
  "pin-project-lite",
  "sha1 0.11.0",
  "sha2 0.11.1",
+ "tracing",
+]
+
+[[package]]
+name = "aws-smithy-compression"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "016ef334a13c53bd75184bb8f89b0fb2aa4d56cb3cfc478ab3f05f13654b60a1"
+dependencies = [
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "bytes",
+ "flate2",
+ "futures-util",
+ "http",
+ "http-body",
+ "http-body-util",
+ "pin-project-lite",
  "tracing",
 ]
 
@@ -12584,7 +12645,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
- "aws-smithy-cbor",
+ "aws-smithy-cbor 0.62.2",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
@@ -13214,7 +13275,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
- "aws-smithy-cbor",
+ "aws-smithy-cbor 0.62.2",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
@@ -14474,11 +14535,14 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-cloudwatch",
  "aws-sdk-cloudwatchlogs",
  "aws-sdk-eventbridge",
  "aws-sdk-s3",
  "aws-sdk-secretsmanager",
  "aws-sdk-sns",
+ "aws-sdk-ssm",
+ "aws-sdk-xray",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
@@ -15081,7 +15145,7 @@ dependencies = [
  "aws-emulator-smithy-server-runtime",
  "aws-sdk-sns",
  "aws-sdk-sqs",
- "aws-smithy-cbor",
+ "aws-smithy-cbor 0.62.2",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
@@ -16686,7 +16750,7 @@ dependencies = [
  "aws-emulator-smithy-server-runtime",
  "aws-sdk-kms",
  "aws-sdk-s3",
- "aws-smithy-cbor",
+ "aws-smithy-cbor 0.62.2",
  "aws-smithy-eventstream 0.60.21",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
@@ -20199,7 +20263,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
- "aws-smithy-cbor",
+ "aws-smithy-cbor 0.62.2",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
@@ -23138,6 +23202,7 @@ dependencies = [
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
  "aws-lc-rs",
+ "aws-sdk-cloudwatch",
  "aws-sdk-cloudwatchlogs",
  "aws-sdk-dynamodbstreams",
  "aws-sdk-eventbridge",

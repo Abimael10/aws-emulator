@@ -33,10 +33,41 @@ use smithy_server_runtime::EmbeddedEmulator;
 /// `Authorization` header is never forwarded.
 #[must_use]
 pub fn ssm_client(callback: &EmbeddedEmulator, region: &str) -> ::aws_sdk_ssm::Client {
+    client_signing_with(callback, region, callback.aws_credentials_provider())
+}
+
+/// The same client, signing every call it makes as `credentials` rather than with the
+/// emulator's own.
+///
+/// What a service uses when the call it makes is one ANOTHER principal makes through it — a
+/// container's own program reading a parameter as the task role, say — so Systems Manager
+/// authorizes it against the policies in force on that principal, exactly as it authorizes any
+/// other signed request. The credentials are a session an emulated service minted through the
+/// token service; nothing here constructs an access key id or a secret.
+#[must_use]
+pub fn ssm_client_signed_as(
+    callback: &EmbeddedEmulator,
+    region: &str,
+    credentials: ::aws_sdk_ssm::config::Credentials,
+) -> ::aws_sdk_ssm::Client {
+    client_signing_with(
+        callback,
+        region,
+        ::aws_sdk_ssm::config::SharedCredentialsProvider::new(credentials),
+    )
+}
+
+/// The ONE builder both constructions above share, so the hop is configured one way whoever
+/// the call is signed as.
+fn client_signing_with(
+    callback: &EmbeddedEmulator,
+    region: &str,
+    credentials: impl ::aws_sdk_ssm::config::ProvideCredentials + 'static,
+) -> ::aws_sdk_ssm::Client {
     let config = ::aws_sdk_ssm::Config::builder()
         .behavior_version(::aws_sdk_ssm::config::BehaviorVersion::latest())
         .http_client(callback.http_client())
-        .credentials_provider(callback.aws_credentials_provider())
+        .credentials_provider(credentials)
         .region(::aws_sdk_ssm::config::Region::new(region.to_string()))
         .endpoint_url(format!("https://ssm.{region}.amazonaws.com"))
         .retry_config(::aws_sdk_ssm::config::retry::RetryConfig::disabled())

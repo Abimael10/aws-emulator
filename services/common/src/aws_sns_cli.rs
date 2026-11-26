@@ -27,7 +27,8 @@
 //! This module holds the two halves nothing about a caller makes different:
 //!
 //! * what one command line ASKS for ([`requested_publish`]) — the command group, the command and
-//!   the members of the call, each read as the CLI reads them. Every other command group, every
+//!   the members of the call, each read as the CLI reads them (the one reading of a line's named
+//!   parameters and of the options every command takes, `crate::aws_cli_options`). Every other command group, every
 //!   other command of this group, and every FORM of this command this program does not perform
 //!   (a parameter it does not take, a line missing the members the call requires) is answered
 //!   `None`, which the caller's session reports as a command it could not run rather than as a
@@ -76,29 +77,9 @@ pub use crate::aws_s3_cli::API_COMMAND_ERROR as COMMAND_ERROR;
 pub use crate::aws_s3_cli::store_answered as service_answered;
 
 /// What the CLI prints the answer to one call as, which this group's `--output` option selects:
-/// "The AWS CLI supports the following output formats" — `json`, "the output is formatted as a
-/// JSON string", and `text`, "the output is formatted as multiple lines of tab-separated string
-/// values" (AWS CLI, controlling command output). Every other format is one this program does
-/// not print, so a line asking for it is not an invocation it performs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum OutputFormat {
-    /// `json`, the CLI's default output format.
-    #[default]
-    Json,
-    /// `text`.
-    Text,
-}
-
-impl OutputFormat {
-    /// The format `written` names, or `None` for one this program does not print.
-    fn of(written: &str) -> Option<Self> {
-        match written {
-            "json" => Some(Self::Json),
-            "text" => Some(Self::Text),
-            _ => None,
-        }
-    }
-}
+/// the workspace's one reading of that option ([`crate::aws_cli_options::OutputFormat`]), so this
+/// group prints an answer in the same formats as every other.
+pub use crate::aws_cli_options::OutputFormat;
 
 /// WHERE one publish sends its message, as the command line addressed it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,8 +124,9 @@ pub struct PublishCall {
 /// It performs [`PUBLISH_COMMAND`] over the parameters that command takes: the destination
 /// (`--topic-arn` or `--target-arn`), `--message`, `--subject`, `--message-structure`,
 /// `--message-group-id`, `--message-deduplication-id`, and the global `--region` and
-/// `--output`. Each is read in both forms the CLI takes a parameter's value in
-/// ([`crate::aws_s3_cli::parameter_of`]). Every other command of the group, every other
+/// `--output`. The line is read by this workspace's one reading of a command line
+/// ([`crate::aws_cli_options::CommandLine`]), so one emulated CLI reads a line the same way
+/// whichever group it belongs to. Every other command of the group, every other
 /// parameter (each changes what the command does, so a line carrying one is not this
 /// invocation), a line missing the members the call requires, one addressing two destinations at
 /// once, and one carrying an operand the command does not take, is answered nothing for.
@@ -157,23 +139,9 @@ pub fn requested_publish(arguments: &[String]) -> Option<PublishCall> {
     if !PERFORMED_SNS_COMMANDS.contains(&words.next()?) {
         return None;
     }
-    let mut held: Vec<(&str, String)> = Vec::new();
-    while let Some(word) = words.next() {
-        // An operand is not a form this command takes: every member of the call is named. Both
-        // forms the CLI takes a parameter's value in are read the one way this workspace reads
-        // them, so one emulated CLI reads a line the same way whichever group it belongs to.
-        let (parameter, value) = crate::aws_s3_cli::parameter_of(word, &mut words)?;
-        // A parameter given twice is not an invocation either.
-        if held.iter().any(|(named, _)| *named == parameter) {
-            return None;
-        }
-        held.push((parameter, value));
-    }
-    let taken = |name: &str| {
-        held.iter()
-            .find(|(named, _)| *named == name)
-            .map(|(_, value)| value.clone())
-    };
+    // An operand is not a form this command takes, and neither is a switch or a list: every
+    // member of the call is named and takes one value.
+    let line = crate::aws_cli_options::CommandLine::read(words, &[], &[])?;
     // Every parameter of the line has to be one this command takes: one it does not changes
     // what the call is.
     const TAKEN_PARAMETERS: [&str; 9] = [
@@ -184,34 +152,33 @@ pub fn requested_publish(arguments: &[String]) -> Option<PublishCall> {
         "message-structure",
         "message-group-id",
         "message-deduplication-id",
-        "region",
-        "output",
+        crate::aws_cli_options::REGION_PARAMETER,
+        crate::aws_cli_options::OUTPUT_PARAMETER,
     ];
-    if held
-        .iter()
-        .any(|(named, _)| !TAKEN_PARAMETERS.contains(named))
-    {
+    if !line.names_only(&TAKEN_PARAMETERS) {
         return None;
     }
-    let target = match (taken("topic-arn"), taken("target-arn")) {
-        (Some(topic), None) => PublishTarget::Topic(topic),
-        (None, Some(endpoint)) => PublishTarget::Endpoint(endpoint),
+    let target = match (line.one("topic-arn"), line.one("target-arn")) {
+        (Some(topic), None) => PublishTarget::Topic(topic.to_string()),
+        (None, Some(endpoint)) => PublishTarget::Endpoint(endpoint.to_string()),
         // A line addressing both, or neither, is not a call this command makes.
         _ => return None,
     };
-    let output = match taken("output") {
-        Some(written) => OutputFormat::of(&written)?,
+    let output = match line.one(crate::aws_cli_options::OUTPUT_PARAMETER) {
+        Some(written) => OutputFormat::of(written)?,
         None => OutputFormat::default(),
     };
     Some(PublishCall {
         target,
         // The message is the one member the call requires, so a line naming none is not one.
-        message: taken("message")?,
-        subject: taken("subject"),
-        message_structure: taken("message-structure"),
-        message_group_id: taken("message-group-id"),
-        message_deduplication_id: taken("message-deduplication-id"),
-        region: taken("region").filter(|region| !region.is_empty()),
+        message: line.one("message")?.to_string(),
+        subject: line.one("subject").map(ToString::to_string),
+        message_structure: line.one("message-structure").map(ToString::to_string),
+        message_group_id: line.one("message-group-id").map(ToString::to_string),
+        message_deduplication_id: line
+            .one("message-deduplication-id")
+            .map(ToString::to_string),
+        region: line.region(),
         output,
     })
 }

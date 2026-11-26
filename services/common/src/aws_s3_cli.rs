@@ -648,38 +648,47 @@ pub async fn head_object_api(
 /// ANSWERED and no others — a member it answered nothing for is absent, never filled in — as
 /// the pretty-printed JSON the CLI's default output format is.
 ///
-/// The format is the CLI's rather than any one service's, so the sibling command groups print
-/// what their calls answered through this one spelling of it ([`crate::aws_sns_cli`]).
+/// The RENDERING is the workspace's one rendering of that format
+/// ([`crate::aws_cli_options::printed_answer`]); what this spelling adds is the member LIST a
+/// group whose response members are known states, which it builds the document out of. So every
+/// command group prints an answer in the same format whichever spelling it uses
+/// ([`crate::aws_sns_cli`]).
 #[must_use]
 pub fn printed_document(members: &[(&str, Option<String>)]) -> String {
-    let answered: ::serde_json::Map<String, ::serde_json::Value> = members
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .clone()
-                .map(|value| ((*name).to_string(), ::serde_json::Value::String(value)))
-        })
-        .collect();
-    if answered.is_empty() {
-        return String::new();
-    }
-    ::serde_json::to_string_pretty(&::serde_json::Value::Object(answered)).unwrap_or_default()
+    crate::aws_cli_options::printed_answer(
+        &answered_document(members),
+        crate::aws_cli_options::OutputFormat::Json,
+    )
 }
 
-/// What the CLI prints for one call in its `text` format: the values the service ANSWERED, in
-/// the order the response states them, separated by tabs — "the output is formatted as multiple
-/// lines of tab-separated string values" (AWS CLI, controlling command output) — where a member
-/// it answered nothing for is absent rather than filled in.
+/// What the CLI prints for one call in its `text` format: the values the service ANSWERED,
+/// separated by tabs — "the output is formatted as multiple lines of tab-separated string values"
+/// (AWS CLI, controlling command output) — where a member it answered nothing for is absent rather
+/// than filled in.
 ///
-/// Beside [`printed_document`] for the same reason: the format is the CLI's rather than any one
-/// service's, so every command group that prints an answer prints it through these two.
+/// Beside [`printed_document`] for the same reason, and through the same one rendering of the
+/// format.
 #[must_use]
 pub fn printed_values(members: &[(&str, Option<String>)]) -> String {
-    members
-        .iter()
-        .filter_map(|(_, value)| value.clone())
-        .collect::<Vec<String>>()
-        .join("\t")
+    crate::aws_cli_options::printed_answer(
+        &answered_document(members),
+        crate::aws_cli_options::OutputFormat::Text,
+    )
+}
+
+/// The response document a group's member list IS: the members the service answered, each as the
+/// text it answered, and no entry at all for one it answered nothing for.
+fn answered_document(members: &[(&str, Option<String>)]) -> ::serde_json::Value {
+    ::serde_json::Value::Object(
+        members
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .clone()
+                    .map(|value| ((*name).to_string(), ::serde_json::Value::String(value)))
+            })
+            .collect(),
+    )
 }
 
 /// The object at `address`, as the text a transfer carries — read whole and bounded by

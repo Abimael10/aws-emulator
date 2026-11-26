@@ -328,6 +328,11 @@ quick-xml = "0.41"
 # PNGs with, so the one renderer every such service shares writes a real image rather than
 # hand-assembled bytes.
 png = "0.18"
+# `aws_cloudwatch_cli`: the in-process Amazon CloudWatch client a service PUBLISHING metric
+# data on another principal's behalf drives — a container's own program publishing as the task
+# role among them — built once here for every such service. Only the generated client is
+# needed: the emulator supplies the transport, so the SDK's own HTTPS stack is left out.
+aws-sdk-cloudwatch = { version = "1", default-features = false }
 # `event_stream`: the `vnd.amazon.eventstream` ENCODER one frame is written with, for an
 # event whose payload is already encoded (an `@eventPayload` blob, or a stream a model
 # declares as a streaming blob rather than as a union of event structures) — the maintained

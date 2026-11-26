@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The AWS CLI as a container's session provides it: the `aws s3` transfers and the `aws sns`
-//! publish one container's program asks for, really performed against this emulator's own
-//! services as the task role.
+//! The AWS CLI as a container's session provides it: the `aws s3` transfers, the `aws sns`
+//! publish, the `aws cloudwatch` publish, the `aws xray` submission and the `aws ssm` read one
+//! container's program asks for, really performed against this emulator's own services as the
+//! task role.
 //!
 //! # The rule this module implements
 //!
@@ -21,9 +22,24 @@
 //! action is refused by Amazon SNS — the command reports that refusal and exits with the status
 //! the CLI answers a service error with.
 //!
+//! And of a command line that REPORTS what the container is doing or READS what it is configured
+//! with — the three commands an instrumented workload's own program is written round:
+//! `aws cloudwatch put-metric-data` "publishes metric data to Amazon CloudWatch", so a counter a
+//! container publishes is readable from the metric it named; `aws xray put-trace-segments`
+//! "uploads segment documents to Amazon Web Services X-Ray", so the frames a container submits
+//! are retrievable as a trace; and `aws ssm get-parameter` "gets information about a single
+//! parameter", so a container reads the configuration a client put in the parameter store. Each
+//! is signed as the task role like every other call of this module, so a task role that may not
+//! perform the action is refused by that service and the command reports the refusal and exits
+//! with the status the CLI answers a service error with — which is what a program written
+//! `if aws xray put-trace-segments …; then … else … fi` branches on, and the reason a container
+//! whose role is missing one statement reports its own refusals instead of its frames.
+//!
 //! What ONE command line asks for, and the calls that carry it, are the workspace's shared
 //! reading of that program ([`::service_common::aws_s3_cli`] for the object commands,
-//! [`::service_common::aws_sns_cli`] for the notification one) — the same one every service
+//! [`::service_common::aws_sns_cli`] for the notification one,
+//! [`::service_common::aws_cloudwatch_cli`], [`::service_common::aws_xray_cli`] and
+//! [`::service_common::aws_ssm_cli`] for the three above) — the same one every service
 //! that runs a caller-supplied command line uses, so two of them cannot carry a different file,
 //! publish a different message or answer a different status. Both of the CLI's object command
 //! groups are provided: the file-oriented `aws s3` commands and the low-level `aws s3api`
@@ -34,9 +50,12 @@
 //!
 //! Every call goes over the framework's in-process callback, through this workspace's one
 //! construction of each client ([`::service_common::s3_client`],
-//! [`::service_common::sns_client`]) — the same transport a client's own request to those
-//! services takes, so the object a container wrote is the object a later `GetObject` of that
-//! bucket reads and the message it published is the one that topic's subscribers receive.
+//! [`::service_common::sns_client`], [`::service_common::cloudwatch_client`],
+//! [`::service_common::xray_segments`], [`::service_common::ssm_client`]) — the same transport a
+//! client's own request to those services takes, so the object a container wrote is the object a
+//! later `GetObject` of that bucket reads, the message it published is the one that topic's
+//! subscribers receive, and the observation it published is the one that metric's own readers
+//! answer from.
 //! Nothing is dialled, resolved or opened, and no host file is read or written. The credential
 //! is held HERE and never reaches the program: it is not in the session's variables, in its
 //! filesystem, or in anything the container writes.
@@ -51,11 +70,15 @@
 
 use ::std::time::Duration;
 
+use ::service_common::aws_cli_options as cli_options;
+use ::service_common::aws_cloudwatch_cli as cloudwatch_cli;
 use ::service_common::aws_s3_cli::{
     self as cli, Location, ObjectAddress, Requested, NO_CREDENTIAL_LOCATED, TRANSFER_FAILED,
     TRANSFER_SUCCEEDED,
 };
 use ::service_common::aws_sns_cli as sns_cli;
+use ::service_common::aws_ssm_cli as ssm_cli;
+use ::service_common::aws_xray_cli as xray_cli;
 use ::service_common::posix_shell_files::ShellFiles;
 
 /// How many bytes ONE transfer carries.
@@ -211,6 +234,15 @@ impl ContainerAwsCli {
         if let Some(call) = sns_cli::requested_publish(arguments) {
             return Some(self.performed_publish(&call).await);
         }
+        if let Some(call) = cloudwatch_cli::requested_put_metric_data(arguments) {
+            return Some(self.performed_metric_publish(&call).await);
+        }
+        if let Some(call) = xray_cli::requested_put_trace_segments(arguments) {
+            return Some(self.performed_segment_submission(&call).await);
+        }
+        if let Some(call) = ssm_cli::requested_get_parameter(arguments) {
+            return Some(self.performed_parameter_read(&call).await);
+        }
         let requested = cli::requested(arguments)?;
         // The Region the transfer's calls go to is the one the command line names, and the
         // Region the task was placed in for a line naming none — the CLI's own reading of that
@@ -281,6 +313,93 @@ impl ContainerAwsCli {
                 output: String::new(),
                 errors: format!("{detail}\n"),
             },
+        }
+    }
+
+    /// Perform one PUBLISH of metric data (`aws cloudwatch put-metric-data …`) and answer what
+    /// the CLI reports for it: nothing on standard output for an operation that answers no
+    /// document of its own, or the service's own refusal on standard error with the status that
+    /// refusal gives the command.
+    ///
+    /// The call is signed as the task role, exactly as this module's transfers are, so CloudWatch
+    /// judges it against the policies in force on that role. A task holding no credential at all
+    /// makes no call: that is the CLI's own failure, with no refusal to report.
+    async fn performed_metric_publish(
+        &self,
+        call: &cloudwatch_cli::PutMetricDataCall,
+    ) -> CliOutcome {
+        let region = call.region.as_deref().unwrap_or(&self.region);
+        let client = match self.metric_client(region) {
+            Ok(client) => client,
+            Err(detail) => return Self::command_failed(&detail),
+        };
+        Self::reported(
+            self.made(cloudwatch_cli::published_metric_data(&client, call))
+                .await,
+        )
+    }
+
+    /// Perform one SUBMISSION of segment documents (`aws xray put-trace-segments …`) and answer
+    /// what the CLI reports for it: the response document on standard output, or the service's own
+    /// refusal on standard error with the status that refusal gives the command — which is the
+    /// status a program whose task role lacks the action branches on.
+    async fn performed_segment_submission(
+        &self,
+        call: &xray_cli::PutTraceSegmentsCall,
+    ) -> CliOutcome {
+        let region = call.region.as_deref().unwrap_or(&self.region);
+        let client = match self.trace_client(region) {
+            Ok(client) => client,
+            Err(detail) => return Self::command_failed(&detail),
+        };
+        Self::reported(
+            self.made(xray_cli::submitted_trace_segments(&client, call))
+                .await,
+        )
+    }
+
+    /// Perform one READ of a parameter (`aws ssm get-parameter …`) and answer what the CLI reports
+    /// for it: the response document on standard output, in the format the line asked for, or the
+    /// service's own refusal on standard error with the status that refusal gives the command.
+    async fn performed_parameter_read(&self, call: &ssm_cli::GetParameterCall) -> CliOutcome {
+        let region = call.region.as_deref().unwrap_or(&self.region);
+        let client = match self.parameter_client(region) {
+            Ok(client) => client,
+            Err(detail) => return Self::command_failed(&detail),
+        };
+        Self::reported(self.made(ssm_cli::read_parameter(&client, call)).await)
+    }
+
+    /// What the CLI reports for one call of the three groups above: the document the call answered
+    /// on standard output and the status of a call that was made, or what it answered about a call
+    /// the service refused on standard error with the status a service error gives the command.
+    fn reported(answered: Result<String, String>) -> CliOutcome {
+        match answered {
+            Ok(document) => CliOutcome {
+                status: cli_options::COMMAND_SUCCEEDED,
+                output: if document.is_empty() {
+                    String::new()
+                } else {
+                    format!("{document}\n")
+                },
+                errors: String::new(),
+            },
+            Err(detail) => CliOutcome {
+                status: cli_options::COMMAND_SERVICE_ERROR,
+                output: String::new(),
+                errors: format!("{detail}\n"),
+            },
+        }
+    }
+
+    /// What the CLI reports for a command it could not carry out at all — no credential to sign
+    /// with among them: no call was made, so this is the CLI's own failure rather than a service
+    /// refusal.
+    fn command_failed(detail: &str) -> CliOutcome {
+        CliOutcome {
+            status: cli_options::COMMAND_ERROR,
+            output: String::new(),
+            errors: format!("{detail}\n"),
         }
     }
 
@@ -582,6 +701,88 @@ impl ContainerAwsCli {
                 ),
             )),
             TaskRoleCredential::Emulator => Ok(::service_common::sns_client::sns_client(
+                &self.callback,
+                region,
+            )),
+            TaskRoleCredential::Absent => Err(NO_CREDENTIAL_LOCATED.to_string()),
+        }
+    }
+
+    /// The Amazon CloudWatch client this command's call is made with, addressed to `region`: the
+    /// same in-process transport and the same credential as this module's transfers
+    /// ([`Self::client`]), through this workspace's one construction of that hop.
+    fn metric_client(&self, region: &str) -> Result<::aws_sdk_cloudwatch::Client, String> {
+        match &self.credential {
+            TaskRoleCredential::Session {
+                access_key_id,
+                secret_access_key,
+                session_token,
+            } => Ok(::service_common::cloudwatch_client::cloudwatch_client_signed_as(
+                &self.callback,
+                region,
+                ::aws_sdk_cloudwatch::config::Credentials::new(
+                    access_key_id.clone(),
+                    secret_access_key.clone(),
+                    Some(session_token.clone()),
+                    None,
+                    TASK_CREDENTIAL_SOURCE,
+                ),
+            )),
+            TaskRoleCredential::Emulator => Ok(
+                ::service_common::cloudwatch_client::cloudwatch_client(&self.callback, region),
+            ),
+            TaskRoleCredential::Absent => Err(NO_CREDENTIAL_LOCATED.to_string()),
+        }
+    }
+
+    /// The AWS X-Ray client this command's submission is made with, addressed to `region`: the
+    /// same in-process transport and the same credential as this module's transfers
+    /// ([`Self::client`]), through this workspace's one construction of that hop.
+    fn trace_client(&self, region: &str) -> Result<::aws_sdk_xray::Client, String> {
+        match &self.credential {
+            TaskRoleCredential::Session {
+                access_key_id,
+                secret_access_key,
+                session_token,
+            } => Ok(::service_common::xray_segments::xray_client_signed_as(
+                &self.callback,
+                region,
+                ::aws_sdk_xray::config::Credentials::new(
+                    access_key_id.clone(),
+                    secret_access_key.clone(),
+                    Some(session_token.clone()),
+                    None,
+                    TASK_CREDENTIAL_SOURCE,
+                ),
+            )),
+            TaskRoleCredential::Emulator => Ok(
+                ::service_common::xray_segments::xray_client_through(&self.callback, region),
+            ),
+            TaskRoleCredential::Absent => Err(NO_CREDENTIAL_LOCATED.to_string()),
+        }
+    }
+
+    /// The AWS Systems Manager client this command's read is made with, addressed to `region`: the
+    /// same in-process transport and the same credential as this module's transfers
+    /// ([`Self::client`]), through this workspace's one construction of that hop.
+    fn parameter_client(&self, region: &str) -> Result<::aws_sdk_ssm::Client, String> {
+        match &self.credential {
+            TaskRoleCredential::Session {
+                access_key_id,
+                secret_access_key,
+                session_token,
+            } => Ok(::service_common::ssm_client::ssm_client_signed_as(
+                &self.callback,
+                region,
+                ::aws_sdk_ssm::config::Credentials::new(
+                    access_key_id.clone(),
+                    secret_access_key.clone(),
+                    Some(session_token.clone()),
+                    None,
+                    TASK_CREDENTIAL_SOURCE,
+                ),
+            )),
+            TaskRoleCredential::Emulator => Ok(::service_common::ssm_client::ssm_client(
                 &self.callback,
                 region,
             )),

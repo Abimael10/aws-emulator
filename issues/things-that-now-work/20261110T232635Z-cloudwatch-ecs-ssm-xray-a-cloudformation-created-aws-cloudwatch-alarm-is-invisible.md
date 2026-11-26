@@ -10,6 +10,8 @@ Issue-Commit: cd6d73564e5f4cf53934bca1327f08de31f2ee5f
 
 > _Note: this issue was identified against the code base at commit `cd6d73564e5f4cf53934bca1327f08de31f2ee5f`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+> _Cause 1 is FIXED (by the time this report was worked, the `AWS::CloudWatch::Alarm` provisioning arm was already on mainline and the check's own alarm assertion passes), and cause 2's RULE is implemented and tested here — a container's program really makes the AWS CLI calls its command lines name, signed as the task role, so its metric data, its trace segments and its parameter reads exist and a task role withholding one action is refused exactly that call. Neither recorded check PASSES yet: the recorded container program is declined by the ECS container session before it reaches any `aws` command, which is a cause of its own. Both replay keys are therefore re-filed, with what this fix established and the blocker named, as `issues/things-that-do-not-work/20261126T000000Z-ecs-the-container-session-declines-the-shell-form-a-recorded-publisher-program-is-written-in.md`, so they are not recorded as working. See the Resolution below for what landed._
+
 ## Operation
 DescribeAlarms
 
@@ -53,3 +55,35 @@ Cause 2:
 1. RegisterTaskDefinition for a FARGATE task whose container emits X-Ray segments and CloudWatch metrics; give one task role xray:PutTraceSegments and withhold it from the other.
 2. ecs:RunTask both definitions (awsvpc, assignPublicIp ENABLED); both succeed with no failures.
 3. Poll cloudwatch:GetMetricStatistics and xray:GetTraceSummaries. Observe nothing is ever published or traced.
+
+## Resolution
+
+Cause 1 — FIXED, and already on mainline by the time this report was worked: the
+`AWS::CloudWatch::Alarm` provisioning arm puts the declared alarm into Amazon CloudWatch through
+that service's own `PutMetricAlarm`, under the physical id CloudFormation gave the resource
+(`services/service-com-amazonaws-cloudformation-cloudformation/src/state/provisioner/cloudwatch_alarms.rs`,
+pinned by that crate's `tests/all/declared_alarm_scalars_reach_cloudwatch.rs`,
+`declared_alarm_is_readable_in_cloudwatch.rs`, `declared_alarm_lifecycle_in_cloudwatch.rs` and
+`cloudwatch_alarm_and_ecs_service_resources.rs`, including the ExtendedStatistic `p90` declaration
+this report cites). The check's own `phase 1/6 deploy` alarm assertion no longer fails.
+
+Cause 2 — the rule is IMPLEMENTED and tested, and what was still missing afterwards is re-filed
+(see the note at the top). What landed: the AWS CLI a container's session provides now performs the
+command groups an instrumented workload is written round, each call signed as a session of the task
+role, so a task role that does not carry an action is refused exactly that call by the service that
+owns it:
+
+* `services/common/src/aws_cli_options.rs` — the CLI's own reading of a line's named parameters
+  (both spellings of a value, switches, lists) and the one rendering of its two `--output` formats.
+* `services/common/src/aws_cloudwatch_cli.rs` — `aws cloudwatch put-metric-data`, in both forms
+  that command takes its data in; `aws_xray_cli.rs` — `aws xray put-trace-segments`;
+  `aws_ssm_cli.rs` — `aws ssm get-parameter`.
+* `services/common/src/cloudwatch_client.rs`, plus `ssm_client_signed_as` and
+  `xray_client_signed_as` — the in-process hops, signed as the vended task-role session.
+* `services/service-com-amazonaws-ecs-amazonec2containerservicev20141113/src/state/container_aws_cli.rs`
+  — the container session's dispatch of those three groups.
+
+Tests that pin it: `core/router/tests/all/ecs_container_publishes_its_telemetry.rs` (the permission
+contrast this report describes, across ECS, IAM, STS, CloudWatch, X-Ray, Systems Manager and
+CloudWatch Logs) and
+`services/service-com-amazonaws-ecs-amazonec2containerservicev20141113/tests/all/container_published_telemetry.rs`.

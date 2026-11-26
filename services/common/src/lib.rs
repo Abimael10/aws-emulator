@@ -746,6 +746,24 @@ pub mod aws_s3_cli;
 /// and the ONE performance of the call it names over that hop, for every service that runs
 /// such a line.
 pub mod aws_sns_cli;
+/// The parts of an AWS CLI command line that are the CLI's own rather than one command group's:
+/// how a line's named parameters are read, and the two options that decide what the answer to a
+/// call is printed as.
+pub mod aws_cli_options;
+/// The ONE reading of the AWS CLI's `aws cloudwatch put-metric-data` a caller-supplied command
+/// line asks for, and the ONE performance of the publish it names, for every service that runs
+/// such a line.
+pub mod aws_cloudwatch_cli;
+/// The ONE reading of the AWS CLI's `aws xray put-trace-segments` a caller-supplied command line
+/// asks for, and the ONE performance of the submission it names, for every service that runs
+/// such a line.
+pub mod aws_xray_cli;
+/// The ONE reading of the AWS CLI's `aws ssm get-parameter` a caller-supplied command line asks
+/// for, and the ONE performance of the read it names, for every service that runs such a line.
+pub mod aws_ssm_cli;
+/// The ONE construction of the in-process Amazon CloudWatch client a service publishing an
+/// observation or reading a metric drives, so no two services configure that hop differently.
+pub mod cloudwatch_client;
 /// The ONE construction of the in-process Amazon SNS client a service publishing a
 /// notification drives, so no two services configure that hop differently.
 pub mod sns_client;

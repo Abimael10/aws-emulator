@@ -151,6 +151,16 @@ aws-sdk-s3 = { version = "1", default-features = false }
 # (`state::container_aws_cli`), signed as the task role, so the message a container published is
 # the one that topic's own subscribers receive.
 aws-sdk-sns = { version = "1", default-features = false }
+# The AWS SDK for Amazon CloudWatch, AWS X-Ray and AWS Systems Manager, driven over that same
+# callback and for the same reason: a container's program publishes its counters through
+# `aws cloudwatch put-metric-data`, submits its frames through `aws xray put-trace-segments` and
+# reads its configuration through `aws ssm get-parameter` (`state::container_aws_cli`), each
+# signed as the task role — so the observation a container published is the one that metric's own
+# readers answer from, the trace it submitted is the one X-Ray's reads resolve, and a task role
+# missing one of those actions is refused by the service that owns it.
+aws-sdk-cloudwatch = { version = "1", default-features = false }
+aws-sdk-xray = { version = "1", default-features = false }
+aws-sdk-ssm = { version = "1", default-features = false }
 # The AWS SDK for Secrets Manager, driven over the same in-process callback: a container's
 # `secrets` entry is read through that service's own `GetSecretValue` before the container's
 # program starts (`state::container_secrets`), so the value injected into a container is the
