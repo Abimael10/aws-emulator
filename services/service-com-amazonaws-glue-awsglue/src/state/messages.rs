@@ -679,29 +679,6 @@ pub fn event_queue_grant_missing(queue_arn: &str) -> String {
     )
 }
 
-/// `CreateCrawler`/`UpdateCrawler` for an Amazon S3 target whose bucket the object store
-/// answered it holds nothing under ([`super::absent_s3_target`]).
-///
-/// Recorded in part: what is pinned is that the refusal NAMES the S3 target and the 404 Amazon
-/// S3 answered about its bucket, and that it is the operation's own modelled
-/// `InvalidInputException` at 400. So the sentence states that the target does not exist, and
-/// is followed by the diagnostic clause this service appends to a refusal another component
-/// raised ([`with_diagnostic`]) — which here states the component that answered (Amazon S3),
-/// the status it answered with and the code it named, exactly as the clause wrapping the
-/// catalog's own miss states that component's.
-///
-/// Its variable parts are read off the request and the clause's own per-call id: the target
-/// path exactly as the request supplied it, and the request id. WHICH bucket is not disclosed
-/// beyond the path the caller itself wrote.
-pub fn s3_target_does_not_exist(path: &str) -> String {
-    with_diagnostic(
-        &format!("S3 target {path} does not exist"),
-        DIAGNOSTIC_SERVICE_S3,
-        DIAGNOSTIC_STATUS_NOT_FOUND,
-        DIAGNOSTIC_CODE_NO_SUCH_BUCKET,
-    )
-}
-
 /// `CreateCrawler` for a DynamoDB target whose table the crawler's `Role` may not read
 /// ([`super::dynamodb_target_refusal`]).
 ///
@@ -1011,15 +988,6 @@ const DIAGNOSTIC_SERVICE_DATA_CATALOG: &str = "AmazonDataCatalog";
 /// resolves the role such a run would be performed as ([`session_role_not_assumable`]).
 /// As recorded.
 const DIAGNOSTIC_SERVICE_JOB_EXECUTOR: &str = "AWSGlueJobExecutor";
-
-/// The component a diagnostic clause names for an answer AMAZON S3 gave, which this service
-/// surfaces wrapped in its own refusal ([`s3_target_does_not_exist`]): the object store is the
-/// component that answered, so its own name, status and code are what the clause states.
-const DIAGNOSTIC_SERVICE_S3: &str = "Amazon S3";
-
-/// The `Error Code` a clause states for an Amazon S3 answer that it holds no bucket under the
-/// name a request addressed — the code that service answers such a read with.
-const DIAGNOSTIC_CODE_NO_SUCH_BUCKET: &str = "NoSuchBucket";
 
 /// The `Error Code` a clause states for a reference that resolved to nothing.
 const DIAGNOSTIC_CODE_ENTITY_NOT_FOUND: &str = "EntityNotFoundException";

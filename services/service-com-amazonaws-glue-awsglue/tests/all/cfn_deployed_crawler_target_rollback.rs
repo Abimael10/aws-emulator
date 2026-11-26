@@ -1,28 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! A CloudFormation stack that declares a Glue crawler over an Amazon S3 target no bucket
-//! exists for is ROLLED BACK, and one whose target names a bucket the same stack creates
-//! deploys.
+//! A CloudFormation stack that declares a Glue crawler whose role Glue cannot assume is ROLLED
+//! BACK, and one whose role trusts the Glue service principal deploys.
 //!
-//! The rule under test: a crawler write refuses a target whose bucket the object store ANSWERS
-//! it holds no bucket under ([`crate::crawler_s3_target_resolution`] drives that rule over the
-//! class of targets), and a declared resource whose own service refuses its create is what makes
-//! CloudFormation fail that resource and unwind the operation — so the stack settles in a
-//! terminal rollback status, its failure reason carries what Glue refused (the S3 target and the
-//! 404 Amazon S3 answered about its bucket), and every resource the create had already made —
-//! the `AWS::Glue::Database` beside the crawler — is gone again, which a client observes as
-//! `GetDatabase` answering the catalog's own miss.
+//! The rule under test: a crawler write resolves the `Role` the crawl would run as against this
+//! emulator's own IAM and refuses the create when IAM answers that Glue cannot assume it
+//! ([`crate::crawler_role_trust`] drives that rule over the class of trust documents), and a
+//! declared resource whose own service refuses its create is what makes CloudFormation fail that
+//! resource and unwind the operation — so the stack settles in a terminal rollback status, its
+//! failure reason carries what Glue refused (the role's trust policy), and every resource the
+//! create had already made — the `AWS::Glue::Database` beside the crawler — is gone again, which
+//! a client observes as `GetDatabase` answering the catalog's own miss.
 //!
-//! WHY it matters: a deployment whose crawler target is a typo'd or not-yet-created bucket is
-//! reported to the deployer as a healthy one if nothing refuses it, so the client discovers the
-//! mistake much later or never, and a template written to be refused at deploy time cannot be
-//! exercised at all.
+//! WHY it matters: a deployment whose crawler cannot be created is reported to the deployer as a
+//! healthy one if nothing refuses it, so the client discovers the mistake much later or never,
+//! and a template written to be refused at deploy time cannot be exercised at all.
 //!
 //! Four crates have to agree for that to hold — CloudFormation makes every create the template
 //! declares through the service that owns the resource, IAM holds the role the crawl would run
-//! as, Amazon S3 holds (or does not hold) the bucket behind the target, and this service decides
-//! the create — so all four are mounted on ONE engine here, the way `core/router/src/lib.rs`
-//! mounts them, and every call travels the real in-process callback.
+//! as, Amazon S3 holds the bucket behind the target, and this service decides the create — so
+//! all four are mounted on ONE engine here, the way `core/router/src/lib.rs` mounts them, and
+//! every call travels the real in-process callback.
 //!
 //! Nothing here sleeps for a span: the wait is for the stack's own STATUS, looked at again until
 //! it is terminal or a generous deadline passes, and no assertion reads the wall clock.
@@ -102,6 +100,11 @@ fn cloudformation_client(router: &MultiServiceRouter) -> aws_sdk_cloudformation:
     aws_sdk_cloudformation::Client::from_conf(config)
 }
 
+/// The whole `Message` Glue refuses a crawler whose role it cannot assume with, which is what
+/// CloudFormation carries into the failed resource's `ResourceStatusReason`.
+const ROLE_NOT_ASSUMABLE: &str =
+    "Service is unable to assume provided role. Please verify role's TrustPolicy";
+
 /// Every name one row's template declares, so what is asserted is computed from the declaration
 /// rather than read back out of the answer being checked.
 struct Names {
@@ -113,7 +116,7 @@ struct Names {
     database: String,
     /// The crawler itself.
     crawler: String,
-    /// The bucket the target names — created by the stack only where the row says so.
+    /// The bucket the target names, created by the stack.
     bucket: String,
 }
 
@@ -134,11 +137,22 @@ impl Names {
     }
 }
 
-/// The template one row deploys: the role the crawl would run as, the database the crawler
-/// writes into, the crawler itself — and, where `creates_the_bucket`, the bucket its target
-/// names.
-fn template(names: &Names, creates_the_bucket: bool) -> String {
-    let mut resources = json!({
+/// The template one row deploys: the bucket the target names, the role the crawl would run as —
+/// trusting the Glue service principal only where `glue_can_assume_the_role` — the database the
+/// crawler writes into, and the crawler itself.
+fn template(names: &Names, glue_can_assume_the_role: bool) -> String {
+    let trusted_principal = if glue_can_assume_the_role {
+        "glue.amazonaws.com"
+    } else {
+        // A service principal that is not this one: IAM holds the role, and answers that Glue
+        // cannot assume it.
+        "ec2.amazonaws.com"
+    };
+    let resources = json!({
+        "Data": {
+            "Type": "AWS::S3::Bucket",
+            "Properties": { "BucketName": &names.bucket },
+        },
         "Role": {
             "Type": "AWS::IAM::Role",
             "Properties": {
@@ -147,7 +161,7 @@ fn template(names: &Names, creates_the_bucket: bool) -> String {
                     "Version": "2012-10-17",
                     "Statement": [{
                         "Effect": "Allow",
-                        "Principal": { "Service": "glue.amazonaws.com" },
+                        "Principal": { "Service": trusted_principal },
                         "Action": "sts:AssumeRole",
                     }],
                 },
@@ -177,7 +191,7 @@ fn template(names: &Names, creates_the_bucket: bool) -> String {
         },
         "Crawler": {
             "Type": "AWS::Glue::Crawler",
-            "DependsOn": ["Catalog"],
+            "DependsOn": ["Catalog", "Data"],
             "Properties": {
                 "Name": &names.crawler,
                 "Role": { "Fn::GetAtt": ["Role", "Arn"] },
@@ -186,13 +200,6 @@ fn template(names: &Names, creates_the_bucket: bool) -> String {
             },
         },
     });
-    if creates_the_bucket {
-        resources["Data"] = json!({
-            "Type": "AWS::S3::Bucket",
-            "Properties": { "BucketName": &names.bucket },
-        });
-        resources["Crawler"]["DependsOn"] = json!(["Catalog", "Data"]);
-    }
     json!({
         "AWSTemplateFormatVersion": "2010-09-09",
         "Description": "a Glue database and a crawler over one Amazon S3 target",
@@ -207,13 +214,13 @@ async fn deployed_status(
     router: &MultiServiceRouter,
     case: &str,
     names: &Names,
-    creates_the_bucket: bool,
+    glue_can_assume_the_role: bool,
 ) -> String {
     let client = cloudformation_client(router);
     client
         .create_stack()
         .stack_name(&names.stack)
-        .template_body(template(names, creates_the_bucket))
+        .template_body(template(names, glue_can_assume_the_role))
         // "If your stack template contains IAM resources with custom names, you must specify
         // CAPABILITY_NAMED_IAM" — the stack names the crawler's role.
         .capabilities(aws_sdk_cloudformation::types::Capability::CapabilityNamedIam)
@@ -273,12 +280,12 @@ async fn failure_reasons(router: &MultiServiceRouter, case: &str, names: &Names)
         .collect()
 }
 
-/// A stack whose crawler names a target in a bucket the same stack creates deploys, and the
+/// A stack whose crawler runs as a role trusting the Glue service principal deploys, and the
 /// database and the crawler it declared are both readable afterwards.
 #[tokio::test]
-async fn a_stack_whose_crawler_target_exists_deploys() {
+async fn a_stack_whose_crawler_role_trusts_glue_deploys() {
     let router = emulator_with_a_stack();
-    let case = "the crawler's target names a bucket the stack creates";
+    let case = "the crawler's role trusts the Glue service principal";
     let names = Names::of("held");
 
     let status = deployed_status(&router, case, &names, true).await;
@@ -308,14 +315,14 @@ async fn a_stack_whose_crawler_target_exists_deploys() {
     );
 }
 
-/// A stack whose crawler names a target in a bucket nothing holds does NOT deploy: it settles in
-/// a terminal rollback status, its failure reason names the S3 target and the 404 Amazon S3
-/// answered, and the database the stack had already created is rolled back with it.
+/// A stack whose crawler runs as a role Glue cannot assume does NOT deploy: it settles in a
+/// terminal rollback status, its failure reason names the trust policy Glue refused, and the
+/// database the stack had already created is rolled back with it.
 #[tokio::test]
-async fn a_stack_whose_crawler_target_names_no_bucket_is_rolled_back() {
+async fn a_stack_whose_crawler_role_glue_cannot_assume_is_rolled_back() {
     let router = emulator_with_a_stack();
-    let case = "the crawler's target names a bucket nothing holds";
-    let names = Names::of("absent");
+    let case = "the crawler's role trusts another service only";
+    let names = Names::of("unassumable");
 
     let status = deployed_status(&router, case, &names, false).await;
     assert!(
@@ -325,18 +332,10 @@ async fn a_stack_whose_crawler_target_names_no_bucket_is_rolled_back() {
 
     let reasons = failure_reasons(&router, case, &names).await;
     assert!(
-        reasons.iter().any(|reason| {
-            let reason = reason.to_lowercase();
-            reason.contains("s3 target") && reason.contains("404")
-        }),
-        "case {case:?}: a failure reason must name the S3 target and the 404, got {reasons:?}"
-    );
-    assert!(
         reasons
             .iter()
-            .any(|reason| reason.contains(&names.target_path())),
-        "case {case:?}: a failure reason must name the target {:?}, got {reasons:?}",
-        names.target_path()
+            .any(|reason| reason.contains(ROLE_NOT_ASSUMABLE)),
+        "case {case:?}: a failure reason must carry {ROLE_NOT_ASSUMABLE:?}, got {reasons:?}"
     );
 
     // The database the create had already made is gone again, which is what a client reads as
