@@ -2174,8 +2174,13 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// from that stored instant rather than advanced by anything a caller does.
     ///
     /// `ImportHypervisorConfiguration` is the operation that performs this: its handler
-    /// resolves the host, bounds the store and then calls here, so the record a caller
-    /// gets an ARN for is the one this map holds.
+    /// validates the request's tag pairs ([`tag_map`]), bounds this store at
+    /// [`MAX_STORED_HYPERVISORS`] and then calls here, which INSERTS without consulting any
+    /// record already stored — so the record a caller gets an ARN for is the one this map
+    /// holds. Nothing a stored record carries is looked up first, and nothing it carries can
+    /// refuse the insert: the ARN minted below is the record's only identity
+    /// ([`Self::hypervisors_for_host`]), so how many records this map already holds is the
+    /// ONLY state an import consults.
     pub fn import_hypervisor(
         &mut self,
         region: &str,

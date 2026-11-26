@@ -18,15 +18,28 @@
 //! in both forms its pattern accepts, `Tags`). The sibling suite
 //! `hypervisor_import_concurrency` spans the number of RACERS and the host forms;
 //! `hypervisor_host_is_not_a_key` spans how a record came to hold a shared host.
+//!
+//! The last two tests state that rule from the handler's side: the ONLY state an import
+//! consults is how many records this store already holds, and the only request-shaped
+//! check it adds to the modelled constraints is on its own tag pairs — so an import is
+//! served or refused by the store's record COUNT and by the pairs the request carried,
+//! never by what any stored record holds.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_backupgateway_backuponpremises_v20210101 as backup_gateway;
+
+use backup_gateway::state::{
+    service_state, Creation, HypervisorConfiguration, MAX_STORED_HYPERVISORS,
+};
+
 use crate::gateway_lifecycle::{
-    build_engine, build_router, call, hypervisor_arns_for_host, hypervisor_count, Reply,
+    build_engine, build_router, call, hypervisor_arns_for_host, hypervisor_count, Reply, REGION,
 };
 
 /// One row: the body every repeat carries, how many repeats there are, and whether they
@@ -407,6 +420,317 @@ async fn which_members_two_imports_share_constrains_neither() {
                 "case {case:?}: record {attempt} must report its own Name and Host, got \
                  {} {reported:?}",
                 read.status
+            );
+        }
+    }
+}
+
+/// The `Name` and `Host` the probing import below asks for — and which a seeded TWIN
+/// record carries too, so a row can tell "the store already holds these very values" from
+/// "the store already holds this many records".
+const PROBE_NAME: &str = "hv-ceiling-probe";
+const PROBE_HOST: &str = "198.51.100.60";
+
+/// The creator a seeded record is dated by: no request wrote it, so it is not a caller.
+const SEEDED_CREATOR: &str = "SEEDED-CREATOR";
+
+/// One row of the table below: how much the store already holds, whether one of those
+/// records carries the probe's own `Name` and `Host`, and whether the import is served.
+#[derive(Debug)]
+struct HeldStoreRow {
+    case: &'static str,
+    /// Records seeded under a `Name` and `Host` of their own.
+    filler: usize,
+    /// Whether ONE more seeded record carries the probe's `Name` and `Host`.
+    twin: bool,
+    accepted: bool,
+}
+
+/// Seed `filler` records of their own identity, plus a `twin` of the probe's `Name` and
+/// `Host`, and hand back the ARNs minted for them: every seeded ARN, and the twin's.
+///
+/// Through the state API rather than one request per record: what is under test is the
+/// handler AT a store of that size, not the operation that filled it.
+fn seed_store(
+    engine: &Arc<engine::InMemoryEngine>,
+    filler: usize,
+    twin: bool,
+) -> (BTreeSet<String>, Option<String>) {
+    let state = service_state(&**engine).expect("the in-memory engine must expose this state");
+    let mut store = state.lock();
+    let mut seeded = BTreeSet::new();
+    let mut seed_one = |name: String, host: String| {
+        store
+            .import_hypervisor(
+                REGION,
+                HypervisorConfiguration {
+                    name,
+                    host,
+                    kms_key_arn: None,
+                    tags: BTreeMap::new(),
+                },
+                Creation {
+                    by: SEEDED_CREATOR.to_string(),
+                    at: SystemTime::now(),
+                },
+            )
+            .arn
+    };
+    for index in 0..filler {
+        seeded.insert(seed_one(
+            format!("hv-seeded-{index}"),
+            format!("hv-seeded-{index}.example.internal"),
+        ));
+    }
+    let twin_arn = twin.then(|| {
+        let arn = seed_one(PROBE_NAME.to_string(), PROBE_HOST.to_string());
+        seeded.insert(arn.clone());
+        arn
+    });
+    (seeded, twin_arn)
+}
+
+/// The `ImportHypervisorConfiguration` body the rows above probe with, plus `extras`.
+fn probe_body(extras: Value) -> Value {
+    let mut body = json!({ "Name": PROBE_NAME, "Host": PROBE_HOST });
+    for (member, value) in extras
+        .as_object()
+        .expect("a probe's extra members are a JSON object")
+    {
+        body[member] = value.clone();
+    }
+    body
+}
+
+/// RULE: the only state an import consults is how many records this store already holds —
+/// below the emulator's ceiling it mints a record of its own whatever another record
+/// carries, and AT the ceiling it is refused for that COUNT, with the same sentence and
+/// with nothing written, whether or not a stored record carries the very values it asks
+/// for.
+///
+/// The rows span the class the count generalises over: an empty store, a store holding one
+/// record, a store one short of the ceiling and a store at it — crossed with whether one of
+/// those records is the probe's twin.
+#[tokio::test]
+async fn an_import_consults_the_record_count_and_nothing_a_stored_record_holds() {
+    let rows = [
+        HeldStoreRow {
+            case: "an empty store",
+            filler: 0,
+            twin: false,
+            accepted: true,
+        },
+        HeldStoreRow {
+            case: "one record carrying the requested name and host",
+            filler: 0,
+            twin: true,
+            accepted: true,
+        },
+        HeldStoreRow {
+            case: "one record short of the ceiling, none of them the twin",
+            filler: MAX_STORED_HYPERVISORS - 1,
+            twin: false,
+            accepted: true,
+        },
+        HeldStoreRow {
+            case: "one record short of the ceiling, one of them the twin",
+            filler: MAX_STORED_HYPERVISORS - 2,
+            twin: true,
+            accepted: true,
+        },
+        HeldStoreRow {
+            case: "the store at the ceiling, none of them the twin",
+            filler: MAX_STORED_HYPERVISORS,
+            twin: false,
+            accepted: false,
+        },
+        HeldStoreRow {
+            case: "the store at the ceiling, one of them the twin",
+            filler: MAX_STORED_HYPERVISORS - 1,
+            twin: true,
+            accepted: false,
+        },
+    ];
+
+    // Every refusal collected, so the sentence can be asserted to be ONE sentence: a
+    // refusal that read a stored record could differ between the last two rows.
+    let mut ceiling_refusals: BTreeSet<String> = BTreeSet::new();
+
+    for row in rows {
+        let case = row.case;
+        // A store of its own per row, so the counts below are exactly what this row wrote.
+        let engine = build_engine();
+        let router = Arc::new(build_router(&engine));
+        let (seeded, twin_arn) = seed_store(&engine, row.filler, row.twin);
+        let held = seeded.len();
+        assert_eq!(
+            hypervisor_count(&engine),
+            held,
+            "case {case:?}: the seed must leave {held} records, got {}",
+            hypervisor_count(&engine)
+        );
+
+        let reply = call(
+            &router,
+            "ImportHypervisorConfiguration",
+            &probe_body(json!({})),
+        )
+        .await;
+
+        if !row.accepted {
+            assert_eq!(
+                (reply.status, reply.code.as_deref()),
+                (400, Some("ValidationException")),
+                "case {case:?}: an import past the store ceiling must answer 400 \
+                 ValidationException, got {} {:?} {:?}",
+                reply.status,
+                reply.code,
+                reply.body
+            );
+            let stated = reply
+                .str_at("/Message")
+                .unwrap_or_else(|| panic!("case {case:?}: no Message in {:?}", reply.body))
+                .to_string();
+            assert!(
+                stated.contains(&MAX_STORED_HYPERVISORS.to_string()),
+                "case {case:?}: the refusal must state the record ceiling it is about, got \
+                 {stated:?}"
+            );
+            assert_eq!(
+                hypervisor_count(&engine),
+                held,
+                "case {case:?}: a refused import must write nothing, got {} records against \
+                 the {held} seeded",
+                hypervisor_count(&engine)
+            );
+            ceiling_refusals.insert(stated);
+            continue;
+        }
+
+        assert_eq!(
+            (reply.status, reply.code.as_deref()),
+            (200, None),
+            "case {case:?}: an import below the store ceiling must answer 200 with no error \
+             code, got {} {:?} {:?}",
+            reply.status,
+            reply.code,
+            reply.body
+        );
+        let minted = reply
+            .str_at("/HypervisorArn")
+            .unwrap_or_else(|| panic!("case {case:?}: no HypervisorArn in {:?}", reply.body))
+            .to_string();
+        assert!(
+            !seeded.contains(&minted),
+            "case {case:?}: the import must mint an ARN of its own, got the seeded {minted}"
+        );
+        assert_eq!(
+            hypervisor_count(&engine),
+            held + 1,
+            "case {case:?}: the import must leave one record more than the {held} seeded, \
+             got {}",
+            hypervisor_count(&engine)
+        );
+
+        // The record is really stored: it reads back through the implemented reader, and
+        // the twin it shares a host with is still stored beside it.
+        let read = call(
+            &router,
+            "GetHypervisor",
+            &json!({ "HypervisorArn": minted }),
+        )
+        .await;
+        let reported = (
+            read.str_at("/Hypervisor/HypervisorArn"),
+            read.str_at("/Hypervisor/Name"),
+            read.str_at("/Hypervisor/Host"),
+        );
+        assert_eq!(
+            (read.status, reported),
+            (
+                200,
+                (Some(minted.as_str()), Some(PROBE_NAME), Some(PROBE_HOST))
+            ),
+            "case {case:?}: the minted record must report its own ARN and the requested \
+             Name and Host, got {} {reported:?}",
+            read.status
+        );
+        let for_host = hypervisor_arns_for_host(&engine, PROBE_HOST);
+        let expected_for_host: BTreeSet<String> =
+            twin_arn.into_iter().chain([minted.clone()]).collect();
+        assert_eq!(
+            for_host, expected_for_host,
+            "case {case:?}: the host must hold the minted record beside every record that \
+             already carried it, got {for_host:?}"
+        );
+    }
+
+    assert_eq!(
+        ceiling_refusals.len(),
+        1,
+        "every import refused at the ceiling must state the one sentence, whatever the \
+         stored records carry, got {ceiling_refusals:?}"
+    );
+}
+
+/// RULE (the other half of the same sentence): the checks an import makes beyond the
+/// modelled constraints are on the request's OWN tag pairs, and they are answered before
+/// the store is bounded — so a pair this service may not persist is refused for being that
+/// pair whatever the store holds, and either refusal writes nothing.
+///
+/// The rows span both pair rules (`backup_gateway::state::validate_tag_pair`: a key must
+/// not start with the reserved prefix, a value must carry no space) crossed with an empty
+/// store and a store at the ceiling.
+#[tokio::test]
+async fn an_import_checks_its_tag_pairs_before_it_bounds_the_store() {
+    let bad_pairs: [(&str, Value); 2] = [
+        (
+            "a reserved tag key",
+            json!([{ "Key": "aws:owner", "Value": "bgw" }]),
+        ),
+        (
+            "a tag value carrying a space",
+            json!([{ "Key": "owner", "Value": "the bgw team" }]),
+        ),
+    ];
+
+    for (pair, tags) in bad_pairs {
+        for filler in [0, MAX_STORED_HYPERVISORS] {
+            let case = format!("{pair} against a store of {filler} records");
+            let engine = build_engine();
+            let router = Arc::new(build_router(&engine));
+            let held = seed_store(&engine, filler, false).0.len();
+
+            let reply = call(
+                &router,
+                "ImportHypervisorConfiguration",
+                &probe_body(json!({ "Tags": tags.clone() })),
+            )
+            .await;
+
+            assert_eq!(
+                (reply.status, reply.code.as_deref()),
+                (400, Some("ValidationException")),
+                "case {case:?}: a tag pair this service may not persist must be refused with \
+                 400 ValidationException, got {} {:?} {:?}",
+                reply.status,
+                reply.code,
+                reply.body
+            );
+            let stated = reply
+                .str_at("/Message")
+                .unwrap_or_else(|| panic!("case {case:?}: no Message in {:?}", reply.body));
+            assert!(
+                !stated.contains(&MAX_STORED_HYPERVISORS.to_string()),
+                "case {case:?}: the tag pair is what the refusal states, not the store \
+                 ceiling, got {stated:?}"
+            );
+            assert_eq!(
+                hypervisor_count(&engine),
+                held,
+                "case {case:?}: a refused import must write nothing, got {} records against \
+                 the {held} seeded",
+                hypervisor_count(&engine)
             );
         }
     }
