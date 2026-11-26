@@ -4009,6 +4009,18 @@ impl StrategyMutation {
             Self::Delete => "delete",
         }
     }
+
+    /// What follows the id. AppConfig words this refusal per operation: the delete's is a
+    /// complete sentence and carries a terminating full stop, while the patch's wording
+    /// ends at the id it echoes. Both are recorded behaviour — the model states no message
+    /// text — so each operation keeps the terminator the service emits for it rather than
+    /// one sentence shape invented for both.
+    fn terminator(self) -> &'static str {
+        match self {
+            Self::Update => "",
+            Self::Delete => ".",
+        }
+    }
 }
 
 /// `Message` for a mutation refused because the strategy it addresses is one of
@@ -4017,16 +4029,18 @@ impl StrategyMutation {
 ///
 /// The sentence is built from the request: the fixed prefix `Cannot <verb> predefined
 /// Deployment Strategy ` — the kind spelled in title case as two words, the verb the
-/// refused mutation's own — followed by the `DeploymentStrategyId` the call submitted, and
-/// no trailing full stop. Nothing of any one request is stored here: the id is echoed from
-/// the call being refused, whichever catalogue entry it names.
+/// refused mutation's own — followed by the `DeploymentStrategyId` the call submitted and
+/// the terminator that operation's own wording carries ([`StrategyMutation::terminator`]).
+/// Nothing of any one request is stored here: the id is echoed from the call being refused,
+/// whichever catalogue entry it names.
 pub fn predefined_deployment_strategy_immutable(
     mutation: StrategyMutation,
     deployment_strategy_id: &str,
 ) -> String {
     format!(
-        "Cannot {} predefined Deployment Strategy {deployment_strategy_id}",
-        mutation.verb()
+        "Cannot {} predefined Deployment Strategy {deployment_strategy_id}{}",
+        mutation.verb(),
+        mutation.terminator()
     )
 }
 

@@ -13,9 +13,11 @@
 //!    reaches the same lookup must word it the same way.
 //! 2. A mutation naming one of AppConfig's predefined deployment strategies is refused
 //!    with a `BadRequestException` whose message is built from the request: the fixed
-//!    prefix `Cannot <verb> predefined Deployment Strategy ` followed by the submitted
-//!    `DeploymentStrategyId`, with no trailing full stop. The guard is about the published
-//!    catalogue, so a strategy this account created still takes the same mutations.
+//!    prefix `Cannot <verb> predefined Deployment Strategy `, the submitted
+//!    `DeploymentStrategyId`, and the terminator that operation's own wording carries —
+//!    the delete refuses with a complete sentence ending in a full stop, the patch's
+//!    wording ends at the id. The guard is about the published catalogue, so a strategy
+//!    this account created still takes the same mutations.
 //! 3. `StartDeployment`'s in-flight guard is a `ConflictException` attributed to the
 //!    ENVIRONMENT: it names the environment and the state it currently has, and nothing
 //!    about the deployment holding it.
@@ -328,6 +330,10 @@ async fn a_not_found_message_is_the_looked_up_kinds_own_template() {
 struct CatalogueMutation {
     operation: &'static str,
     verb: &'static str,
+    /// What this operation's refusal puts after the echoed id: AppConfig words the delete's
+    /// as a complete sentence (terminating full stop) and the patch's without one, so the
+    /// terminator is carried per row rather than assumed uniform.
+    terminator: &'static str,
     method: &'static str,
     /// The collection segment this operation's route uses. The delete's is the model's own
     /// misspelling (`/deployementstrategies/{DeploymentStrategyId}`, from
@@ -341,12 +347,14 @@ const CATALOGUE_MUTATIONS: [CatalogueMutation; 2] = [
     CatalogueMutation {
         operation: "UpdateDeploymentStrategy",
         verb: "update",
+        terminator: "",
         method: "PATCH",
         collection: "/deploymentstrategies",
     },
     CatalogueMutation {
         operation: "DeleteDeploymentStrategy",
         verb: "delete",
+        terminator: ".",
         method: "DELETE",
         collection: "/deployementstrategies",
     },
@@ -386,8 +394,9 @@ async fn get_strategy(router: &MultiServiceRouter, id: &str) -> Answer {
 
 /// A mutation naming one of AppConfig's predefined deployment strategies is refused with a
 /// 400 `BadRequestException` whose message is the fixed prefix `Cannot <verb> predefined
-/// Deployment Strategy ` followed by the id the request submitted — for every entry of the
-/// published catalogue, on both mutating operations, whatever the request body carries.
+/// Deployment Strategy `, the id the request submitted and that operation's own terminator
+/// — for every entry of the published catalogue, on both mutating operations, whatever the
+/// request body carries.
 #[tokio::test]
 async fn a_predefined_strategy_mutation_is_refused_with_appconfigs_template() {
     let router = router();
@@ -437,8 +446,8 @@ async fn a_predefined_strategy_mutation_is_refused_with_appconfigs_template() {
                 refused.error_code()
             );
             let expected = format!(
-                "Cannot {} predefined Deployment Strategy {}",
-                mutation.verb, predefined.id
+                "Cannot {} predefined Deployment Strategy {}{}",
+                mutation.verb, predefined.id, mutation.terminator
             );
             let message = refused.string("Message").unwrap_or_default();
             assert_eq!(
