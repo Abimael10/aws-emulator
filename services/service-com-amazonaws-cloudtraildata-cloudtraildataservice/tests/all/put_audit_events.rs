@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use service_com_amazonaws_cloudtraildata_cloudtraildataservice::state::{
-    self, Channel, MAX_EVENT_DATA_BYTES, MAX_RETAINED_BYTES_PER_CHANNEL,
+    self, Channel, MAX_REQUEST_EVENT_DATA_BYTES, MAX_RETAINED_BYTES_PER_CHANNEL,
     MAX_RETAINED_EVENTS_PER_CHANNEL,
 };
 use service_com_amazonaws_cloudtraildata_cloudtraildataservice::EmulatedService;
@@ -446,7 +446,7 @@ async fn per_event_defects_are_reported_per_event() {
         ("correct checksum", ev("ok-2", good).signed(), None),
         (
             "eventData exactly at the 1 MB limit",
-            ev("ok-3", json_object_of_len(MAX_EVENT_DATA_BYTES)),
+            ev("ok-3", json_object_of_len(MAX_REQUEST_EVENT_DATA_BYTES)),
             None,
         ),
         (
@@ -486,74 +486,322 @@ async fn per_event_defects_are_reported_per_event() {
         ),
         (
             "eventData one byte past the 1 MB limit",
-            ev("bad-8", json_object_of_len(MAX_EVENT_DATA_BYTES + 1)),
+            ev("bad-8", json_object_of_len(MAX_REQUEST_EVENT_DATA_BYTES + 1)),
             Some("FieldTooLong"),
         ),
     ];
 
-    let batch: Vec<Ev> = rows.iter().map(|(_, event, _)| event.clone()).collect();
-    let reply = harness.put(&arn, None, &batch).await;
-    assert_eq!(
-        reply.status, 200,
-        "per-event defects are partial failures, not operation errors: expected HTTP 200, \
-         got {} with body {}",
-        reply.status, reply.body
-    );
-
-    let successful = reply.successful();
-    let failed = reply.failed();
+    // Each row is submitted as its OWN request: a per-event verdict is about one event,
+    // while the 1 MB the operation documents is a budget on one whole REQUEST (asserted by
+    // `the_payload_budget_is_charged_once_per_request`), so rows whose payloads together
+    // run past that budget travel as the separate requests a caller would send.
+    let mut expected_stored: Vec<String> = Vec::new();
     for (case, event, expected) in &rows {
-        match expected {
-            None => {
-                assert!(
-                    successful.iter().any(|(id, _)| id == &event.id),
-                    "case {case:?}: expected {} in successful[], got successful {successful:?} \
-                     and failed {failed:?}",
-                    event.id
-                );
-            }
-            Some(code) => {
-                let actual = failed
-                    .iter()
-                    .find(|(id, _)| id == &event.id)
-                    .map(|(_, code)| code.clone());
-                assert_eq!(
-                    actual.as_deref(),
-                    Some(*code),
-                    "case {case:?}: expected {} in failed[] with errorCode {code}, got \
-                     {actual:?} (successful {successful:?})",
-                    event.id
-                );
-            }
+        let reply = harness
+            .put(&arn, None, std::slice::from_ref(event))
+            .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: a per-event defect is a partial failure, not an operation \
+             error: expected HTTP 200, got {} with body {}",
+            reply.status, reply.body
+        );
+        assert!(
+            reply.member("successful").is_some() && reply.member("failed").is_some(),
+            "case {case:?}: both successful and failed are @required and must always be \
+             present, got {}",
+            reply.body
+        );
+        assert_entry_verdict(&reply, case, event, *expected);
+        if expected.is_none() {
+            expected_stored.push(event.id.clone());
         }
     }
 
-    // Every failed entry carries the @required errorMessage.
-    for entry in reply.member("failed").expect("failed is @required") {
-        let message = entry
-            .get("errorMessage")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        assert!(
-            !message.is_empty(),
-            "every failed entry must carry an errorMessage, got {entry}"
-        );
+    // And within ONE request, the verdicts coexist: every row small enough that the rows
+    // together stay inside one request's budget, submitted as a single batch under ids of
+    // its own, is still decided entry by entry — some accepted, some refused, in one and
+    // the same response.
+    let batched: Vec<(&str, Ev, Option<&str>)> = rows
+        .iter()
+        .filter(|(_, event, _)| event.data.len() <= 1_024)
+        .map(|(case, event, expected)| {
+            let mut batched = event.clone();
+            // A fresh id, so the batch repeats none of the ids the single-event requests
+            // above already submitted; the payload — and with it the checksum a row
+            // carries — is the row's own, unchanged.
+            batched.id = format!("{}-batched", event.id);
+            (*case, batched, *expected)
+        })
+        .collect();
+    let batch: Vec<Ev> = batched.iter().map(|(_, event, _)| event.clone()).collect();
+    let charged: usize = batch.iter().map(|event| event.data.len()).sum();
+    assert!(
+        charged <= MAX_REQUEST_EVENT_DATA_BYTES,
+        "the batched rows must fit one request's payload budget, got {charged} bytes"
+    );
+    let reply = harness.put(&arn, None, &batch).await;
+    assert_eq!(
+        reply.status, 200,
+        "case \"one batch of per-event defects\": per-event defects are partial failures, \
+         not operation errors: expected HTTP 200, got {} with body {}",
+        reply.status, reply.body
+    );
+    for (case, event, expected) in &batched {
+        assert_entry_verdict(&reply, case, event, *expected);
+        if expected.is_none() {
+            expected_stored.push(event.id.clone());
+        }
     }
+    assert!(
+        !reply.successful().is_empty() && !reply.failed().is_empty(),
+        "case \"one batch of per-event defects\": a partial failure reports both buckets in \
+         one response, got successful {:?} and failed {:?}",
+        reply.successful(),
+        reply.failed()
+    );
 
     let stored: Vec<String> = harness
         .ingest_log(&arn)
         .into_iter()
         .map(|(source_id, _)| source_id)
         .collect();
-    let expected_stored: Vec<&str> = rows
-        .iter()
-        .filter(|(_, _, expected)| expected.is_none())
-        .map(|(_, event, _)| event.id.as_str())
-        .collect();
     assert_eq!(
         stored, expected_stored,
         "only accepted events may be stored, got {stored:?}"
     );
+}
+
+/// Assert the verdict `expected` states for `event` — ingested, or refused under that
+/// `errorCode` with a message — against the response `reply`.
+fn assert_entry_verdict(reply: &Reply, case: &str, event: &Ev, expected: Option<&str>) {
+    let successful = reply.successful();
+    let failed = reply.failed();
+    match expected {
+        None => {
+            assert!(
+                successful.iter().any(|(id, _)| id == &event.id),
+                "case {case:?}: expected {} in successful[], got successful {successful:?} \
+                 and failed {failed:?}",
+                event.id
+            );
+        }
+        Some(code) => {
+            let actual = failure_of(reply, &event.id);
+            assert_eq!(
+                actual.as_ref().map(|(code, _)| code.as_str()),
+                Some(code),
+                "case {case:?}: expected {} in failed[] with errorCode {code}, got \
+                 {actual:?} (successful {successful:?})",
+                event.id
+            );
+            // `ResultErrorEntry$errorMessage` is @required: a refusal has to say why.
+            let message = actual.map(|(_, message)| message).unwrap_or_default();
+            assert!(
+                !message.is_empty(),
+                "case {case:?}: the failed entry for {} must carry an errorMessage",
+                event.id
+            );
+        }
+    }
+}
+
+/// One row of the payload-budget table: a batch, and what one request may do with it.
+struct BudgetRow {
+    case: &'static str,
+    events: Vec<Ev>,
+    /// The ids that must be ingested, in order — empty for a request refused whole.
+    ingested: Vec<String>,
+    /// The ids that must be reported in `failed` under `FieldTooLong`: an event carrying
+    /// more `eventData` than one whole request may add.
+    too_long: Vec<String>,
+    /// Whether this request asks to add more than one request may, so it is refused whole.
+    over_budget: bool,
+}
+
+/// A batch of `count` events of `bytes` of `eventData` each, under ids built from `prefix`.
+fn batch_of(prefix: &str, count: usize, bytes: usize) -> Vec<Ev> {
+    (0..count)
+        .map(|i| ev(format!("{prefix}-{i}"), json_object_of_len(bytes)))
+        .collect()
+}
+
+/// The ids of a batch, in order.
+fn ids_of(events: &[Ev]) -> Vec<String> {
+    events.iter().map(|event| event.id.clone()).collect()
+}
+
+/// The documented 1 MB is a budget on one whole REQUEST, charged ONCE: "You can add up to
+/// 100 of these events (or up to 1 MB) per PutAuditEvents request" states both of that
+/// sentence's bounds per request, so the `eventData` a request asks to add is SUMMED and
+/// held to the bound — a batch whose events each fit it but which together carry more is
+/// refused whole and stores nothing, while a batch that fits is ingested whatever its
+/// event count. An event no request could add at all adds nothing, so it charges nothing
+/// against the budget of the request carrying it.
+///
+/// Rows differ along what the rule generalises over: the number of events in the request,
+/// the size of each, whether their SUM sits under, exactly at or past the bound, and
+/// whether an event that cannot be added at all travels with them.
+#[tokio::test]
+async fn the_payload_budget_is_charged_once_per_request() {
+    let harness = Harness::new();
+
+    // Half the budget, so two such events sit exactly at it, and the smallest payload
+    // `json_object_of_len` can build, for the rows that are about COUNT rather than size.
+    let half = MAX_REQUEST_EVENT_DATA_BYTES / 2;
+    let tenth_of_a_percent = MAX_REQUEST_EVENT_DATA_BYTES / 1_000;
+
+    let at_the_budget = batch_of("at", 1, MAX_REQUEST_EVENT_DATA_BYTES);
+    let two_halves = batch_of("halves", 2, half);
+    let one_byte_past = vec![
+        ev("edge-0", json_object_of_len(half)),
+        ev("edge-1", json_object_of_len(half + 1)),
+    ];
+    let four_megabytes = batch_of("megabytes", 4, MAX_REQUEST_EVENT_DATA_BYTES);
+    let full_batch_within = batch_of("full", 100, tenth_of_a_percent);
+    let full_batch_past = batch_of("flood", 100, 32 * 1_024);
+    let unaddable = vec![
+        ev("small", AUDIT_EVENT),
+        ev(
+            "unaddable",
+            json_object_of_len(MAX_REQUEST_EVENT_DATA_BYTES + 1),
+        ),
+    ];
+
+    let rows: Vec<BudgetRow> = vec![
+        BudgetRow {
+            case: "one event of exactly the budget",
+            ingested: ids_of(&at_the_budget),
+            events: at_the_budget,
+            too_long: Vec::new(),
+            over_budget: false,
+        },
+        BudgetRow {
+            case: "two events summing to exactly the budget",
+            ingested: ids_of(&two_halves),
+            events: two_halves,
+            too_long: Vec::new(),
+            over_budget: false,
+        },
+        BudgetRow {
+            case: "two events one byte past the budget together",
+            events: one_byte_past,
+            ingested: Vec::new(),
+            too_long: Vec::new(),
+            over_budget: true,
+        },
+        BudgetRow {
+            case: "four events of 1 MB each: a multi-megabyte batch",
+            events: four_megabytes,
+            ingested: Vec::new(),
+            too_long: Vec::new(),
+            over_budget: true,
+        },
+        BudgetRow {
+            case: "the modelled maximum batch of 100 events, inside the budget",
+            ingested: ids_of(&full_batch_within),
+            events: full_batch_within,
+            too_long: Vec::new(),
+            over_budget: false,
+        },
+        BudgetRow {
+            case: "100 events of 32 KiB each, far past the budget",
+            events: full_batch_past,
+            ingested: Vec::new(),
+            too_long: Vec::new(),
+            over_budget: true,
+        },
+        BudgetRow {
+            case: "an event no request can add charges nothing",
+            ingested: vec!["small".to_string()],
+            too_long: vec!["unaddable".to_string()],
+            events: unaddable,
+            over_budget: false,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let BudgetRow {
+            case,
+            events,
+            ingested,
+            too_long,
+            over_budget,
+        } = row;
+        // A channel of its own per row, so what one request stored says nothing about the
+        // next row's.
+        let arn = channel_arn(&format!("{index:08x}-1111-4222-8333-444455556666"));
+        harness.register(Channel::from_arn(&arn, "Custom").expect("a channel ARN"));
+
+        let reply = harness.put(&arn, None, events).await;
+        if *over_budget {
+            // The charge is the `eventData` the request asked to ADD, which for these rows
+            // is every event in the batch.
+            let charged: usize = events.iter().map(|event| event.data.len()).sum();
+            assert_eq!(
+                reply.status, 400,
+                "case {case:?}: {charged} bytes of eventData is past the \
+                 {MAX_REQUEST_EVENT_DATA_BYTES} byte budget of one request, which must be \
+                 refused, got {} with body {}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.error_code(),
+                "ValidationException",
+                "case {case:?}: a request past the budget is refused as an invalid request, \
+                 got {}",
+                reply.body
+            );
+            let message = crate::channel_arn_refusals::message_of(&reply);
+            assert!(
+                message.contains(&charged.to_string())
+                    && message.contains(&MAX_REQUEST_EVENT_DATA_BYTES.to_string()),
+                "case {case:?}: the refusal must state what the request asked to add \
+                 ({charged} bytes) and the budget it is charged against \
+                 ({MAX_REQUEST_EVENT_DATA_BYTES} bytes), got {message:?}"
+            );
+        } else {
+            assert_eq!(
+                reply.status, 200,
+                "case {case:?}: a request inside the budget is served, got {} with body {}",
+                reply.status, reply.body
+            );
+            let accepted: Vec<String> = reply
+                .successful()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            assert_eq!(
+                &accepted, ingested,
+                "case {case:?}: every event the request may add must be reported in \
+                 successful[], got {accepted:?} and failed {:?}",
+                reply.failed()
+            );
+            let refused: Vec<(String, String)> = reply.failed();
+            let expected_refused: Vec<(String, String)> = too_long
+                .iter()
+                .map(|id| (id.clone(), "FieldTooLong".to_string()))
+                .collect();
+            assert_eq!(
+                refused, expected_refused,
+                "case {case:?}: an event carrying more than one request may add is reported \
+                 for its own fault, got {refused:?}"
+            );
+        }
+
+        // What the channel holds afterwards: a refused request stores nothing at all, and a
+        // served one stores exactly what it reported.
+        let stored: Vec<String> = harness
+            .ingest_log(&arn)
+            .into_iter()
+            .map(|(source_id, _)| source_id)
+            .collect();
+        assert_eq!(
+            &stored, ingested,
+            "case {case:?}: the channel must hold exactly the events this request added, \
+             got {stored:?}"
+        );
+    }
 }
 
 /// Resolving the channel: a channel ARN that is not registered is `ChannelNotFound`,
@@ -994,7 +1242,10 @@ async fn the_ingest_log_is_bounded_by_its_retention_limits() {
     harness.register(Channel::from_arn(&by_bytes, "Custom").expect("a channel ARN"));
     let calls = 20;
     for i in 0..calls {
-        let event = ev(format!("big-{i}"), json_object_of_len(MAX_EVENT_DATA_BYTES));
+        let event = ev(
+            format!("big-{i}"),
+            json_object_of_len(MAX_REQUEST_EVENT_DATA_BYTES),
+        );
         let reply = harness.put(&by_bytes, None, &[event]).await;
         assert_eq!(
             reply.status, 200,

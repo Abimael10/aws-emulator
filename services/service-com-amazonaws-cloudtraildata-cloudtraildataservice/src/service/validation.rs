@@ -44,10 +44,14 @@ use smithy_server_runtime::{ErasedOperation, Operation, Refused, Service, Violat
 
 /// The error code the framework's own default names a refusal it words itself with on this
 /// service's JSON protocol — a constraint refusal and a body its codec could not read
-/// alike — restated here because [`Refused`] replaces the code and the message together,
-/// and because the access record of a request answered in that wording states the code the
+/// alike — named here because [`Refused`] replaces the code and the message together, and
+/// because the access record of a request answered in that wording states the code the
 /// caller was answered under.
-const VALIDATION_EXCEPTION: &str = "ValidationException";
+///
+/// Read from the handler module, beside this operation's other wire codes, so this layer
+/// and the handler behind it (which answers the same code for a request outside a rule the
+/// model does not express as a constraint) cannot name two codes for one fault.
+use crate::ops::put_audit_events::VALIDATION_EXCEPTION_CODE as VALIDATION_EXCEPTION;
 
 /// The member positions one element of the batch spends: one per member `AuditEvent`
 /// declares — id, eventData, eventDataChecksum

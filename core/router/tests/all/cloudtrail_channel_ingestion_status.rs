@@ -25,7 +25,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_cloudtraildata_cloudtraildataservice::state::MAX_EVENT_DATA_BYTES;
+use service_com_amazonaws_cloudtraildata_cloudtraildataservice::state::MAX_REQUEST_EVENT_DATA_BYTES;
 
 use crate::cloudtrail_lake_custom_event_ingestion::{
     audit_event_with, authorization, control_plane, create_channel, create_event_data_store,
@@ -86,12 +86,13 @@ fn refused_data(id: &str) -> Submitted {
     }
 }
 
-/// An event refused because its `eventData` alone is past the documented 1 MB an event
-/// may carry (`MAX_EVENT_DATA_BYTES`, this emulator's one statement of that bound).
+/// An event refused because its `eventData` alone is past the documented 1 MB one whole
+/// request may add (`MAX_REQUEST_EVENT_DATA_BYTES`, this emulator's one statement of that
+/// bound), so no request could add it whatever else it carried.
 fn refused_too_long(id: &str) -> Submitted {
     Submitted {
         id: id.to_string(),
-        data: payload_of_len(MAX_EVENT_DATA_BYTES + 1),
+        data: payload_of_len(MAX_REQUEST_EVENT_DATA_BYTES + 1),
         checksum: None,
         expected_error_code: "FieldTooLong",
     }

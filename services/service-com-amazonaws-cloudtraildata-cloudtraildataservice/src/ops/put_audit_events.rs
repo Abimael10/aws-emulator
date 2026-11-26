@@ -11,8 +11,9 @@
 //! denied before the channel is looked up, the caller's account and the channel's
 //! external-id requirement (stated by the channel's resource policy, which the
 //! CloudTrail control plane's `PutResourcePolicy` / `DeleteResourcePolicy` carry into
-//! this service's registry) are checked, the batch is rejected as a whole when it
-//! repeats an event id or when an event's `eventData` declares no audit event schema at
+//! this service's registry) are checked, the batch is rejected as a whole when it asks to
+//! add more `eventData` than the budget one request has, when it repeats an event id or
+//! when an event's `eventData` declares no audit event schema at
 //! all, and every event that passes per-event validation is APPENDED to
 //! the channel's ingest log under a freshly minted `eventID` which is then echoed in
 //! `successful`. Events that fail validation are reported per event in `failed`, which
@@ -145,10 +146,10 @@ impl From<PutAuditEventsErrorModeled> for PutAuditEventsError {
     }
 }
 
-/// The largest `eventData` payload a single event may carry, as
-/// [`crate::state::MAX_EVENT_DATA_BYTES`] — exported there so this handler and the
-/// crate's tests cannot disagree about where the bound sits.
-use crate::state::MAX_EVENT_DATA_BYTES;
+/// The `eventData` budget one request may add, as
+/// [`crate::state::MAX_REQUEST_EVENT_DATA_BYTES`] — exported there so this handler and
+/// the crate's tests cannot disagree about where the bound sits.
+use crate::state::MAX_REQUEST_EVENT_DATA_BYTES;
 
 /// The message of `InvalidChannelARN`.
 ///
@@ -177,6 +178,29 @@ const CHANNEL_NOT_OWNED_MESSAGE: &str =
 /// more entries in the request have the same event ID."
 const DUPLICATED_AUDIT_EVENT_ID_MESSAGE: &str =
     "Two or more entries in the request have the same event ID.";
+
+/// The error code the wire carries for a request this service refuses because it is
+/// outside a rule the model does not express as a constraint — the code the framework's
+/// own refusal channel renders ([`crate::scaffolded::Scaffolded::validation`]) and the
+/// code the layer in FRONT of this handler states a modelled constraint refusal under, so
+/// a request that has to be fixed before it can be served is answered under one code
+/// whichever layer found the fault.
+pub(crate) const VALIDATION_EXCEPTION_CODE: &str = "ValidationException";
+
+/// The message of the refusal of a request past the `eventData` budget one request has:
+/// the total the request asked to add and the budget it is charged against, both read off
+/// the request and this service's own bound, with the rest of the sentence fixed.
+fn over_budget_message(charged: usize) -> String {
+    format!(
+        "auditEvents carries {charged} bytes of eventData, which exceeds the \
+         {MAX_REQUEST_EVENT_DATA_BYTES} byte limit of one {OPERATION_NAME} request."
+    )
+}
+
+/// What the access record of a request past that budget states: the request asked to add
+/// more than one request may, so it was refused whole and nothing of it was persisted.
+const OVER_BUDGET_DETAIL: &str =
+    "the batch asks to add more eventData than one request may; nothing was persisted";
 
 /// The error code the wire carries for a channel reference that is not a channel ARN.
 /// Named here, beside the handler that answers it, so `crate::service`'s refusal
@@ -450,6 +474,12 @@ enum Verdict {
 /// (was the payload received intact?), then content. An event that breaks several is
 /// reported under the earliest.
 ///
+/// The SIZE verdict here is the floor case of the request's own budget
+/// ([`MAX_REQUEST_EVENT_DATA_BYTES`]): an event carrying more than one whole request may
+/// add can be added by no request at all, so it is reported for its own fault rather than
+/// charged against a budget it could never fit. What the request asks to add as a whole is
+/// charged once, by the handler below.
+///
 /// CONTENT is decided against the open audit event schema CloudTrail Lake ingests events
 /// in ([`AUDIT_EVENT_SCHEMA`]): a payload that is no JSON object at all carries no
 /// content (`InvalidData`); one that names no schema is the call's
@@ -458,11 +488,12 @@ enum Verdict {
 /// is `InvalidData`. Members are decided in schema order, so an event missing several is
 /// reported under the first.
 fn verdict(event: &AuditEvent) -> Verdict {
-    if event.event_data.len() > MAX_EVENT_DATA_BYTES {
+    if event.event_data.len() > MAX_REQUEST_EVENT_DATA_BYTES {
         return Verdict::Failed(
             "FieldTooLong",
             format!(
-                "eventData is {} bytes, which exceeds the {MAX_EVENT_DATA_BYTES} byte limit.",
+                "eventData is {} bytes, which exceeds the {MAX_REQUEST_EVENT_DATA_BYTES} byte \
+                 limit.",
                 event.event_data.len()
             ),
         );
@@ -763,6 +794,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // The documented payload budget is charged ONCE, against the whole request: "You
+        // can add up to 100 of these events (or up to 1 MB) per PutAuditEvents request"
+        // states BOTH bounds per request, so the `eventData` this request asks to add is
+        // summed and held to [`MAX_REQUEST_EVENT_DATA_BYTES`] — a batch whose events each
+        // fit the budget but which together carry more than it is past the budget that one
+        // request has. An event this request cannot add at all (reported per event, above)
+        // adds nothing, so it charges nothing.
+        //
+        // Refused as a WHOLE, before anything is written, so such a request persists
+        // nothing and a caller cannot have part of a batch accepted and have to work out
+        // which part. The model declares no error for a request outside a bound it does
+        // not express as a constraint, so the refusal is the one this service states for
+        // every such request (`ValidationException`, 400): the request has to be split
+        // before it can be served, which is a fault in the request and not in the channel
+        // or in the caller's grants.
+        let charged: usize = input
+            .audit_events
+            .iter()
+            .zip(&verdicts)
+            .filter(|(_, verdict)| matches!(verdict, Verdict::Accepted))
+            .map(|(event, _)| event.event_data.len())
+            .sum();
+        if charged > MAX_REQUEST_EVENT_DATA_BYTES {
+            record_access(
+                ctx,
+                &input.channel_arn,
+                VALIDATION_EXCEPTION_CODE,
+                OVER_BUDGET_DETAIL,
+            );
+            return Err(crate::scaffolded::Scaffolded::validation(
+                over_budget_message(charged),
+            ));
         }
 
         // Per-event outcome, recorded against the channel whichever way it goes: an

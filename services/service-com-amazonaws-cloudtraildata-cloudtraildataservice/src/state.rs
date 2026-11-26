@@ -29,19 +29,27 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const MAX_RETAINED_EVENTS_PER_CHANNEL: usize = 1_000;
 
 /// How many `eventData` bytes one channel's ingest log retains, for the same reason as
-/// [`MAX_RETAINED_EVENTS_PER_CHANNEL`]: an event may carry up to 1 MB, so a count alone
-/// would not bound the bytes held.
+/// [`MAX_RETAINED_EVENTS_PER_CHANNEL`]: one request may add up to 1 MB of `eventData`
+/// ([`MAX_REQUEST_EVENT_DATA_BYTES`]), so a count alone would not bound the bytes held.
 pub const MAX_RETAINED_BYTES_PER_CHANNEL: usize = 16 * 1024 * 1024;
 
-/// The largest `eventData` payload a single event may carry.
+/// The `eventData` budget ONE `PutAuditEvents` request may add, charged once against the
+/// whole request.
 ///
 /// From `PutAuditEvents`' own doc: "You can add up to 100 of these events (or up to
-/// 1 MB) per PutAuditEvents request" — so an event whose `eventData` alone already
-/// exceeds 1 MB can never be ingested, whatever else the request holds, and is reported
-/// for that event as `FieldTooLong`. (Charging a whole BATCH against the same 1 MB
-/// budget is a separate gap, deferred by the bootstrap issue.) It lives here, beside the
-/// retention bounds, so the handler and this crate's tests read one definition.
-pub const MAX_EVENT_DATA_BYTES: usize = 1024 * 1024;
+/// 1 MB) per PutAuditEvents request" — two bounds on one request, the count (the
+/// `auditEvents` member's modelled `@length`, enforced at the boundary) and this one, and
+/// both are stated PER REQUEST. So this is charged against the SUM of the `eventData` the
+/// request asks to add rather than against each event separately: a batch whose events
+/// each fit it but which together carry more than it is past the budget that one request
+/// has.
+///
+/// An event whose `eventData` alone already exceeds it can be added by no request
+/// whatever else that request holds, and is reported for that event as `FieldTooLong`.
+///
+/// It lives here, beside the retention bounds, so the handler and this crate's tests read
+/// one definition.
+pub const MAX_REQUEST_EVENT_DATA_BYTES: usize = 1024 * 1024;
 
 /// The IAM condition key a channel's resource policy states an external ID under.
 ///
