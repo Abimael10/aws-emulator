@@ -4389,20 +4389,26 @@ pub const ABSENT_PUBLIC_KEY_IN_KEY_GROUP_MESSAGE: &str =
 /// The modelled `InvalidArgument` (HTTP 400) for a `ListKeyGroups` `Marker` that is no
 /// resume point this service handed out.
 ///
-/// ONE CONSTANT for the condition, for the same reason [`invalid_public_key_marker`] is one:
-/// what the refusal states is the CONSTRAINT on the parameter — a marker is a key group id
-/// ([`is_key_group_id`]) — which is a property of the parameter rather than of the value
-/// submitted, so nothing from the request belongs in the text.
+/// Recorded behaviour: this listing states the condition over the KIND of resource it pages
+/// ([`invalid_resource_marker_message`]) — the family the policy listings of this service
+/// already state, reached through that one renderer so no two listings word the same
+/// condition differently — rather than the constraint the value has to satisfy, which is what
+/// the listings of the resources whose marker the API publishes as an id state
+/// ([`invalid_public_key_marker`]). Which family a listing states is a property of the
+/// LISTING, and so is the sentence: fixed text throughout, carrying nothing of the marker
+/// submitted and nothing out of the store, so every refusal of this condition reads the same.
 pub fn invalid_key_group_marker() -> crate::ops::types::InvalidArgument {
     crate::ops::types::InvalidArgument {
-        message: Some(INVALID_KEY_GROUP_MARKER_MESSAGE.to_string()),
+        message: Some(invalid_key_group_marker_message()),
     }
 }
 
-/// The message `ListKeyGroups` refuses an unusable `Marker` with: the constraint on the
-/// parameter, worded as [`INVALID_PUBLIC_KEY_MARKER_MESSAGE`] words the same constraint on
-/// the neighbouring listing's marker, naming this listing's own resource.
-pub const INVALID_KEY_GROUP_MARKER_MESSAGE: &str = "Marker must be a valid CF key group Id";
+/// The message `ListKeyGroups` refuses an unusable `Marker` with: the kind of resource this
+/// listing pages ([`KEY_GROUP_MARKER_RESOURCE`]) in the sentence this service states that
+/// condition in.
+pub fn invalid_key_group_marker_message() -> String {
+    invalid_resource_marker_message(KEY_GROUP_MARKER_RESOURCE)
+}
 
 /// Mint the request id ONE response names the request it answers with — the `RequestId`
 /// element of this service's `<ErrorResponse>` envelope (`crate::service::envelope`).

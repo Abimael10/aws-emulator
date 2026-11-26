@@ -165,7 +165,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // NextMarker value from the current response as the Marker value": the marker is a
         // resume point this service handed out — a key group id — so a value outside that
         // shape was never one, and an unusable argument is the one refusal this listing
-        // models.
+        // models. What the refusal SAYS is this listing's own sentence for the condition
+        // ([`crate::state::invalid_key_group_marker`]), which names the resource the listing
+        // pages and nothing of the value submitted.
         if let Some(marker) = crate::state::resume_marker(input.marker.as_deref()) {
             if !crate::state::is_key_group_id(marker) {
                 return Err(ListKeyGroupsErrorModeled::InvalidArgument(

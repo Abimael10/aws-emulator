@@ -3,22 +3,24 @@
 //! How this service refuses a listing's `Marker` when the value is no resume point that
 //! listing hands out.
 //!
-//! A `Marker` is where the previous page ended, so WHAT the value is decides which refusal an
-//! unusable one gets — three answers, each read off the listing's own model:
+//! A `Marker` is where the previous page ended, so WHAT the service states about an unusable
+//! one decides which refusal it gets — three families of sentence, each the wire text recorded
+//! for the listings that state it:
 //!
-//! * the marker is the identifier of a resource of the kind the listing pages, and the model
-//!   binds a not-found error NAMED for that kind: a marker that resolves to no such resource
-//!   is reported as that resource not existing, under that code, in the sentence that names
-//!   the MARKER of that resource ([`invalid_resource_marker_message`]). The FORM of the value
-//!   is no separate condition, because this service publishes no form for the identifiers it
-//!   mints;
+//! * the listing states the condition over the KIND of resource it pages rather than over the
+//!   form the value has to take, in the sentence that names the MARKER of that resource
+//!   ([`invalid_resource_marker_message`]) — under the code the listing's own model binds,
+//!   which is the not-found error named for that kind where the model binds one and the
+//!   unusable-argument error where that is all it binds. The FORM of the value is no separate
+//!   condition there, because this service publishes no form for the identifiers it mints;
 //! * the model publishes a CONSTRAINT for the shape such a value has to be: a value outside it
 //!   is a value this API cannot read, stated in the frame every constraint violation of this
 //!   API is stated in ([`unreadable_pagination_token_message`]) and answered under the code an
 //!   unreadable request carries (`crate::service::envelope`);
 //! * the model offers neither: the refusal states the CONSTRAINT on the parameter — which kind
-//!   of identifier a marker of that listing has to be ([`invalid_marker_message`]) — which is
-//!   all such a listing can say, under the `InvalidArgument` its model does bind.
+//!   of identifier a marker of that listing has to be ([`invalid_marker_message`]) — under the
+//!   `InvalidArgument` its model does bind. Which of this family and the first one a listing
+//!   states is recorded behaviour of that listing, not something its model predicts.
 //!
 //! Each sentence is a property of the LISTING rather than of the value submitted, so nothing
 //! read off the request (the marker itself) and nothing read off the service's own state (an
@@ -165,6 +167,11 @@ pub const RESPONSE_HEADERS_POLICY_MARKER_RESOURCE: &str = "response headers poli
 
 /// The resource a CONTINUOUS DEPLOYMENT POLICY listing pages, as its marker refusal names it.
 pub const CONTINUOUS_DEPLOYMENT_POLICY_MARKER_RESOURCE: &str = "continuous deployment policy";
+
+/// The resource a KEY GROUP listing pages, as its marker refusal names it — recorded wire
+/// text for that listing, which states the condition over the kind of resource it pages
+/// rather than over the form the value has to take.
+pub const KEY_GROUP_MARKER_RESOURCE: &str = "key group";
 
 #[cfg(test)]
 mod tests {

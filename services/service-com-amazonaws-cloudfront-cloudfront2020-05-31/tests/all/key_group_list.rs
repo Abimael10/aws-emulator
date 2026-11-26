@@ -32,7 +32,7 @@
 //! writer and readers are the sibling suites', reused rather than copied.
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    INVALID_KEY_GROUP_MARKER_MESSAGE, MAX_ITEMS,
+    invalid_key_group_marker_message, MAX_ITEMS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -488,13 +488,14 @@ async fn a_page_size_or_marker_that_names_no_page_is_refused() {
             answer.raw
         );
         if over_marker {
-            // What the refusal states is the CONSTRAINT on the parameter — a marker is a key
-            // group id — so every unusable marker is refused with that one sentence rather
-            // than with text quoted out of the request.
+            // What the refusal states is this listing's own sentence for the condition — the
+            // kind of resource it pages — so every unusable marker is refused with that one
+            // sentence rather than with text quoted out of the request.
             let message = answer.root().find_text("Message").unwrap_or_default();
             assert_eq!(
-                message, INVALID_KEY_GROUP_MARKER_MESSAGE,
-                "case {case}: expected the marker constraint stated for {query}, got {}",
+                message,
+                invalid_key_group_marker_message(),
+                "case {case}: expected this listing's marker sentence for {query}, got {}",
                 answer.raw
             );
         }
