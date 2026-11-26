@@ -135,6 +135,21 @@ impl From<UpdateBrandProfileAttributeErrorModeled> for UpdateBrandProfileAttribu
     }
 }
 
+/// The members of this request this operation's own gates refuse a value on, as this
+/// service's own refusals name a member at fault in `ValidationExceptionField$path`: a
+/// member of the request itself by the member's own name, with no pointer syntax around
+/// it. A member nested inside a list — which only the create path has — is named by its
+/// JSON pointer instead, because that is what also names the element at fault.
+const ATTACHMENT_BODY_MEMBER: &str = "attachmentBody";
+
+/// The text member an update of a media attribute names its content by, named the same
+/// way ([`ATTACHMENT_BODY_MEMBER`]).
+const ATTRIBUTE_VALUE_MEMBER: &str = "attributeValue";
+
+/// The member a refused `category` arrived on, named the same way
+/// ([`ATTACHMENT_BODY_MEMBER`]).
+const CATEGORY_MEMBER: &str = "category";
+
 /// The `UpdateBrandProfileAttribute` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -198,7 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !crate::state::is_supported_attribute_category(category) {
                 return Err(
                     UpdateBrandProfileAttributeErrorModeled::ValidationException(
-                        crate::state::invalid_category("/category", category),
+                        crate::state::invalid_category(CATEGORY_MEMBER, category),
                     )
                     .into(),
                 );
@@ -278,8 +293,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateBrandProfileAttributeErrorModeled::ValidationException(
                     crate::state::member_not_for_attribute_type(
-                        "/attachmentBody",
-                        "attachmentBody",
+                        ATTACHMENT_BODY_MEMBER,
                         &attribute.attribute_type,
                     ),
                 )
@@ -298,7 +312,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(
                         UpdateBrandProfileAttributeErrorModeled::ValidationException(
                             crate::state::media_attribute_content_required(
-                                "/attributeValue",
+                                ATTRIBUTE_VALUE_MEMBER,
                                 &attribute.attribute_type,
                             ),
                         )
@@ -323,7 +337,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateBrandProfileAttributeErrorModeled::ValidationException(
                     crate::state::unsupported_media_file_type(
-                        "/attachmentBody",
+                        ATTACHMENT_BODY_MEMBER,
                         &input.attribute_name,
                     ),
                 )

@@ -38,18 +38,29 @@
 //!   broke, while every other constraint class names the member and the requirement alone;
 //! * a refusal this service words ITSELF names the member at fault in `fieldList` by the
 //!   member's own name, and the identifier-format gate states there the one sentence it
-//!   states in `message`.
+//!   states in `message`;
+//! * that same spelling holds for every gate this service words itself, whichever
+//!   operation and member: a member of the request itself is named by its own name alone,
+//!   and only a member nested inside a list is named by the JSON pointer that also names
+//!   the element at fault — unlike a modelled-constraint refusal, which points at every
+//!   member it lists.
 //!
 //! The constraint rows reach operations beyond the brand profiles, because the envelope is
 //! the service's rather than one operation's: `call` addresses any of them.
 
 use std::sync::{Arc, LazyLock};
 
+use base64::Engine as _;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_endusermessaging_endusermessaging::EmulatedService;
+
+// The media an attachment carries, taken from the sibling suite that states each file
+// type's own published signature: a PNG, which an attribute's media may be, and a GIF,
+// which it may not.
+use crate::brand_profile_attributes::{GIF, PNG};
 
 /// This service's sigv4 signing name, from the model (`OPERATIONS.md`, "Wire protocol").
 const SIGNING_NAME: &str = "end-user-messaging";
@@ -181,6 +192,24 @@ impl Emulator {
             "GET",
             &format!("/v1/brand-profiles/{id_or_arn}/attributes/{name}"),
             None,
+        )
+        .await
+    }
+
+    async fn create_attributes(&self, id_or_arn: &str, body: Value) -> Reply {
+        self.call(
+            "POST",
+            &format!("/v1/brand-profiles/{id_or_arn}/attributes"),
+            Some(body),
+        )
+        .await
+    }
+
+    async fn update_attribute(&self, id_or_arn: &str, name: &str, body: Value) -> Reply {
+        self.call(
+            "PUT",
+            &format!("/v1/brand-profiles/{id_or_arn}/attributes/{name}"),
+            Some(body),
         )
         .await
     }
@@ -1281,5 +1310,170 @@ async fn the_identifier_format_gate_names_its_member_and_states_one_sentence() {
                 reply.body
             );
         }
+    }
+}
+
+/// An attachment body as restJson1 carries a blob member.
+fn attachment(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+#[tokio::test]
+async fn every_gate_this_service_words_itself_names_its_member_the_same_way() {
+    // One spelling across the whole surface: a member of the request itself is named by its
+    // own name, and only a member nested inside a list is named by the pointer that also
+    // names the element at fault. The rows differ in the operation refusing, the member at
+    // fault, the kind of gate (a cross-member rule, a value set, a file type, an identifier
+    // format, an ARN) and in where the member sits in the request.
+    let em = Emulator::new();
+    let created = em.create(json!({ "brandProfileName": "gate owner" })).await;
+    let profile = created.string("brandProfileId");
+    let seeded = em
+        .create_attributes(
+            &profile,
+            json!({ "attributes": [
+                { "attributeName": "Note", "attributeType": "TEXT", "attributeValue": "a note" },
+                {
+                    "attributeName": "Logo",
+                    "attributeType": "IMAGE",
+                    "attachmentBody": attachment(PNG),
+                },
+            ] }),
+        )
+        .await;
+    assert_eq!(
+        seeded.status, 200,
+        "the attributes the rows address must exist, got {} / {:?}",
+        seeded.status, seeded.body
+    );
+
+    // (case, the refused reply, the member at fault as this service names it)
+    let rows: Vec<(&str, Reply, &str)> = vec![
+        (
+            "media offered to a TEXT attribute",
+            em.update_attribute(&profile, "Note", json!({ "attachmentBody": attachment(PNG) }))
+                .await,
+            "attachmentBody",
+        ),
+        (
+            "an attachment of a file type no attribute is held as",
+            em.update_attribute(&profile, "Logo", json!({ "attachmentBody": attachment(GIF) }))
+                .await,
+            "attachmentBody",
+        ),
+        (
+            "a text value that names no object for a media attribute",
+            em.update_attribute(&profile, "Logo", json!({ "attributeValue": "not a url" }))
+                .await,
+            "attributeValue",
+        ),
+        (
+            "a category outside the supported set",
+            em.update_attribute(&profile, "Note", json!({ "category": "MARKETING" }))
+                .await,
+            "category",
+        ),
+        (
+            "an operationType no job of this service carries",
+            em.call("GET", "/v1/jobs?operationType=CreateBrandProfile", None)
+                .await,
+            "operationType",
+        ),
+        (
+            "an ARN of another vendor",
+            em.call("GET", "/v1/tags/arn:aws:s3:::a-bucket", None).await,
+            "resourceArn",
+        ),
+        (
+            "a value that is no brand profile identifier",
+            em.get_attribute("a-profile-name", "Note").await,
+            "brandProfileId",
+        ),
+        (
+            "media offered to the TEXT entry at position 1 of a batch",
+            em.create_attributes(
+                &profile,
+                json!({ "attributes": [
+                    { "attributeName": "Fresh One", "attributeType": "TEXT", "attributeValue": "v" },
+                    {
+                        "attributeName": "Fresh Two",
+                        "attributeType": "TEXT",
+                        "attachmentBody": attachment(PNG),
+                    },
+                ] }),
+            )
+            .await,
+            "/attributes/1/attachmentBody",
+        ),
+        (
+            "a category outside the supported set on the entry at position 0",
+            em.create_attributes(
+                &profile,
+                json!({ "attributes": [{
+                    "attributeName": "Fresh Three",
+                    "attributeType": "TEXT",
+                    "attributeValue": "v",
+                    "category": "MARKETING",
+                }] }),
+            )
+            .await,
+            "/attributes/0/category",
+        ),
+        (
+            "a name the batch repeats at position 2",
+            em.create_attributes(
+                &profile,
+                json!({ "attributes": [
+                    { "attributeName": "Fresh Four", "attributeType": "TEXT", "attributeValue": "v" },
+                    { "attributeName": "Fresh Five", "attributeType": "TEXT", "attributeValue": "v" },
+                    { "attributeName": "Fresh Four", "attributeType": "TEXT", "attributeValue": "w" },
+                ] }),
+            )
+            .await,
+            "/attributes/2/attributeName",
+        ),
+    ];
+
+    for (case, refused, member) in rows {
+        assert_eq!(
+            (refused.status, refused.error.as_deref()),
+            (400, Some("ValidationException")),
+            "case {case:?}: expected 400 ValidationException, got {} / {:?}",
+            refused.status,
+            refused.body
+        );
+        let listed = refused.body["fieldList"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: no fieldList in {}", refused.body))
+            .clone();
+        assert_eq!(
+            listed.len(),
+            1,
+            "case {case:?}: one member is at fault, got {:?}",
+            refused.body
+        );
+        assert_eq!(
+            listed[0]["path"],
+            json!(member),
+            "case {case:?}: expected the member named {member:?}, got {:?}",
+            refused.body
+        );
+        // Whatever the entry says about that member, it says something: the gate names the
+        // member in order to tell the caller what to correct.
+        assert!(
+            listed[0]["message"]
+                .as_str()
+                .is_some_and(|stated| !stated.is_empty()),
+            "case {case:?}: the entry must state something about its member, got {:?}",
+            refused.body
+        );
+        // Whichever spelling the member has, it is the one this service's own gates use:
+        // never the dotted path the framework's constraint walk builds.
+        let named = listed[0]["path"].as_str().unwrap_or_default();
+        assert!(
+            !named.contains(".member."),
+            "case {case:?}: the member must not be named by the framework's dotted path, \
+             got {named:?}"
+        );
     }
 }

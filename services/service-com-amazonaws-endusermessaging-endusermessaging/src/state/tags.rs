@@ -68,7 +68,7 @@ fn invalid_resource_arn(resource_arn: &str) -> crate::ops::types::ValidationExce
             "Invalid ARN: {resource_arn} is not the ARN of an {ARN_NAMESPACE} resource"
         ),
         field_list: Some(vec![crate::ops::types::ValidationExceptionField {
-            path: RESOURCE_ARN_POINTER.to_string(),
+            path: RESOURCE_ARN_MEMBER.to_string(),
             message: format!(
                 "The value must be an Amazon Resource Name of the form \
                  arn:<partition>:{ARN_NAMESPACE}:<region>:<account-id>:<resource>"
@@ -113,15 +113,15 @@ fn arn_scope_mismatch(
     crate::ops::types::ValidationException {
         message: stated.clone(),
         field_list: Some(vec![crate::ops::types::ValidationExceptionField {
-            path: RESOURCE_ARN_POINTER.to_string(),
+            path: RESOURCE_ARN_MEMBER.to_string(),
             message: stated,
         }]),
     }
 }
 
-/// The JSON pointer naming the member a refused `resourceArn` arrived on, as
-/// `ValidationExceptionField$path` documents it.
-const RESOURCE_ARN_POINTER: &str = "/resourceArn";
+/// The member a refused `resourceArn` arrived on, as this service's own refusals name a
+/// member at fault in `ValidationExceptionField$path`: by the member's own name.
+const RESOURCE_ARN_MEMBER: &str = "resourceArn";
 
 /// The one failure that is not about the request: an ARN resolved to a resource this
 /// state then had no record of, which the lock the resolution and the read share

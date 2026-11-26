@@ -225,7 +225,7 @@ async fn an_arn_outside_the_requests_scope_is_refused_as_a_scope_mismatch() {
                 );
                 assert_eq!(
                     refused.member("fieldList")[0]["path"],
-                    json!("/resourceArn"),
+                    json!("resourceArn"),
                     "case {case} on {operation}: the refusal must name the member it \
                      refused, got {:?}",
                     refused.body

@@ -265,7 +265,8 @@ pub fn brand_profile_attribute_exists_conflict(
 }
 
 /// `ValidationException` for a create batch that asks for one `attributeName` more than
-/// once, reported against the repeated entry's own member at `pointer`.
+/// once, reported against the repeated entry's own member, named as
+/// [`stated_about_member`] names one.
 ///
 /// `attributeName` "is unique within a brand profile", so a request listing the same name
 /// twice contradicts itself whatever the profile holds: it asks for a state no profile can
@@ -279,11 +280,11 @@ pub fn brand_profile_attribute_exists_conflict(
 /// to change.
 #[must_use]
 pub fn duplicate_attribute_name(
-    pointer: &str,
+    member_path: &str,
     attribute_name: &str,
 ) -> crate::ops::types::ValidationException {
     stated_about_member(
-        pointer,
+        member_path,
         format!("Duplicate attribute name: '{attribute_name}'"),
     )
 }
@@ -320,17 +321,20 @@ pub fn is_supported_attribute_category(category: &str) -> bool {
 }
 
 /// `ValidationException` for a `category` outside [`SUPPORTED_ATTRIBUTE_CATEGORIES`],
-/// reported against the member at `pointer` — the JSONPointer of the `category` member
-/// in the request document, which is what `ValidationExceptionField$path` documents.
+/// reported against the `category` member the request carried it on, named as
+/// [`stated_about_member`] names one.
 ///
 /// The fixed text is the `Invalid category '…'. Supported values: …` sentence over the
 /// supported set; its one variable part is the rejected value, taken from the request.
 /// The `fieldList` entry states the same sentence about the member it names, so a
 /// caller sending a list of attributes is told which entry to change.
 #[must_use]
-pub fn invalid_category(pointer: &str, category: &str) -> crate::ops::types::ValidationException {
+pub fn invalid_category(
+    member_path: &str,
+    category: &str,
+) -> crate::ops::types::ValidationException {
     stated_about_member(
-        pointer,
+        member_path,
         format!(
             "Invalid category '{category}'. Supported values: {}",
             SUPPORTED_ATTRIBUTE_CATEGORIES.join(", ")
@@ -392,14 +396,14 @@ pub fn attribute_media_file_name(attribute_name: &str, content_type: &str) -> St
 }
 
 /// `ValidationException` for media whose file type is not one this API holds, reported
-/// against the member that named it at `pointer`.
+/// against the member that named it, as [`stated_about_member`] names one.
 ///
 /// The fixed text is the `Unsupported file type for attribute '…'. Allowed: …` sentence over
 /// [`SUPPORTED_MEDIA_FILE_TYPES`]; its one variable part is the name the request names the
 /// attribute by.
 #[must_use]
 pub fn unsupported_media_file_type(
-    pointer: &str,
+    member_path: &str,
     attribute_name: &str,
 ) -> crate::ops::types::ValidationException {
     let allowed: Vec<&str> = SUPPORTED_MEDIA_FILE_TYPES
@@ -407,7 +411,7 @@ pub fn unsupported_media_file_type(
         .map(|(label, _, _)| *label)
         .collect();
     stated_about_member(
-        pointer,
+        member_path,
         format!(
             "Unsupported file type for attribute '{attribute_name}'. Allowed: {}",
             allowed.join(", ")
@@ -416,7 +420,8 @@ pub fn unsupported_media_file_type(
 }
 
 /// `ValidationException` for a request offering an attribute BOTH of the two members that
-/// carry its content, reported against the text member at `pointer`.
+/// carry its content, reported against the text member, as [`stated_about_member`] names
+/// one.
 ///
 /// An attribute holds one content: the text member and the media member are alternatives, so
 /// a request supplying both asks for two contents at once and names no single one — which is
@@ -425,11 +430,11 @@ pub fn unsupported_media_file_type(
 /// its one variable part is the name the request names the attribute by.
 #[must_use]
 pub fn attribute_content_members_are_exclusive(
-    pointer: &str,
+    member_path: &str,
     attribute_name: &str,
 ) -> crate::ops::types::ValidationException {
     stated_about_member(
-        pointer,
+        member_path,
         format!(
             "Only one of attributeValue or attachmentBody can be provided for attribute \
              '{attribute_name}'"
@@ -453,18 +458,18 @@ pub fn media_location_key(attribute_value: &str) -> Option<String> {
 }
 
 /// `ValidationException` for a media attribute whose `attributeValue` is not an S3 object
-/// location, reported against that member at `pointer`.
+/// location, reported against that member, as [`stated_about_member`] names one.
 ///
 /// The fixed text is the `attributeValue must be an S3 URL (s3://bucket/key) for …` sentence;
 /// its variable parts are the attribute's own type and the name the request names it by.
 #[must_use]
 pub fn attribute_value_not_a_media_location(
-    pointer: &str,
+    member_path: &str,
     attribute_type: &str,
     attribute_name: &str,
 ) -> crate::ops::types::ValidationException {
     stated_about_member(
-        pointer,
+        member_path,
         format!(
             "attributeValue must be an S3 URL (s3://bucket/key) for {attribute_type} attribute \
              '{attribute_name}'"
@@ -473,7 +478,7 @@ pub fn attribute_value_not_a_media_location(
 }
 
 /// `ValidationException` for an UPDATE of a media attribute whose content the request names
-/// neither way, reported against the text member at `pointer`.
+/// neither way, reported against the text member, as [`stated_about_member`] names one.
 ///
 /// An update REPLACES the content of the attribute it addresses, and the content of an
 /// `IMAGE` or `DOCUMENT` attribute is named either by the `s3://bucket/key` location of the
@@ -486,11 +491,11 @@ pub fn attribute_value_not_a_media_location(
 /// ([`attribute_value_not_a_media_location`]).
 #[must_use]
 pub fn media_attribute_content_required(
-    pointer: &str,
+    member_path: &str,
     attribute_type: &str,
 ) -> crate::ops::types::ValidationException {
     stated_about_member(
-        pointer,
+        member_path,
         format!(
             "Either attributeValue (S3 URL) or attachmentBody must be provided for \
              {attribute_type} attribute"
@@ -499,20 +504,24 @@ pub fn media_attribute_content_required(
 }
 
 /// `ValidationException` for a request supplying `member` for an attribute whose
-/// `attribute_type` does not take it, reported against the member at `pointer`.
+/// `attribute_type` does not take it, reported against that member.
 ///
 /// Which member carries an attribute's content follows from its type: `attachmentBody`
 /// is "The binary content for an attribute of type IMAGE or DOCUMENT", so a `TEXT`
 /// attribute takes none, and an update of a media attribute takes no inline value. The
 /// fixed text is the `… cannot be provided for … attribute` sentence; its variable parts are
 /// the member the request supplied and the attribute's own type.
+///
+/// `member` is a member of the request itself here — only the create path carries one
+/// nested in a list ([`member_not_for_named_attribute_type`]) — so the one name serves both
+/// as the member the sentence states and as the `fieldList` path naming it
+/// ([`stated_about_member`]).
 #[must_use]
 pub fn member_not_for_attribute_type(
-    pointer: &str,
     member: &str,
     attribute_type: &str,
 ) -> crate::ops::types::ValidationException {
-    stated_about_member(pointer, member_not_taken(member, attribute_type, None))
+    stated_about_member(member, member_not_taken(member, attribute_type, None))
 }
 
 /// [`member_not_for_attribute_type`] for a request that DESCRIBES the attribute at fault
@@ -525,13 +534,13 @@ pub fn member_not_for_attribute_type(
 /// ([`brand_profile_attribute_not_found`]), whose name stays in the member modelled for it.
 #[must_use]
 pub fn member_not_for_named_attribute_type(
-    pointer: &str,
+    member_path: &str,
     member: &str,
     attribute_type: &str,
     attribute_name: &str,
 ) -> crate::ops::types::ValidationException {
     stated_about_member(
-        pointer,
+        member_path,
         member_not_taken(member, attribute_type, Some(attribute_name)),
     )
 }
@@ -548,14 +557,24 @@ fn member_not_taken(member: &str, attribute_type: &str, attribute_name: Option<&
 }
 
 /// `message` as this API states a refusal it words ITSELF about one member: the sentence as
-/// the summary, and the same sentence as the `fieldList` entry of the member at `pointer` —
-/// the JSONPointer of that member in the request document, which is what
-/// `ValidationExceptionField$path` documents.
-fn stated_about_member(pointer: &str, message: String) -> crate::ops::types::ValidationException {
+/// the summary, and the same sentence as the `fieldList` entry of the member
+/// `member_path` names.
+///
+/// How a refusal this service words itself names the member at fault there is the service's
+/// own spelling rather than the boundary validator's: a member of the request itself is
+/// named by the member's own name (`attachmentBody`), while a member nested inside a list is
+/// named by the JSON pointer that also names the element at fault
+/// (`/attributes/0/attachmentBody`) — the spelling `ValidationExceptionField$path` documents,
+/// and the one a modelled-constraint refusal uses for every member. Each caller passes the
+/// name the member has in the request it refused.
+fn stated_about_member(
+    member_path: &str,
+    message: String,
+) -> crate::ops::types::ValidationException {
     crate::ops::types::ValidationException {
         message: message.clone(),
         field_list: Some(vec![crate::ops::types::ValidationExceptionField {
-            path: pointer.to_string(),
+            path: member_path.to_string(),
             message,
         }]),
     }

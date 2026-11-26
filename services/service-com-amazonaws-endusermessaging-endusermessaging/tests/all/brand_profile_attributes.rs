@@ -384,9 +384,13 @@ fn batch(attributes: &[Attribute]) -> Value {
 /// A PNG, a JPEG, a GIF and a PDF, each reduced to the magic-number signature its format
 /// publishes (PNG, RFC 2083 §5.2; JPEG, ISO/IEC 10918-1; GIF89a; PDF, ISO 32000-1 §7.5.2),
 /// which is what a media type is read from when the request declares none.
-const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR payload";
+///
+/// The two that every suite of this target needs — one file type an attribute's media may
+/// be, and one it may not — are reachable from its sibling suites, so a second copy of a
+/// signature cannot drift from this one.
+pub(crate) const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR payload";
 const JPEG: &[u8] = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00 payload";
-const GIF: &[u8] = b"GIF89a\x01\x00\x01\x00 payload";
+pub(crate) const GIF: &[u8] = b"GIF89a\x01\x00\x01\x00 payload";
 const PDF: &[u8] = b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n";
 
 /// Bytes announcing no format at all, which are served as unnamed binary.
@@ -796,7 +800,7 @@ async fn an_unsupported_media_file_type_is_refused() {
     );
     assert_eq!(
         refused.body["fieldList"],
-        json!([{ "path": "/attachmentBody", "message": stated }]),
+        json!([{ "path": "attachmentBody", "message": stated }]),
         "the refusal must name the member at fault, got {:?}",
         refused.body
     );
@@ -2676,7 +2680,7 @@ async fn a_category_outside_the_supported_set_is_refused() {
         );
         assert_eq!(
             refused.body["fieldList"],
-            json!([{ "path": "/category", "message": expected }]),
+            json!([{ "path": "category", "message": expected }]),
             "case {value:?}: the refusal must name the member at fault, got {:?}",
             refused.body
         );
@@ -2741,7 +2745,7 @@ async fn an_update_carrying_content_the_attribute_type_does_not_take_is_refused(
         );
         assert_eq!(
             refused.body["fieldList"],
-            json!([{ "path": format!("/{member}"), "message": expected }]),
+            json!([{ "path": member, "message": expected }]),
             "case {case}: the refusal must name the member at fault, got {:?}",
             refused.body
         );
@@ -2833,7 +2837,7 @@ async fn an_update_of_a_media_attribute_names_its_content_by_an_s3_location_or_b
             );
             assert_eq!(
                 refused.body["fieldList"],
-                json!([{ "path": "/attributeValue", "message": expected }]),
+                json!([{ "path": "attributeValue", "message": expected }]),
                 "case {case}: the refusal must name the member at fault, got {:?}",
                 refused.body
             );

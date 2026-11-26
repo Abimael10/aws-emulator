@@ -1228,7 +1228,7 @@ async fn an_arn_this_request_cannot_reach_is_refused_as_invalid() {
             );
             assert_eq!(
                 refused.member("fieldList")[0]["path"],
-                json!("/resourceArn"),
+                json!("resourceArn"),
                 "case {case}: the refusal must name the member it refused, got {:?}",
                 refused.body
             );
@@ -1265,7 +1265,7 @@ async fn an_arn_this_request_cannot_reach_is_refused_as_invalid() {
         );
         assert_eq!(
             refused.member("fieldList")[0]["path"],
-            json!("/resourceArn"),
+            json!("resourceArn"),
             "case {not_a_resource_arn}: the refusal must name the member it refused, got {:?}",
             refused.body
         );
