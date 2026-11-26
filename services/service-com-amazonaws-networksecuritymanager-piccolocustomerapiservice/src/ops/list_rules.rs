@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages through the rules persisted in [`crate::state`], in `ruleId` order, with an
+//! opaque `nextToken` that resumes exactly where the previous page stopped. A pure read:
+//! it never writes.
 //!
 //! ## Shape of an operation
 //!
@@ -153,20 +147,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRules"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListRulesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the rule store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A `nextToken` this service did not mint names no page, and the model expresses
+        // only its character set, so the boundary validator cannot refuse it.
+        let start_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_next_token(token) {
+                Some(key) => Some(key),
+                None => {
+                    let message =
+                        "nextToken is not a token this service issued; restart the listing \
+                         without it"
+                            .to_string();
+                    return Err(ListRulesErrorModeled::ValidationException(
+                        ValidationException {
+                            reason: Some(crate::state::VALIDATION_REASON_FIELD.to_string()),
+                            field_list: Some(vec![ValidationExceptionField {
+                                name: "nextToken".to_string(),
+                                message: message.clone(),
+                            }]),
+                            message,
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        // `RuleSummaryList` is modelled `@length(max: 100)`, so an unbounded request still
+        // pages at 100 rather than returning a list it could not serialize.
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_RULE_PAGE, |requested| {
+                (requested as usize).clamp(1, crate::state::MAX_RULE_PAGE)
+            });
+
+        let store = state.lock();
+        // `rules` is keyed by `ruleId`, so this walk is in a stable order and the token
+        // below resumes immediately after the last summary returned. The walk is over the
+        // stored records and never over their names, so two rules sharing a `ruleName` are
+        // each listed as the distinct resource they are.
+        let mut matching = store
+            .rules
+            .values()
+            .filter(|rule| {
+                start_after
+                    .as_deref()
+                    .is_none_or(|after| rule.rule_id.as_str() > after)
+            })
+            .filter(|rule| {
+                input
+                    .status
+                    .as_deref()
+                    .is_none_or(|wanted| rule.status == wanted)
+            });
+
+        let rules: Vec<RuleSummary> = matching
+            .by_ref()
+            .take(page_size)
+            .map(crate::state::Rule::summary)
+            .collect();
+        // A `nextToken` is emitted only when a further summary really exists, so a caller
+        // that follows it never gets an empty final page.
+        let next_token = matching.next().and_then(|_| {
+            rules
+                .last()
+                .map(|last| crate::state::encode_next_token(&last.rule_id))
+        });
+
+        Ok(ListRulesOutput { next_token, rules })
     }
 }

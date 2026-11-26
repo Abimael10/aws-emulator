@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The Rule entity: the record `CreateRule` persists and `GetRule` reads back.
+//! The Rule entity: the record `CreateRule` persists and `GetRule` and `ListRules` read
+//! back.
 //!
 //! Kept beside [`super`]'s policy record rather than inside any one `src/ops/*.rs`, so
 //! every rule operation agrees on one copy of the record, the id minting and the
@@ -8,6 +9,8 @@
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
+
+use crate::ops::types::RuleSummary;
 
 use super::{
     ComAmazonawsNetworksecuritymanagerPiccolocustomerapiserviceState as State, mint_entity_id,
@@ -31,6 +34,11 @@ pub const RULE_IDENTIFIER_MEMBER: &str = "ruleIdentifier";
 /// that reaching it is refused through a modelled error rather than by exhausting the
 /// host.
 pub const MAX_RULES: usize = 100;
+
+/// The largest page `ListRules` can answer with, and so the page size used when the
+/// caller sends no `maxResults`: `RuleSummaryList` is modelled `@length(max: 100)`, so a
+/// larger page could not be serialized at all.
+pub const MAX_RULE_PAGE: usize = 100;
 
 /// One persisted rule: every member `GetRule` answers with, plus the bookkeeping the
 /// lifecycle needs (`tags`, `created_at`).
@@ -72,6 +80,23 @@ impl Rule {
     /// `updatedAt` as the modelled `DateTimestamp`.
     pub fn updated_at_timestamp(&self) -> ::aws_smithy_types::DateTime {
         to_date_time(self.updated_at)
+    }
+
+    /// This rule as the `RuleSummary` `ListRules` returns — every member read out of the
+    /// stored record, so a summary never states anything a read of the same rule would
+    /// contradict.
+    pub fn summary(&self) -> RuleSummary {
+        RuleSummary {
+            rule_id: self.rule_id.clone(),
+            rule_arn: self.rule_arn.clone(),
+            rule_name: self.rule_name.clone(),
+            firewall_type: Some(self.firewall_type.clone()),
+            rule_type: Some(self.rule_type.clone()),
+            status: Some(self.status.clone()),
+            version: Some(self.version_string()),
+            has_published_version: Some(self.has_published_version),
+            updated_at: Some(self.updated_at_timestamp()),
+        }
     }
 }
 
