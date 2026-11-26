@@ -31,6 +31,15 @@ mod security_controls;
 
 pub use security_controls::*;
 
+/// What one account has CUSTOMIZED about a published security control — the parameter
+/// values `UpdateSecurityControl` sets and `BatchGetSecurityControls` reports — kept
+/// beside the published catalog rather than inside it, because the catalog is service
+/// metadata identical for every caller while a customization belongs to one account's
+/// hub.
+mod security_control_parameters;
+
+pub use security_control_parameters::*;
+
 /// The hub V2 subscription — the resource the V2 API family is enabled and described
 /// through — kept beside the CSPM hub below rather than inside it, because the two are
 /// separate resources with separate ARNs and separate lifecycles.
@@ -339,6 +348,11 @@ pub struct ComAmazonawsSecurityhubSecurityhubapiserviceState {
     /// The organization's delegated administrator designations, keyed by Region +
     /// `SecurityHubFeature` — the identity [`OrganizationAdminKey`] describes.
     pub organization_admins: HashMap<OrganizationAdminKey, OrganizationAdminRecord>,
+    /// What each hub has customized about a published security control, keyed by hub +
+    /// `SecurityControlId`: a control's custom parameter values are per account and
+    /// Region, exactly like the hub whose findings the control's checks produce.
+    pub security_control_customizations:
+        HashMap<SecurityControlCustomizationKey, SecurityControlCustomization>,
     /// Source of [`StoredFinding::imported_seq`] / [`StoredFinding::updated_seq`]
     /// and of [`AutomationRule::created_seq`].
     pub write_seq: u64,
@@ -1080,6 +1094,14 @@ const IAM_4: StandardsControlDefinition = StandardsControlDefinition {
     related_requirements: &[],
 };
 
+const IAM_7: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "IAM.7",
+    title: "Password policies for IAM users should have strong configurations",
+    description: "This control checks whether the account password policy for IAM users requires the character classes and numeric bounds the control's parameters name. The control fails if the password policy is weaker than any of those parameters requires. Unless you provide custom parameter values, Security Hub uses the default value of each parameter.",
+    severity_rating: "MEDIUM",
+    related_requirements: &[],
+};
+
 const KMS_4: StandardsControlDefinition = StandardsControlDefinition {
     control_id: "KMS.4",
     title: "AWS KMS key rotation should be enabled",
@@ -1178,7 +1200,7 @@ const AI_SECURITY_BEST_PRACTICES_CONTROLS: [StandardsControlDefinition; 4] =
 
 /// The controls of the AWS Foundational Security Best Practices standard, which
 /// addresses each one by the security control's own id.
-const FSBP_CONTROLS: [StandardsControlDefinition; 10] = [
+const FSBP_CONTROLS: [StandardsControlDefinition; 11] = [
     ACM_1,
     ACM_2,
     CLOUDTRAIL_1,
@@ -1188,6 +1210,7 @@ const FSBP_CONTROLS: [StandardsControlDefinition; 10] = [
     EC2_2,
     GUARDDUTY_1,
     IAM_4,
+    IAM_7,
     S3_1,
 ];
 
@@ -1496,6 +1519,22 @@ pub fn standards_control_remediation_url(control_id: &str) -> String {
     format!("https://docs.aws.amazon.com/console/securityhub/{control_id}/remediation")
 }
 
+/// The `ControlStatus` a subscription holds for one of its controls: the status a
+/// caller last set for it, or `ENABLED` — the status enabling the standard gave every
+/// control of it — while nobody has changed it. The single definition of that default,
+/// so every reader of a control's enablement agrees on it.
+pub fn subscription_control_status<'a>(
+    record: &'a StandardsSubscriptionRecord,
+    control_id: &str,
+) -> &'a str {
+    record
+        .control_statuses
+        .get(control_id)
+        .map_or(CONTROL_STATUS_ENABLED, |status| {
+            status.control_status.as_str()
+        })
+}
+
 /// One control of one subscription as the modelled `StandardsControl` every operation
 /// that reports a control answers with: the control's published metadata, plus the
 /// status this subscription holds for it.
@@ -1511,12 +1550,7 @@ pub fn standards_control_view(
     let status = record.control_statuses.get(control.control_id);
     StandardsControl {
         standards_control_arn: Some(standards_control_arn(region, definition, control.control_id)),
-        control_status: Some(
-            status.map_or(CONTROL_STATUS_ENABLED, |status| {
-                status.control_status.as_str()
-            })
-            .to_string(),
-        ),
+        control_status: Some(subscription_control_status(record, control.control_id).to_string()),
         disabled_reason: status.and_then(|status| status.disabled_reason.clone()),
         control_status_updated_at: Some(
             status.map_or(record.enabled_at, |status| status.control_status_updated_at),

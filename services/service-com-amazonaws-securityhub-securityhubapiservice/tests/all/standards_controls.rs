@@ -85,6 +85,7 @@ const STANDARDS: [StandardRow; 13] = [
             "EC2.2",
             "GuardDuty.1",
             "IAM.4",
+            "IAM.7",
             "S3.1",
         ],
     },

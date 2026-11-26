@@ -28,8 +28,8 @@ use std::collections::HashMap;
 
 use super::*;
 use crate::ops::types::{
-    ConfigurationOptions, IntegerConfigurationOptions, ParameterDefinition,
-    SecurityControlDefinition, StringListConfigurationOptions,
+    BooleanConfigurationOptions, ConfigurationOptions, IntegerConfigurationOptions,
+    ParameterDefinition, SecurityControlDefinition, StringListConfigurationOptions,
 };
 
 /// `RegionAvailabilityStatus$AVAILABLE`: the control is available in the Region the
@@ -72,6 +72,12 @@ pub enum ParameterConfiguration {
         re2_expression: &'static str,
         expression_description: &'static str,
     },
+    /// `ConfigurationOptions$Boolean`: "The options for customizing a security control
+    /// parameter that is a boolean. For a boolean parameter, the options are `true` and
+    /// `false`" (`smithy_query(query="shape", shape="ConfigurationOptions")`, member
+    /// `Boolean`). Both values are always accepted, so the only option such a parameter
+    /// publishes is the value the control uses until a caller customizes it.
+    Boolean { default_value: bool },
 }
 
 /// One customizable parameter of one security control: the name the parameter is
@@ -139,6 +145,69 @@ const ACM_1_PARAMETERS: [PublishedControlParameter; 1] = [PublishedControlParame
     },
 }];
 
+/// IAM.7's parameters: the password-policy settings the control checks an account's
+/// password policy against. The reference publishes one BOOLEAN parameter per character
+/// class the policy may require — the toggle-style parameters a client branches on the
+/// boolean path for — and one integer parameter per numeric bound it may set, each with
+/// the default the control uses until a caller customizes it.
+const IAM_7_PARAMETERS: [PublishedControlParameter; 7] = [
+    PublishedControlParameter {
+        name: "RequireUppercaseCharacters",
+        description: "Whether the account password policy requires at least one uppercase character",
+        configuration: ParameterConfiguration::Boolean {
+            default_value: true,
+        },
+    },
+    PublishedControlParameter {
+        name: "RequireLowercaseCharacters",
+        description: "Whether the account password policy requires at least one lowercase character",
+        configuration: ParameterConfiguration::Boolean {
+            default_value: true,
+        },
+    },
+    PublishedControlParameter {
+        name: "RequireSymbols",
+        description: "Whether the account password policy requires at least one symbol",
+        configuration: ParameterConfiguration::Boolean {
+            default_value: true,
+        },
+    },
+    PublishedControlParameter {
+        name: "RequireNumbers",
+        description: "Whether the account password policy requires at least one number",
+        configuration: ParameterConfiguration::Boolean {
+            default_value: true,
+        },
+    },
+    PublishedControlParameter {
+        name: "MinimumPasswordLength",
+        description: "The minimum number of characters the account password policy requires a password to hold",
+        configuration: ParameterConfiguration::Integer {
+            default_value: 8,
+            min: 6,
+            max: 128,
+        },
+    },
+    PublishedControlParameter {
+        name: "PasswordReusePrevention",
+        description: "The number of previous passwords the account password policy prevents the reuse of",
+        configuration: ParameterConfiguration::Integer {
+            default_value: 5,
+            min: 1,
+            max: 24,
+        },
+    },
+    PublishedControlParameter {
+        name: "MaxPasswordAge",
+        description: "The number of days after which the account password policy requires a password to be rotated",
+        configuration: ParameterConfiguration::Integer {
+            default_value: 90,
+            min: 1,
+            max: 1095,
+        },
+    },
+];
+
 /// The parameter of a "should be tagged" control: the tag keys the evaluated resource
 /// must carry. The reference publishes the same parameter for every tagging control,
 /// so the entries share this definition rather than restating it.
@@ -165,7 +234,7 @@ const REQUIRED_TAG_KEYS_PARAMETERS: [PublishedControlParameter; 1] = [PublishedC
 ///
 /// Ordered by `SecurityControlId`, which is the order a list of definitions is
 /// reported in, so a page boundary falls in the same place on every call.
-pub const SECURITY_CONTROL_CATALOG: [SecurityControlCatalogEntry; 24] = [
+pub const SECURITY_CONTROL_CATALOG: [SecurityControlCatalogEntry; 25] = [
     SecurityControlCatalogEntry {
         control: ACM_1,
         remediation_url: "https://docs.aws.amazon.com/acm/latest/userguide/email-renewal-validation.html",
@@ -275,6 +344,12 @@ pub const SECURITY_CONTROL_CATALOG: [SecurityControlCatalogEntry; 24] = [
         parameters: &[],
     },
     SecurityControlCatalogEntry {
+        control: IAM_7,
+        remediation_url: "https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_passwords_account-policy.html",
+        provider: SECURITY_CONTROLS_PROVIDER_AWS,
+        parameters: &IAM_7_PARAMETERS,
+    },
+    SecurityControlCatalogEntry {
         control: KMS_4,
         remediation_url: "https://docs.aws.amazon.com/kms/latest/developerguide/rotate-keys.html",
         provider: SECURITY_CONTROLS_PROVIDER_AWS,
@@ -364,6 +439,11 @@ fn parameter_definition_view(parameter: &PublishedControlParameter) -> Parameter
             max_items: Some(max_items),
             expression_description: Some(expression_description.to_string()),
         }),
+        ParameterConfiguration::Boolean { default_value } => {
+            ConfigurationOptions::Boolean(BooleanConfigurationOptions {
+                default_value: Some(default_value),
+            })
+        }
     };
     ParameterDefinition {
         description: parameter.description.to_string(),

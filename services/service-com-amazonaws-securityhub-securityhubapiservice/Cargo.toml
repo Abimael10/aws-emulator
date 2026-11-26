@@ -29,6 +29,9 @@ hex = { workspace = true }
 # The per-response `RequestId` every Security Hub error envelope reports
 # (`crate::scaffolded`).
 uuid = { version = "1", features = ["v4"] }
+# RE2 matcher for the `Re2Expression` a customizable control parameter publishes, which
+# a custom value for that parameter must match (`crate::state`).
+regex = "1.13"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -3,8 +3,10 @@
 //! End-to-end HTTP coverage of the published security-control catalog:
 //! `ListSecurityControlDefinitions`' listing — the `StandardsArn` and `Providers`
 //! selections, `MaxResults`/`NextToken` paging, and how a customizable control reports
-//! its parameters — and `GetSecurityControlDefinition`'s single-control read of that
-//! same catalog.
+//! its parameters — `GetSecurityControlDefinition`'s single-control read of that same
+//! catalog, and the CUSTOMIZATION of a published control's parameters:
+//! `UpdateSecurityControl`'s write and `BatchGetSecurityControls`' read of the effective
+//! values.
 //!
 //! Every case drives the real restJson1 wire path through `MultiServiceRouter`, so a
 //! route, a status code or a serialized member that is wrong on the wire fails here.
@@ -13,12 +15,16 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_securityhub_securityhubapiservice::ops::types::{
-    REGION_AVAILABILITY_STATUS_VALUES, SECURITY_CONTROLS_PROVIDER_VALUES,
-    SECURITY_CONTROL_PROPERTY_VALUES, SEVERITY_RATING_VALUES,
+    PARAMETER_VALUE_TYPE_VALUES, REGION_AVAILABILITY_STATUS_VALUES,
+    SECURITY_CONTROLS_PROVIDER_VALUES, SECURITY_CONTROL_PROPERTY_VALUES, SEVERITY_RATING_VALUES,
+    UNPROCESSED_ERROR_CODE_VALUES, UPDATE_STATUS_VALUES,
 };
 use service_com_amazonaws_securityhub_securityhubapiservice::state::{
+    security_control_arn, security_control_does_not_exist_message,
+    security_control_parameter_does_not_exist_message, standard_applies_security_control,
     standard_arn, standard_controls, standards_control_remediation_url, ParameterConfiguration,
-    SecurityControlCatalogEntry, SECURITY_CONTROL_CATALOG, STANDARDS_CATALOG,
+    SecurityControlCatalogEntry, CONTROL_STATUS_DISABLED, CONTROL_STATUS_ENABLED,
+    SECURITY_CONTROL_CATALOG, STANDARDS_CATALOG,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -49,6 +55,24 @@ impl Harness {
         let harness = Self::new(region);
         let (status, body) = harness
             .call("POST", "/accounts", Some(json!({})))
+            .await;
+        assert_eq!(
+            status, 200,
+            "region {region:?}: EnableSecurityHub must succeed, got {status} with {body}"
+        );
+        harness
+    }
+
+    /// An emulator whose hub is subscribed in `region` with NO default standard, so no
+    /// standard the account subscribes to carries any security control.
+    async fn subscribed_without_default_standards(region: &str) -> Self {
+        let harness = Self::new(region);
+        let (status, body) = harness
+            .call(
+                "POST",
+                "/accounts",
+                Some(json!({ "EnableDefaultStandards": false })),
+            )
             .await;
         assert_eq!(
             status, 200,
@@ -106,6 +130,83 @@ impl Harness {
             format!("/securityControl/definition?SecurityControlId={security_control_id}");
         self.call("GET", &path, None).await
     }
+
+    /// `UpdateSecurityControl`, as the modelled `PATCH /securityControl/update` binding
+    /// carries it: the whole request is the body.
+    async fn update_control(&self, request: Value) -> (u16, Value) {
+        self.call("PATCH", "/securityControl/update", Some(request))
+            .await
+    }
+
+    /// `UpdateSecurityControl` setting ONE parameter of one control to a custom value,
+    /// with the reason for the change.
+    async fn set_custom_parameter(
+        &self,
+        security_control_id: &str,
+        parameter: &str,
+        value: &Value,
+        reason: &str,
+    ) -> (u16, Value) {
+        self.update_control(json!({
+            "SecurityControlId": security_control_id,
+            "Parameters": { parameter: { "ValueType": "CUSTOM", "Value": value } },
+            "LastUpdateReason": reason,
+        }))
+        .await
+    }
+
+    /// `UpdateSecurityControl` putting ONE parameter of one control back on the value
+    /// the catalog publishes for it, naming no reason.
+    async fn reset_parameter(&self, security_control_id: &str, parameter: &str) -> (u16, Value) {
+        self.update_control(json!({
+            "SecurityControlId": security_control_id,
+            "Parameters": { parameter: { "ValueType": "DEFAULT" } },
+        }))
+        .await
+    }
+
+    /// `BatchGetSecurityControls` for a batch of ids, ARNs, or a mix of both, as the
+    /// modelled `POST /securityControls/batchGet` binding carries it.
+    async fn batch_get(&self, identifiers: &[&str]) -> (u16, Value) {
+        self.call(
+            "POST",
+            "/securityControls/batchGet",
+            Some(json!({ "SecurityControlIds": identifiers })),
+        )
+        .await
+    }
+}
+
+/// The `SecurityControls` entry a batch reported for `security_control_id`, which the
+/// batch must carry one of.
+fn reported_control(case: &str, body: &Value, security_control_id: &str) -> Value {
+    body["SecurityControls"]
+        .as_array()
+        .and_then(|controls| {
+            controls
+                .iter()
+                .find(|control| control["SecurityControlId"].as_str() == Some(security_control_id))
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: the batch must report {security_control_id}, got {body}")
+        })
+}
+
+/// The `Parameters` entry a reported control carries for `parameter`, which a control
+/// that publishes the parameter must report.
+fn reported_parameter(case: &str, control: &Value, parameter: &str) -> Value {
+    control["Parameters"]
+        .get(parameter)
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: the control must report parameter {parameter}, got {control}")
+        })
+}
+
+/// The error code of a refusal envelope.
+fn refusal_code(body: &Value) -> Option<&str> {
+    body["Code"].as_str()
 }
 
 /// The `SecurityControlDefinitions` entries of a response, in the order it listed them.
@@ -451,6 +552,7 @@ async fn a_standards_arn_selects_the_controls_that_standard_applies() {
                 "EC2.2",
                 "GuardDuty.1",
                 "IAM.4",
+                "IAM.7",
                 "S3.1",
             ],
         ),
@@ -863,6 +965,15 @@ async fn the_definition_of_one_control_carries_the_definitions_of_its_parameters
                         "control {id}: a parameter with no default reports none, got {options}"
                     );
                 }
+                ParameterConfiguration::Boolean { default_value } => {
+                    let boolean = &options["Boolean"];
+                    assert_eq!(
+                        boolean["DefaultValue"].as_bool(),
+                        Some(default_value),
+                        "control {id}: unexpected boolean options for {}, got {options}",
+                        parameter.name
+                    );
+                }
             }
         }
     }
@@ -1265,6 +1376,12 @@ async fn a_single_read_reports_the_parameters_the_control_publishes() {
                     .is_object(),
                 "case {case:?}: a string-list parameter reports string-list options, got {body}"
             ),
+            Some(ParameterConfiguration::Boolean { .. }) => assert!(
+                reported["ParameterDefinitions"][entry.parameters[0].name]["ConfigurationOptions"]
+                    ["Boolean"]
+                    .is_object(),
+                "case {case:?}: a boolean parameter reports boolean options, got {body}"
+            ),
         }
     }
 
@@ -1616,4 +1733,855 @@ async fn the_parameter_surface_follows_the_control_not_the_service() {
             }
         }
     }
+}
+
+/// RULE: a published control's customizable parameter is reported under the
+/// `ConfigurationOptions` union member that names its DATA TYPE, so every data type the
+/// catalog publishes a parameter for is discoverable from the catalog alone — a client
+/// that branches on a parameter's data type finds the branch it needs.
+///
+/// Discovered from the WIRE exactly as a client does: page every definition, keep the
+/// ones whose `CustomizableProperties` names `Parameters`, read each one and collect the
+/// option member every parameter reports. The boolean member is the one no published
+/// control exposed, so it is asserted by name; the rest spans whatever the catalog
+/// publishes.
+#[tokio::test]
+async fn every_published_parameter_data_type_is_discoverable_from_the_catalog() {
+    // Every `ConfigurationOptions` member the model declares
+    // (`smithy_query(query="shape", shape="ConfigurationOptions")`).
+    const CONFIGURATION_OPTIONS_MEMBERS: [&str; 8] = [
+        "Integer",
+        "IntegerList",
+        "Double",
+        "String",
+        "StringList",
+        "Boolean",
+        "Enum",
+        "EnumList",
+    ];
+
+    let harness = Harness::subscribed("us-east-2").await;
+    let customizable: Vec<String> = page_through_definitions(&harness, "", 20)
+        .await
+        .iter()
+        .filter(|definition| {
+            definition["CustomizableProperties"]
+                .as_array()
+                .is_some_and(|properties| {
+                    properties
+                        .iter()
+                        .any(|property| property.as_str() == Some("Parameters"))
+                })
+        })
+        .map(|definition| {
+            definition["SecurityControlId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert!(
+        !customizable.is_empty(),
+        "the catalog must publish at least one customizable control"
+    );
+
+    // (option member, control id, parameter name) per parameter the catalog publishes.
+    let mut by_member: Vec<(&'static str, String, String)> = Vec::new();
+    for id in &customizable {
+        let (status, body) = harness.definition(id).await;
+        assert_eq!(
+            status, 200,
+            "control {id}: expected 200, got {status} with {body}"
+        );
+        let definitions = body["SecurityControlDefinition"]["ParameterDefinitions"]
+            .as_object()
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!("control {id}: a customizable control reports ParameterDefinitions, got {body}")
+            });
+        for (name, definition) in definitions {
+            let options = definition["ConfigurationOptions"]
+                .as_object()
+                .cloned()
+                .unwrap_or_else(|| {
+                    panic!("control {id}: parameter {name} must report ConfigurationOptions")
+                });
+            assert_eq!(
+                options.len(),
+                1,
+                "control {id}: parameter {name} reports exactly one option member, got {options:?}"
+            );
+            let member = options.keys().next().expect("one option member").clone();
+            let declared = CONFIGURATION_OPTIONS_MEMBERS
+                .iter()
+                .find(|candidate| **candidate == member)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "control {id}: parameter {name} reports {member}, which is no modelled ConfigurationOptions member"
+                    )
+                });
+            by_member.push((declared, id.clone(), name.clone()));
+        }
+    }
+
+    let boolean_parameters: Vec<(&str, String, String)> = by_member
+        .iter()
+        .filter(|(member, _, _)| *member == "Boolean")
+        .cloned()
+        .collect();
+    assert!(
+        !boolean_parameters.is_empty(),
+        "a published control must expose a customizable boolean parameter, got {by_member:?}"
+    );
+    for (_, id, name) in &boolean_parameters {
+        let (status, body) = harness.definition(id).await;
+        assert_eq!(
+            status, 200,
+            "control {id}: expected 200, got {status} with {body}"
+        );
+        let options = &body["SecurityControlDefinition"]["ParameterDefinitions"][name]
+            ["ConfigurationOptions"]["Boolean"];
+        assert!(
+            options["DefaultValue"].as_bool().is_some(),
+            "control {id}: boolean parameter {name} publishes a boolean DefaultValue, got {options}"
+        );
+    }
+
+    // The member a parameter is reported under is the one its catalogued data type
+    // names, for every parameter the catalog publishes.
+    for entry in SECURITY_CONTROL_CATALOG.iter() {
+        for parameter in entry.parameters {
+            let expected = match parameter.configuration {
+                ParameterConfiguration::Integer { .. } => "Integer",
+                ParameterConfiguration::StringList { .. } => "StringList",
+                ParameterConfiguration::Boolean { .. } => "Boolean",
+            };
+            let reported = by_member
+                .iter()
+                .find(|(_, id, name)| {
+                    id == entry.control.control_id && name == parameter.name
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "control {}: parameter {} must be discoverable from the catalog",
+                        entry.control.control_id, parameter.name
+                    )
+                });
+            assert_eq!(
+                reported.0, expected,
+                "control {}: parameter {} must report {expected} options, got {}",
+                entry.control.control_id, parameter.name, reported.0
+            );
+        }
+    }
+}
+
+/// RULE: a control parameter set with `ValueType` `CUSTOM` keeps the value the request
+/// carried for the caller's account and Region — a later read reports that parameter as
+/// `CUSTOM` with that value and every other parameter of the control as `DEFAULT` — and
+/// setting it back to `DEFAULT` restores the published default, reported as `DEFAULT`
+/// with no value of its own.
+///
+/// The rows span what the rule generalises over: the parameter's DATA TYPE (boolean,
+/// integer, string list), the VALUE (a boolean on either side of its published default,
+/// an integer at each published bound and inside the range, a list of one and a list at
+/// the published maximum length), and the CONTROL (four published controls, two of which
+/// publish the same parameter name).
+#[tokio::test]
+async fn a_custom_parameter_value_round_trips_and_a_default_reset_restores_it() {
+    let region = "eu-north-1";
+    let harness = Harness::subscribed(region).await;
+    let reason = "parameter round trip";
+
+    // (case, control id, parameter name, custom value)
+    let rows: [(&str, &str, &str, Value); 9] = [
+        (
+            "a boolean turned off",
+            "IAM.7",
+            "RequireUppercaseCharacters",
+            json!({ "Boolean": false }),
+        ),
+        (
+            "a boolean set to the value it already defaults to",
+            "IAM.7",
+            "RequireSymbols",
+            json!({ "Boolean": true }),
+        ),
+        (
+            "another boolean parameter of the same control",
+            "IAM.7",
+            "RequireNumbers",
+            json!({ "Boolean": false }),
+        ),
+        (
+            "an integer at the published minimum",
+            "IAM.7",
+            "MinimumPasswordLength",
+            json!({ "Integer": 6 }),
+        ),
+        (
+            "an integer at the published maximum",
+            "IAM.7",
+            "MaxPasswordAge",
+            json!({ "Integer": 1095 }),
+        ),
+        (
+            "an integer inside another control's published range",
+            "ACM.1",
+            "daysToExpiration",
+            json!({ "Integer": 60 }),
+        ),
+        (
+            "an integer at that control's published minimum",
+            "ACM.1",
+            "daysToExpiration",
+            json!({ "Integer": 14 }),
+        ),
+        (
+            "a one-item string list",
+            "EC2.52",
+            "requiredTagKeys",
+            json!({ "StringList": ["Owner"] }),
+        ),
+        (
+            "a string list at the published maximum length, on a third control",
+            "ECS.13",
+            "requiredTagKeys",
+            json!({ "StringList": ["Owner", "Environment", "CostCenter", "Team", "App", "Tier"] }),
+        ),
+    ];
+
+    for (case, control_id, parameter, value) in rows {
+        // Before the write, the parameter runs on the value the catalog publishes.
+        let (status, body) = harness.batch_get(&[control_id]).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: BatchGetSecurityControls must succeed, got {status} with {body}"
+        );
+        let before =
+            reported_parameter(case, &reported_control(case, &body, control_id), parameter);
+        assert_eq!(
+            before["ValueType"].as_str(),
+            Some("DEFAULT"),
+            "case {case:?}: an uncustomized parameter reports DEFAULT, got {before}"
+        );
+
+        let (status, body) = harness
+            .set_custom_parameter(control_id, parameter, &value, reason)
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: UpdateSecurityControl must succeed, got {status} with {body}"
+        );
+        assert!(
+            body.is_null() || body.as_object().is_some_and(serde_json::Map::is_empty),
+            "case {case:?}: UpdateSecurityControl answers an empty response, got {body}"
+        );
+
+        let (status, body) = harness.batch_get(&[control_id]).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: BatchGetSecurityControls must succeed, got {status} with {body}"
+        );
+        let control = reported_control(case, &body, control_id);
+        let reported = reported_parameter(case, &control, parameter);
+        assert_eq!(
+            reported["ValueType"].as_str(),
+            Some("CUSTOM"),
+            "case {case:?}: a customized parameter reports CUSTOM, got {reported}"
+        );
+        assert_eq!(
+            reported["Value"], value,
+            "case {case:?}: expected the value that was set, got {reported}"
+        );
+        assert_eq!(
+            control["LastUpdateReason"].as_str(),
+            Some(reason),
+            "case {case:?}: the control reports the reason of the most recent update, got {control}"
+        );
+        assert!(
+            UPDATE_STATUS_VALUES.contains(&control["UpdateStatus"].as_str().unwrap_or_default()),
+            "case {case:?}: UpdateStatus must be a modelled value, got {control}"
+        );
+        // Only the parameter that was set is customized: the control's other parameters
+        // still run on their published defaults.
+        for other in catalog_entry(control_id).parameters {
+            if other.name == parameter {
+                continue;
+            }
+            let untouched = reported_parameter(case, &control, other.name);
+            assert_eq!(
+                untouched["ValueType"].as_str(),
+                Some("DEFAULT"),
+                "case {case:?}: parameter {} was not set, so it reports DEFAULT, got {untouched}",
+                other.name
+            );
+        }
+
+        let (status, body) = harness.reset_parameter(control_id, parameter).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the DEFAULT reset must succeed, got {status} with {body}"
+        );
+        let (status, body) = harness.batch_get(&[control_id]).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: BatchGetSecurityControls must succeed, got {status} with {body}"
+        );
+        let control = reported_control(case, &body, control_id);
+        let restored = reported_parameter(case, &control, parameter);
+        assert_eq!(
+            restored["ValueType"].as_str(),
+            Some("DEFAULT"),
+            "case {case:?}: a reset parameter reports DEFAULT, got {restored}"
+        );
+        assert!(
+            restored.get("Value").is_none(),
+            "case {case:?}: a DEFAULT parameter carries no value of its own, got {restored}"
+        );
+        assert!(
+            control.get("LastUpdateReason").is_none(),
+            "case {case:?}: the most recent update named no reason, got {control}"
+        );
+    }
+
+    // Two customizations of different controls stand side by side, and each parameter
+    // reports the value set for ITS control.
+    let (status, body) = harness
+        .set_custom_parameter("ACM.1", "daysToExpiration", &json!({ "Integer": 45 }), reason)
+        .await;
+    assert_eq!(status, 200, "ACM.1 must accept a custom value, got {body}");
+    let (status, body) = harness
+        .set_custom_parameter(
+            "IAM.7",
+            "RequireLowercaseCharacters",
+            &json!({ "Boolean": false }),
+            reason,
+        )
+        .await;
+    assert_eq!(status, 200, "IAM.7 must accept a custom value, got {body}");
+    let (status, body) = harness.batch_get(&["ACM.1", "IAM.7"]).await;
+    assert_eq!(
+        status, 200,
+        "the batch must succeed, got {status} with {body}"
+    );
+    let case = "two controls customized at once";
+    assert_eq!(
+        reported_parameter(case, &reported_control(case, &body, "ACM.1"), "daysToExpiration")
+            ["Value"],
+        json!({ "Integer": 45 }),
+        "case {case:?}: expected ACM.1's own value, got {body}"
+    );
+    assert_eq!(
+        reported_parameter(
+            case,
+            &reported_control(case, &body, "IAM.7"),
+            "RequireLowercaseCharacters"
+        )["Value"],
+        json!({ "Boolean": false }),
+        "case {case:?}: expected IAM.7's own value, got {body}"
+    );
+}
+
+/// RULE: a custom parameter value must satisfy the options the control publishes for
+/// that parameter — the data type its `ConfigurationOptions` member names and the bounds
+/// that member carries — so a request naming a control or a parameter the catalog does
+/// not publish, or a value outside the published options, is refused and changes nothing.
+///
+/// The rows span the refusal classes: an unpublished control id (404), an unpublished
+/// parameter name (on a customizable control and on one that supports no parameter), a
+/// value of the wrong data type for each of the three published types, an integer one
+/// past each published bound, a list one past its published length, a list item the
+/// published expression rejects, `CUSTOM` with no value at all, and a `ValueType` the
+/// model does not declare.
+#[tokio::test]
+async fn a_parameter_value_outside_the_published_options_is_refused() {
+    let region = "ap-southeast-2";
+    let harness = Harness::subscribed(region).await;
+
+    // (case, request, expected status, expected error code, expected message)
+    let rows: [(&str, Value, u16, &str, Option<String>); 12] = [
+        (
+            "a control the catalog publishes nothing for",
+            json!({
+                "SecurityControlId": "Redshift.1",
+                "Parameters": { "daysToExpiration": { "ValueType": "DEFAULT" } },
+            }),
+            404,
+            "ResourceNotFoundException",
+            Some(security_control_does_not_exist_message("Redshift.1")),
+        ),
+        (
+            "a parameter name the control publishes none under",
+            json!({
+                "SecurityControlId": "IAM.7",
+                "Parameters": { "requireUppercaseCharacters": { "ValueType": "DEFAULT" } },
+            }),
+            400,
+            "InvalidInputException",
+            Some(security_control_parameter_does_not_exist_message(
+                "IAM.7",
+                "requireUppercaseCharacters",
+            )),
+        ),
+        (
+            "any parameter on a control that supports none",
+            json!({
+                "SecurityControlId": "IAM.4",
+                "Parameters": {
+                    "daysToExpiration": { "ValueType": "CUSTOM", "Value": { "Integer": 30 } },
+                },
+            }),
+            400,
+            "InvalidInputException",
+            Some(security_control_parameter_does_not_exist_message(
+                "IAM.4",
+                "daysToExpiration",
+            )),
+        ),
+        (
+            "an integer value for a boolean parameter",
+            json!({
+                "SecurityControlId": "IAM.7",
+                "Parameters": {
+                    "RequireSymbols": { "ValueType": "CUSTOM", "Value": { "Integer": 1 } },
+                },
+            }),
+            400,
+            "InvalidInputException",
+            None,
+        ),
+        (
+            "a boolean value for an integer parameter",
+            json!({
+                "SecurityControlId": "ACM.1",
+                "Parameters": {
+                    "daysToExpiration": { "ValueType": "CUSTOM", "Value": { "Boolean": true } },
+                },
+            }),
+            400,
+            "InvalidInputException",
+            None,
+        ),
+        (
+            "a string value for a string-list parameter",
+            json!({
+                "SecurityControlId": "EC2.52",
+                "Parameters": {
+                    "requiredTagKeys": { "ValueType": "CUSTOM", "Value": { "String": "Owner" } },
+                },
+            }),
+            400,
+            "InvalidInputException",
+            None,
+        ),
+        (
+            "an integer one below the published minimum",
+            json!({
+                "SecurityControlId": "ACM.1",
+                "Parameters": {
+                    "daysToExpiration": { "ValueType": "CUSTOM", "Value": { "Integer": 13 } },
+                },
+            }),
+            400,
+            "InvalidInputException",
+            None,
+        ),
+        (
+            "an integer one above the published maximum",
+            json!({
+                "SecurityControlId": "ACM.1",
+                "Parameters": {
+                    "daysToExpiration": { "ValueType": "CUSTOM", "Value": { "Integer": 366 } },
+                },
+            }),
+            400,
+            "InvalidInputException",
+            None,
+        ),
+        (
+            "an integer one below another control's published minimum",
+            json!({
+                "SecurityControlId": "IAM.7",
+                "Parameters": {
+                    "MinimumPasswordLength": { "ValueType": "CUSTOM", "Value": { "Integer": 5 } },
+                },
+            }),
+            400,
+            "InvalidInputException",
+            None,
+        ),
+        (
+            "one list item more than the published maximum",
+            json!({
+                "SecurityControlId": "EC2.52",
+                "Parameters": {
+                    "requiredTagKeys": {
+                        "ValueType": "CUSTOM",
+                        "Value": { "StringList": ["a", "b", "c", "d", "e", "f", "g"] },
+                    },
+                },
+            }),
+            400,
+            "InvalidInputException",
+            None,
+        ),
+        (
+            "a list item the published expression rejects",
+            json!({
+                "SecurityControlId": "EC2.52",
+                "Parameters": {
+                    "requiredTagKeys": {
+                        "ValueType": "CUSTOM",
+                        "Value": { "StringList": ["Owner!"] },
+                    },
+                },
+            }),
+            400,
+            "InvalidInputException",
+            None,
+        ),
+        (
+            "CUSTOM with no value at all",
+            json!({
+                "SecurityControlId": "IAM.7",
+                "Parameters": { "RequireNumbers": { "ValueType": "CUSTOM" } },
+            }),
+            400,
+            "InvalidInputException",
+            None,
+        ),
+    ];
+
+    for (case, request, expected_status, expected_code, expected_message) in rows {
+        let (status, body) = harness.update_control(request).await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected {expected_status}, got {status} with {body}"
+        );
+        assert_eq!(
+            refusal_code(&body),
+            Some(expected_code),
+            "case {case:?}: expected {expected_code}, got {body}"
+        );
+        if let Some(expected) = expected_message {
+            assert_eq!(
+                body["Message"].as_str(),
+                Some(expected.as_str()),
+                "case {case:?}: unexpected refusal message, got {body}"
+            );
+        } else {
+            assert!(
+                !body["Message"].as_str().unwrap_or_default().is_empty(),
+                "case {case:?}: a refusal states why, got {body}"
+            );
+        }
+    }
+
+    // A `ValueType` outside the two values `ParameterValueType` declares is refused by
+    // the modelled constraint itself, before this operation's own checks run.
+    let (status, body) = harness
+        .update_control(json!({
+            "SecurityControlId": "IAM.7",
+            "Parameters": {
+                "RequireNumbers": { "ValueType": "custom", "Value": { "Boolean": false } },
+            },
+        }))
+        .await;
+    assert_eq!(
+        status, 400,
+        "a ValueType the model does not declare: expected 400, got {status} with {body}"
+    );
+    assert!(
+        body["__type"].as_str() == Some("ValidationException")
+            || refusal_code(&body) == Some("InvalidInputException"),
+        "a ValueType the model does not declare must be refused as invalid input, got {body}"
+    );
+
+    // A refused request wrote nothing: every parameter of every control the rows named
+    // still runs on the value the catalog publishes.
+    for control_id in ["ACM.1", "EC2.52", "IAM.4", "IAM.7"] {
+        let (status, body) = harness.batch_get(&[control_id]).await;
+        assert_eq!(
+            status, 200,
+            "control {control_id}: expected 200, got {status} with {body}"
+        );
+        let control = reported_control("after the refusals", &body, control_id);
+        for parameter in catalog_entry(control_id).parameters {
+            let reported = reported_parameter("after the refusals", &control, parameter.name);
+            assert_eq!(
+                reported["ValueType"].as_str(),
+                Some("DEFAULT"),
+                "control {control_id}: a refused write leaves {} on its default, got {reported}",
+                parameter.name
+            );
+        }
+    }
+}
+
+/// RULE: a batch read reports one entry per control it resolved — addressed by its
+/// `SecurityControlId` or by its `SecurityControlArn`, carrying the control's published
+/// metadata — and reports an identifier no control is published under under
+/// `UnprocessedIds` with a modelled error code, so one unknown identifier does not cost
+/// the caller the controls it asked for beside it. A batch longer than the service's
+/// bound is refused rather than served.
+#[tokio::test]
+async fn a_batch_reports_resolved_controls_and_lists_the_unknown_identifiers() {
+    let region = "us-west-1";
+    let harness = Harness::subscribed(region).await;
+
+    let iam_arn = security_control_arn(region, "IAM.7");
+    let unknown_arn = security_control_arn(region, "Redshift.1");
+    let identifiers = [
+        "ACM.1",
+        iam_arn.as_str(),
+        "Redshift.1",
+        unknown_arn.as_str(),
+        "ECS.13",
+    ];
+    let (status, body) = harness.batch_get(&identifiers).await;
+    assert_eq!(
+        status, 200,
+        "the batch must succeed, got {status} with {body}"
+    );
+
+    let reported_ids: Vec<&str> = body["SecurityControls"]
+        .as_array()
+        .map(|controls| {
+            controls
+                .iter()
+                .map(|control| control["SecurityControlId"].as_str().unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        reported_ids,
+        vec!["ACM.1", "IAM.7", "ECS.13"],
+        "the batch reports the resolved controls in request order, got {body}"
+    );
+
+    // Every reported control carries the metadata its definition publishes, and the ARN
+    // form resolves the same control as the id.
+    for id in ["ACM.1", "IAM.7", "ECS.13"] {
+        let control = reported_control("resolved", &body, id);
+        let (status, definition) = harness.definition(id).await;
+        assert_eq!(
+            status, 200,
+            "control {id}: expected 200, got {status} with {definition}"
+        );
+        let published = &definition["SecurityControlDefinition"];
+        for member in [
+            "Title",
+            "Description",
+            "RemediationUrl",
+            "SeverityRating",
+            "Provider",
+        ] {
+            assert_eq!(
+                control[member], published[member],
+                "control {id}: {member} must match the published definition, got {control}"
+            );
+        }
+        assert_eq!(
+            control["SecurityControlArn"].as_str(),
+            Some(security_control_arn(region, id).as_str()),
+            "control {id}: unexpected SecurityControlArn, got {control}"
+        );
+        assert!(
+            SEVERITY_RATING_VALUES.contains(&control["SeverityRating"].as_str().unwrap_or_default()),
+            "control {id}: SeverityRating must be a modelled value, got {control}"
+        );
+    }
+
+    let unprocessed = body["UnprocessedIds"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let unprocessed_ids: Vec<&str> = unprocessed
+        .iter()
+        .map(|entry| entry["SecurityControlId"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        unprocessed_ids,
+        vec!["Redshift.1", unknown_arn.as_str()],
+        "every unresolved identifier is reported once, got {body}"
+    );
+    for entry in &unprocessed {
+        let code = entry["ErrorCode"].as_str().unwrap_or_default();
+        assert!(
+            UNPROCESSED_ERROR_CODE_VALUES.contains(&code),
+            "an unprocessed entry carries a modelled error code, got {entry}"
+        );
+        assert_eq!(
+            code, "RESOURCE_NOT_FOUND",
+            "an identifier nothing answers to is reported as not found, got {entry}"
+        );
+        let identifier = entry["SecurityControlId"].as_str().unwrap_or_default();
+        assert_eq!(
+            entry["ErrorReason"].as_str(),
+            Some(security_control_does_not_exist_message(identifier).as_str()),
+            "an unprocessed entry states why, got {entry}"
+        );
+    }
+
+    // A batch that resolves nothing is still a success, and so is an empty one.
+    for (case, requested) in [
+        ("only unknown identifiers", vec!["Nope.1", "Nope.2"]),
+        ("no identifier at all", Vec::new()),
+    ] {
+        let (status, body) = harness.batch_get(&requested).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            body["SecurityControls"].as_array().map(Vec::len),
+            Some(0),
+            "case {case:?}: no control was resolved, got {body}"
+        );
+        assert_eq!(
+            body["UnprocessedIds"].as_array().map(Vec::len),
+            Some(requested.len()),
+            "case {case:?}: every identifier is accounted for, got {body}"
+        );
+    }
+
+    // One call addresses a bounded batch: one identifier past the bound is refused,
+    // while a batch at the bound is served.
+    let ids = catalog_ids();
+    let over_the_bound: Vec<&str> = (0..101)
+        .map(|index| ids[index % ids.len()].as_str())
+        .collect();
+    let (status, body) = harness.batch_get(&over_the_bound).await;
+    assert_eq!(
+        status, 400,
+        "a batch past the bound is refused, got {status} with {body}"
+    );
+    assert_eq!(
+        refusal_code(&body),
+        Some("InvalidInputException"),
+        "expected InvalidInputException, got {body}"
+    );
+    let at_the_bound: Vec<&str> = over_the_bound[..100].to_vec();
+    let (status, body) = harness.batch_get(&at_the_bound).await;
+    assert_eq!(
+        status, 200,
+        "a batch at the bound is served, got {status} with {body}"
+    );
+}
+
+/// RULE: a control's reported status follows the standards the account subscribes to — a
+/// control is `ENABLED` while a subscribed standard carries it and `DISABLED` once none
+/// does — and both control operations refuse an account with no subscription at all with
+/// `InvalidAccessException`, because a customization belongs to one account's hub.
+///
+/// The expectation per control is computed from the published catalog (which standards
+/// are enabled by default, and which controls each one carries), so the rows span both
+/// sides of the rule without restating the catalog.
+#[tokio::test]
+async fn a_control_status_follows_the_standards_the_account_subscribes_to() {
+    let region = "eu-west-3";
+    let ids = ["ACM.1", "IAM.7", "ECS.13", "AzureStorage.1"];
+
+    let default_standards = Harness::subscribed(region).await;
+    let no_standards = Harness::subscribed_without_default_standards(region).await;
+
+    let mut enabled_seen = 0usize;
+    let mut disabled_seen = 0usize;
+    for id in ids {
+        let entry = catalog_entry(id);
+        // A control is enabled while a standard this account subscribes to carries it;
+        // with the default standards, those are the standards the catalog enables by
+        // default.
+        let expected = if STANDARDS_CATALOG
+            .iter()
+            .filter(|standard| standard.enabled_by_default)
+            .any(|standard| standard_applies_security_control(standard, entry))
+        {
+            enabled_seen += 1;
+            CONTROL_STATUS_ENABLED
+        } else {
+            disabled_seen += 1;
+            CONTROL_STATUS_DISABLED
+        };
+
+        let (status, body) = default_standards.batch_get(&[id]).await;
+        assert_eq!(
+            status, 200,
+            "control {id}: expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            reported_control("with the default standards", &body, id)["SecurityControlStatus"]
+                .as_str(),
+            Some(expected),
+            "control {id}: expected {expected} with the default standards, got {body}"
+        );
+
+        // With no standard enabled, no subscription carries the control at all.
+        let (status, body) = no_standards.batch_get(&[id]).await;
+        assert_eq!(
+            status, 200,
+            "control {id}: expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            reported_control("with no standard", &body, id)["SecurityControlStatus"].as_str(),
+            Some(CONTROL_STATUS_DISABLED),
+            "control {id}: a control no subscribed standard carries is disabled, got {body}"
+        );
+    }
+    assert!(
+        enabled_seen > 0 && disabled_seen > 0,
+        "the rows must span both sides of the rule, got {enabled_seen} enabled and {disabled_seen} disabled"
+    );
+
+    // A customization is per hub, so an account with none has nothing to read or write.
+    let account_id = engine::emulator_account_id();
+    let unsubscribed = Harness::new(region);
+    let expected_message =
+        format!("Account {account_id} is not subscribed to AWS Security Hub CSPM");
+    let (status, body) = unsubscribed.batch_get(&["ACM.1"]).await;
+    assert_eq!(
+        status, 401,
+        "BatchGetSecurityControls without a hub: expected 401, got {status} with {body}"
+    );
+    assert_eq!(
+        refusal_code(&body),
+        Some("InvalidAccessException"),
+        "expected InvalidAccessException, got {body}"
+    );
+    assert_eq!(
+        body["Message"].as_str(),
+        Some(expected_message.as_str()),
+        "unexpected refusal message, got {body}"
+    );
+    let (status, body) = unsubscribed
+        .set_custom_parameter(
+            "ACM.1",
+            "daysToExpiration",
+            &json!({ "Integer": 60 }),
+            "no hub",
+        )
+        .await;
+    assert_eq!(
+        status, 401,
+        "UpdateSecurityControl without a hub: expected 401, got {status} with {body}"
+    );
+    assert_eq!(
+        refusal_code(&body),
+        Some("InvalidAccessException"),
+        "expected InvalidAccessException, got {body}"
+    );
+    assert_eq!(
+        body["Message"].as_str(),
+        Some(expected_message.as_str()),
+        "unexpected refusal message, got {body}"
+    );
+
+    // `ParameterValueType` declares exactly the two values a reported parameter can
+    // carry, which is what makes DEFAULT and CUSTOM an exhaustive report.
+    assert_eq!(
+        PARAMETER_VALUE_TYPE_VALUES.len(),
+        2,
+        "ParameterValueType declares exactly two values, got {PARAMETER_VALUE_TYPE_VALUES:?}"
+    );
 }
