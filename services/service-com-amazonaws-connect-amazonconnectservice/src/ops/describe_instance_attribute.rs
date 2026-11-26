@@ -8,6 +8,13 @@
 //! an updated one, the instance's own call-direction flag, or that type's default — and
 //! all three are derived from what is already stored, so this read writes nothing.
 //!
+//! Both path labels are refused by this handler rather than at the request boundary
+//! (`skip_validation` in `super::types::describe_instance_attribute_types`), in the words
+//! Connect states for each: an `AttributeType` that names no toggle of an instance is the
+//! modelled `InvalidRequestException` (HTTP 400)
+//! `crate::state::instance_attribute_type_refusal` builds, never the boundary's generic
+//! enum-validation prose under an error shape no operation of this service declares.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -155,6 +162,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // all is a request that addresses nothing, answered as the modelled
         // `InvalidRequestException` (HTTP 400) rather than as a missing resource.
         if let Some(refusal) = crate::state::instance_label_refusal(&input.instance_id) {
+            return Err(
+                DescribeInstanceAttributeErrorModeled::InvalidRequestException(refusal).into(),
+            );
+        }
+
+        // The attribute type is checked next, also before any state is resolved: a value
+        // that names no toggle an instance holds is a value this service cannot read, so
+        // it is refused whatever the store holds, by the one rule every operation of this
+        // plane applies (`crate::state::instance_attribute_type_refusal`).
+        if let Some(refusal) = crate::state::instance_attribute_type_refusal(&input.attribute_type)
+        {
             return Err(
                 DescribeInstanceAttributeErrorModeled::InvalidRequestException(refusal).into(),
             );

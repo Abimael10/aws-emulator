@@ -14,6 +14,13 @@
 //! `InboundCallsEnabled` / `OutboundCallsEnabled` flags but IN them, so setting the
 //! `INBOUND_CALLS` or `OUTBOUND_CALLS` toggle is what `DescribeInstance` then reports.
 //!
+//! Both path labels are refused by this handler rather than at the request boundary
+//! (`skip_validation` in `super::types::update_instance_attribute_types`), so an
+//! `AttributeType` that names no toggle of an instance is the modelled
+//! `InvalidRequestException` (HTTP 400)
+//! `crate::state::instance_attribute_type_refusal` builds — the same refusal the read
+//! side of this plane states for it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -199,11 +206,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The attribute type is checked next, also before any state is resolved: a value
+        // that names no toggle an instance holds is a value this service cannot read, so
+        // it is refused whatever the store holds, by the one rule every operation of this
+        // plane applies (`crate::state::instance_attribute_type_refusal`) rather than by
+        // the request boundary, whose generic enum prose names an error shape this
+        // operation does not model (`skip_validation` in
+        // `super::types::update_instance_attribute_types`).
+        if let Some(refusal) = crate::state::instance_attribute_type_refusal(&input.attribute_type)
+        {
+            return Err(
+                UpdateInstanceAttributeErrorModeled::InvalidRequestException(refusal).into(),
+            );
+        }
+
         // The value is checked BEFORE any state is resolved: a value that is not a
         // toggle setting at all is a client-input fault whatever the store holds, and
         // resolving first would report a missing resource for a request that was never
-        // valid. `AttributeType` needs no check of its own here — it is an enum the
-        // request boundary admits only the modelled members of.
+        // valid.
         if !crate::state::is_instance_attribute_toggle(&input.value) {
             return Err(UpdateInstanceAttributeErrorModeled::InvalidParameterException(
                 crate::state::invalid_parameter(crate::state::INSTANCE_ATTRIBUTE_VALUE_PARAMETER),

@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInstanceAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInstanceAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInstanceAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation reports
+//!
+//! One page of the identified instance's feature toggles: every attribute type that
+//! instance holds a value for, each projected onto the modelled `Attribute`
+//! ([`crate::state::InstanceRecord::instance_attributes_in_order`]), in ascending
+//! attribute-type order — which is the key a page cursor is cut on. Every value is
+//! DERIVED from what is already stored, by the same projection
+//! `DescribeInstanceAttribute` reads one toggle through, so the listing and the
+//! single-attribute read cannot disagree and listing stores nothing.
+//!
+//! The instance is resolved first, so a request naming an instance this account does not
+//! hold is the modelled `ResourceNotFoundException` (HTTP 404) rather than an instance
+//! that has no toggles — which is what lets a caller tell "no attributes" from "bad
+//! request". `InstanceId` and `MaxResults` are checked HERE rather than at the request
+//! boundary (`skip_validation` in `super::types::list_instance_attributes_types`): see
+//! [`ListInstanceAttributes::handle`] for which end of the modelled `@range` this
+//! operation applies, and why.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +162,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInstanceAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInstanceAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInstanceAttributes"))
+        let _ = ctx;
+        // The path label is checked BEFORE any state is resolved, by the one rule every
+        // operation addressing an instance applies
+        // (`crate::state::instance_label_refusal`): a label carrying no identifier at all
+        // is a request that addresses nothing, and one longer than the identifier's
+        // modelled maximum is not an identifier this service can read — both the modelled
+        // `InvalidRequestException` (HTTP 400) rather than a missing resource.
+        if let Some(refusal) = crate::state::instance_label_refusal(&input.instance_id) {
+            return Err(
+                ListInstanceAttributesErrorModeled::InvalidRequestException(refusal).into(),
+            );
+        }
+
+        // Only the MINIMUM end of `MaxResults`'s modelled `@range` is a check on the
+        // request, the way every page-size member of this service applies it (see
+        // `crate::ops::list_instances`, whose two ends are both recorded): below it, the
+        // service's own modelled `InvalidRequestException`. The maximum bounds neither the
+        // request nor the page here — AWS answers this operation with a page holding MORE
+        // attributes than that maximum — so the caller's own page size is honoured as
+        // asked.
+        if input.max_results.is_some_and(|requested| {
+            requested < crate::state::LIST_INSTANCE_ATTRIBUTES_MAX_RESULTS_MIN
+        }) {
+            return Err(ListInstanceAttributesErrorModeled::InvalidRequestException(
+                crate::state::page_size_below_minimum(
+                    crate::state::MAX_RESULTS_PARAMETER,
+                    crate::state::LIST_INSTANCE_ATTRIBUTES_MAX_RESULTS_MIN,
+                ),
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListInstanceAttributesErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Amazon Connect store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // A cursor this service never issued names no position in the scan, so it is
+        // refused as the malformed request it is rather than read as a restart from the
+        // beginning.
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListInstanceAttributesErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some("NextToken is not a token this service issued".to_string()),
+                        reason: None,
+                    },
+                )
+            })?),
+            None => None,
+        };
+
+        let store = state.lock();
+
+        // The toggles belong to an instance, so there is nothing to enumerate until that
+        // instance exists — including an identifier that named one until a delete retired
+        // it. Connect states ONE not-found sentence for a resource inside an instance
+        // (`crate::state::resource_not_found`), quoting nothing the request carried.
+        let instance = store.instances.get(&input.instance_id).ok_or_else(|| {
+            ListInstanceAttributesErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(),
+            )
+        })?;
+
+        // Reporting only: every value is derived from what is already stored, so reading
+        // the set changes nothing a later caller sees.
+        let entries = instance.instance_attributes_in_order();
+        drop(store);
+
+        let (attributes, next_token) = crate::state::paginate(
+            entries,
+            cursor.as_deref(),
+            input.max_results,
+            crate::state::LIST_INSTANCE_ATTRIBUTES_DEFAULT_PAGE_SIZE,
+        );
+
+        Ok(ListInstanceAttributesOutput {
+            // Always serialized, so a page beyond the last toggle is reported as the empty
+            // list rather than as an absent member.
+            attributes: Some(attributes),
+            next_token,
+        })
     }
 }

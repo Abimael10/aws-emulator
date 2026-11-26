@@ -11,7 +11,19 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-connect-amazonconnectservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.connect#ListInstanceAttributesRequest")]
+// `skip_validation = ["InstanceId", "MaxResults"]`: this operation refuses its path label
+// itself, in the words Connect states for it (`crate::state::instance_label_refusal`), and
+// it applies its page-size member's modelled `@range` itself — the minimum as a check on
+// the request, answered with the service's own modelled `InvalidRequestException`, and the
+// maximum not at all, because AWS SERVES a page larger than it (see
+// `crate::ops::list_instance_attributes`). Leaving either bound at the request boundary
+// refuses a listing AWS satisfies, with a framework `ValidationException` this operation
+// does not model. `skip_validation` drops only those members' constraint traits;
+// `NextToken` keeps its boundary checks.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.connect#ListInstanceAttributesRequest",
+    skip_validation = ["InstanceId", "MaxResults"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListInstanceAttributesInput {
     pub instance_id: String,

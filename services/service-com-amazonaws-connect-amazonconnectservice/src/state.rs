@@ -44,15 +44,18 @@ pub use chat_contacts::{
     REQUIRED_MESSAGING_CONTENT_TYPE, SUPPORTED_MESSAGING_CONTENT_TYPES,
 };
 
-/// The instance's feature toggles: what `UpdateInstanceAttribute` writes and
-/// `DescribeInstanceAttribute` reads back. Its own file because it is one concern of its
-/// own, and it is re-exported so a handler reaches it through `crate::state` like
-/// everything else here.
+/// The instance's feature toggles: what `UpdateInstanceAttribute` writes,
+/// `DescribeInstanceAttribute` reads back and `ListInstanceAttributes` enumerates. Its own
+/// file because it is one concern of its own, and it is re-exported so a handler reaches it
+/// through `crate::state` like everything else here.
 mod instance_attributes;
 pub use instance_attributes::{
-    default_instance_attribute_value, instance_attribute_toggle, is_instance_attribute_toggle,
-    ATTRIBUTES_ENABLED_BY_DEFAULT, INBOUND_CALLS_ATTRIBUTE, INSTANCE_ATTRIBUTE_DISABLED,
-    INSTANCE_ATTRIBUTE_ENABLED, INSTANCE_ATTRIBUTE_VALUE_PARAMETER, OUTBOUND_CALLS_ATTRIBUTE,
+    default_instance_attribute_value, instance_attribute_toggle, instance_attribute_type_refusal,
+    is_instance_attribute_toggle, is_instance_attribute_type, ATTRIBUTES_ENABLED_BY_DEFAULT,
+    INBOUND_CALLS_ATTRIBUTE, INSTANCE_ATTRIBUTE_DISABLED, INSTANCE_ATTRIBUTE_ENABLED,
+    INSTANCE_ATTRIBUTE_TYPES_BEYOND_THE_MODEL, INSTANCE_ATTRIBUTE_TYPE_PARAMETER,
+    INSTANCE_ATTRIBUTE_VALUE_PARAMETER, LIST_INSTANCE_ATTRIBUTES_DEFAULT_PAGE_SIZE,
+    LIST_INSTANCE_ATTRIBUTES_MAX_RESULTS_MIN, OUTBOUND_CALLS_ATTRIBUTE,
 };
 
 /// The tagging plane's lookup from a resource ARN to the tag map that resource carries:
@@ -65,11 +68,11 @@ mod tagging;
 /// `crate::state` like everything else here.
 mod refusals;
 pub use refusals::{
-    instance_id_is_not_valid, instance_label_refusal, instance_not_found, invalid_parameter,
-    invalid_request, page_size_below_minimum, resource_not_found, value_above_maximum_length,
-    value_below_minimum_length, INSTANCE_ID_MAX_LENGTH, INSTANCE_ID_NOT_VALID_MESSAGE,
-    INVALID_REQUEST_MESSAGE, QUEUE_NAME_MAX_LENGTH, QUEUE_NAME_MIN_LENGTH, QUEUE_NAME_PARAMETER,
-    RESOURCE_NOT_FOUND_MESSAGE,
+    instance_id_is_not_valid, instance_label_refusal, instance_not_found, invalid_enum_value,
+    invalid_parameter, invalid_request, page_size_below_minimum, resource_not_found,
+    value_above_maximum_length, value_below_minimum_length, INSTANCE_ID_MAX_LENGTH,
+    INSTANCE_ID_NOT_VALID_MESSAGE, INVALID_REQUEST_MESSAGE, QUEUE_NAME_MAX_LENGTH,
+    QUEUE_NAME_MIN_LENGTH, QUEUE_NAME_PARAMETER, RESOURCE_NOT_FOUND_MESSAGE,
 };
 
 use crate::ops::types::{

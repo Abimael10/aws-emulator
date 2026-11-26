@@ -11,7 +11,19 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-connect-amazonconnectservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.connect#DescribeInstanceAttributeRequest")]
+// `skip_validation = ["InstanceId", "AttributeType"]`: this operation refuses both of its
+// path labels itself, in the words Connect states for each — the instance label through
+// `crate::state::instance_label_refusal`, and an `AttributeType` the modelled
+// `InstanceAttributeType` enum does not declare through
+// `crate::state::instance_attribute_type_refusal`. Leaving either bound at the request
+// boundary answers it with a framework `ValidationException` instead, which is an error
+// shape this operation (and this service) models nowhere, and whose prose quotes the
+// rejected value and the whole permitted enum set back to the caller.
+// `skip_validation` drops only those members' constraint traits.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.connect#DescribeInstanceAttributeRequest",
+    skip_validation = ["InstanceId", "AttributeType"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct DescribeInstanceAttributeInput {
     pub instance_id: String,

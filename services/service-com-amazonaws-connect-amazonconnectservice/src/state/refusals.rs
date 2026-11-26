@@ -21,6 +21,9 @@
 //!   is the one place that choice is made);
 //! * a parameter whose value is not one the service accepts ([`invalid_parameter`]),
 //!   which names the offending member;
+//! * a value the service cannot read as a member of the set its member admits
+//!   ([`invalid_enum_value`]), which names that member and nothing else — not the rejected
+//!   value, and not the set of values the member admits;
 //! * a value longer (or shorter) than the maximum (minimum) the model declares for it
 //!   ([`value_above_maximum_length`] / [`value_below_minimum_length`]), which names the
 //!   parameter and the violated bound;
@@ -117,6 +120,27 @@ impl ComAmazonawsConnectAmazonconnectserviceState {
 pub fn invalid_parameter(member: &str) -> InvalidParameterException {
     InvalidParameterException {
         message: Some(format!("Invalid parameter: {member}")),
+    }
+}
+
+/// Connect's refusal for a value it cannot read as a member of the set its member admits:
+/// the modelled `InvalidRequestException` (HTTP 400) whose message is `Invalid ` plus that
+/// member's name, spelled as the model spells it.
+///
+/// The whole sentence is fixed for one member: neither the rejected value nor the set of
+/// values the member admits appears in it. It is the same sentence opening
+/// [`page_size_below_minimum`] states for a page size the service cannot act on
+/// (`Invalid MaxResults. …`), under the same modelled error — this service words a value
+/// it cannot read as an invalid REQUEST, naming the member.
+///
+/// A value no member of the set matches is refused HERE, by the operation, rather than
+/// left to the request boundary — whose generic enum-validation prose names an error shape
+/// this service models for no operation and quotes both the rejected value and the whole
+/// permitted set back to the caller.
+pub fn invalid_enum_value(member: &str) -> InvalidRequestException {
+    InvalidRequestException {
+        message: Some(format!("Invalid {member}")),
+        reason: None,
     }
 }
 
@@ -323,6 +347,21 @@ mod tests {
         for member in ["InstanceId", "QueueId"] {
             let expected = format!("Invalid parameter: {member}");
             let actual = invalid_parameter(member).message;
+            assert_eq!(
+                actual.as_deref(),
+                Some(expected.as_str()),
+                "member {member:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// A refusal of a value the service cannot read names the member and nothing else, in
+    /// the same sentence opening a page-size refusal takes.
+    #[test]
+    fn an_enum_refusal_names_the_member() {
+        for member in ["AttributeType", "ResourceType"] {
+            let expected = format!("Invalid {member}");
+            let actual = invalid_enum_value(member).message;
             assert_eq!(
                 actual.as_deref(),
                 Some(expected.as_str()),

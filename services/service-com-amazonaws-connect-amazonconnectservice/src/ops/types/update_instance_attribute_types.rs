@@ -11,7 +11,16 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-connect-amazonconnectservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.connect#UpdateInstanceAttributeRequest")]
+// `skip_validation = ["InstanceId", "AttributeType"]`: the same two path labels as
+// `describe_instance_attribute_types`, refused by this handler in the same words through
+// the same two rules (`crate::state::instance_label_refusal` and
+// `crate::state::instance_attribute_type_refusal`), so one `AttributeType` the modelled
+// enum does not declare is answered alike whichever operation of the attribute plane was
+// asked. `Value` keeps its boundary checks: its bound is a `@length`, not an enum.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.connect#UpdateInstanceAttributeRequest",
+    skip_validation = ["InstanceId", "AttributeType"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct UpdateInstanceAttributeInput {
     pub instance_id: String,

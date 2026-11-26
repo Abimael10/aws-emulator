@@ -10,9 +10,9 @@
 //! BOTH. Each one therefore also requires the request's first URI path segment to be
 //! one its own model declares.
 //!
-//! This suite pins that: with both services mounted, each one's path space reaches it —
-//! whether the operation behind it is implemented (it answers from its own store) or
-//! still scaffolded (it answers the scaffold's `NotImplemented`).
+//! This suite pins that: with both services mounted, each one's path space reaches it,
+//! and every row names what the claiming service's own handler answered — its modelled
+//! error, or a member only its output carries.
 
 use std::sync::Arc;
 
@@ -89,10 +89,9 @@ async fn each_service_sharing_the_connect_signing_name_serves_its_own_path_space
     // Contact Lens owns `/realtime-contact-analysis`: its one operation is implemented,
     // and with no analysis session seeded it answers its own modeled
     // `ResourceNotFoundException`. Amazon Connect owns `/instance` (and the rest of its
-    // model's path space): `ListInstances`, `DescribeInstance` and
-    // `DescribeInstanceAttribute` are implemented, so they answer from Connect's own
-    // store, while an operation still carrying the scaffold header
-    // (`ListInstanceAttributes`) answers the scaffold's `NotImplemented`. Asserting WHAT
+    // model's path space): `ListInstances`, `DescribeInstance`,
+    // `DescribeInstanceAttribute` and `ListInstanceAttributes` are implemented, so they
+    // answer from Connect's own store. Asserting WHAT
     // the response carries, not just the status, is what excludes the two routing
     // failures: the router answers `UnknownService` (404) when nobody claims a request
     // and `AmbiguousService` (500) when both do, so a row naming a service's own error —
@@ -140,8 +139,8 @@ async fn each_service_sharing_the_connect_signing_name_serves_its_own_path_space
             "GET",
             "/instance/inst-1/attributes",
             "",
-            501,
-            Expect::Error("NotImplemented"),
+            404,
+            Expect::Error("ResourceNotFoundException"),
         ),
     ];
 
