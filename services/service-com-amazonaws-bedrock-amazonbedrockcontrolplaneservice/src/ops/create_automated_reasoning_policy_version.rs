@@ -188,14 +188,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `TagList` admits up to 200 entries, while one RESOURCE may carry at most
         // `MAX_TAGS_PER_RESOURCE` — the bound `TooManyTagsException` itself documents — so
-        // a request past it is refused rather than stored.
+        // a request past it is refused rather than stored. The refusal states the bound and
+        // nothing of the request: `resourceName` is left unset, as this service leaves it on
+        // every `TooManyTagsException` it answers.
         let tag_count = input.tags.as_ref().map_or(0, Vec::len);
         if tag_count > crate::state::MAX_TAGS_PER_RESOURCE {
             return Err(
                 CreateAutomatedReasoningPolicyVersionErrorModeled::TooManyTagsException(
                     TooManyTagsException {
                         message: Some(crate::state::too_many_tags_message()),
-                        resource_name: Some(input.policy_arn.clone()),
+                        resource_name: None,
                     },
                 )
                 .into(),

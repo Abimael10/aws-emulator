@@ -18,7 +18,10 @@
 //! ([`crate::state::tagging_resource_not_found_message`]), and a
 //! request that would leave the resource carrying more than the 50 tags
 //! `TooManyTagsException` documents is refused in full, before any pair is applied, so a
-//! refused call changes nothing.
+//! refused call changes nothing. That refusal is evaluated against the RESULTANT tag set
+//! and worded for it
+//! ([`crate::state::resultant_tag_set_too_many_tags_message`]), which is not the sentence a
+//! create's own over-long `tags` list is refused with.
 //!
 //! The one resolution of a tagging ARN lives in `crate::state` (`tagged_resource`), shared
 //! with `ops/list_tags_for_resource.rs` and `ops/untag_resource.rs`.
@@ -169,12 +172,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // included in your current request", and only the keys the resource does not
         // already carry grow it. The whole request is refused before a single pair is
         // applied, so a refused call leaves the resource's tags exactly as they were.
+        //
+        // The refusal is worded for the set it was evaluated against — the RESULTANT one —
+        // and carries no part of the request: `resourceName` is left unset, as this service
+        // leaves it on every `TooManyTagsException` it answers.
         let merged = crate::state::tag_count_after(held, &input.tags);
         if merged > crate::state::MAX_TAGS_PER_RESOURCE {
             return Err(TagResourceErrorModeled::TooManyTagsException(
                 TooManyTagsException {
-                    message: Some(crate::state::too_many_tags_message()),
-                    resource_name: Some(input.resource_arn.clone()),
+                    message: Some(crate::state::resultant_tag_set_too_many_tags_message()),
+                    resource_name: None,
                 },
             )
             .into());

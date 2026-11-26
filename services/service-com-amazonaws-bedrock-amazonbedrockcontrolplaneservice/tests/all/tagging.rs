@@ -97,6 +97,26 @@ pub(crate) fn tag_list(pairs: &[(&str, &str)]) -> Value {
     )
 }
 
+/// `count` distinct tags whose keys start at `start`, as the owned pairs a listing is
+/// compared against: a suite that builds batches at an OFFSET — the keys a resource does not
+/// carry yet — reads the same pairs back. Each key and value is inside `TagKey`/`TagValue`'s
+/// own pattern.
+pub(crate) fn numbered_tags(start: usize, count: usize) -> Vec<(String, String)> {
+    (start..start + count)
+        .map(|index| (format!("key-{index}"), format!("value-{index}")))
+        .collect()
+}
+
+/// Owned pairs as the `TagList` a request carries.
+pub(crate) fn owned_tag_list(pairs: &[(String, String)]) -> Value {
+    Value::Array(
+        pairs
+            .iter()
+            .map(|(key, value)| json!({ "key": key, "value": value }))
+            .collect(),
+    )
+}
+
 /// `n` distinct tags, each key and value inside `TagKey`/`TagValue`'s own pattern.
 fn many_tags(n: usize) -> Value {
     Value::Array(

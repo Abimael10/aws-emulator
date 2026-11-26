@@ -225,16 +225,33 @@ pub fn prompt_router_not_found_message(prompt_router_arn: &str) -> String {
 /// more is refused with that error rather than stored.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
-/// What this service answers as its `TooManyTagsException` message for a request carrying
-/// more tags than one resource may hold.
+/// What this service answers as its `TooManyTagsException` message for a CREATE whose own
+/// `tags` list carries more tags than one resource may hold.
 ///
 /// RECORDED behaviour: Amazon Bedrock states the BOUND and nothing about the request — no
 /// member path, no submitted tag count and no resource — so the one variable part is the
 /// bound itself, read off [`MAX_TAGS_PER_RESOURCE`] rather than spelled into the sentence,
-/// and every operation that refuses a request for its tag count answers alike.
+/// and every operation that refuses the tag list a create CARRIES answers alike. A call that
+/// instead merges tags into a resource's existing set is refused against the RESULTANT set,
+/// which Amazon Bedrock words differently
+/// ([`resultant_tag_set_too_many_tags_message`]).
 #[must_use]
 pub fn too_many_tags_message() -> String {
     format!("You can assign a maximum of {MAX_TAGS_PER_RESOURCE} tags to a resource")
+}
+
+/// What this service answers as its `TooManyTagsException` message for a tagging call whose
+/// RESULTANT tag set — the tags the resource already carries together with the request's —
+/// would exceed what one resource may hold.
+///
+/// RECORDED behaviour: Amazon Bedrock states the rule over the RESULTANT set, which is the
+/// set such a call is evaluated against, and nothing about the request — no ARN, no tag key,
+/// no submitted count — so the one variable part is the bound itself, read off
+/// [`MAX_TAGS_PER_RESOURCE`] rather than spelled into the sentence. A create's own tag list
+/// is a different refusal and keeps its own sentence ([`too_many_tags_message`]).
+#[must_use]
+pub fn resultant_tag_set_too_many_tags_message() -> String {
+    format!("The resultant tag set must not have more than {MAX_TAGS_PER_RESOURCE} user tags.")
 }
 
 /// What a tagging call whose `resourceARN` names no resource of this account answers as its

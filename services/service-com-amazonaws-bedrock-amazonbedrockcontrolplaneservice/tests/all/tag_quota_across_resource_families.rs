@@ -30,6 +30,10 @@
 //! * whether that refused batch also re-values keys the resource already carries, which do
 //!   not grow it.
 //!
+//! The refusal's WORDING — the sentence Amazon Bedrock words a resultant-set quota refusal
+//! with, and the `resourceName` it leaves unset — is `crate::tag_quota_refusal_wording`'s
+//! rule; these rows assert it holds for every family too.
+//!
 //! The 404 side of the same resolution (an ARN naming no resource) is
 //! `crate::automated_reasoning_policy_tagging`'s third suite; this one is about the quota
 //! contract behind the call. Every expectation is derived from the model
@@ -39,33 +43,15 @@ use serde_json::{json, Value};
 
 use crate::automated_reasoning_policy_tagging::{definition, given_policy, given_version};
 use crate::support::{emulator, foundation_model_arn, Emulator, ACCOUNT, REGION};
-use crate::tagging::{given_guardrail, list_tags, listed, tag, tag_list, MAX_TAGS};
+use crate::tagging::{
+    given_guardrail, list_tags, listed, numbered_tags, owned_tag_list, tag, tag_list, MAX_TAGS,
+};
 
 /// Base model ids this account's published catalog carries (`ListFoundationModels` reports
 /// them), used as the target and the fallback of the prompt router and as the source of the
 /// application inference profile these rows tag.
 const ROUTED_MODEL: &str = "amazon.nova-pro-v1:0";
 const ROUTED_FALLBACK_MODEL: &str = "amazon.nova-lite-v1:0";
-
-/// `count` distinct tags whose keys start at `start`, as the owned pairs a listing is
-/// compared against: these rows build batches at an OFFSET — the keys a resource does not
-/// carry yet — and read the same pairs back. Each key and value is inside
-/// `TagKey`/`TagValue`'s own pattern (`^[a-zA-Z0-9\s._:/=+@-]*$`).
-fn numbered_tags(start: usize, count: usize) -> Vec<(String, String)> {
-    (start..start + count)
-        .map(|index| (format!("key-{index}"), format!("value-{index}")))
-        .collect()
-}
-
-/// Owned pairs as the `TagList` a request carries.
-fn owned_tag_list(pairs: &[(String, String)]) -> Value {
-    Value::Array(
-        pairs
-            .iter()
-            .map(|(key, value)| json!({ "key": key, "value": value }))
-            .collect(),
-    )
-}
 
 /// Create a prompt router and hand back the ARN a TAGGING call addresses it by.
 ///
@@ -302,12 +288,12 @@ async fn the_quota_contract_holds_for(family: TaggedFamily) {
             "case {case:?}: the refusal is the modelled TooManyTagsException, got {:?}",
             refused.error
         );
-        // `TooManyTagsException$resourceName` is "the name of the resource with too many
-        // tags", a `TaggableResourcesArn` — so it is the ARN the request addressed.
+        // `TooManyTagsException$resourceName` is optional and Amazon Bedrock leaves it
+        // UNSET on this refusal, so the body carries the message alone.
         assert_eq!(
-            refused.get("resourceName").as_str(),
-            Some(arn.as_str()),
-            "case {case:?}: the refusal must name the resource addressed, got {:?}",
+            refused.get("resourceName"),
+            Value::Null,
+            "case {case:?}: the refusal must leave resourceName unset, got {:?}",
             refused.body
         );
         let message = refused.get("message");
@@ -317,6 +303,14 @@ async fn the_quota_contract_holds_for(family: TaggedFamily) {
                 refused.body
             )
         });
+        // The quota was evaluated against the RESULTANT tag set, and the sentence states
+        // that rule and the bound — nothing of the request. Spelled here rather than read
+        // off the handler, so a re-wording of it fails this row.
+        let expected = format!("The resultant tag set must not have more than {MAX_TAGS} user tags.");
+        assert_eq!(
+            message, expected,
+            "case {case:?}: the refusal must be worded {expected:?}, got {message:?}"
+        );
         assert!(
             message.contains(&MAX_TAGS.to_string()),
             "case {case:?}: the refusal must state the bound {MAX_TAGS}, got {message:?}"
