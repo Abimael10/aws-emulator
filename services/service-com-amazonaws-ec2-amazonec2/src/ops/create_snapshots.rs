@@ -35,7 +35,7 @@
 //! assembled from the request. Every snapshot of one request carries the same `StartTime`
 //! ("This is the same for all snapshots initiated by the same request",
 //! `SnapshotInfo$StartTime`) and is `pending` with no progress yet; reaching `completed` is
-//! owed by the clock, which [`crate::state::SnapshotRecord::view_at`] derives on every read.
+//! owed by the clock, which [`crate::state::SnapshotRecord::view_at`] derives on every read.\n//! Each snapshot's OUTCOME is published onto the account's default EventBridge bus once that\n//! outcome falls due ([`crate::state::SnapshotNotification`]) — one event per snapshot of the\n//! set, because each one settles on its own.
 //!
 //! `DryRun` sits after every parameter has been validated and before the first write, so it
 //! reports whether the request WOULD have succeeded and leaves the store untouched. The
@@ -201,20 +201,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            COPY_TAGS_FROM_SOURCE_VOLUME, MAX_EXCLUDED_DATA_VOLUME_IDS, MAX_STORED_BYTES,
-            MAX_STORED_SNAPSHOTS, MAX_TAGS_PER_RESOURCE, SNAPSHOT_LOCATION_LOCAL,
-            SNAPSHOT_LOCATION_REGIONAL, SNAPSHOT_STORAGE_TIER_STANDARD,
-            SNAPSHOT_TAGGABLE_RESOURCE, SnapshotView, invalid_volume_id_malformed,
-            require_service_state, snapshot_limit_exceeded, snapshot_payload_bytes, tag_list,
-            tags_from_specifications, volume_id_is_well_formed,
+            COPY_TAGS_FROM_SOURCE_VOLUME, CREATE_SNAPSHOTS_EVENT, MAX_EXCLUDED_DATA_VOLUME_IDS,
+            MAX_STORED_BYTES, MAX_STORED_SNAPSHOTS, MAX_TAGS_PER_RESOURCE,
+            SNAPSHOT_LOCATION_LOCAL, SNAPSHOT_LOCATION_REGIONAL, SNAPSHOT_STORAGE_TIER_STANDARD,
+            SNAPSHOT_TAGGABLE_RESOURCE, SnapshotNotification, SnapshotView,
+            invalid_volume_id_malformed, request_region, require_service_state,
+            snapshot_limit_exceeded, snapshot_payload_bytes, tag_list, tags_from_specifications,
+            volume_id_is_well_formed,
         };
 
         let specification = &input.instance_specification;
-        // The store is reached through `self.engine`, and nothing here depends on the
-        // Region a request was signed for: a snapshot carries no Region-derived member (no
-        // ARN, and the Availability Zone belongs to a LOCAL snapshot, which is refused
-        // below), so `ctx` carries nothing this handler reads.
-        let _ = ctx;
+        // Nothing a snapshot REPORTS depends on the Region a request was signed for: a
+        // snapshot carries no Region-derived member (no ARN, and the Availability Zone
+        // belongs to a LOCAL snapshot, which is refused below). The Region is read for the
+        // account's default event bus each snapshot's outcome is published onto, which is the
+        // one in the Region the call was made in; the store is reached through `self.engine`.
+        let region = request_region(ctx.parts());
 
         // "The IDs of the data (non-root) volumes to exclude from the multi-volume snapshot
         // set. […] You can specify up to 40 volume IDs per request"
@@ -342,6 +344,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             sources.push(SourceVolume {
                 volume_id: volume_id.clone(),
+                // The ARN the account knows the volume by, which is what the published
+                // outcome of its snapshot names as that snapshot's SOURCE: read off the
+                // stored volume, the one place it is written.
+                volume_arn: record.view.volume_arn.clone().unwrap_or_default(),
                 size: record.view.size,
                 encrypted: record.view.encrypted,
                 kms_key_id: record.view.kms_key_id.clone(),
@@ -419,9 +425,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for all snapshots initiated by the same request" (`SnapshotInfo$StartTime`).
         let started_at = ::std::time::SystemTime::now();
         let owner_id = ::engine::emulator_account_id().to_string();
-        let mut snapshot_ids: Vec<String> = Vec::with_capacity(sources.len());
+        // Each snapshot this call minted, beside the ARN of the volume it is a snapshot OF:
+        // the outcome published for a snapshot names its own source, and this set has one
+        // source per snapshot.
+        let mut minted: Vec<(String, String)> = Vec::with_capacity(sources.len());
         for (source, tags) in sources.iter().zip(tag_sets) {
-            snapshot_ids.push(store.insert_snapshot(
+            let snapshot_id = store.insert_snapshot(
                 SnapshotView {
                     // "A description propagated to every snapshot specified by the instance"
                     // (`CreateSnapshotsRequest$Description`).
@@ -480,21 +489,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     completion_time: None,
                 },
                 started_at,
-            ));
+            );
+            minted.push((snapshot_id, source.volume_arn.clone()));
         }
 
         // Read the answer back OUT of the store, so the caller sees what a later read of
-        // these snapshots will see rather than the request object.
+        // these snapshots will see rather than the request object — and, off the same
+        // records, the notification each snapshot's OUTCOME is published as.
         let read_at = ::std::time::Instant::now();
-        let mut snapshots: Vec<SnapshotInfo> = Vec::with_capacity(snapshot_ids.len());
-        for snapshot_id in &snapshot_ids {
+        let mut snapshots: Vec<SnapshotInfo> = Vec::with_capacity(minted.len());
+        let mut notifications: Vec<SnapshotNotification> = Vec::with_capacity(minted.len());
+        for (snapshot_id, source_arn) in &minted {
             let record = store.snapshots.get(snapshot_id).ok_or_else(|| {
                 Scaffolded::internal_error(format!(
                     "the newly created snapshot '{snapshot_id}' could not be read back"
                 ))
             })?;
             snapshots.push(snapshot_info(record.view_at(read_at)));
+            notifications.push(SnapshotNotification::of(
+                CREATE_SNAPSHOTS_EVENT,
+                record,
+                read_at,
+                &region,
+                source_arn,
+            ));
         }
+        // The store's guard is given back before the publications are handed on: a lock of
+        // this store is never held while another service is called.
+        drop(store);
+
+        // The call is ANSWERED with the `pending` snapshots above, and the outcome of EACH
+        // one is published once that outcome falls due: one event per snapshot this call
+        // created, because each snapshot of the set settles on its own.
+        for notification in notifications {
+            notification.publish_when_due(ctx.callback().clone());
+        }
+
         Ok(CreateSnapshotsOutput {
             snapshots: Some(snapshots),
         })
@@ -540,6 +570,9 @@ fn require_instance_with_volumes<'a, E>(
 struct SourceVolume {
     /// The volume's id, which its snapshot reports as the source volume.
     volume_id: String,
+    /// The ARN the account knows the volume by, which the published outcome of its snapshot
+    /// names as that snapshot's source.
+    volume_arn: String,
     /// "Size of the volume from which this snapshot was created", in GiB.
     size: Option<i32>,
     /// Whether the volume is encrypted, which decides whether its snapshot is.

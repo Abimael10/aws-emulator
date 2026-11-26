@@ -14,8 +14,10 @@
 //! 2. `SourceRegion` HAS TO NAME A REGION of the account's partition, and is VALIDATED ONLY:
 //!    a stored snapshot carries no Region of its own, so every accepted Region copies the
 //!    same source, and a value that names no Region is refused;
-//! 3. A SOURCE SNAPSHOT THE COPY CANNOT RESOLVE IS REFUSED WITH ONE ANSWER, whether the
-//!    value is not a snapshot id at all or is well formed and names no snapshot;
+//! 3. THE SOURCE ID IS VALIDATED, NOT RESOLVED: a value this service cannot READ as a
+//!    snapshot id is refused with one answer, and every value it CAN read is accepted — the
+//!    copy of a source that is not there failing ASYNCHRONOUSLY, as the copy's own `error`
+//!    state and the detail of that failure;
 //! 4. A REQUEST THAT CANNOT BE SERVED IS REFUSED WITH EC2'S OWN CODE AND NOTHING IS STORED:
 //!    an encryption state the member cannot carry, a KMS key for a copy that is not
 //!    encrypted, a destination Outpost or Local Zone this emulator has none of, a completion
@@ -38,8 +40,9 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use ec2::state::{
     MAX_KMS_KEY_ID_CHARS, SNAPSHOT_PROGRESS_COMPLETED, SNAPSHOT_PROGRESS_PENDING,
-    SNAPSHOT_STATE_COMPLETED, SNAPSHOT_STATE_PENDING, SNAPSHOT_STORAGE_TIER_STANDARD,
-    SNAPSHOT_TRANSFER_TYPE_STANDARD, SNAPSHOT_TRANSFER_TYPE_TIME_BASED, regions_in_partition_of,
+    SNAPSHOT_STATE_COMPLETED, SNAPSHOT_STATE_ERROR, SNAPSHOT_STATE_PENDING,
+    SNAPSHOT_STORAGE_TIER_STANDARD, SNAPSHOT_TRANSFER_TYPE_STANDARD,
+    SNAPSHOT_TRANSFER_TYPE_TIME_BASED, regions_in_partition_of,
 };
 
 use super::ec2_query::{element, elements, error_code, error_message};
@@ -67,11 +70,24 @@ const ANY_AMI: &str = "ami-0123456789abcdef0";
 /// carries.
 const UNKNOWN_SNAPSHOT_ID: &str = "snap-0123456789abcdef0";
 
-/// The sentence EC2 answers a `CopySnapshot` whose source snapshot it cannot copy from. It
-/// names the member and NOT the value, which is how AWS words this refusal — the recorded
-/// call behind `issues/.../20261023T102725Z-ec2-copysnapshot-stub.md` carries exactly this
-/// text.
-const UNRESOLVABLE_SOURCE_MESSAGE: &str = "The specified snapshotId is invalid";
+/// The sentence EC2 answers a `CopySnapshot` whose `SourceSnapshotId` it cannot READ as a
+/// snapshot id. It names the member and NOT the value, which is how AWS words this refusal —
+/// the recorded call behind `issues/.../20261023T102725Z-ec2-copysnapshot-stub.md` carries
+/// exactly this text.
+const UNREADABLE_SOURCE_MESSAGE: &str = "The specified snapshotId is invalid";
+
+/// The sentence a copy whose source could not be resolved reports as its `StateMessage`, in
+/// AWS's own words for that failure: it names neither the id nor the Region, spelled out here
+/// rather than imported so a wrong constant in the implementation cannot make a test pass.
+const MISSING_SOURCE_STATE_MESSAGE: &str = "Source snapshot is not found";
+
+/// How long a poll keeps asking for a snapshot to settle out of `pending` before giving up.
+/// Generous: the move is owed a transition span after the call, so this is many times the
+/// work a row does and still lets a broken case fail rather than hang.
+const SETTLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a poll waits between asks.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// A KMS key identifier of the `Key ID` form the member documents
 /// (`CopySnapshotRequest$KmsKeyId`: "Key ID. For example,
@@ -260,6 +276,29 @@ fn stored_snapshot_ids(engine: &engine::InMemoryEngine) -> Vec<String> {
     let store = engine.state::<ec2::ComAmazonawsEc2Amazonec2State>();
     let guard = store.lock();
     guard.snapshots.keys().cloned().collect()
+}
+
+/// The snapshot `snapshot_id` once it has settled out of `pending`, read back over the wire
+/// — looked for until [`SETTLE_BUDGET`] passes rather than waited out, so the answer is the
+/// one the service settled on however fast the host runs.
+async fn settled_snapshot(
+    router: &MultiServiceRouter,
+    case: &str,
+    snapshot_id: &str,
+) -> ReportedSnapshot {
+    let deadline = std::time::Instant::now() + SETTLE_BUDGET;
+    loop {
+        let reported = described(router, case, snapshot_id).await;
+        if reported.member("status") != SNAPSHOT_STATE_PENDING {
+            return reported;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: {snapshot_id} must settle out of {SNAPSHOT_STATE_PENDING:?}, got \
+             {reported:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// The `TagSpecification` form fields for one `snapshot` specification carrying `tags`.
@@ -677,32 +716,33 @@ async fn a_copy_source_region_has_to_name_a_region() {
 }
 
 // ---------------------------------------------------------------------------
-// RULE 3: one answer for a source this copy cannot resolve
+// RULE 3: the source id is VALIDATED, and a source that is not there fails the copy
 // ---------------------------------------------------------------------------
 
-/// RULE 3: every `SourceSnapshotId` this copy cannot resolve gets the SAME answer — 400
-/// `InvalidParameterValue` naming the member and not the value — whether the value is not a
-/// snapshot id at all or is a well-formed id the account holds no snapshot for.
+/// RULE 3: a `SourceSnapshotId` this service cannot READ as a snapshot id is refused — 400
+/// `InvalidParameterValue` naming the member and not the value — and every value it CAN read
+/// is ACCEPTED, the copy of a source that is not there failing ASYNCHRONOUSLY: the snapshot
+/// the call minted stands `pending`, then settles in `error` carrying why, with no progress
+/// and no completion time.
 ///
-/// The rows span both id forms EC2 has issued (8 and 17 hexadecimal digits), values outside
-/// that form, and the id of another kind of resource.
+/// The refused rows span values outside the id form, the id of another kind of resource, and
+/// the null id no mint can issue; the accepted rows span both id forms EC2 has issued (8 and
+/// 17 hexadecimal digits).
 #[tokio::test]
-async fn a_source_snapshot_this_copy_cannot_resolve_gets_one_answer() {
+async fn a_source_snapshot_this_copy_cannot_read_is_refused_and_a_missing_one_fails_the_copy() {
     let (router, engine) = emulator();
-    // One stored snapshot the account DOES hold, so the refusals below are about the id the
+    // One stored snapshot the account DOES hold, so the rows below are about the id the
     // request named rather than about an empty store.
     let source = seed_source(&router, &engine, "the source", 8, false).await;
 
-    let rows: [(&str, String); 7] = [
-        ("a well-formed long id naming no snapshot", UNKNOWN_SNAPSHOT_ID.to_string()),
-        ("a well-formed short id naming no snapshot", "snap-1a2b3c4d".to_string()),
-        ("the null id no mint can issue", "snap-00000000000000000".to_string()),
+    let refused: [(&str, String); 5] = [
         ("a value that is not a snapshot id at all", "not-a-snapshot".to_string()),
         ("the prefix with no digits", "snap-".to_string()),
         ("an uppercase id", UNKNOWN_SNAPSHOT_ID.to_uppercase()),
         ("the id of another kind of resource", source.volume_id.clone()),
+        ("the null id no mint can issue", "snap-00000000000000000".to_string()),
     ];
-    for (case, source_snapshot_id) in rows {
+    for (case, source_snapshot_id) in refused {
         let (status, body) = op(
             &router,
             "CopySnapshot",
@@ -723,8 +763,8 @@ async fn a_source_snapshot_this_copy_cannot_resolve_gets_one_answer() {
         );
         assert_eq!(
             error_message(&body),
-            UNRESOLVABLE_SOURCE_MESSAGE,
-            "case {case:?}: expected the one unresolvable-source sentence, got {:?}",
+            UNREADABLE_SOURCE_MESSAGE,
+            "case {case:?}: expected the one unreadable-source sentence, got {:?}",
             error_message(&body)
         );
         assert!(
@@ -736,8 +776,82 @@ async fn a_source_snapshot_this_copy_cannot_resolve_gets_one_answer() {
 
     assert_eq!(
         stored_snapshot_ids(&engine),
-        vec![source.snapshot_id],
+        vec![source.snapshot_id.clone()],
         "no refused row stores anything, got {:?}",
+        stored_snapshot_ids(&engine)
+    );
+
+    // Every value this service CAN read names a snapshot of the Region `SourceRegion` points
+    // at, which this call does not reach: the copy is accepted, and a source that is not
+    // there is reported through the copy's own state rather than as a refusal.
+    let accepted: [(&str, String); 2] = [
+        ("a well-formed long id naming no snapshot", UNKNOWN_SNAPSHOT_ID.to_string()),
+        ("a well-formed short id naming no snapshot", "snap-1a2b3c4d".to_string()),
+    ];
+    let mut failed_copies: Vec<String> = Vec::new();
+    for (case, source_snapshot_id) in accepted {
+        let (status, body) = op(
+            &router,
+            "CopySnapshot",
+            &[
+                p("SourceSnapshotId", source_snapshot_id.clone()),
+                p("SourceRegion", REGION),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a readable source id is accepted, got {status} with body {body}"
+        );
+        let copy_id = element(&body, "snapshotId")
+            .unwrap_or_else(|| panic!("case {case:?}: the copy reports its id, got {body}"));
+        // The transient state the call hands back: the copy is `pending` while the work the
+        // clock owes it has not fallen due, so the failure is not a fact yet.
+        let accepted_as = described(&router, case, &copy_id).await;
+        assert_eq!(
+            accepted_as.member("status"),
+            SNAPSHOT_STATE_PENDING,
+            "case {case:?}: the copy is handed back pending, got {:?}",
+            accepted_as.member("status")
+        );
+
+        // And then it settles in `error`, carrying the detail of the failure, with nothing
+        // transferred and no completion time: the copy failed, it did not complete.
+        let settled = settled_snapshot(&router, case, &copy_id).await;
+        assert_eq!(
+            settled.member("status"),
+            SNAPSHOT_STATE_ERROR,
+            "case {case:?}: a copy whose source is not there settles in error, got {:?}",
+            settled.member("status")
+        );
+        assert_eq!(
+            settled.member("statusMessage"),
+            MISSING_SOURCE_STATE_MESSAGE,
+            "case {case:?}: the copy states why it failed, got {:?}",
+            settled.member("statusMessage")
+        );
+        assert_eq!(
+            settled.member("progress"),
+            SNAPSHOT_PROGRESS_PENDING,
+            "case {case:?}: a copy that failed transferred nothing, got {:?}",
+            settled.member("progress")
+        );
+        assert_eq!(
+            settled.member("completionTime"),
+            "",
+            "case {case:?}: a copy that failed never completed, got {:?}",
+            settled.member("completionTime")
+        );
+        failed_copies.push(copy_id);
+    }
+
+    let mut expected = failed_copies;
+    expected.push(source.snapshot_id);
+    expected.sort();
+    assert_eq!(
+        stored_snapshot_ids(&engine),
+        expected,
+        "each accepted row stored the copy it minted, got {:?}",
         stored_snapshot_ids(&engine)
     );
 }

@@ -48,14 +48,6 @@ use ::service_com_amazonaws_ebs_ebs::state::{
 
 use super::*;
 
-/// A snapshot the EBS direct APIs hold that did not complete: the `SnapshotState` enum's
-/// `error` member (`smithy_query(query="shape",shape="SnapshotState")`), which is what a
-/// snapshot whose `Timeout` elapsed before `CompleteSnapshot` completed it is in, and what a
-/// snapshot whose completion declared a different number of blocks from the number written
-/// into it is in — the EBS direct APIs report the same condition as their own `Status`
-/// `error`.
-pub const SNAPSHOT_STATE_ERROR: &str = "error";
-
 /// Every snapshot the EBS direct APIs hold for this account as of `now`, keyed by
 /// `SnapshotId`, as the `Snapshot` shape an EC2 report answers with.
 ///

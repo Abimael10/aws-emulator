@@ -22,6 +22,15 @@
 //! move the clock already owed without writing anything, and two writers cannot store two
 //! different words for one snapshot's state.
 //!
+//! A snapshot whose work cannot be done at all settles in `error` rather than `completed` at
+//! that same instant, carrying the detail of the failure as its `StateMessage`: the record
+//! keeps WHY ([`SnapshotRecord::failure`], written by
+//! [`ComAmazonawsEc2Amazonec2State::insert_snapshot_failing`]) and the same derivation
+//! reports it. That is what makes a `CopySnapshot` whose source cannot be resolved
+//! observable: EC2 accepts the call, and the failure surfaces as the snapshot's state and as
+//! the outcome published for it ([`super::SnapshotNotification`]), never as a synchronous
+//! refusal.
+//!
 //! The FULL SIZE is settled where the snapshot is STORED rather than derived on read: "the
 //! size of all the blocks that were written to the source volume AT THE TIME THE SNAPSHOT WAS
 //! CREATED" (`Snapshot$FullSnapshotSizeInBytes`) is a fact of that source as the write found
@@ -63,6 +72,17 @@ pub const SNAPSHOT_STATE_PENDING: &str = "pending";
 /// A snapshot that holds all of the source volume's data: the `SnapshotState` enum's
 /// `completed` member, which is what the clock owes a `pending` snapshot.
 pub const SNAPSHOT_STATE_COMPLETED: &str = "completed";
+
+/// A snapshot whose data could never be written: the `SnapshotState` enum's `error` member
+/// (`smithy_query(query="shape",shape="SnapshotState")`).
+///
+/// The ONE place that word lives, for every snapshot of this account that did not complete:
+/// where the clock settles a `pending` snapshot whose asynchronous work failed instead of
+/// `completed` ([`SnapshotRecord::failure`]), and what a snapshot the EBS DIRECT APIs hold
+/// reports when its `Timeout` elapsed before `CompleteSnapshot` completed it, or when its
+/// completion declared a different number of blocks from the number written into it — those
+/// APIs reporting the same condition as their own `Status` `error`.
+pub const SNAPSHOT_STATE_ERROR: &str = "error";
 
 /// "The progress of the snapshot, as a percentage" (`Snapshot$Progress`) for a snapshot
 /// that has only just been started: EMPTY. AWS answers the element with no text at all for
@@ -194,6 +214,18 @@ pub struct SnapshotRecord {
     /// reported timestamp has to be a wall-clock one, while the comparison that decides
     /// whether the move is due must not be.
     pub completion_time: SystemTime,
+    /// Why this snapshot's work could not be done, for one the store settled on FAILING, and
+    /// `None` for every snapshot that will hold its source's data.
+    ///
+    /// The work a snapshot action starts runs AFTER the call is answered, so what defeats it
+    /// — a source the copy cannot resolve, a key that will not serve — is not something the
+    /// caller is told: the snapshot it was handed stays `pending` for the span the clock owes
+    /// it and then settles in [`SNAPSHOT_STATE_ERROR`] instead of
+    /// [`SNAPSHOT_STATE_COMPLETED`], reporting this sentence as its `StateMessage` ("if a
+    /// snapshot copy operation fails … this field displays error state details to help you
+    /// diagnose why the error occurred", `Snapshot$StateMessage`) and publishing it as the
+    /// `cause` of its outcome ([`super::SnapshotNotification`]).
+    pub failure: Option<String>,
 }
 
 impl SnapshotRecord {
@@ -204,24 +236,28 @@ impl SnapshotRecord {
             view,
             completed_at,
             completion_time,
+            failure: None,
         }
     }
 
     /// The snapshot's `SnapshotState` at `now`: `pending` until the clock-owed move falls
-    /// due, `completed` from then on.
+    /// due, and from then on `completed` — or `error` for the snapshot whose work the store
+    /// settled on failing ([`Self::failure`]).
     pub fn state_at(&self, now: Instant) -> &'static str {
         if now < self.completed_at {
             SNAPSHOT_STATE_PENDING
+        } else if self.failure.is_some() {
+            SNAPSHOT_STATE_ERROR
         } else {
             SNAPSHOT_STATE_COMPLETED
         }
     }
 
     /// The snapshot's `Progress` at `now`, which is the same fact as its state: nothing has
-    /// been transferred for a snapshot that has only just started, and all of it has for one
-    /// that has completed.
+    /// been transferred for a snapshot that has only just started or for one whose work
+    /// failed, and all of it has for one that has completed.
     pub fn progress_at(&self, now: Instant) -> &'static str {
-        if now < self.completed_at {
+        if now < self.completed_at || self.failure.is_some() {
             SNAPSHOT_PROGRESS_PENDING
         } else {
             SNAPSHOT_PROGRESS_COMPLETED
@@ -232,13 +268,24 @@ impl SnapshotRecord {
     /// completion time the clock has reached. A read observes the transition the clock
     /// already owed without writing anything.
     pub fn view_at(&self, now: Instant) -> SnapshotView {
-        let completed = now >= self.completed_at;
+        let settled = now >= self.completed_at;
+        let completed = settled && self.failure.is_none();
         SnapshotView {
             state: Some(self.state_at(now).to_string()),
             progress: Some(self.progress_at(now).to_string()),
             // "The time stamp when the snapshot was completed": a snapshot that has not
-            // completed has none, rather than one in the future.
+            // completed — one still `pending`, and one whose work failed — has none, rather
+            // than one in the future or one for data that was never written.
             completion_time: completed.then(|| system_time_to_date_time(self.completion_time)),
+            // "If a snapshot copy operation fails … this field displays error state details
+            // to help you diagnose why the error occurred" (`Snapshot$StateMessage`): the
+            // detail of the failure the store settled on, reported from the instant that
+            // outcome falls due, so a snapshot still `pending` carries none.
+            state_message: self
+                .failure
+                .clone()
+                .filter(|_| settled)
+                .or_else(|| self.view.state_message.clone()),
             // The full size is the one the write settled (see the module docs): "the size of
             // all the blocks that were written to the source volume AT THE TIME THE SNAPSHOT
             // WAS CREATED" (`Snapshot$FullSnapshotSizeInBytes`) is a fact of that source as
@@ -341,6 +388,26 @@ impl ComAmazonawsEc2Amazonec2State {
     /// here, so no path can store them uncharged.
     pub fn insert_snapshot(&mut self, view: SnapshotView, started_at: SystemTime) -> String {
         self.insert_snapshot_completing_at(view, started_at, Instant::now() + TRANSITION_DELAY)
+    }
+
+    /// [`Self::insert_snapshot`] for a snapshot whose work CANNOT be done: it is stored and
+    /// answered exactly like any other, stands `pending` for the span the clock owes it, and
+    /// then settles in [`SNAPSHOT_STATE_ERROR`] with `cause` as its `StateMessage`.
+    ///
+    /// The one writer of a failed snapshot, so every asynchronous failure of a snapshot
+    /// action is stored the same way and reported by the same derivation
+    /// ([`SnapshotRecord::view_at`]).
+    pub fn insert_snapshot_failing(
+        &mut self,
+        view: SnapshotView,
+        started_at: SystemTime,
+        cause: String,
+    ) -> String {
+        let snapshot_id = self.insert_snapshot(view, started_at);
+        if let Some(record) = self.snapshots.get_mut(&snapshot_id) {
+            record.failure = Some(cause);
+        }
+        snapshot_id
     }
 
     /// [`Self::insert_snapshot`] with the instant the `pending` -> `completed` move falls

@@ -882,14 +882,15 @@ async fn the_other_ec2_snapshot_readers_resolve_a_direct_api_snapshot_and_still_
             "InvalidParameterValue",
         ),
         (
-            // `CopySnapshot` answers a source it cannot resolve with its own recorded
-            // refusal, which is about the PARAMETER rather than about a snapshot that does
-            // not exist — unchanged by this fix.
-            "a copy whose source nothing holds",
+            // `CopySnapshot` answers a value it cannot READ as a snapshot id with its own
+            // recorded refusal, which is about the PARAMETER rather than about a snapshot
+            // that does not exist. A well-formed id nothing holds is a different case: that
+            // copy is ACCEPTED and fails asynchronously, which `copy_snapshot.rs` covers.
+            "a copy whose source is not a snapshot id at all",
             "CopySnapshot",
             vec![
                 p("SourceRegion", REGION),
-                p("SourceSnapshotId", UNKNOWN_SNAPSHOT_ID),
+                p("SourceSnapshotId", "not-a-snapshot"),
             ],
             "InvalidParameterValue",
         ),

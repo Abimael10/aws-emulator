@@ -7,13 +7,16 @@
 //!
 //! Four rules this handler keeps:
 //!
-//! 1. a source snapshot this copy cannot resolve is refused with ONE answer — 400
-//!    `InvalidParameterValue` ([`unresolvable_source_snapshot_id`]) — whether the value is
-//!    not a snapshot id at all or is well formed and names no snapshot of the account,
-//!    because the copy's subject lives in the Region `SourceRegion` names rather than in the
-//!    Region this call is made in, so it VALIDATES the id instead of resolving a resource of
-//!    its own Region (the reading `crate::ops::copy_fpga_image` gives its own source id).
-//!    The operations that read a snapshot of this Region — `DescribeSnapshots`,
+//! 1. the `SourceSnapshotId` is VALIDATED rather than resolved: the copy's subject lives in
+//!    the Region `SourceRegion` names rather than in the Region this call is made in, so the
+//!    call answers before anything is resolved (the reading `crate::ops::copy_fpga_image`
+//!    gives its own source id). A value this service cannot READ as a snapshot id is refused
+//!    — 400 `InvalidParameterValue` ([`unreadable_source_snapshot_id`]) — and a value it CAN
+//!    read is ACCEPTED: the copy is minted and answered, and a source that is not there
+//!    settles it in `error` with the cause, a span later and asynchronously, where
+//!    `DescribeSnapshots` and the published outcome report it
+//!    ([`crate::state::ComAmazonawsEc2Amazonec2State::insert_snapshot_failing`]).
+//!    The operations that read a snapshot of THIS Region — `DescribeSnapshots`,
 //!    `CreateVolume` — keep drawing the malformed/not-found distinction
 //!    [`crate::state::unresolvable_snapshot_id`] holds;
 //! 2. "The ID of the Region that contains the snapshot to be copied"
@@ -200,18 +203,20 @@ impl From<CopySnapshotErrorModeled> for CopySnapshotError {
 /// a range can express, so the handler is the only place it can be held to.
 const COMPLETION_DURATION_INCREMENT_MINUTES: i32 = 15;
 
-/// The ONE answer this operation has for a source snapshot it cannot resolve: HTTP 400
+/// The answer this operation has for a value it cannot READ as a snapshot id: HTTP 400
 /// `InvalidParameterValue`, in the sentence AWS answers a `CopySnapshot` whose
-/// `SourceSnapshotId` it cannot copy from.
+/// `SourceSnapshotId` is not one.
 ///
 /// The sentence interpolates nothing — it names the member and not the value — which is how
 /// AWS words this refusal: the recorded `CopySnapshot` call behind
 /// `issues/.../20261023T102725Z-ec2-copysnapshot-stub.md` was answered
-/// `InvalidParameterValue` with exactly this text. The same answer covers a value that is
-/// not a snapshot id at all and a well-formed id the account holds no snapshot for, because
-/// this operation's subject is a snapshot of the Region `SourceRegion` names, which it
-/// cannot tell apart (see rule 1 in this module's docs).
-fn unresolvable_source_snapshot_id() -> CopySnapshotError {
+/// `InvalidParameterValue` with exactly this text.
+///
+/// It covers the FORM question only. A value this service CAN read as a snapshot id names a
+/// snapshot of the Region `SourceRegion` points at, which this call does not resolve before
+/// it answers — so whether a snapshot is really there is not a fact of the request, and the
+/// copy is accepted and FAILS ASYNCHRONOUSLY instead (see rule 1 in this module's docs).
+fn unreadable_source_snapshot_id() -> CopySnapshotError {
     crate::scaffolded::Scaffolded::invalid_parameter_value("The specified snapshotId is invalid")
 }
 
@@ -253,19 +258,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            MAX_KMS_KEY_ID_CHARS, MAX_STORED_BYTES, MAX_STORED_SNAPSHOTS,
-            SNAPSHOT_STORAGE_TIER_STANDARD, SNAPSHOT_TAGGABLE_RESOURCE,
-            SNAPSHOT_TRANSFER_TYPE_STANDARD, SNAPSHOT_TRANSFER_TYPE_TIME_BASED, SnapshotView,
+            COPY_SNAPSHOT_EVENT, COPY_SOURCE_SNAPSHOT_NOT_FOUND_MESSAGE, MAX_KMS_KEY_ID_CHARS,
+            MAX_STORED_BYTES, MAX_STORED_SNAPSHOTS, SNAPSHOT_STORAGE_TIER_STANDARD,
+            SNAPSHOT_TAGGABLE_RESOURCE, SNAPSHOT_TRANSFER_TYPE_STANDARD,
+            SNAPSHOT_TRANSFER_TYPE_TIME_BASED, SnapshotNotification, SnapshotView,
             VOLUME_ID_PREFIX, dry_run_operation, is_catalog_region, regions_in_partition_of,
-            request_region, require_service_state, snapshot_id_is_well_formed,
+            request_region, require_service_state, snapshot_arn, snapshot_id_is_well_formed,
             snapshot_limit_exceeded, snapshot_payload_bytes, tags_from_specifications,
         };
 
-        // Something that is not a snapshot id at all names no source snapshot, so it is
-        // refused before there is anything to look up — with the ONE answer this operation
-        // has for a source it cannot resolve.
+        // Something that is not a snapshot id at all names no source snapshot in any Region,
+        // so it is refused before there is anything to copy — the FORM question, which is the
+        // only one about the source this call answers.
         if !snapshot_id_is_well_formed(&input.source_snapshot_id) {
-            return Err(unresolvable_source_snapshot_id());
+            return Err(unreadable_source_snapshot_id());
         }
 
         // "The ID of the Region that contains the snapshot to be copied"
@@ -370,8 +376,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // alone: a stored snapshot carries no Region member, so nothing about resolving one
         // depends on a Region (see rule 2 in this module's docs). A snapshot the EBS DIRECT
         // APIs hold is a snapshot of this account too — the two APIs describe one resource —
-        // so an id this store holds nothing under is resolved against that side before it is
-        // refused, with the same answer as a value that is not a snapshot id at all.
+        // so an id this store holds nothing under is resolved against that side as well.
+        //
+        // An id that resolves to NO snapshot is not a refusal: the copy's subject lives in
+        // another Region, which this call does not reach before it answers, so the copy is
+        // minted all the same and what the clock owes it is the `error` state rather than
+        // `completed` (below).
         let source = store
             .snapshots
             .get(&input.source_snapshot_id)
@@ -382,8 +392,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &input.source_snapshot_id,
                     ::std::time::SystemTime::now(),
                 )
-            })
-            .ok_or_else(unresolvable_source_snapshot_id)?;
+            });
 
         // "Copies of encrypted snapshots are encrypted, even if you omit this parameter and
         // encryption by default is not enabled", and "the encryption outcome for the
@@ -393,7 +402,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // read under the guard this copy is written under, so no enable or disable can land
         // in between, and it is the DESTINATION Region's — this call's own.
         let encrypted = input.encrypted == Some(true)
-            || source.encrypted == Some(true)
+            || source
+                .as_ref()
+                .is_some_and(|source| source.encrypted == Some(true))
             || store.ebs_encryption_by_default(&region);
         // "If KmsKeyId is specified, the encrypted state must be true"
         // (`CopySnapshotRequest$KmsKeyId`) — a key only names HOW the copy is encrypted, so
@@ -408,10 +419,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // default key is reported as no key, the way `CreateVolume` and `CopyVolumes` report
         // it. An encrypted source whose key the request does not override keeps being
         // encrypted under that key.
-        let kms_key_id = input
-            .kms_key_id
-            .clone()
-            .or_else(|| source.kms_key_id.clone().filter(|_| encrypted));
+        let kms_key_id = input.kms_key_id.clone().or_else(|| {
+            source
+                .as_ref()
+                .and_then(|source| source.kms_key_id.clone())
+                .filter(|_| encrypted)
+        });
 
         // The ceilings are asked BEFORE anything is minted, so a copy this emulator cannot
         // hold is refused rather than half-written.
@@ -446,83 +459,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // makes it arbitrary and unique.
         let arbitrary_volume_id = store.next_id(VOLUME_ID_PREFIX);
         let started_at = ::std::time::SystemTime::now();
-        let snapshot_id = store.insert_snapshot(
-            SnapshotView {
-                // "A description for the EBS snapshot" (`CopySnapshotRequest$Description`):
-                // the copy's own, which the request supplies — the source's description is
-                // not carried over.
-                description: input.description.clone(),
-                tags: Some(tags),
-                encrypted: Some(encrypted),
-                kms_key_id,
-                // "Creates an exact copy of an Amazon EBS snapshot" (`CopySnapshot`): the
-                // copy holds the source's data, so its volume size is the source's.
-                volume_size: source.volume_size,
-                volume_id: Some(arbitrary_volume_id),
-                owner_id: Some(::engine::emulator_account_id().to_string()),
-                // "`standard` indicates that the snapshot is stored in the standard snapshot
-                // storage tier and that it is ready for use" (`Snapshot$StorageTier`);
-                // `ModifySnapshotTier` is what archives one.
-                storage_tier: Some(SNAPSHOT_STORAGE_TIER_STANDARD.to_string()),
-                // "Only for snapshot copies. Indicates whether the snapshot copy was created
-                // with a standard or time-based snapshot copy operation"
-                // (`Snapshot$TransferType`), which is exactly whether the request asked for
-                // a completion duration: "Time-based snapshot copy operations complete
-                // within the specified duration. […] If you do not specify a value, the
-                // snapshot copy operation is completed on a best-effort basis".
-                transfer_type: Some(
-                    if input.completion_duration_minutes.is_some() {
-                        SNAPSHOT_TRANSFER_TYPE_TIME_BASED
-                    } else {
-                        SNAPSHOT_TRANSFER_TYPE_STANDARD
-                    }
-                    .to_string(),
-                ),
-                // "Only for snapshot copies created with time-based snapshot copy
-                // operations. The completion duration requested for the time-based snapshot
-                // copy operation" (`Snapshot$CompletionDurationMinutes`).
-                completion_duration_minutes: input.completion_duration_minutes,
-                // The members a regional copy carries nothing for: the owner alias names an
-                // Amazon-published snapshot, the Outpost ARN one stored on an Outpost and the
-                // Availability Zone one in a Local Zone (both refused above), the restore
-                // expiry a temporarily restored archived snapshot, the state message a failed
-                // asynchronous copy, and the data encryption key id a member "only returned
-                // by DescribeSnapshots". `SseType` is "reserved for future use".
-                owner_alias: None,
-                outpost_arn: None,
-                availability_zone: None,
-                restore_expiry_time: None,
-                sse_type: None,
-                state_message: None,
-                data_encryption_key_id: None,
-                // "The full size of the snapshot, in bytes. […] represents the size of all
-                // the blocks that were written to the source volume"
-                // (`Snapshot$FullSnapshotSizeInBytes`): a copy holds every block the SOURCE
-                // SNAPSHOT holds, so it measures exactly what that snapshot measures — the
-                // copy's own arbitrary volume id names no volume of the account to read it
-                // off.
-                full_snapshot_size_in_bytes: source.full_snapshot_size_in_bytes,
-                // Minted, stamped and derived by the store: the id, the start time, and the
-                // state, progress and completion time the clock decides.
-                snapshot_id: None,
-                start_time: None,
-                state: None,
-                progress: None,
-                completion_time: None,
-            },
-            started_at,
-        );
+        let copied = SnapshotView {
+            // "A description for the EBS snapshot" (`CopySnapshotRequest$Description`):
+            // the copy's own, which the request supplies — the source's description is
+            // not carried over.
+            description: input.description.clone(),
+            tags: Some(tags),
+            encrypted: Some(encrypted),
+            kms_key_id,
+            // "Creates an exact copy of an Amazon EBS snapshot" (`CopySnapshot`): the
+            // copy holds the source's data, so its volume size is the source's — and a
+            // copy whose source is not there holds no data to measure.
+            volume_size: source.as_ref().and_then(|source| source.volume_size),
+            volume_id: Some(arbitrary_volume_id),
+            owner_id: Some(::engine::emulator_account_id().to_string()),
+            // "`standard` indicates that the snapshot is stored in the standard snapshot
+            // storage tier and that it is ready for use" (`Snapshot$StorageTier`);
+            // `ModifySnapshotTier` is what archives one.
+            storage_tier: Some(SNAPSHOT_STORAGE_TIER_STANDARD.to_string()),
+            // "Only for snapshot copies. Indicates whether the snapshot copy was created
+            // with a standard or time-based snapshot copy operation"
+            // (`Snapshot$TransferType`), which is exactly whether the request asked for
+            // a completion duration: "Time-based snapshot copy operations complete
+            // within the specified duration. […] If you do not specify a value, the
+            // snapshot copy operation is completed on a best-effort basis".
+            transfer_type: Some(
+                if input.completion_duration_minutes.is_some() {
+                    SNAPSHOT_TRANSFER_TYPE_TIME_BASED
+                } else {
+                    SNAPSHOT_TRANSFER_TYPE_STANDARD
+                }
+                .to_string(),
+            ),
+            // "Only for snapshot copies created with time-based snapshot copy
+            // operations. The completion duration requested for the time-based snapshot
+            // copy operation" (`Snapshot$CompletionDurationMinutes`).
+            completion_duration_minutes: input.completion_duration_minutes,
+            // The members a regional copy carries nothing for: the owner alias names an
+            // Amazon-published snapshot, the Outpost ARN one stored on an Outpost and the
+            // Availability Zone one in a Local Zone (both refused above), the restore
+            // expiry a temporarily restored archived snapshot, and the data encryption key
+            // id a member "only returned by DescribeSnapshots". `SseType` is "reserved for
+            // future use". The state message is the store's: it is the detail of the
+            // failure the clock owes a copy whose source was not there, which the record
+            // keeps and every read derives.
+            owner_alias: None,
+            outpost_arn: None,
+            availability_zone: None,
+            restore_expiry_time: None,
+            sse_type: None,
+            state_message: None,
+            data_encryption_key_id: None,
+            // "The full size of the snapshot, in bytes. […] represents the size of all
+            // the blocks that were written to the source volume"
+            // (`Snapshot$FullSnapshotSizeInBytes`): a copy holds every block the SOURCE
+            // SNAPSHOT holds, so it measures exactly what that snapshot measures — the
+            // copy's own arbitrary volume id names no volume of the account to read it
+            // off.
+            full_snapshot_size_in_bytes: source
+                .as_ref()
+                .and_then(|source| source.full_snapshot_size_in_bytes),
+            // Minted, stamped and derived by the store: the id, the start time, and the
+            // state, progress and completion time the clock decides.
+            snapshot_id: None,
+            start_time: None,
+            state: None,
+            progress: None,
+            completion_time: None,
+        };
+        // The copy is STORED either way, and which outcome the clock owes it follows from
+        // whether its source was there: a copy with a source completes, and one without
+        // settles in `error` carrying the cause — "the call is accepted and the failure
+        // surfaces afterwards", which is what makes a copy's failure asynchronous. The cause
+        // is the crate's one sentence for a snapshot the account holds none of.
+        let snapshot_id = match source {
+            Some(_) => store.insert_snapshot(copied, started_at),
+            None => store.insert_snapshot_failing(
+                copied,
+                started_at,
+                COPY_SOURCE_SNAPSHOT_NOT_FOUND_MESSAGE.to_string(),
+            ),
+        };
 
         // Read the answer back OUT of the store, so the caller is told what a later
-        // `DescribeSnapshots` will report rather than the request object.
-        let stored = store.snapshots.get(&snapshot_id).ok_or_else(|| {
-            Scaffolded::internal_error(format!(
-                "the newly copied snapshot '{snapshot_id}' could not be read back"
-            ))
-        })?;
-        let stored_tags = stored.view.tags.clone().unwrap_or_default();
+        // `DescribeSnapshots` will report rather than the request object — and, off the same
+        // record, the notification this copy's OUTCOME is published as, so what is published
+        // is what the store settled on.
+        let now = ::std::time::Instant::now();
+        let read_back = store
+            .snapshots
+            .get(&snapshot_id)
+            .map(|record| {
+                (
+                    record.view.snapshot_id.clone(),
+                    record.view.tags.clone().unwrap_or_default(),
+                    SnapshotNotification::of(
+                        COPY_SNAPSHOT_EVENT,
+                        record,
+                        now,
+                        &region,
+                        // "The ID of the Region that contains the snapshot to be copied"
+                        // (`CopySnapshotRequest$SourceRegion`): the source of this copy is
+                        // that Region's snapshot, so the ARN the outcome names it by is the
+                        // one of the Region the request pointed at.
+                        &snapshot_arn(&input.source_region, &input.source_snapshot_id),
+                    ),
+                )
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the newly copied snapshot '{snapshot_id}' could not be read back"
+                ))
+            });
+        // The store's guard is given back before the publication is handed on: a lock of this
+        // store is never held while another service is called.
+        drop(store);
+        let (copy_id, stored_tags, notification) = read_back?;
+
+        // The copy is ANSWERED above and its outcome — the state the copy settles in, and why
+        // if that is a failure — is published for whatever watches snapshots once that
+        // outcome falls due, exactly ONE event per copy this call made.
+        notification.publish_when_due(ctx.callback().clone());
+
         Ok(CopySnapshotOutput {
-            snapshot_id: stored.view.snapshot_id.clone(),
+            snapshot_id: copy_id,
             // "Any tags applied to the new snapshot" (`CopySnapshotResult$Tags`): a copy
             // the request tagged reports those tags, and one it did not reports no tag set
             // at all rather than an empty one.

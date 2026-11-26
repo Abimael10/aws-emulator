@@ -3272,6 +3272,11 @@ mod launch_volume_keys;
 /// EventBridge bus. Everything it declares is re-exported below, so a handler reaches it as
 /// `crate::state::VolumeNotification` like any other primitive of this module.
 mod volume_notifications;
+/// The event an EBS snapshot's OUTCOME is published as, onto that same bus — the one a
+/// create's completion and a copy's ASYNCHRONOUS failure are both reported through.
+/// Everything it declares is re-exported below, so a handler reaches it as
+/// `crate::state::SnapshotNotification` like any other primitive of this module.
+mod snapshot_notifications;
 /// The event every change of an INSTANCE's state is published as, onto that same bus.
 /// Everything it declares is re-exported below, so a handler reaches it as
 /// `crate::state::InstanceStateNotification` like any other primitive of this module.
@@ -3359,6 +3364,7 @@ pub use tag_descriptions::*;
 pub use volume_encryption::*;
 pub use launch_volume_keys::*;
 pub use volume_notifications::*;
+pub use snapshot_notifications::*;
 pub use instance_state_notifications::*;
 pub use volumes::*;
 pub use import_image_tasks_and_verified_access::*;
