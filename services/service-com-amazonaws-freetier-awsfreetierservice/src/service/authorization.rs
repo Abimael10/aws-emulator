@@ -26,11 +26,14 @@
 //!    service's OWN accessors (`principal_policies`, `permissions_boundary_document`),
 //!    where the collection rule itself lives — so a policy `iam:PutUserPolicy` wrote takes
 //!    effect on the next request and deleting it lifts the grant again;
-//! 3. **the decision** — [`::service_common::iam_authorization`], the ONE shared
-//!    evaluation of those documents against `(action, resource)`, so this service and
-//!    every other one handed the same documents answer alike: an explicit `Deny` wins,
-//!    otherwise an `Allow` about the request grants it, and with neither the request falls
-//!    to IAM's default deny.
+//! 3. **the decision, and the sentence it is stated in** —
+//!    [`::service_common::iam_authorization`], the ONE shared evaluation of those documents
+//!    against `(action, resource)`, so this service and every other one handed the same
+//!    documents answer alike: an explicit `Deny` wins, otherwise an `Allow` about the
+//!    request grants it, and with neither the request falls to IAM's default deny. The
+//!    WORDS of a refusal come from that same module
+//!    ([`iam::not_authorized_by_identity_policy`] and the reason clauses beside it), so no
+//!    part of IAM's wording is spelled in this crate.
 //!
 //! Only the store LOOKUPS live here; neither the decision nor the ARN readings do. The
 //! lookups stay in this service crate for the reason every other gate keeps theirs there:
@@ -142,7 +145,7 @@ pub fn authorize<Eng: Send + Sync + 'static>(
             &caller.arn,
             &action,
             &resource,
-            "with an explicit deny in an identity-based policy",
+            iam::IDENTITY_POLICY_EXPLICIT_DENY,
         ));
     }
     let granted =
@@ -152,7 +155,7 @@ pub fn authorize<Eng: Send + Sync + 'static>(
             &caller.arn,
             &action,
             &resource,
-            &format!("because no identity-based policy allows the {action} action"),
+            &iam::no_identity_policy_allows(&action),
         ));
     }
     // "A permissions boundary sets the maximum permissions that an identity-based policy
@@ -164,10 +167,8 @@ pub fn authorize<Eng: Send + Sync + 'static>(
             // An explicit deny is a fact about the boundary document, so the refusal names
             // it; a boundary that merely states nothing withheld the grant the
             // identity-based policies gave.
-            Decision::Denied => "with an explicit deny in a permissions boundary".to_string(),
-            Decision::NotStated => {
-                format!("because no permissions boundary allows the {action} action")
-            }
+            Decision::Denied => iam::PERMISSIONS_BOUNDARY_EXPLICIT_DENY.to_string(),
+            Decision::NotStated => iam::no_permissions_boundary_allows(&action),
         };
         return Err(not_authorized(&caller.arn, &action, &resource, &reason));
     }
@@ -178,6 +179,11 @@ pub fn authorize<Eng: Send + Sync + 'static>(
 /// which resource, and which of IAM's rules refused it. Every value in it comes from the
 /// request and from the stored policies — the principal from the credential the request
 /// presented, the action and the resource from the operation it named.
+///
+/// The sentence itself is the shared one every gate in this tree words this refusal with
+/// ([`iam::not_authorized_by_identity_policy`], whose own reason clauses `authorize` reaches
+/// for), so a correction to IAM's wording reaches this service instead of being copied into
+/// it.
 ///
 /// The sentence stays inside the modelled bound of `AccessDeniedException$message` (a
 /// `GenericString` of `@length(0, 1024)`, `smithy_query(query="shape",
@@ -191,10 +197,7 @@ fn not_authorized(
     reason: &str,
 ) -> AccessDeniedException {
     AccessDeniedException {
-        message: format!(
-            "User: {principal} is not authorized to perform: {action} on resource: {resource} \
-             {reason}"
-        ),
+        message: iam::not_authorized_by_identity_policy(principal, action, resource, reason),
     }
 }
 

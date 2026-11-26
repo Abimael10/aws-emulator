@@ -941,3 +941,109 @@ async fn an_operation_that_models_no_denial_is_not_judged() {
         );
     }
 }
+
+/// RULE: the sentence either gated operation refuses with — and every reason clause it can
+/// end in — is the ONE statement of IAM's wording the shared crate holds
+/// (`service_common::iam_authorization`'s `not_authorized_by_identity_policy` and the
+/// clauses beside it), so what this service puts on the wire is RENDERED by that statement
+/// rather than by a copy of it kept in this crate.
+///
+/// The rows are the four clauses a decision taken here can rest on, each driven over the
+/// wire through BOTH gated operations: no readable document allows the action, a readable
+/// document explicitly denies it, the permissions boundary states nothing about it, and the
+/// boundary explicitly denies it. The expectation is the shared statement's own output for
+/// the principal STS reports and the action and resource the request named — so a reworded
+/// clause or a repunctuated sentence in that one place is still exactly what this service
+/// answers.
+#[tokio::test]
+async fn the_refusal_is_worded_by_the_shared_statement_of_iams_sentence() {
+    use service_common::iam_authorization as iam_wording;
+
+    let emulator = Emulator::new();
+
+    for operation in GATED_OPERATIONS {
+        let action = action_of(operation);
+        let suffix = operation.to_lowercase();
+        // A boundary allowing a DIFFERENT Free Tier action states nothing about this one;
+        // a boundary carrying an explicit `Deny` of it denies it outright.
+        let silent_boundary = emulator
+            .managed_policy(
+                &format!("freetier-wording-boundary-silent-{suffix}"),
+                &allow(&action_of(other_gated(operation)), "*"),
+            )
+            .await;
+        let denying_boundary = emulator
+            .managed_policy(
+                &format!("freetier-wording-boundary-deny-{suffix}"),
+                &allow_all_but(&action),
+            )
+            .await;
+
+        // (case, the access key id that asks, the clause the shared statement words it with)
+        let mut rows: Vec<(&str, String, String)> = vec![
+            (
+                "no readable document allows the action",
+                emulator
+                    .user_key(&format!("freetier-wording-bare-{suffix}"), None)
+                    .await,
+                iam_wording::no_identity_policy_allows(&action),
+            ),
+            (
+                "a readable document explicitly denies the action",
+                emulator
+                    .user_key(
+                        &format!("freetier-wording-denied-{suffix}"),
+                        Some(&allow_all_but(&action)),
+                    )
+                    .await,
+                iam_wording::IDENTITY_POLICY_EXPLICIT_DENY.to_string(),
+            ),
+        ];
+
+        let capped = format!("freetier-wording-capped-{suffix}");
+        let capped_key = emulator.user_key(&capped, Some(&allow(&action, "*"))).await;
+        emulator.put_user_boundary(&capped, &silent_boundary).await;
+        rows.push((
+            "the permissions boundary states nothing about the action",
+            capped_key,
+            iam_wording::no_permissions_boundary_allows(&action),
+        ));
+
+        let boundary_denied = format!("freetier-wording-boundary-denied-{suffix}");
+        let boundary_denied_key = emulator
+            .user_key(&boundary_denied, Some(&allow(&action, "*")))
+            .await;
+        emulator
+            .put_user_boundary(&boundary_denied, &denying_boundary)
+            .await;
+        rows.push((
+            "the permissions boundary explicitly denies the action",
+            boundary_denied_key,
+            iam_wording::PERMISSIONS_BOUNDARY_EXPLICIT_DENY.to_string(),
+        ));
+
+        for (case, access_key_id, clause) in &rows {
+            let case = format!("{case}, asking {operation}");
+            let (status, payload) = emulator.call(access_key_id, operation).await;
+            assert_eq!(
+                (status, error_code(&payload).as_str()),
+                (403, "AccessDeniedException"),
+                "case {case:?}: expected the modelled 403, got {status} with {payload}"
+            );
+            // The principal comes from STS's own reading of that credential, as everywhere
+            // else in this suite.
+            let principal = emulator.caller_arn(access_key_id).await;
+            let message = message_of(&payload);
+            assert_eq!(
+                message,
+                iam_wording::not_authorized_by_identity_policy(
+                    &principal,
+                    &action,
+                    &resource_of(operation),
+                    clause
+                ),
+                "case {case:?}: expected the shared statement's own sentence, got {message:?}"
+            );
+        }
+    }
+}
