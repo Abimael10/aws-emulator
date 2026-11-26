@@ -48,6 +48,12 @@ pub(super) use crate::state::provisioner::redshift_serverless;
 // ([`crate::state::provisioner::appflow_connector_profiles`]), for the same reason.
 pub(super) use crate::state::provisioner::appflow_connector_profiles;
 
+// The two IAM Access Analyzer types: their own NAMES, the ARN forms they publish and the
+// attributes each of them publishes live beside the arms that provision them
+// ([`crate::state::provisioner::access_analyzer`]), so this catalogue and the provisioner
+// cannot name the same attribute differently.
+pub(in crate::state) use crate::state::provisioner::access_analyzer;
+
 // The three Amazon EFS types: their own NAMES and the names of the attributes each publishes
 // live beside the arms that provision them
 // ([`crate::state::provisioning::efs_resources`]), for the same reason.
@@ -471,6 +477,13 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // A hypervisor publishes the ARN Backup Gateway minted for it, which is the one return
         // value these naming rules compute a stand-in for before it exists.
         BACKUP_GATEWAY_HYPERVISOR => BACKUP_GATEWAY_HYPERVISOR_ATTRIBUTES,
+        // An analyzer publishes the ARN IAM Access Analyzer records for it, which these naming
+        // rules compute from the name the declaration states; an ARCHIVE RULE of one publishes
+        // that same ARN with the rule's own name beneath it, beside the two instants that
+        // service keeps for the rule — its own clock, which reach the resource off its report of
+        // the rule rather than from here, exactly as a spending limit's `CreatedAt` does.
+        access_analyzer::ACCESSANALYZER_ANALYZER => access_analyzer::ANALYZER_ATTRIBUTES,
+        access_analyzer::ACCESSANALYZER_ARCHIVE_RULE => access_analyzer::ARCHIVE_RULE_ATTRIBUTES,
         // An IoT Core Device Advisor suite definition publishes the id that service mints for
         // it, the ARN built around that id, and the version label it keeps the suite's live
         // configuration under — the three return values these naming rules compute a stand-in
@@ -2001,6 +2014,12 @@ pub fn name_scope_properties(resource_type: &str) -> &'static [&'static str] {
         crate::state::provisioner::auto_scaling_group_children::AUTOSCALING_LIFECYCLE_HOOK
         | crate::state::provisioner::auto_scaling_group_children::AUTOSCALING_SCHEDULED_ACTION => {
             &["AutoScalingGroupName"]
+        }
+        // An archive rule's name identifies it WITHIN one analyzer: every call of IAM Access
+        // Analyzer on a rule binds the analyzer as its own URI label beside the rule's name, so
+        // two analyzers each carrying a rule of one name carry two rules.
+        access_analyzer::ACCESSANALYZER_ARCHIVE_RULE => {
+            &[access_analyzer::ANALYZER_NAME_PROPERTY]
         }
         _ => &[],
     }

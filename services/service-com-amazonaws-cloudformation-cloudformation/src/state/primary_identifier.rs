@@ -189,6 +189,15 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         // returns the hypervisor ARN") — the `ServerArn` every call on a hypervisor takes; the
         // type's own `Name` is only what the hypervisor is called.
         BACKUP_GATEWAY_HYPERVISOR => "HypervisorArn",
+        // An IAM Access Analyzer analyzer, identified by the ARN that service records for it
+        // ("Ref returns the ARN of the analyzer"), and an ARCHIVE RULE of one by the identity
+        // built around that ARN and the rule's own name. Either type's own name property is
+        // what the resource is CALLED inside that service; the published identity is the ARN,
+        // which is what a client naming an existing resource of the type supplies.
+        access_analyzer::ACCESSANALYZER_ANALYZER
+        | access_analyzer::ACCESSANALYZER_ARCHIVE_RULE => {
+            crate::state::provisioner::access_analyzer::ACCESS_ANALYZER_ARN_ATTRIBUTE
+        }
         // An IoT Core Device Advisor suite definition, identified by the id that service minted
         // for it ("Ref returns the suite definition id") — the `suiteDefinitionId` every call on
         // one takes; the suite's own name lives inside its configuration and two accounts' suites

@@ -408,6 +408,22 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // takes the host, the credentials, the name and the log group), so a declaration
         // restating it asks for a different hypervisor.
         BACKUP_GATEWAY_HYPERVISOR => &["KmsKeyArn"],
+        // An analyzer keeps the KIND it was created as: `type` is a member of `CreateAnalyzer`
+        // ("the type of analyzer to create", which fixes the zone of trust it monitors) and of
+        // no member of `UpdateAnalyzer`, whose one member beside the analyzer's name is the
+        // configuration — so a declaration naming another kind asks for a different analyzer,
+        // which CloudFormation replaces. (Its NAME is in that position through
+        // [`name_is_create_only`]: no call of that service renames an analyzer. An ARCHIVE
+        // RULE's name is too, `UpdateArchiveRule` addressing a rule BY that name, and its
+        // criteria are the one property that call can restate.)
+        crate::state::provisioner::access_analyzer::ACCESSANALYZER_ANALYZER => &["Type"],
+        // An archive rule belongs to the analyzer it was created on: `analyzerName` is the URI
+        // label of `CreateArchiveRule`, of `UpdateArchiveRule` and of `DeleteArchiveRule`
+        // alike, so no call of that service moves a rule to another analyzer and a declaration
+        // naming one asks for a different rule.
+        crate::state::provisioner::access_analyzer::ACCESSANALYZER_ARCHIVE_RULE => {
+            &[crate::state::provisioner::access_analyzer::ANALYZER_NAME_PROPERTY]
+        }
         // A retention rule retains the ONE resource type it was created for: `ResourceType` is
         // a member of `CreateRule`, and `UpdateRule`'s member of that name is documented
         // "currently not supported. You can't update a retention rule's resource type after

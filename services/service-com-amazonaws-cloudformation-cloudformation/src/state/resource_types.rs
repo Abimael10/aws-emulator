@@ -79,6 +79,9 @@
 //! template is admitted, and its resources are recorded as declared.
 
 use super::provisioner::appflow_connector_profiles::APPFLOW_CONNECTOR_PROFILE;
+use super::provisioner::access_analyzer::{
+    ACCESSANALYZER_ANALYZER, ACCESSANALYZER_ARCHIVE_RULE,
+};
 use super::provisioner::client_vpn::{
     EC2_CLIENT_VPN_AUTHORIZATION_RULE, EC2_CLIENT_VPN_ENDPOINT,
 };
@@ -204,6 +207,11 @@ const TEMPLATE_FORMAT_ERROR_PREFIX: &str = "Template format error: ";
 /// add it here, in its namespace's group, rather than to weaken the check to a shape test
 /// (`AWS::<anything>::<anything>`), which would admit `AWS::SWF::Domain` again.
 pub const AWS_RESOURCE_TYPES: &[&str] = &[
+    // IAM Access Analyzer. The analyzer the account or the organization is monitored with and
+    // the archive rule of one are both created in the owning service (`super::provisioner`):
+    // `CreateAnalyzer` and `CreateArchiveRule`.
+    ACCESSANALYZER_ANALYZER,
+    ACCESSANALYZER_ARCHIVE_RULE,
     // Amazon Web Services Private CA. The certificate authority itself, a certificate one
     // of its CAs issues, the activation of a CA with such a certificate and the permission a
     // CA grants to a service principal are all created in the owning service

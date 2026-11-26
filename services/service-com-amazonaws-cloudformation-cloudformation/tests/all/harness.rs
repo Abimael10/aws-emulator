@@ -311,6 +311,15 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
     router.register_service(
         service_com_amazonaws_rbin_amazonrecyclebin::EmulatedService::new(Arc::clone(&engine)),
     );
+    // IAM Access Analyzer, for the `AWS::AccessAnalyzer::Analyzer` and the
+    // `AWS::AccessAnalyzer::ArchiveRule` of one a stack really creates there, so a suite that
+    // deploys one reads the analyzer and its archive rules back through that service's own wire
+    // by the identities the stack publishes.
+    router.register_service(
+        service_com_amazonaws_accessanalyzer_accessanalyzer::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
+    );
     // AWS Direct Connect, for the `AWS::DirectConnect::DirectConnectGateway` and the
     // `AWS::DirectConnect::ResiliencyGroup` a stack really creates there, so a suite that
     // deploys one reads the gateway and the group back through that service's own wire by the

@@ -801,6 +801,18 @@ impl Provisioner {
                     .await
                     .map(Some)
             }
+            // `UpdateAnalyzer` reconfigures the analyzer the stack created, by the name it was
+            // created under, taking the configuration alone — and the analyzer's own inline
+            // archive rules are reconciled beside it, each through the call that adds, restates
+            // or removes one. `UpdateArchiveRule` restates the criteria of a rule declared as a
+            // resource of its own. So a changed declaration of either reaches that service
+            // rather than replacing the resource; the analyzer's tags travel separately
+            // ([`Self::retag`]).
+            Self::AccessAnalyzerResource(kind) => {
+                update_access_analyzer_resource(ctx, region, kind, resource, declared)
+                    .await
+                    .map(Some)
+            }
             // `UpdateGraph` reconfigures the graph the stack created, by the id Neptune
             // Analytics minted for it, taking the memory it is provisioned with and its two
             // flags — so a changed declaration of one of those is applied to that graph rather
@@ -1026,6 +1038,15 @@ impl Provisioner {
             // a hypervisor is to end up carrying is reconciled.
             Self::BackupGatewayHypervisor => {
                 retag_backup_gateway_hypervisor(ctx, region, resource, declared, propagated).await
+            }
+            // An analyzer's tags are IAM Access Analyzer's own `TagResource` and
+            // `UntagResource`: `CreateAnalyzer`'s `tags` map applies to the analyzer that call
+            // creates, and `UpdateAnalyzer` carries no tags at all, so this is where the set an
+            // analyzer is to end up carrying is reconciled. An ARCHIVE RULE has no tags of its
+            // own, which that arm decides from the kind it carries.
+            Self::AccessAnalyzerResource(kind) => {
+                retag_access_analyzer_resource(ctx, region, kind, resource, declared, propagated)
+                    .await
             }
             // A dashboard's and a scheduled report's tags are that service's own
             // `TagResource` and `UntagResource`: each create's `resourceTags` list applies to

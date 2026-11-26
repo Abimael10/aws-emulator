@@ -3000,6 +3000,11 @@ enum Characters {
 /// (`AWS::Glue::Job`, whose `Ref` is the job name, which is the default this module already
 /// gives every type).
 pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
+    // The two IAM Access Analyzer types: the analyzer, publishing the ARN that service records
+    // for it, and the archive rule of one, publishing that ARN with the rule's own name beneath
+    // it and the two instants that service keeps for the rule.
+    crate::state::provisioner::access_analyzer::ACCESSANALYZER_ANALYZER,
+    crate::state::provisioner::access_analyzer::ACCESSANALYZER_ARCHIVE_RULE,
     ACMPCA_CERTIFICATE,
     ACMPCA_CERTIFICATE_AUTHORITY,
     ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION,

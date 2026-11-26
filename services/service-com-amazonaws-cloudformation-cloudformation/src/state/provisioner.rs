@@ -1817,6 +1817,17 @@ pub(super) enum Provisioner {
     /// stack publishes for one is what that service's own reads resolve. Which of the three it
     /// is travels with the variant, the three sharing one set of arms ([`lex_bots::Kind`]).
     LexBot(lex_bots::Kind),
+    /// `AWS::AccessAnalyzer::Analyzer` and `AWS::AccessAnalyzer::ArchiveRule`: the analyzer IAM
+    /// Access Analyzer's own `CreateAnalyzer` records under the name the template states,
+    /// `UpdateAnalyzer` reconfigures and `DeleteAnalyzer` removes, and the archive rule of one
+    /// its `CreateArchiveRule` adds, `UpdateArchiveRule` restates and `DeleteArchiveRule`
+    /// removes. Every call of that service on either resource addresses it by the analyzer's
+    /// NAME — and a rule by that name and its own — so the identity the naming rules compute is
+    /// the one the resource really has, and what the create reports back is the ARN that service
+    /// recorded beside the instants it keeps for a rule ([`access_analyzer`]). Which of the two
+    /// the declaration is travels with the variant, the two sharing one set of arms
+    /// ([`access_analyzer::Resource`]).
+    AccessAnalyzerResource(access_analyzer::Resource),
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -2134,6 +2145,9 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
             network_security_manager::Entity::Scope,
         )),
         BACKUP_GATEWAY_HYPERVISOR => Some(Provisioner::BackupGatewayHypervisor),
+        access_analyzer::ACCESSANALYZER_ANALYZER | access_analyzer::ACCESSANALYZER_ARCHIVE_RULE => {
+            access_analyzer_provisioner_for(resource_type).map(Provisioner::AccessAnalyzerResource)
+        }
         MEDIACONVERT_CERTIFICATE_ASSOCIATION => {
             Some(Provisioner::MediaConvertCertificateAssociation)
         }
@@ -3221,6 +3235,12 @@ impl Provisioner {
             // which is this resource's physical id: a bot by the `botId`, and a version or an
             // alias by the pair its own identity is composed of.
             Self::LexBot(kind) => delete_lex_resource(ctx, region, kind, resource).await,
+            // Either IAM Access Analyzer delete addresses its resource by the names inside the
+            // identity it was created under: an analyzer by its own name, a rule by that name
+            // and the rule's.
+            Self::AccessAnalyzerResource(kind) => {
+                delete_access_analyzer_resource(ctx, region, kind, physical_resource_id).await
+            }
         }
     }
 
@@ -3735,6 +3755,18 @@ use bedrock_data_automation::{
 /// attributes each publishes.
 pub(in crate::state) mod lex_bots;
 use lex_bots::{create_lex_resource, delete_lex_resource, describe_lex_resource};
+
+/// The two IAM Access Analyzer types — the analyzer and the archive rule of one — whose arms
+/// are [`access_analyzer`]'s. Visible to the rest of this service's state because that module
+/// names the two types it serves, the ARN forms they publish and the attributes each of them
+/// publishes, which the catalogue of declarable types, the return-value catalogue and the
+/// primary-identifier table each key an entry by.
+pub(in crate::state) mod access_analyzer;
+use access_analyzer::{
+    access_analyzer_provisioner_for, create_access_analyzer_resource,
+    delete_access_analyzer_resource, describe_access_analyzer_resource,
+    retag_access_analyzer_resource, update_access_analyzer_resource,
+};
 
 /// What the owning service says about a resource's LIFECYCLE PROGRESS — whether a created
 /// resource has come up, what it publishes once it has, and whether a deleted one is gone —

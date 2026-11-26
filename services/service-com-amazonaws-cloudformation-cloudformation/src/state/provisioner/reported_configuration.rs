@@ -995,6 +995,11 @@ impl Provisioner {
             Self::BackupGatewayHypervisor => {
                 describe_backup_gateway_hypervisor(ctx, region, physical_resource_id).await
             }
+            // IAM Access Analyzer's own read of the analyzer, by the name it was created under,
+            // or of the archive rule, by that name and the rule's own.
+            Self::AccessAnalyzerResource(kind) => {
+                describe_access_analyzer_resource(ctx, region, kind, physical_resource_id).await
+            }
             // MediaConvert publishes no read of its certificate associations, so the trust is
             // read from the other side: the resources Certificate Manager reports as using
             // the certificate that is this resource's physical id.

@@ -358,6 +358,12 @@ service-com-amazonaws-directconnect-overtureservice = { workspace = true }
 # owning service mounted beside CloudFormation, or the create is refused and the stack fails —
 # and the lifecycle policy the stack published is read back through that service's own wire.
 service-com-amazonaws-dlm-dlm-20180112 = { workspace = true }
+# IAM Access Analyzer, for the `AWS::AccessAnalyzer::Analyzer` and the
+# `AWS::AccessAnalyzer::ArchiveRule` of one a stack really creates there
+# (`state::provisioner::access_analyzer`): a suite that deploys one must have its owning service
+# mounted beside CloudFormation, or the create is refused and the stack fails — and the analyzer
+# and its archive rules are read back through that service's own wire.
+service-com-amazonaws-accessanalyzer-accessanalyzer = { workspace = true }
 
 [lints]
 workspace = true

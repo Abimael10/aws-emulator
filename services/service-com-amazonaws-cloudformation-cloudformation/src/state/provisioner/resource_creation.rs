@@ -1227,6 +1227,15 @@ impl Provisioner {
             Self::BackupGatewayHypervisor => {
                 create_backup_gateway_hypervisor(ctx, region, resource, propagated).await
             }
+            // `AWS::AccessAnalyzer::Analyzer` publishes `Tags`, which `CreateAnalyzer` takes as
+            // the `TagsMap` of its own, so an analyzer a stack creates carries the tags
+            // CloudFormation gives it beside the ones its declaration asks for. An
+            // `AWS::AccessAnalyzer::ArchiveRule` publishes none at all — `CreateArchiveRule`
+            // takes no tags and that service holds none on a rule — so none are propagated to
+            // one, which that arm decides from the kind it carries.
+            Self::AccessAnalyzerResource(kind) => {
+                create_access_analyzer_resource(ctx, region, kind, resource, propagated).await
+            }
             // `AWS::Rekognition::Collection` publishes `Tags`, and `CreateCollection` takes a
             // `TagMap` of its own, so a collection a stack creates carries the tags
             // CloudFormation gives it beside the ones the declaration asks for.

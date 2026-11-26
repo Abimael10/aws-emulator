@@ -986,6 +986,16 @@ pub(super) fn database_port(
 /// single lookup when this list grows enough to make that worth it.
 pub(super) fn declared_name_property(resource_type: &str) -> Option<&'static str> {
     match resource_type {
+        // IAM Access Analyzer's `CreateArchiveRule` takes the rule's own name as its `ruleName`
+        // member — the name every call of that service on a rule addresses it by — so
+        // `AWS::AccessAnalyzer::ArchiveRule` publishes `RuleName`, where the type's last
+        // segment is `ArchiveRule`: neither `ArchiveRuleName` nor `Name` finds it, and a
+        // generated `<stack>-<logical id>-<unique id>` would name no rule that service holds.
+        // (The ANALYZER's own `AnalyzerName` IS the convention, its last segment being
+        // `Analyzer`.)
+        crate::state::provisioner::access_analyzer::ACCESSANALYZER_ARCHIVE_RULE => {
+            Some(crate::state::provisioner::access_analyzer::RULE_NAME_PROPERTY)
+        }
         "AWS::BedrockAgentCore::Runtime" => Some("AgentRuntimeName"),
         // Amazon Bedrock Data Automation's `CreateDataAutomationProject` takes a `projectName`
         // and `CreateDataAutomationLibrary` a `libraryName`, so each type takes `ProjectName` /

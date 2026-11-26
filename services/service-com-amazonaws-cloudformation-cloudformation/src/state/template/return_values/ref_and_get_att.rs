@@ -2875,6 +2875,54 @@ pub(crate) fn return_values(
             attributes.insert("HypervisorArn".to_string(), arn.clone());
             (arn, attributes)
         }
+        // IAM Access Analyzer's own control plane: the analyzer an `AWS::AccessAnalyzer::Analyzer`
+        // declares. "Ref returns the ARN of the analyzer" (the type's primary identifier); Fn::GetAtt
+        // reads `Arn`. That ARN is built around the NAME the declaration states — the name every
+        // call of that service on an analyzer takes — so it is a value these naming rules compute
+        // rather than a stand-in: the create answers the same ARN, both being built from the one
+        // account id this emulator mints.
+        access_analyzer::ACCESSANALYZER_ANALYZER => {
+            let arn = access_analyzer::analyzer_arn(region, name);
+            attributes.insert(
+                access_analyzer::ACCESS_ANALYZER_ARN_ATTRIBUTE.to_string(),
+                arn.clone(),
+            );
+            (arn, attributes)
+        }
+        // The archive rule of such an analyzer, which an `AWS::AccessAnalyzer::ArchiveRule`
+        // declares. A rule is a resource OF the analyzer — every call of that service on one
+        // binds the analyzer as its URI label beside the rule's own name — so its identity is
+        // the analyzer's ARN with the rule's name beneath it, over the analyzer the declaration
+        // names (by name, or as the ARN a `Ref` of a declared analyzer resolves to). Its two
+        // INSTANTS are that service's clock, so what the rules give the resource is a stand-in
+        // ([`service_assigned_document`]) that `super::provisioning` re-points at what that
+        // service reported for the rule
+        // ([`super::provisioner::Provisioner::AccessAnalyzerResource`]).
+        access_analyzer::ACCESSANALYZER_ARCHIVE_RULE => {
+            let declared_analyzer = properties
+                .get(access_analyzer::ANALYZER_NAME_PROPERTY)
+                .and_then(|value| text(value, scope, 0, budget))
+                .unwrap_or_default();
+            let arn = access_analyzer::archive_rule_arn(
+                region,
+                access_analyzer::declared_analyzer_name(&declared_analyzer),
+                name,
+            );
+            attributes.insert(
+                access_analyzer::ACCESS_ANALYZER_ARN_ATTRIBUTE.to_string(),
+                arn.clone(),
+            );
+            for instant in [
+                access_analyzer::ARCHIVE_RULE_CREATED_AT_ATTRIBUTE,
+                access_analyzer::ARCHIVE_RULE_UPDATED_AT_ATTRIBUTE,
+            ] {
+                attributes.insert(
+                    instant.to_string(),
+                    service_assigned_document(name, instant),
+                );
+            }
+            (arn, attributes)
+        }
         // AWS Network Security Manager's own control plane: the rule, the template, the
         // policy and the scope an `AWS::NetworkSecurityManager::*` declares. "Ref returns the
         // ARN" of the entity — each type's primary identifier, and the `…Identifier` every
