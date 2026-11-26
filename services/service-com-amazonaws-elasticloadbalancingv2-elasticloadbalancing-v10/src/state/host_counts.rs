@@ -41,7 +41,9 @@
 //!   one the registration itself names ("the port on which the target is listening",
 //!   `TargetDescription$Port`, the target group's own port where the registration takes it)
 //!   beside the ones that instance's guest is listening on ([`guest_ports_behind`], the very
-//!   fact a `forward` to such a target is served from);
+//!   fact a `forward` to such a target is served from). A registration whose workload's ports
+//!   nothing holds at all is not failed for its port: what a check CONNECTS to is contradicted
+//!   only by ports something behind the registration is positively held to be listening on;
 //! * a registration the security groups governing it admit no connection to on that port from
 //!   the load balancer doing the checking fails every check too: a check that cannot arrive
 //!   is answered by nothing. Those groups are the ones the scheduler running the workload
@@ -1151,7 +1153,13 @@ fn observation(
 /// of this account ([`listens_on_health_check_port`] says what follows for each). A
 /// registration no instance of this account is reported RUNNING behind is ABSENT from the
 /// answer rather than present with no ports: nothing of what it runs is known, and nothing is
-/// failed on silence.
+/// failed on silence. So is one whose instance EC2 does not know the listening ports of at all
+/// — a guest whose own program asked for something that service performs nothing of, which
+/// may have been asking it to serve
+/// (`ComAmazonawsEc2Amazonec2State::instance_guest_listening_is_known`): what that machine
+/// listens on is not the servers EC2 holds for it, so no port of it is a port nothing answers
+/// on. An instance present with an EMPTY list is one EC2 does know: it is up, its own program
+/// was performed in full and it runs no server at all.
 ///
 /// Bounded by the registrations of the pass ([`MAX_CHECKS_PER_PASS`]) rather than by the size
 /// of the inventory, and read under the guard the pass already holds.
@@ -1171,6 +1179,9 @@ fn guest_ports_behind(
         {
             continue;
         }
+        if !store.instance_guest_listening_is_known(&target.id) {
+            continue;
+        }
         listening.insert(
             target.id.clone(),
             store.instance_guest_server_ports(&target.id),
@@ -1188,9 +1199,11 @@ struct Inventory {
     /// The ports the GUEST behind each checked `instance` registration is listening on, keyed
     /// by that registration's own target id ([`guest_ports_behind`]).
     ///
-    /// A registration absent from this is one no running instance of this account is reported
-    /// behind, whose listening ports are therefore not known; one present with an empty list
-    /// is an instance that is up and running no server at all.
+    /// A registration absent from this is one whose listening ports are not known: no running
+    /// instance of this account is reported behind it, or the instance behind it is one EC2
+    /// knows the ports of no better ([`guest_ports_behind`]). One present with an empty list is
+    /// an instance that is up, whose own program was performed in full, and that runs no server
+    /// at all.
     guest_ports: HashMap<String, Vec<i32>>,
     /// Every `VpcId` the inventory holds.
     vpcs: HashSet<String>,
@@ -1349,13 +1362,23 @@ fn observe(target: &Checked, held: Option<&Inventory>) -> Observation {
 ///
 /// A port none of them names is a port nothing answers on, so every check of it fails and the
 /// registration reaches the `unhealthy` its group's own `UnhealthyThresholdCount` takes.
-/// `true` wherever the question is not decided, because nothing is failed on silence: a check
-/// whose port no number names, a registration naming no instance this account reports
-/// RUNNING — what such a registration stands for is decided by [`observe`] instead — and every
-/// registration naming an ADDRESS whose ports nothing declared, since what listens at an
-/// address is whatever holds it, including a workload another service runs and records its own
-/// server for (`::service_common::served_http_addresses`), which no port of this store is a
-/// statement about.
+/// `true` wherever the question is not decided, because nothing is failed on silence — a check
+/// is failed for its port only against ports something behind the registration is POSITIVELY
+/// held to be listening on, never against a list this emulator could not read:
+///
+/// * a check whose port no number names;
+/// * a registration naming no instance this account reports RUNNING — what such a registration
+///   stands for is decided by [`observe`] instead;
+/// * a registration naming an instance whose listening ports EC2 does not know
+///   ([`guest_ports_behind`]), which is a guest whose own program asked for something this
+///   emulator performs nothing of: the port the registration names is taken on the caller's
+///   word, and the group's own `HealthCheckPort` — "the port the load balancer uses when
+///   performing health checks on targets" — is a statement of the same kind about the same
+///   workload, so neither is contradicted by a reading that holds no port of it at all;
+/// * every registration naming an ADDRESS whose ports nothing declared, since what listens at
+///   an address is whatever holds it, including a workload another service runs and records its
+///   own server for (`::service_common::served_http_addresses`), which no port of this store is
+///   a statement about.
 fn listens_on_health_check_port(target: &Checked, held: Option<&Inventory>) -> bool {
     if let Some(declared) = target.serves_health_check_port {
         return declared;
@@ -1366,8 +1389,9 @@ fn listens_on_health_check_port(target: &Checked, held: Option<&Inventory>) -> b
     let Some(port) = target.health_check_port else {
         return true;
     };
-    // Only an instance this account reports running has its ports known at all: what it is
-    // listening on is what Amazon EC2 holds for it ([`guest_ports_behind`]).
+    // Only an instance this account reports running, and reports the listening ports OF, has
+    // them known at all: what it is listening on is what Amazon EC2 holds for it
+    // ([`guest_ports_behind`]).
     let Some(guest_ports) = held.and_then(|held| held.guest_ports(target)) else {
         return true;
     };
@@ -2019,8 +2043,8 @@ mod tests {
     ///
     /// The rows span the check reaching the port the registration names, a port only the guest
     /// holds a server on, a port neither holds, an instance running no server at all, an
-    /// instance this account does not report running, and a registration naming an address
-    /// rather than an instance.
+    /// instance whose listening ports this account does not know, and a registration naming an
+    /// address rather than an instance.
     #[test]
     fn a_check_is_answered_only_on_a_port_something_behind_the_registration_listens_on() {
         let instance = "i-0123456789abcdef0".to_string();
@@ -2047,8 +2071,8 @@ mod tests {
                 expected: Some(true),
             },
             PortRow {
-                case: "the recorded configuration: a health-check port of its own that nothing \
-                       behind the instance listens on",
+                case: "an instance running no server at all, checked on a health-check port of \
+                       its own",
                 target_type: INSTANCE_TARGET_TYPE,
                 id: instance.clone(),
                 guest_ports: Some(Vec::new()),
@@ -2073,8 +2097,8 @@ mod tests {
                 expected: Some(false),
             },
             PortRow {
-                case: "an instance this account does not report running, checked beside the \
-                       port its registration names",
+                case: "an instance whose listening ports this account does not know, checked \
+                       beside the port its registration names",
                 target_type: INSTANCE_TARGET_TYPE,
                 id: instance.clone(),
                 guest_ports: None,

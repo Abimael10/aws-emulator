@@ -1199,6 +1199,9 @@ pub struct ShellSession {
     /// bounds the walk, so the recursion a single program text could drive would be bounded by
     /// the length of that text alone.
     arithmetic_depth: usize,
+    /// How many commands of this program named something NOTHING resolved — see
+    /// [`Self::unresolved_commands`].
+    unresolved_commands: usize,
 }
 
 /// What a `break` or a `continue` asked for: which of the two it was, and how many enclosing
@@ -1386,6 +1389,7 @@ impl ShellSession {
             last_status: 0,
             positional: Vec::new(),
             arithmetic_depth: 0,
+            unresolved_commands: 0,
             config,
         };
         for (name, value) in variables {
@@ -1582,6 +1586,22 @@ impl ShellSession {
     #[must_use]
     pub fn exit_status(&self) -> Option<i32> {
         self.exit_status
+    }
+
+    /// How many commands of this program named something NOTHING resolved: no utility of this
+    /// session's own catalogs, no program of the environment it runs in and no file of the
+    /// tree it works over, so the command did not run at all
+    /// ([`Self::command_not_found`] is where each is counted).
+    ///
+    /// For a caller that has to know whether what its program DID is the whole of what it
+    /// asked for: a count of nothing means every command of it was performed here, and any
+    /// count above that means the program asked for something this environment provides
+    /// nothing of — whose effect, whatever the program wanted of it, is held nowhere. A
+    /// caller reporting state the program may have changed reads this to tell what it holds
+    /// from what it merely did not see.
+    #[must_use]
+    pub fn unresolved_commands(&self) -> usize {
+        self.unresolved_commands
     }
 
     /// The lines this session's `echo` commands wrote, in the order they wrote them. Empty
@@ -2792,6 +2812,7 @@ impl ShellSession {
     /// status with nothing written for it would leave a caller unable to tell a command this
     /// environment does not have from one that ran and wrote nothing.
     fn command_not_found(&mut self, name: &str, redirections: &Redirections) -> i32 {
+        self.unresolved_commands = self.unresolved_commands.saturating_add(1);
         let _ = self.write_stderr(
             &format!("{SHELL_NAME}: {name}: {COMMAND_NOT_FOUND}\n"),
             redirections,

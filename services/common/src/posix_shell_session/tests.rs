@@ -2383,6 +2383,39 @@ fn a_command_nothing_resolved_says_so_on_standard_error() {
     );
 }
 
+/// RULE: a session COUNTS the commands of its program that named something nothing resolved,
+/// so a caller can tell a program this session performed in full from one that asked for
+/// something this environment provides none of — whose effect is held nowhere.
+///
+/// The rows differ along what the rule generalises over: a program every command of which ran,
+/// one command nothing resolved, several of them, a program that mixes the two, one whose
+/// unresolved command stands inside a pipeline, and one reached through a wrapper.
+#[test]
+fn a_session_counts_the_commands_nothing_resolved() {
+    // (case, the program, how many of its commands named something nothing resolved)
+    let rows: &[(&str, &str, usize)] = &[
+        ("a program every command of which ran", "echo kept\necho again", 0),
+        ("one command nothing resolved", "jq", 1),
+        ("two of them", "jq\ncurl https://example.invalid", 2),
+        (
+            "a program that mixes the two",
+            "echo kept\n/opt/sidecar --listen 9090\necho again",
+            1,
+        ),
+        ("one inside a pipeline", "jq . | cat", 1),
+        ("one reached through a wrapper", "nohup jq -r .", 1),
+        ("no program at all", "", 0),
+    ];
+    for (case, program, expected) in rows {
+        let held = run(program);
+        let counted = held.unresolved_commands();
+        assert_eq!(
+            counted, *expected,
+            "case {case:?}: expected {expected} unresolved command(s), got {counted}"
+        );
+    }
+}
+
 /// RULE: `set` turns the shell OPTIONS its words name on and off, and the options hold for
 /// the commands AFTER it — `-e` ends the program at the first command that fails other than
 /// one whose status the program itself reads, `-u` makes the expansion of a variable the

@@ -933,6 +933,11 @@ fn run_guest_program(
             break;
         }
     }
+    // What this program ASKED FOR that this emulator has no program of: such a command did not
+    // run, so whatever it was there to do — including starting a server of its own — is held
+    // nowhere, and what this guest is listening on is therefore not the whole of what it runs
+    // ([`super::guest_services::GuestRuntime::unperformed_program`]).
+    services.note_unresolved_commands(session.unresolved_commands());
     let logged: Vec<String> = session.output().to_vec();
     let volume = session.into_volume().unwrap_or_default();
     let mut written: Vec<GuestOutput> = volume

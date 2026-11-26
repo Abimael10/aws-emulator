@@ -190,6 +190,22 @@ pub struct GuestRuntime {
     /// filesystem holds against that file, which is what `fallocate` takes and what the
     /// filesystem reports in use from then on.
     pub reserved: BTreeMap<String, i64>,
+    /// Whether this boot's own program asked for a command this emulator performs NOTHING of
+    /// — a program name nothing of the guest resolved
+    /// (`::service_common::posix_shell_session::ShellSession::unresolved_commands`).
+    ///
+    /// What it decides is how much [`Self::listening`] is worth as a statement about the
+    /// machine: a guest whose program was performed in full is listening on exactly the ports
+    /// of the servers recorded there, while one that asked for a program this emulator does
+    /// not have may have been asking that program to serve — so what such a guest listens on
+    /// is NOT known, which every reader of its ports has to tell apart from a guest known to
+    /// listen on none
+    /// ([`ComAmazonawsEc2Amazonec2State::instance_guest_listening_is_known`]).
+    ///
+    /// A fact of the BOOT, so it does not survive one ([`Self::restarted`]): what a program of
+    /// an earlier boot started is gone with that boot, and the units the init system brings up
+    /// again are ones this emulator holds.
+    pub unperformed_program: bool,
 }
 
 impl GuestRuntime {
@@ -214,6 +230,11 @@ impl GuestRuntime {
             // The space a file holds on the filesystem is on the machine's storage, so it
             // survives a boot exactly as the file it was reserved for does.
             reserved: self.reserved.clone(),
+            // What a program of the EARLIER boot asked for is not what this machine runs now:
+            // the servers it has are the ones the init system started again, which this
+            // emulator holds — so what it listens on is known again until this boot's own
+            // program asks for something this emulator does not have.
+            unperformed_program: false,
         };
         for unit in &self.enabled {
             if let Some(package) = package_named(unit) {
@@ -307,6 +328,14 @@ impl GuestServices {
     #[must_use]
     pub fn taken(&self) -> GuestRuntime {
         self.held().clone()
+    }
+
+    /// Record that the program performed over these services asked for `commands` commands
+    /// nothing of this guest resolved ([`GuestRuntime::unperformed_program`]).
+    pub fn note_unresolved_commands(&self, commands: usize) {
+        if commands > 0 {
+            self.held().unperformed_program = true;
+        }
     }
 
     /// The shared runtime. A guard another thread panicked while holding still holds this
@@ -1412,11 +1441,39 @@ impl ComAmazonawsEc2Amazonec2State {
     /// What another service asks to learn which ports of a registered instance anything
     /// answers on — a load balancer's health check of a target reads exactly this. A READ:
     /// nothing about the instance moves.
+    ///
+    /// Read beside [`Self::instance_guest_listening_is_known`]: an empty answer is a guest
+    /// running no server this emulator holds, which is a statement that nothing listens only
+    /// for a guest whose own program this emulator performed in full.
     #[must_use]
     pub fn instance_guest_server_ports(&self, instance_id: &str) -> Vec<i32> {
         self.serving_instance(instance_id)
             .map(|instance| instance.guest_runtime.listening.keys().copied().collect())
             .unwrap_or_default()
+    }
+
+    /// Whether what the guest of the instance `instance_id` names is LISTENING on is known at
+    /// all — which is what makes [`Self::instance_guest_server_ports`] the whole truth about
+    /// that machine's ports rather than the part of it this emulator could read.
+    ///
+    /// It is known for a guest whose own program was performed here in full: what such a
+    /// machine runs is what that program installed and started, and this emulator holds every
+    /// one of those servers ([`GuestRuntime::listening`]) — including the empty case, a
+    /// machine given no program of its own, which runs nothing and listens on nothing.
+    ///
+    /// It is NOT known for a guest whose program asked for a command this emulator performs
+    /// nothing of ([`GuestRuntime::unperformed_program`]): a program an instance behind a load
+    /// balancer runs is there to serve something, so a machine that asked for one this
+    /// emulator does not have may be listening on a port no record of it names. A caller that
+    /// would otherwise read "no server on that port" out of this store reads that as the
+    /// silence it is.
+    ///
+    /// `false` for an id this store holds no SERVING instance for, whose ports are not known
+    /// either: nothing of what an instance that is not up runs is held anywhere.
+    #[must_use]
+    pub fn instance_guest_listening_is_known(&self, instance_id: &str) -> bool {
+        self.serving_instance(instance_id)
+            .is_some_and(|instance| !instance.guest_runtime.unperformed_program)
     }
 
     /// What the guest of the instance `instance_id` names answers for a request for `path`
