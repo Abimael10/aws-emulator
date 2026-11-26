@@ -71,6 +71,10 @@ pub mod guest_machine;
 /// a published endpoint hands it.
 pub mod guest_runtime;
 
+/// The guest of an image whose command starts an interpreter's own HTTP FILE-SERVER
+/// module: what that server answers out of the MicroVM's filesystem.
+pub mod guest_file_server;
+
 /// The network a MicroVM's guest reaches: which outbound connection its
 /// `egressNetworkConnectors` carry, and what the guest observes of the one they do.
 pub mod microvm_network;

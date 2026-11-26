@@ -201,7 +201,9 @@ impl GuestMachine {
         let machine = Self {
             boot_id,
             hostname,
-            entry: program.map(|program| program.entry.clone()).unwrap_or_default(),
+            entry: program
+                .map(|program| program.entry().to_string())
+                .unwrap_or_default(),
             arch: guest_arch(architecture),
             env: Self::environment(env),
             booted_at,
@@ -228,7 +230,10 @@ impl GuestMachine {
     /// Seed what the machine published to its guest before any of the guest's own code
     /// ran: its directories, the MODULES its image's build produced (under the working
     /// directory its command runs from, which is where a container's build context is
-    /// copied), and the kernel's own read-only entries.
+    /// copied), the FILES that image holds at the absolute path each is at
+    /// ([`super::guest_program::GuestProgram::files`] — what the build's own steps wrote,
+    /// which is where a context materialises the content its guest serves), and the
+    /// kernel's own read-only entries.
     fn seed(&self, program: Option<&super::guest_program::GuestProgram>, now: Instant) {
         let mut files = self.hold();
         for directory in SEEDED_DIRECTORIES {
@@ -240,6 +245,13 @@ impl GuestMachine {
             // module past this machine's bounds is not seeded, which the guest reads as
             // the absent file it is.
             let _ = files.put_file(&format!("{GUEST_WORKING_DIRECTORY}/{path}"), source);
+        }
+        for (path, source) in program.map(|program| &program.files).into_iter().flatten() {
+            // The FILESYSTEM the image holds, at the absolute path each file is at: the
+            // build context where the command runs from, and what the build's own steps
+            // wrote, where each wrote it ([`super::guest_program::GuestProgram::files`]).
+            // It is what a guest SERVES as well as what it runs.
+            let _ = files.put_file(path, source);
         }
         let _ = files.seal_file(BOOT_ID_PATH, &format!("{}\n", self.boot_id));
         let _ = files.seal_file(HOSTNAME_PATH, &format!("{}\n", self.hostname));
@@ -348,6 +360,13 @@ impl GuestMachine {
         self.hold().read(&self.at(path))
     }
 
+    /// The names directly under the DIRECTORY `path` names, each once and in path order —
+    /// what a program or a server that LISTS a directory of this machine answers out of.
+    #[must_use]
+    pub fn entry_names(&self, path: &str) -> Vec<String> {
+        self.hold().entry_names(&self.at(path))
+    }
+
     /// Write `contents` at `path`, replacing what is there or appending to it. `false` is
     /// a write that did not happen: a sealed path, a directory, a path whose directory
     /// the machine does not have, or one past this machine's bounds.
@@ -440,8 +459,11 @@ mod tests {
                 .into_iter()
                 .map(|(path, source)| (path.to_string(), source.to_string()))
                 .collect(),
-            entry: entry.to_string(),
-            language: super::super::guest_program::GuestLanguage::JavaScript,
+            files: BTreeMap::new(),
+            start: super::super::guest_program::GuestStart::Module {
+                entry: entry.to_string(),
+                language: super::super::guest_program::GuestLanguage::JavaScript,
+            },
         }
     }
 

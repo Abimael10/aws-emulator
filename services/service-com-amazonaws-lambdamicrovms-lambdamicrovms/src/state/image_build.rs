@@ -114,6 +114,14 @@ pub fn perform(bytes: &[u8], key: &str) -> Built {
         return Built::default();
     };
     let steps = build_steps(&spec);
+    // The context the tree is seeded with below, by the path each entry is seeded at: what
+    // the steps LEFT is what the tree holds that is not one of these, since the artifact's
+    // own entries are the image's under the directory its command runs from rather than at
+    // the root the steps ran in ([`super::guest_program`] holds both).
+    let seeded: BTreeMap<String, String> = entries
+        .iter()
+        .map(|entry| (format!("/{}", entry.path), entry.source.clone()))
+        .collect();
     // The tree the steps run over is the build context: the artifact's own files, so a
     // step reads what the artifact holds rather than an empty directory. It is the IMAGE's
     // own storage, bounded by what a MicroVM's machine holds
@@ -148,6 +156,9 @@ pub fn perform(bytes: &[u8], key: &str) -> Built {
         .into_volume()
         .map(|tree| {
             tree.stored_files()
+                .filter(|(path, contents)| {
+                    seeded.get(*path).map(String::as_str) != Some(*contents)
+                })
                 .map(|(path, contents)| (path.to_string(), contents.to_string()))
                 .collect()
         })
@@ -168,17 +179,27 @@ pub fn refuted(bytes: &[u8], key: &str) -> Option<String> {
     perform(bytes, key).failure_reason
 }
 
-/// The build steps `dockerfile` declares, in the order the builder performs them: the
-/// command of every `RUN` instruction it carries.
+/// How many INSTRUCTIONS of one specification are read.
 ///
-/// An instruction continued over several lines with a trailing `\` is ONE step, as the
-/// builder reads it, and a comment line is none. Both forms a `RUN` is written in are
-/// read: the shell form (`RUN make build`) and the JSON array form (`RUN ["make",
-/// "build"]`), whose words make up the one command line.
-fn build_steps(dockerfile: &str) -> Vec<String> {
-    let mut steps: Vec<String> = Vec::new();
+/// The specification is the caller's own text, so what reading one can cost is bounded —
+/// well above any image's instruction count, and far below what would cost this process
+/// anything noticeable. An instruction past the budget is not read at all.
+const MAX_INSTRUCTIONS: usize = 1_024;
+
+/// The INSTRUCTIONS `dockerfile` declares, in order, each as `(NAME, arguments)` with the
+/// name upper-cased: the ONE reading of a container specification's instruction lines in
+/// this service, which [`super::guest_program`] reads the command the image STARTS out of.
+///
+/// An instruction continued over several lines with a trailing `\` is ONE instruction, as
+/// the builder reads it, and a comment line is none. An instruction carrying no argument at
+/// all declares nothing and is left out.
+pub(super) fn instructions(dockerfile: &str) -> Vec<(String, String)> {
+    let mut declared: Vec<(String, String)> = Vec::new();
     let mut joined = String::new();
     for line in dockerfile.lines() {
+        if declared.len() >= MAX_INSTRUCTIONS {
+            return declared;
+        }
         let trimmed = line.trim();
         if joined.is_empty() && (trimmed.is_empty() || trimmed.starts_with('#')) {
             continue;
@@ -194,30 +215,44 @@ fn build_steps(dockerfile: &str) -> Vec<String> {
             }
         }
         let instruction = std::mem::take(&mut joined);
-        if let Some(step) = run_command(&instruction) {
-            steps.push(step);
-            if steps.len() >= MAX_BUILD_STEPS {
-                break;
-            }
+        if let Some(named) = named_instruction(&instruction) {
+            declared.push(named);
         }
     }
     // An instruction left open by a trailing `\` at the end of the file is still the
     // instruction the context declared.
-    if let Some(step) = run_command(joined.trim()) {
-        if steps.len() < MAX_BUILD_STEPS {
-            steps.push(step);
+    if let Some(named) = named_instruction(joined.trim()) {
+        if declared.len() < MAX_INSTRUCTIONS {
+            declared.push(named);
         }
     }
-    steps
+    declared
 }
 
-/// The command one instruction runs, or `None` for an instruction that is not a `RUN`.
-fn run_command(instruction: &str) -> Option<String> {
+/// One instruction as its NAME and its arguments, and `None` for a line that declares
+/// neither.
+fn named_instruction(instruction: &str) -> Option<(String, String)> {
     let (name, arguments) = instruction.split_once(char::is_whitespace)?;
-    if !name.eq_ignore_ascii_case(RUN_INSTRUCTION) {
-        return None;
-    }
     let arguments = arguments.trim();
+    (!arguments.is_empty()).then(|| (name.to_ascii_uppercase(), arguments.to_string()))
+}
+
+/// The build steps `dockerfile` declares, in the order the builder performs them: the
+/// command of every `RUN` instruction it carries ([`instructions`] reads the lines).
+///
+/// Both forms a `RUN` is written in are read: the shell form (`RUN make build`) and the
+/// JSON array form (`RUN ["make", "build"]`), whose words make up the one command line.
+fn build_steps(dockerfile: &str) -> Vec<String> {
+    instructions(dockerfile)
+        .into_iter()
+        .filter(|(name, _)| name == RUN_INSTRUCTION)
+        .filter_map(|(_, arguments)| run_command(&arguments))
+        .take(MAX_BUILD_STEPS)
+        .collect()
+}
+
+/// The command a `RUN`'s `arguments` run, in either form they are written in.
+fn run_command(arguments: &str) -> Option<String> {
     let command = match exec_form_words(arguments) {
         Some(words) => words.join(" "),
         None => arguments.to_string(),
@@ -225,9 +260,14 @@ fn run_command(instruction: &str) -> Option<String> {
     (!command.is_empty()).then_some(command)
 }
 
-/// The words of a `RUN` written in JSON array form (`["make", "build"]`), and `None` for
-/// one written in shell form.
-fn exec_form_words(arguments: &str) -> Option<Vec<String>> {
+/// The words of an instruction written in JSON array form — the EXEC form, which a `RUN`
+/// (`["make", "build"]`) and the instruction that declares the container's own command
+/// (`["/bin/sh", "-c", "…"]`) are both written in — and `None` for one written in shell
+/// form.
+///
+/// The ONE reading of that form in this service: [`super::guest_program`] reads the command
+/// the image STARTS out of the same spelling.
+pub(super) fn exec_form_words(arguments: &str) -> Option<Vec<String>> {
     let parsed: ::serde_json::Value = ::serde_json::from_str(arguments).ok()?;
     let words = parsed.as_array()?;
     words
@@ -368,6 +408,16 @@ mod tests {
             found.map(|(path, source)| (path.as_str(), source.as_str())),
             Some(("/srv/server.js", "baked\n")),
             "expected the file the step wrote, got {:?}",
+            built.files
+        );
+        // The context the steps ran over is the artifact's own, which the image holds where
+        // its command runs from rather than at the root: a step left none of it.
+        assert!(
+            !built
+                .files
+                .iter()
+                .any(|(path, _)| path == &format!("/{CONTAINER_SPEC}")),
+            "expected the context the steps ran over not to be reported as left, got {:?}",
             built.files
         );
     }

@@ -17131,6 +17131,7 @@ dependencies = [
 name = "service-com-amazonaws-lambdamicrovms-lambdamicrovms"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",

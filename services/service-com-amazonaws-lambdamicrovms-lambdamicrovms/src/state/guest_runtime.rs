@@ -92,7 +92,7 @@ use ::rquickjs::function::Func;
 use ::rquickjs::{CatchResultExt, Context, Ctx, Function, Object, Runtime};
 
 use super::guest_machine::GuestMachine;
-use super::guest_program::{GuestLanguage, GuestProgram};
+use super::guest_program::{GuestLanguage, GuestProgram, GuestStart};
 use super::microvm_network::ConnectVerdict;
 use super::ComAmazonawsLambdamicrovmsLambdamicrovmsState as ServiceState;
 
@@ -357,30 +357,66 @@ fn serve_calls(
     bound: &::tokio::sync::watch::Sender<Option<Vec<i32>>>,
 ) {
     let seams = Seams::new(Arc::clone(machine));
-    // WHICH engine runs the guest is the image's own declaration, read off the module that
-    // starts it ([`super::guest_program::GuestLanguage`]): a program of a language this
-    // emulator embeds no engine for is a MicroVM nothing is listening inside of, which is
-    // what the endpoint then answers for.
-    let started = match program.language {
-        GuestLanguage::JavaScript => Engine::start(program, &seams),
-        GuestLanguage::Python => Err(super::guest_python::no_engine_for_a_python_guest()),
-    };
-    // What the guest bound is published whichever way its program ended, so nothing waits
+    let started = start_guest(program, &seams);
+    // What the guest bound is published whichever way its program started, so nothing waits
     // on a process that started no server at all.
-    let _ = bound.send(Some(
-        started
-            .as_ref()
-            .map(|engine| engine.ports.clone())
-            .unwrap_or_default(),
-    ));
+    let _ = bound.send(Some(started.ports()));
     while let Some(call) = queue.blocking_recv() {
         let outcome = match &started {
-            Ok(engine) => engine.answer(&seams, &call.request, &call.connects),
-            // A program that did not start answers nothing, however often it is asked:
+            Guest::Engine(engine) => engine.answer(&seams, &call.request, &call.connects),
+            // The interpreter's own server, answering out of the machine's filesystem.
+            Guest::Files(served) => {
+                super::guest_file_server::answer(machine, served, &call.request)
+            }
+            // A guest that did not start answers nothing, however often it is asked:
             // nothing is listening inside this MicroVM.
-            Err(outcome) => outcome.clone(),
+            Guest::None(outcome) => outcome.clone(),
         };
         let _ = call.reply.send(outcome);
+    }
+}
+
+/// What a guest PROCESS runs, once its image's own declaration has started it.
+enum Guest {
+    /// A program the embedded engine compiled and started.
+    Engine(Engine),
+    /// The interpreter's own HTTP file server, over the machine's filesystem
+    /// ([`super::guest_file_server`]).
+    Files(::service_common::static_web_servers::ServedModule),
+    /// Nothing runs inside this MicroVM: every request is answered with this.
+    None(GuestOutcome),
+}
+
+impl Guest {
+    /// The ports this guest is listening on, which is what the endpoint reads the port it
+    /// FRONTS from — empty where nothing is listening inside the MicroVM at all.
+    fn ports(&self) -> Vec<i32> {
+        match self {
+            Guest::Engine(engine) => engine.ports.clone(),
+            Guest::Files(served) => vec![served.port],
+            Guest::None(_) => Vec::new(),
+        }
+    }
+}
+
+/// START what the image's own container specification declares
+/// ([`super::guest_program::GuestStart`]): the module it names, in the engine that module's
+/// own suffix names, or the interpreter's own server where the command starts that instead.
+///
+/// A program of a language this emulator embeds no engine for is a MicroVM nothing is
+/// listening inside of, which is what the endpoint then answers for.
+fn start_guest(program: &GuestProgram, seams: &Seams) -> Guest {
+    match &program.start {
+        GuestStart::Module { language, .. } => match language {
+            GuestLanguage::JavaScript => match Engine::start(program, seams) {
+                Ok(engine) => Guest::Engine(engine),
+                Err(outcome) => Guest::None(outcome),
+            },
+            GuestLanguage::Python => {
+                Guest::None(super::guest_python::no_engine_for_a_python_guest())
+            }
+        },
+        GuestStart::FileServer(served) => Guest::Files(served.clone()),
     }
 }
 
@@ -778,7 +814,7 @@ fn hand_over(
     // From here on what runs is the GUEST's: its own modules, started the way its image's
     // command starts them, and the ports they bound are what it is listening on.
     match start
-        .call::<_, String>((modules, program.entry.clone()))
+        .call::<_, String>((modules, program.entry().to_string()))
         .catch(&ctx)
     {
         Ok(bound) => Ok(Started {
@@ -1971,8 +2007,11 @@ mod tests {
         modules.insert("index.js".to_string(), source.to_string());
         Arc::new(GuestProgram {
             modules,
-            entry: "index.js".to_string(),
-            language: GuestLanguage::JavaScript,
+            files: ::std::collections::BTreeMap::new(),
+            start: GuestStart::Module {
+                entry: "index.js".to_string(),
+                language: GuestLanguage::JavaScript,
+            },
         })
     }
 

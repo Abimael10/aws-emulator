@@ -45,6 +45,15 @@ aws-sdk-ec2 = { version = "1", default-features = false, features = ["rt-tokio",
 # so its own records are read through the engine both services live in — the seam
 # `service-com-amazonaws-lambda-awsgirapiservice` reads Amazon ECR's images through.
 service-com-amazonaws-lambdacore-lambdacoreapiservice = { workspace = true }
+# Amazon EC2, for the ONE reading of what a STATIC server answers for a request
+# (`state::guest_services::served_from`): a MicroVM whose image's command starts the
+# interpreter's own HTTP file-server module runs that server over the MicroVM's own
+# filesystem (`src/state/guest_file_server.rs`), and an Amazon EC2 instance's own static
+# server is answered through that same reading — so the two cannot drift apart. It is
+# mounted beside this service in the guest data-plane harness as well, where the subnet,
+# the destination interface and the security groups it holds are what decide a MicroVM's
+# outbound connection.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # Renders the calendar hour a MicroVM image version's state settled in, which is what the
 # recorded `versionStateTimeBucket` names (`src/state.rs`): no calendar arithmetic is
 # hand-written here.
@@ -86,6 +95,9 @@ rquickjs = "0.14"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs`, so this crate's suites are one test
+# target rooted at `tests/all/main.rs` and a new suite needs no declaration.
+automod = { workspace = true }
 # Builds the opaque `nextToken` candidates the pagination suites hand back.
 hex = { workspace = true }
 # Packages the .zip code artifact the guest suites stage, so a guest program reaches the
@@ -97,12 +109,6 @@ tokio = { workspace = true, features = ["time"] }
 # settles on the failure branch exactly when the object store does not serve its code
 # artifact can only be driven end to end with the owner of objects on the same engine.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
-# Amazon EC2, mounted beside this service in the guest data-plane harness: whether a
-# MicroVM's proxied outbound connection reaches an address is decided by the subnet, the
-# destination interface and the security groups EC2 holds, so it can only be driven end
-# to end with that owner on the same engine. (lambda-core, the other owner that harness
-# needs, is a regular dependency above: the MicroVM endpoint reads its connectors.)
-service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 
 [lints]
 workspace = true
