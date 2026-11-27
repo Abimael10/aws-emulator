@@ -244,6 +244,11 @@ impl Provisioner {
             // CERTIFICATE: a zone Route 53 does not hold is the same declaration naming a
             // zone that is not there, so it reads the same way here.
             Self::AcmCertificate => code.contains(NO_SUCH_HOSTED_ZONE),
+            // A crawler's Amazon S3 targets are the data it crawls, while the resource this
+            // handler manages is the CRAWLER: a bucket the object store answered it holds none
+            // of ([`super::glue_crawler_targets`]) is a declaration naming data that is not
+            // there, so it is in the same position.
+            Self::GlueCrawler => code == BUCKET_NOT_FOUND,
             _ => false,
         };
         if references_another_resource {

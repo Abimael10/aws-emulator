@@ -35,20 +35,20 @@ use crate::wire::{call, error_code, error_message, ok, REGION};
 /// How long the wait for a stack to settle lasts before it is given up on, and how often the
 /// status is looked at. The deadline is generous — what is waited for is the condition, not a
 /// span — so a loaded or a fast host reaches the same verdict.
-const STACK_DEADLINE: Duration = Duration::from_secs(60);
+pub(crate) const STACK_DEADLINE: Duration = Duration::from_secs(60);
 /// See [`STACK_DEADLINE`].
-const LOOK_INTERVAL: Duration = Duration::from_millis(50);
+pub(crate) const LOOK_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The stack statuses a create settles in: the healthy one, and the two a failed create rests
 /// in once the operation has unwound.
-const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
+pub(crate) const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
 /// See [`CREATE_COMPLETE`].
-const CREATE_FAILED: &str = "CREATE_FAILED";
+pub(crate) const CREATE_FAILED: &str = "CREATE_FAILED";
 /// See [`CREATE_COMPLETE`].
-const ROLLBACK_COMPLETE: &str = "ROLLBACK_COMPLETE";
+pub(crate) const ROLLBACK_COMPLETE: &str = "ROLLBACK_COMPLETE";
 
 /// The statuses the wait below stops at: every one a create can come to rest in.
-const TERMINAL_STACK_STATUSES: [&str; 4] = [
+pub(crate) const TERMINAL_STACK_STATUSES: [&str; 4] = [
     CREATE_COMPLETE,
     CREATE_FAILED,
     ROLLBACK_COMPLETE,
@@ -56,10 +56,10 @@ const TERMINAL_STACK_STATUSES: [&str; 4] = [
 ];
 
 /// The resource status a declared resource whose create its own service refused reports.
-const RESOURCE_CREATE_FAILED: &str = "CREATE_FAILED";
+pub(crate) const RESOURCE_CREATE_FAILED: &str = "CREATE_FAILED";
 
 /// An emulator with this service, CloudFormation, IAM and Amazon S3 on ONE shared engine.
-fn emulator_with_a_stack() -> MultiServiceRouter {
+pub(crate) fn emulator_with_a_stack() -> MultiServiceRouter {
     let engine: std::sync::Arc<engine::InMemoryEngine> =
         std::sync::Arc::new(engine::InMemoryEngine::new());
     let mut router = crate::wire::emulator_on(std::sync::Arc::clone(&engine));
@@ -82,7 +82,7 @@ fn emulator_with_a_stack() -> MultiServiceRouter {
 /// The CloudFormation client this suite deploys through, over the emulator's own in-process
 /// callback — the transport every emulated service reaches another through, so nothing outside
 /// this process is addressed.
-fn cloudformation_client(router: &MultiServiceRouter) -> aws_sdk_cloudformation::Client {
+pub(crate) fn cloudformation_client(router: &MultiServiceRouter) -> aws_sdk_cloudformation::Client {
     let callback = smithy_server_runtime::EmbeddedEmulator::from_router(router.clone());
     let config = aws_sdk_cloudformation::Config::builder()
         .behavior_version(aws_sdk_cloudformation::config::BehaviorVersion::latest())
@@ -216,8 +216,7 @@ async fn deployed_status(
     names: &Names,
     glue_can_assume_the_role: bool,
 ) -> String {
-    let client = cloudformation_client(router);
-    client
+    cloudformation_client(router)
         .create_stack()
         .stack_name(&names.stack)
         .template_body(template(names, glue_can_assume_the_role))
@@ -227,12 +226,26 @@ async fn deployed_status(
         .send()
         .await
         .unwrap_or_else(|error| panic!("case {case:?}: the stack must be accepted: {error:?}"));
+    settled_status(router, case, &names.stack).await
+}
 
+/// The status `stack` comes to rest in, waiting for a TERMINAL status rather than for a span.
+///
+/// Shared with every suite that deploys a crawler through CloudFormation
+/// ([`crate::cfn_deployed_crawler_absent_target`] drives the same wait over the class of
+/// declared Amazon S3 targets), so one wait cannot disagree with another about when a stack
+/// has settled.
+pub(crate) async fn settled_status(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack_name: &str,
+) -> String {
+    let client = cloudformation_client(router);
     let deadline = Instant::now() + STACK_DEADLINE;
     loop {
         let described = client
             .describe_stacks()
-            .stack_name(&names.stack)
+            .stack_name(stack_name)
             .send()
             .await
             .unwrap_or_else(|error| {
@@ -260,10 +273,14 @@ async fn deployed_status(
 }
 
 /// Every `ResourceStatusReason` the stack's events carry for a resource whose create FAILED.
-async fn failure_reasons(router: &MultiServiceRouter, case: &str, names: &Names) -> Vec<String> {
+pub(crate) async fn failure_reasons(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack_name: &str,
+) -> Vec<String> {
     let described = cloudformation_client(router)
         .describe_stack_events()
-        .stack_name(&names.stack)
+        .stack_name(stack_name)
         .send()
         .await
         .unwrap_or_else(|error| panic!("case {case:?}: the events must be readable: {error:?}"));
@@ -293,7 +310,7 @@ async fn a_stack_whose_crawler_role_trusts_glue_deploys() {
         status, CREATE_COMPLETE,
         "case {case:?}: expected the stack to deploy, it settled {status:?} with the failures \
          {:?}",
-        failure_reasons(&router, case, &names).await
+        failure_reasons(&router, case, &names.stack).await
     );
 
     let database = ok(
@@ -330,7 +347,7 @@ async fn a_stack_whose_crawler_role_glue_cannot_assume_is_rolled_back() {
         "case {case:?}: expected the stack to fail and unwind, it settled {status:?}"
     );
 
-    let reasons = failure_reasons(&router, case, &names).await;
+    let reasons = failure_reasons(&router, case, &names.stack).await;
     assert!(
         reasons
             .iter()

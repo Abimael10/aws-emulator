@@ -3408,6 +3408,11 @@ use appflow_connector_profiles::*;
 /// on one of the Data Catalog tables [`platform_services`] creates, which that service keys
 /// by the catalog, the database, the table and the optimizer's own type together.
 mod glue_table_optimizers;
+/// The AMAZON S3 TARGETS an `AWS::Glue::Crawler` declares its crawler over: resolved against
+/// this account's object store before the crawler [`platform_services`] creates is submitted,
+/// because a target is data the declaration REFERENCES rather than anything the crawler's own
+/// create brings into being.
+mod glue_crawler_targets;
 /// The AWS Glue TRIGGER arms: the trigger an `AWS::Glue::Trigger` declares, which is what
 /// starts the jobs [`platform_services`] creates. Visible to the rest of this service's state
 /// because the type's own NAME lives here, beside the arms that provision it, and the table of

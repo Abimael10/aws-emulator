@@ -3425,12 +3425,23 @@ pub(super) async fn describe_glue_table(
 /// CREATE alone, for the reason an `AWS::Glue::Job`'s does ([`create_glue_job`]): a
 /// crawler's tags are that service's own tagging calls rather than part of the configuration
 /// an update overwrites.
+///
+/// The Amazon S3 targets the declaration states are data it merely REFERENCES, so this
+/// provider resolves them against the account's own object store first and fails the resource
+/// for a target that is not there ([`super::glue_crawler_targets`]), exactly as the api
+/// providers resolve the definition object their declaration addresses.
 pub(super) async fn create_glue_crawler(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
     propagated: &[(String, String)],
 ) -> Result<Created, Refusal> {
+    if let Some(refusal) =
+        super::glue_crawler_targets::absent_target_refusal(ctx, region, &resource.properties)
+            .await
+    {
+        return Err(refusal);
+    }
     let mut request = glue_crawler_configuration(&resource.properties, &resource.physical_resource_id);
     let tags = tags_as_map(&tags_of(&resource.properties, propagated));
     if !tags.is_empty() {
@@ -3448,12 +3459,21 @@ pub(super) async fn create_glue_crawler(
 /// Every property of the type but its name and its tags is a member of `UpdateCrawler` too,
 /// so the declaration this deployment states IS that request, against the `Name` the crawler
 /// is held under.
+///
+/// A CHANGED declaration states the targets the crawler is to crawl from now on, so they are
+/// resolved exactly as the create's are ([`super::glue_crawler_targets`]): a deployment that
+/// re-points a crawler at data that is not there fails the resource rather than applying it.
 pub(super) async fn update_glue_crawler(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
     declared: &Value,
 ) -> Result<Created, Refusal> {
+    if let Some(refusal) =
+        super::glue_crawler_targets::absent_target_refusal(ctx, region, declared).await
+    {
+        return Err(refusal);
+    }
     let request = glue_crawler_configuration(declared, &resource.physical_resource_id);
     call_glue(ctx, region, "UpdateCrawler", &Value::Object(request)).await?;
     Ok(Created::default())
