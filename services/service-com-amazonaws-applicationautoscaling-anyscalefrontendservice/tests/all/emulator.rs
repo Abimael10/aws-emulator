@@ -248,9 +248,8 @@ impl Emulator {
     /// `ecs:service:DesiredCount` scalable target names it by.
     ///
     /// The cluster is given capacity because that is what lets the ECS scheduler PLACE the
-    /// tasks the service wants: a capacity movement this service performs is fulfilled when
-    /// the owning service reports the new count as running, so a cluster with nowhere to run a
-    /// task is an estate where no movement is ever fulfilled — which is what
+    /// tasks the service wants, so its `runningCount` reaches the count it is asked for. A
+    /// cluster with nowhere to run a task holds the count all the same, which is what
     /// [`Emulator::given_ecs_service_without_capacity`] is for.
     pub async fn given_ecs_service(
         &self,
@@ -438,8 +437,8 @@ impl Emulator {
     }
 
     /// The `runningCount` ECS reports for one service, as `DescribeServices` answers it: "the
-    /// number of tasks in the cluster that are in the RUNNING state", which is the capacity
-    /// actually in effect for `ecs:service:DesiredCount`.
+    /// number of tasks in the cluster that are in the RUNNING state", which is the count the
+    /// scheduler drives towards once it holds a new `desiredCount`.
     pub async fn ecs_running_count(&self, cluster: &str, service: &str) -> i64 {
         let (status, body) = self
             .call_ecs(

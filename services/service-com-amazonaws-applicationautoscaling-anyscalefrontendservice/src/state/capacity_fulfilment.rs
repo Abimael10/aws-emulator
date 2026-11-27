@@ -12,16 +12,24 @@
 //! service gives it ([`super::ACTIVITY_FULFILMENT`]) and reaches `Successful` once the capacity
 //! it set is the capacity the owning service holds for the scaled property.
 //!
-//! Setting the count is NOT the fulfilment of it. The count this service writes is what the
-//! owning service is asked FOR — `ecs:service:DesiredCount` is "the task count of an ECS
-//! service", and `Service$desiredCount` is "the desired number of instantiations of the task
-//! definition to keep running on the service", a number the request leaves behind the instant
-//! it is made — while the change being fulfilled is that service RUNNING the count:
-//! `Service$runningCount` is "the number of tasks in the cluster that are in the RUNNING
-//! state". So the movement waits for the owning service to catch its own desired count up, and
-//! an estate with nowhere to place the tasks — no capacity registered to the cluster, no
-//! address, no quota — is one where that never happens and the activity stays non-terminal,
-//! which is the whole of what the waiting message tells a client that is polling it.
+//! What gets fulfilled is the CHANGE, not the work the changed capacity implies. A scalable
+//! dimension "consists of the service namespace, resource type, and scaling property", and the
+//! property this one names is the task count of an ECS service
+//! (`RegisterScalableTarget$ScalableDimension`: "ecs:service:DesiredCount - The task count of an
+//! ECS service") — `Service$desiredCount`, "the desired number of instantiations of the task
+//! definition to keep running on the service". So the owning service has fulfilled the change
+//! once it HOLDS that property at the capacity the movement set, which is the one thing this
+//! service asked it for.
+//!
+//! What that service then does to honour the count is its own scheduling, and no part of the
+//! change: `Service$runningCount`, "the number of tasks in the cluster that are in the RUNNING
+//! state", catches the desired count up on that service's own clock, long after the change was
+//! taken on. A movement that waited for it would report the change as still on its way for as
+//! long as the placement took — and for ever on an estate with nowhere to place a task, which
+//! is a cluster whose scheduler has no capacity rather than a change Amazon ECS has not taken.
+//! Recorded behaviour says the same: a scaling activity of an ECS service carries an `EndTime`
+//! about a second after its `StartTime`, well before any task the new count asks for could have
+//! reached `RUNNING`.
 //!
 //! Which capacity the owning service holds is a fact only that service has, so it is READ
 //! there, once per pass ([`settle_activity_fulfilments`]), for the movements whose own span has
@@ -41,8 +49,8 @@ use super::{
     service_state, ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState, TargetKey,
 };
 
-/// The `ecs` namespace, whose owning service runs the capacity `ecs:service:DesiredCount`
-/// scales as the tasks behind `Service$runningCount`.
+/// The `ecs` namespace, whose owning service holds the capacity `ecs:service:DesiredCount`
+/// scales as `Service$desiredCount`.
 const ECS_NAMESPACE: &str = "ecs";
 
 /// Whether a movement of a target in this namespace has its fulfilment CONFIRMED in the
@@ -184,26 +192,26 @@ fn owner_has_fulfilled<Eng: Send + Sync + 'static>(
     }
 }
 
-/// Whether the ECS service an `ecs` `ResourceId` names is RUNNING the task count a movement
-/// set on it, which is what `ecs:service:DesiredCount` scales: a count the service has taken
-/// on as `Service$desiredCount` ("the desired number of instantiations of the task definition
-/// to keep running on the service") and reached as `Service$runningCount` ("the number of
-/// tasks in the cluster that are in the RUNNING state").
+/// Whether the ECS service an `ecs` `ResourceId` names HOLDS the task count a movement set on
+/// it, which is the property `ecs:service:DesiredCount` scales: `Service$desiredCount`, "the
+/// desired number of instantiations of the task definition to keep running on the service".
 ///
-/// A count the service is not RUNNING yet is a change still being fulfilled: the movement is
-/// queued for the owning service and delivered with this service's lock released
-/// (`super::policy_execution::deliver_pending_capacity`), its scheduler then has to place or
-/// stop the tasks the new count asks for, and an estate with nowhere to place them is one
-/// where the count is never reached at all — which is a movement whose capacity never took
-/// effect, not a fulfilled one. A LATER movement of the same target, which leaves the service
-/// driving towards ITS capacity instead, resolves this activity as overridden rather than
-/// fulfilled
+/// A count the service does not hold yet is a change still on its way: the movement is queued
+/// for the owning service and delivered with this service's lock released
+/// (`super::policy_execution::deliver_pending_capacity`), so the count is read back here rather
+/// than assumed from the queueing. A LATER movement of the same target, which leaves the
+/// service driving towards ITS capacity instead, resolves this activity as overridden rather
+/// than fulfilled
 /// (`super::ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState::override_unfulfilled_activities`).
 ///
-/// The placements and stops the ECS clock has already made due are materialised by the pass
-/// before the counts are read ([`settle_owner_clocks`]): they were owed at an instant of that
-/// service's own, whether or not anybody called it, so reading without taking them would
-/// report a count that was already reached as outstanding.
+/// What the scheduler then does to honour that count — placing or stopping the tasks it asks
+/// for, which is what `Service$runningCount` reports — is the owning service's own work and no
+/// part of the change this movement made; see the module docs.
+///
+/// What the ECS clock has already made due is materialised by the pass before the count is read
+/// ([`settle_owner_clocks`]): it was owed at an instant of that service's own, whether or not
+/// anybody called it, so reading without taking it would report a change already taken on as
+/// outstanding.
 ///
 /// There is nothing to wait on — so the movement is as fulfilled as it will get — where that
 /// count says nothing about this movement at all: a resource id that names no ECS service, an
@@ -230,8 +238,5 @@ fn ecs_has_fulfilled<Eng: Send + Sync + 'static>(
     else {
         return true;
     };
-    if desired_count != capacity {
-        return false;
-    }
-    store.service_tally(cluster, service_name).running == capacity
+    desired_count == capacity
 }

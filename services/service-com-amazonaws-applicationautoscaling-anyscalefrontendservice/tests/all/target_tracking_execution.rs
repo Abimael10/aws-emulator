@@ -1036,3 +1036,321 @@ async fn a_breach_answers_the_peak_of_the_range_its_alarm_graded() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// A metric sitting AT the target asks for no movement at all
+// ---------------------------------------------------------------------------
+//
+// The capacity a target-tracking policy asks for is the one at which the tracked metric would
+// sit at the target value — "Application Auto Scaling […] scales the capacity to keep the metric
+// at, or close to, the specified target value" — so the controller is proportional and comes to
+// REST: a metric that already reads the target at the capacity the resource holds asks for that
+// same capacity, which is no movement and no scaling activity. The alarms say the same thing
+// first: the pair a policy mints is a `GreaterThanThreshold` on the target utilisation and a
+// `LessThanThreshold` on the buffered one, and a metric at the target is on neither side of
+// them, so nothing is even triggered.
+//
+// What that forbids is a controller with no proportional answer: one that treats any reading at
+// or above the target as a breach and adds capacity again on every evaluation walks the capacity
+// up until the registered `MaxCapacity` absorbs it, and then reports the customer's own safety
+// limit as where the metric settled. So every row here is asserted to hold its capacity over a
+// watch window, to record nothing, and to rest somewhere other than that bound.
+
+/// How long a resting row is WATCHED: long enough for the alarm clock and the scaling clock to
+/// wake several times, so a controller that acts once per evaluation is caught acting. Nothing
+/// in the emulator sleeps for it.
+const REST_WATCH: Duration = Duration::from_secs(5);
+
+/// The metric values that ask for no movement, as rows of [`ExecutionRow`]: `measured` is the
+/// value the tracked series takes in every window its alarms grade, and `capacity` is the
+/// capacity the resource holds throughout — the one the row starts at.
+///
+/// The rows differ along what the rule generalises over: which service owns the resource,
+/// whether the tracked metric counts consumed units or is already the quantity the target names,
+/// the target value, whether the metric reads exactly the target or just under it, and where the
+/// resting capacity sits in the registered window (at its floor, in the middle, one unit under
+/// its ceiling). Neither alarm of the pair is breaching on any of them.
+const RESTING_CATALOG: &[ExecutionRow] = &[
+    // The shape of a closed loop that has converged: 8 tasks each averaging the 50% target.
+    ExecutionRow {
+        case: "a percentage metric at the target",
+        tracked: Tracked::EcsCpu,
+        starting: 8,
+        min: 1,
+        max: 20,
+        target_value: 50.0,
+        measured: 50.0,
+        direction: Direction::Out,
+        capacity: 8,
+    },
+    // Just under the target, and still above the buffered target the scale-in alarm watches (a
+    // tenth under, 45%): neither direction is triggered, and the proportional answer
+    // (8 * 49 / 50 = 7.84, taken up) is the capacity already held.
+    ExecutionRow {
+        case: "a percentage metric just under the target",
+        tracked: Tracked::EcsCpu,
+        starting: 8,
+        min: 1,
+        max: 20,
+        target_value: 50.0,
+        measured: 49.0,
+        direction: Direction::Out,
+        capacity: 8,
+    },
+    // The same reading with ONE task of room left under the ceiling, which is where a
+    // controller that scales out on every evaluation would end up.
+    ExecutionRow {
+        case: "a percentage metric at the target one task under the ceiling",
+        tracked: Tracked::EcsCpu,
+        starting: 8,
+        min: 1,
+        max: 9,
+        target_value: 50.0,
+        measured: 50.0,
+        direction: Direction::Out,
+        capacity: 8,
+    },
+    // A single task at a higher target: the resting capacity is the window's floor.
+    ExecutionRow {
+        case: "a percentage metric at a 70% target on one task",
+        tracked: Tracked::EcsCpu,
+        starting: 1,
+        min: 1,
+        max: 20,
+        target_value: 70.0,
+        measured: 70.0,
+        direction: Direction::Out,
+        capacity: 1,
+    },
+    // A metric that COUNTS consumed units instead: 300 units a minute is exactly 50% of the 10
+    // provisioned units over the 60-second period, so 300 / (0.5 * 60) is the 10 units held.
+    ExecutionRow {
+        case: "a consumed-units metric at the target",
+        tracked: Tracked::DynamodbRead,
+        starting: 10,
+        min: 1,
+        max: 50,
+        target_value: 50.0,
+        measured: 300.0,
+        direction: Direction::Out,
+        capacity: 10,
+    },
+    // The other half of the same provisioned throughput, at another target: 144 units a minute
+    // is 40% of 6 provisioned units, and 144 / (0.4 * 60) is those 6 units.
+    ExecutionRow {
+        case: "a consumed-units write metric at a 40% target",
+        tracked: Tracked::DynamodbWrite,
+        starting: 6,
+        min: 1,
+        max: 50,
+        target_value: 40.0,
+        measured: 144.0,
+        direction: Direction::Out,
+        capacity: 6,
+    },
+];
+
+/// Stand a resting row up: the resource, the scalable target, the policy and the load it reads.
+async fn given_resting_row(emulator: &Emulator, row: &ExecutionRow, resource: &str) -> Value {
+    let case = row.case;
+    let resource_id = given_resource(emulator, row, resource).await;
+    let target = target_of(row, &resource_id);
+    let mut registration = target.clone();
+    registration["MinCapacity"] = json!(row.min);
+    registration["MaxCapacity"] = json!(row.max);
+    let (status, body) = emulator.call("RegisterScalableTarget", registration).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected RegisterScalableTarget to answer 200, got {status} {body:?}"
+    );
+    put_policy(emulator, row, &target, "tracker").await;
+    seed_load(emulator, row, resource);
+    target
+}
+
+#[tokio::test]
+async fn a_metric_at_the_target_moves_no_capacity_and_records_nothing() {
+    for row in RESTING_CATALOG {
+        let case = row.case;
+        let emulator = Emulator::empty();
+        let resource = "tracked";
+        let target = given_resting_row(&emulator, row, resource).await;
+
+        // The capacity and the log are both WATCHED rather than looked at once: a controller
+        // that acts per evaluation acts inside this window, and reading the log and the owning
+        // service is also what keeps the alarm clock and the scaling clock running.
+        let deadline = Instant::now() + REST_WATCH;
+        loop {
+            let held = capacity_of(&emulator, row, resource).await;
+            assert_eq!(
+                held, row.capacity,
+                "case {case:?}: expected a metric reading {} against a target of {} to leave the \
+                 capacity at {}, got {held} (activities {:?})",
+                row.measured,
+                row.target_value,
+                row.capacity,
+                activities(&emulator, &target, case).await,
+            );
+            let mut with_not_scaled = target.clone();
+            with_not_scaled["IncludeNotScaledActivities"] = json!(true);
+            let listed = activities(&emulator, &with_not_scaled, case).await;
+            assert!(
+                listed.is_empty(),
+                "case {case:?}: expected a metric at the target to record no scaling activity, \
+                 got {listed:?}"
+            );
+            if Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(CLOCK_POLL).await;
+        }
+
+        // The resting capacity is not the bound the customer set as a safety limit: a run-away
+        // controller ends there, a converged one ends where the metric asked.
+        assert_ne!(
+            row.capacity, row.max,
+            "case {case:?}: expected the resting capacity to be inside the registered window, \
+             not its MaxCapacity {}",
+            row.max
+        );
+
+        // And NEITHER alarm of the pair on the tracked metric is in `ALARM`: a metric at the
+        // target is on neither side of the thresholds the target value decides.
+        let states = alarm_states(&emulator).await;
+        for direction in [Direction::Out, Direction::In] {
+            let kind = direction.alarm_kind();
+            let breaching = states
+                .iter()
+                .any(|(held, state)| held == kind && state == "ALARM");
+            assert!(
+                !breaching,
+                "case {case:?}: expected no {kind} alarm to be in ALARM for a metric reading {} \
+                 against a target of {}, got {states:?}",
+                row.measured, row.target_value
+            );
+        }
+    }
+}
+
+/// The status a movement the owning service has taken the capacity on reaches.
+const SUCCESSFUL: &str = "Successful";
+
+/// A metric PAST the target, and the capacity its proportional answer asks for.
+///
+/// The rows differ in how far past the target the reading is — a single point over it, double
+/// it, and six times it — which is what says the answer is proportional to the reading rather
+/// than a step towards a bound. The last row's answer is past the registered ceiling, where the
+/// clamp is what the capacity lands on because the policy really asked for more.
+const PROPORTIONAL_CATALOG: &[ExecutionRow] = &[
+    // 8 tasks one point over a 50% target: 8 * 51 / 50 = 8.16, taken up to 9 — one task, not
+    // the twelve that separate 8 from the ceiling.
+    ExecutionRow {
+        case: "a reading one point over the target",
+        tracked: Tracked::EcsCpu,
+        starting: 8,
+        min: 1,
+        max: 20,
+        target_value: 50.0,
+        measured: 51.0,
+        direction: Direction::Out,
+        capacity: 9,
+    },
+    // Double the target asks for double the capacity: 8 * 100 / 50 = 16, still under the
+    // ceiling.
+    ExecutionRow {
+        case: "a reading at double the target",
+        tracked: Tracked::EcsCpu,
+        starting: 8,
+        min: 1,
+        max: 20,
+        target_value: 50.0,
+        measured: 100.0,
+        direction: Direction::Out,
+        capacity: 16,
+    },
+    // Six times the target asks for 48 tasks, which the registered window holds at its
+    // ceiling: a movement that overshoots a bound is still performed, at the bound.
+    ExecutionRow {
+        case: "a reading the ceiling holds",
+        tracked: Tracked::EcsCpu,
+        starting: 8,
+        min: 1,
+        max: 20,
+        target_value: 50.0,
+        measured: 300.0,
+        direction: Direction::Out,
+        capacity: 20,
+    },
+];
+
+#[tokio::test]
+async fn a_reading_past_the_target_moves_once_to_the_capacity_it_asks_for() {
+    for row in PROPORTIONAL_CATALOG {
+        let case = row.case;
+        let emulator = Emulator::empty();
+        let resource = "tracked";
+        let target = given_resting_row(&emulator, row, resource).await;
+        await_alarm(&emulator, row.direction.alarm_kind(), case).await;
+
+        let moved = await_capacity(&emulator, row, resource, row.capacity).await;
+        assert_eq!(
+            moved, row.capacity,
+            "case {case:?}: expected a reading of {} against a target of {} to move the capacity \
+             to {}, got {moved} (activities {:?})",
+            row.measured,
+            row.target_value,
+            row.capacity,
+            activities(&emulator, &target, case).await,
+        );
+
+        // ONE movement, however long the alarm goes on reporting the same breach: an alarm
+        // executes its actions when it CHANGES state, so the capacity the answer asked for is
+        // reached once rather than added to on every evaluation.
+        let deadline = Instant::now() + REST_WATCH;
+        loop {
+            let listed = activities(&emulator, &target, case).await;
+            assert_eq!(
+                listed.len(),
+                1,
+                "case {case:?}: expected the one movement the breach asked for, got {listed:?}"
+            );
+            let held = capacity_of(&emulator, row, resource).await;
+            assert_eq!(
+                held, row.capacity,
+                "case {case:?}: expected the capacity to stay at {} while the same breach went \
+                 on being reported, got {held}",
+                row.capacity
+            );
+            if Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(CLOCK_POLL).await;
+        }
+
+        // And that movement settles: the service that owns the resource holds the capacity it
+        // set, so the activity reaches its terminal status with an `EndTime`.
+        let deadline = Instant::now() + CLOCK_WAIT;
+        let mut newest = activities(&emulator, &target, case).await;
+        while newest
+            .first()
+            .is_some_and(|activity| activity["StatusCode"] != json!(SUCCESSFUL))
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(CLOCK_POLL).await;
+            newest = activities(&emulator, &target, case).await;
+        }
+        let activity = newest
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: expected the movement's activity"));
+        assert_eq!(
+            activity["StatusCode"],
+            json!(SUCCESSFUL),
+            "case {case:?}: expected the movement to reach {SUCCESSFUL}, got {activity:?}"
+        );
+        assert!(
+            activity["EndTime"].as_f64().is_some(),
+            "case {case:?}: expected a settled movement to carry an EndTime, got {activity:?}"
+        );
+    }
+}
